@@ -1,0 +1,29 @@
+// For format details, see https://aka.ms/devcontainer.json. For config options, see the
+// README at: https://github.com/devcontainers/templates/tree/main/src/python
+{
+	"name": "Python 3",
+	// Or use a Dockerfile or Docker Compose file. More info: https://containers.dev/guide/dockerfile
+	"image": "mcr.microsoft.com/devcontainers/python:3.12",
+	"features": {
+		"ghcr.io/devcontainers-extra/features/copier:7.0.15": {
+			"version": "9.10.2"
+		},
+		"ghcr.io/devcontainers-extra/features/hatch:2.0.18": {
+			"version": "1.14.2"
+		},
+		"ghcr.io/devcontainers-extra/features/pre-commit:2.0.18": {
+			"version": "4.3.0"
+		},
+		"ghcr.io/devcontainers-extra/features/black:2.0.18": {
+			"version": "25.9.0"
+		},
+		"ghcr.io/devcontainers-extra/features/isort:2.0.18": {
+			"version": "6.0.1"
+		},
+		"ghcr.io/va-h/devcontainers-features/uv:1": {
+			"version": "0.8.22"
+		},
+	},
+	"extensions": [
+		"ms-vscode.live-server",
+	]

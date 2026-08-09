@@ -1,0 +1,79 @@
+name: Build & Publish to PyPI
+on:
+  release:
+    types: [published]
+  push:
+    branches:
+      - main
+jobs:
+  # setup build separate from publish
+  # See https://github.com/pypa/gh-action-pypi-publish/issues/217#issuecomment-1965727093
+  build:
+    runs-on: ubuntu-latest
+    # This ensures that the publish action only runs in the main repository
+    # rather than on any forks of your repo. You only should publish from the
+    # main repository
+    # Environment is encouraged but not required. The build step of this action
+    # Only builds your package's sdist and wheel
+    environment: build
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v4
+        with:
+          # This fetch element is only important if you are use SCM based
+          # versioning (that looks at git tags to gather the version)
+          fetch-depth: 100
+
+      # Need the tags so that setuptools-scm can form a valid version number
+      - name: Fetch git tags
+        run: git fetch origin 'refs/tags/*:refs/tags/*'
+
+      - name: Setup Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v5
+        with:
+          python-version: "3.11"
+      - name: Install Hatch
+        run: |
+          pipx install hatch
+          pip list
+
+      - name: Build package using Hatch
+        run: |
+          hatch run build:check
+          echo ""
+          echo "Generated files:"
+          ls -lh dist/
+      # Store an artifact of the build to use in the publish step below
+      - name: Store the distribution packages
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v4
+        with:
+          name: python-package-distributions
+          path: dist/
+  # The publish step will only run on a release from the pyopensci repository
+  # There are several checks in place including setting up the pypi environment in
+  # GitHub so that only people on your maintainer team can allow the deployment
+  publish:
+    name: >-
+      Publish Python 🐍 distribution 📦 to PyPI
+    if: github.repository_owner == 'pyopensci' && github.event_name == 'release'
+    needs:
+      - build
+    runs-on: ubuntu-latest
+    # This is the trusted environment. Notice that it's called pypi
+    # that is the name that you will use in your pypi configuration
+    environment:
+      name: pypi
+      url: https://pypi.org/p/pyospackage
+    permissions:
+      id-token: write  # this permission is mandatory for pypi publishing
+    steps:
+      # Version 4 doesn't support GitHub enterprise yet
+      - name: Download all the dists
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v4
+        with:
+          name: python-package-distributions
+          path: dist/
+      - name: Publish package to PyPI
+        # Only publish to real PyPI on release
+        if: github.event_name == 'release'
+        uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e # v1.13.0
