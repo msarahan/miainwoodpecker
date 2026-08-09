@@ -22,8 +22,23 @@
 # SOFTWARE.
 
 """
-Add a docstring here for the init module.
-
-This might include a very brief description of the package,
-its purpose, and any important notes.
+Planning helpers for a STEM control and analysis application replacement.
 """
+
+from pyospackage.replacement_strategy import (
+    LicensingAssessment,
+    ModernizationStep,
+    ReinventionArea,
+    ReplacementPlan,
+    assess_plugin_adaptation,
+    build_replacement_plan,
+)
+
+__all__ = [
+    "LicensingAssessment",
+    "ModernizationStep",
+    "ReinventionArea",
+    "ReplacementPlan",
+    "assess_plugin_adaptation",
+    "build_replacement_plan",
+]

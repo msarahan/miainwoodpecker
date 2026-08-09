@@ -1,4 +1,4 @@
-# Welcome to pyosPackage's documentation
+# STEM replacement planning documentation
 
 :::{toctree}
 :maxdepth: 2
@@ -9,31 +9,18 @@ Home <self>
 Documentation <documentation/index>
 :::
 
-This documentation example uses myst as the primary documentation syntax.
+This package provides planning helpers for a Python-based replacement for Nion
+Swift, with emphasis on STEM hardware control, GPU-friendly modernization, and
+careful handling of proprietary plugins.
 
-:::{button-link} <https://www.pyopensci.org/python-package-guide/documentation/hosting-tools/myst-markdown-rst-doc-syntax.html>
+:::{button-link} <https://github.com/nion-software/nionswift>
 :color: primary
 :class: sd-rounded-pill float-left
 
-Learn more about myst in our pyOpenSci packaging guide.
+Reference the upstream application being evaluated.
 
 :::
 
-Myst is a version of markdown that has more formatting flexibility.
-This is what a sphinx directive looks like using myst markdown formatting:
-
-```markdown
-:::{toctree}
-:maxdepth: 2
-:caption: Contents:
-:::
-
-```
-
-If you see syntax like the syntax below, you are looking at rst.
-
-```rst
-.. toctree::
-   :maxdepth: 2
-   :caption: Contents:
-```
+Use the Python API to inspect the recommended language choice,
+modernization steps, and licensing constraints for proprietary
+instrument plugins.

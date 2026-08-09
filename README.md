@@ -10,7 +10,16 @@
 
 ## What does pyospackage do?
 
-pyospackage is a demonstration Python package that compliments the pyOpenSci [beginner tutorial series on creating a Python package](https://www.pyopensci.org/python-package-guide/tutorials/intro.html).
+`pyospackage` now provides a small, testable planning API for starting a
+replacement for Nion Swift with a focus on scanning transmission electron
+microscope (STEM) instrument control and data analysis.
+
+The current package captures three concrete outcomes from the issue discussion:
+
+* a recommendation to keep **Python** as the primary language,
+* a prioritized modernization plan for retiring bespoke architecture, and
+* a licensing assessment helper for adaptations that must interoperate with
+  proprietary scan and camera plugins.
 
 ## 🔧 About This Template
 
@@ -61,20 +70,44 @@ uv pip install pyospackage
 
 Or just run `uv run python` in the directory where the package lives and it will install it automatically into the chosen uv venv.
 
-## Get started using packagename
+## Get started using pyospackage
 
 To use this package:
 
 ```python
-from pyospackage.add_numbers import add_num
+from pyospackage import assess_plugin_adaptation, build_replacement_plan
 
+plan = build_replacement_plan()
+print(plan.recommended_language)
+print(plan.hardware_priorities)
 
-a = add_num(1, 2)
-print(a)
+assessment = assess_plugin_adaptation(
+    distributed=False,
+    bundles_proprietary_plugins=False,
+)
+print(assessment.summary)
 
 ```
 
-You can also add any links to this section to tutorials in your documentation.
+The plan currently recommends Python because it keeps the easiest path to
+existing scientific tooling and proprietary hardware integrations, while moving
+performance-sensitive display work onto established Qt or GPU-backed
+infrastructure.
+
+## What the starter plan includes
+
+`build_replacement_plan()` returns structured guidance covering:
+
+* bespoke subsystems that should be replaced with standard tooling,
+* the recommended modernization order, and
+* the highest-priority hardware capabilities to support first, especially
+  **scan control** and **camera control**.
+
+`assess_plugin_adaptation()` helps distinguish between:
+
+* internal use of a modified GPL host with existing proprietary plugins,
+* distribution of the GPL adaptation without vendor binaries, and
+* unsafe redistribution scenarios that bundle proprietary plugins.
 
 ## Development
 
