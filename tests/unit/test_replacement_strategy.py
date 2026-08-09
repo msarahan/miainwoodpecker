@@ -66,6 +66,7 @@ def test_distributed_bundle_is_not_allowed():
 
     assert assessment.may_run_against_user_obtained_plugins is True
     assert assessment.may_redistribute_proprietary_plugins is False
+    assert assessment.requires_vendor_license_review is True
     assert "Do not distribute" in assessment.summary
 
 
