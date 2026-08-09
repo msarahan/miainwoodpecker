@@ -10,7 +10,7 @@
 
 ## What does pyospackage do?
 
-`pyospackage` now provides a small, testable planning API for starting a
+`pyospackage` provides a small, testable planning API for starting a
 replacement for Nion Swift with a focus on scanning transmission electron
 microscope (STEM) instrument control and data analysis.
 
@@ -21,19 +21,17 @@ The current package captures three concrete outcomes from the issue discussion:
 * a licensing assessment helper for adaptations that must interoperate with
   proprietary scan and camera plugins.
 
-## 🔧 About This Template
+## Design goals
 
-This package was built using [pyOpenSci’s Python package Copier template](https://github.com/pyOpenSci/pyos-package-template).l This template makes it easy for anyone to quickly create a Python package following best practices developed by the pyOpenSci community.
+The package focuses on the early planning work needed before implementing a
+full replacement:
 
-The template includes configuration for:
-
-* [Standard Python package layout and structure](https://www.pyopensci.org/python-package-guide/package-structure-code/python-package-structure.html)
-* [Code linting and formatting tools like Ruff](https://www.pyopensci.org/python-package-guide/package-structure-code/code-style-linting-format.html)
-* [Setup for a test suite](https://www.pyopensci.org/python-package-guide/tests/index.html)
-* [Basic setup for Continuous Integration and Deployment (CI/CD)](https://www.pyopensci.org/python-package-guide/continuous-integration/ci.html)
-* [Basic documentation infrastructure and files](https://www.pyopensci.org/python-package-guide/documentation/index.html) using mkdocs or sphinx
-
-If you're interested in using the template, check out the [Copier Template Repo](https://github.com/pyOpenSci/pyos-package-template).
+* preserve the fastest path to proprietary **scan control** and **camera
+  control** integrations,
+* identify the bespoke Nion Swift subsystems that should be replaced with
+  standard tooling, and
+* encode licensing constraints so adaptation plans do not assume proprietary
+  vendor plugins can be redistributed.
 
 ## 📘 Learn More About Python Packaging
 
