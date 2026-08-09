@@ -78,7 +78,7 @@ class LicensingAssessment:
 
     Attributes
     ----------
-    may_use_existing_plugins : bool
+    may_run_against_user_obtained_plugins : bool
         Whether the adaptation may run against plugins the user already has.
     may_redistribute_proprietary_plugins : bool
         Whether the adaptation may ship the proprietary plugins.
@@ -90,7 +90,7 @@ class LicensingAssessment:
         Follow-up actions to keep the adaptation compliant.
     """
 
-    may_use_existing_plugins: bool
+    may_run_against_user_obtained_plugins: bool
     may_redistribute_proprietary_plugins: bool
     requires_vendor_license_review: bool
     summary: str
@@ -280,7 +280,7 @@ def assess_plugin_adaptation(
     """
     if not distributed:
         return LicensingAssessment(
-            may_use_existing_plugins=True,
+            may_run_against_user_obtained_plugins=True,
             may_redistribute_proprietary_plugins=False,
             requires_vendor_license_review=True,
             summary=(
@@ -296,7 +296,7 @@ def assess_plugin_adaptation(
 
     if bundles_proprietary_plugins:
         return LicensingAssessment(
-            may_use_existing_plugins=False,
+            may_run_against_user_obtained_plugins=True,
             may_redistribute_proprietary_plugins=False,
             requires_vendor_license_review=True,
             summary=(
@@ -312,7 +312,7 @@ def assess_plugin_adaptation(
         )
 
     return LicensingAssessment(
-        may_use_existing_plugins=True,
+        may_run_against_user_obtained_plugins=True,
         may_redistribute_proprietary_plugins=False,
         requires_vendor_license_review=True,
         summary=(

@@ -45,7 +45,7 @@ def test_internal_use_assessment_allows_existing_plugins():
         bundles_proprietary_plugins=False,
     )
 
-    assert assessment.may_use_existing_plugins is True
+    assert assessment.may_run_against_user_obtained_plugins is True
     assert assessment.may_redistribute_proprietary_plugins is False
     assert assessment.requires_vendor_license_review is True
 
@@ -57,7 +57,7 @@ def test_distributed_bundle_is_not_allowed():
         bundles_proprietary_plugins=True,
     )
 
-    assert assessment.may_use_existing_plugins is False
+    assert assessment.may_run_against_user_obtained_plugins is True
     assert assessment.may_redistribute_proprietary_plugins is False
     assert "Do not distribute" in assessment.summary
 
@@ -69,6 +69,6 @@ def test_distributed_adaptation_without_plugins_is_supported():
         bundles_proprietary_plugins=False,
     )
 
-    assert assessment.may_use_existing_plugins is True
+    assert assessment.may_run_against_user_obtained_plugins is True
     assert assessment.may_redistribute_proprietary_plugins is False
     assert "user-installed vendor binaries" in assessment.summary
