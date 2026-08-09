@@ -60,3 +60,15 @@ def test_distributed_bundle_is_not_allowed():
     assert assessment.may_use_existing_plugins is False
     assert assessment.may_redistribute_proprietary_plugins is False
     assert "Do not distribute" in assessment.summary
+
+
+def test_distributed_adaptation_without_plugins_is_supported():
+    """Distributed adaptations may rely on separately installed plugins."""
+    assessment = assess_plugin_adaptation(
+        distributed=True,
+        bundles_proprietary_plugins=False,
+    )
+
+    assert assessment.may_use_existing_plugins is True
+    assert assessment.may_redistribute_proprietary_plugins is False
+    assert "user-installed vendor binaries" in assessment.summary
