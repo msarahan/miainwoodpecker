@@ -277,7 +277,20 @@ def assess_plugin_adaptation(
     -------
     LicensingAssessment
         Guidance for using proprietary plugins with a GPL-based host.
+
+    Raises
+    ------
+    ValueError
+        Raised when proprietary plugins are marked as bundled for a scenario
+        that is not being distributed.
     """
+    if bundles_proprietary_plugins and not distributed:
+        msg = (
+            "bundles_proprietary_plugins only applies to distributed "
+            "adaptations."
+        )
+        raise ValueError(msg)
+
     if not distributed:
         return LicensingAssessment(
             may_run_against_user_obtained_plugins=True,

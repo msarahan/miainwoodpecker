@@ -23,6 +23,8 @@
 
 """Tests for the STEM replacement planning helpers."""
 
+import pytest
+
 from pyospackage import assess_plugin_adaptation, build_replacement_plan
 
 
@@ -71,4 +73,14 @@ def test_distributed_adaptation_without_plugins_is_supported():
 
     assert assessment.may_run_against_user_obtained_plugins is True
     assert assessment.may_redistribute_proprietary_plugins is False
+    assert assessment.requires_vendor_license_review is True
     assert "user-installed vendor binaries" in assessment.summary
+
+
+def test_internal_bundle_flag_is_rejected():
+    """Bundling only makes sense for a distributed adaptation."""
+    with pytest.raises(ValueError, match="only applies to distributed"):
+        assess_plugin_adaptation(
+            distributed=False,
+            bundles_proprietary_plugins=True,
+        )
