@@ -11,7 +11,7 @@
 ## What does pyospackage do?
 
 `pyospackage` provides a small, testable planning API for starting a
-replacement for Nion Swift with a focus on scanning transmission electron
+replacement for Nion Swift, with a focus on scanning transmission electron
 microscopy (STEM), instrument control, and data analysis.
 
 The current package captures three concrete outcomes from the issue discussion:
