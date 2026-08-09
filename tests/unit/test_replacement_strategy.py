@@ -50,6 +50,11 @@ def test_internal_use_assessment_allows_existing_plugins():
     assert assessment.may_run_against_user_obtained_plugins is True
     assert assessment.may_redistribute_proprietary_plugins is False
     assert assessment.requires_vendor_license_review is True
+    assert "Internal use" in assessment.summary
+    assert assessment.next_steps == (
+        "Confirm the plugin agreement permits use with a modified host.",
+        "Keep proprietary plugins out of any redistributed artifact.",
+    )
 
 
 def test_distributed_bundle_is_not_allowed():
