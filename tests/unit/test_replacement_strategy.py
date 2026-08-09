@@ -68,6 +68,11 @@ def test_distributed_bundle_is_not_allowed():
     assert assessment.may_redistribute_proprietary_plugins is False
     assert assessment.requires_vendor_license_review is True
     assert "Do not distribute" in assessment.summary
+    assert assessment.next_steps == (
+        "Distribute only the GPL adaptation.",
+        "Require end users to install vendor plugins separately.",
+        "Ask the vendor for written permission if redistribution is required.",
+    )
 
 
 def test_distributed_adaptation_without_plugins_is_supported():
@@ -81,6 +86,11 @@ def test_distributed_adaptation_without_plugins_is_supported():
     assert assessment.may_redistribute_proprietary_plugins is False
     assert assessment.requires_vendor_license_review is True
     assert "user-installed vendor binaries" in assessment.summary
+    assert assessment.next_steps == (
+        "Distribute the adaptation without proprietary plugins.",
+        "Document that users must obtain plugins from the vendor.",
+        "Review the vendor terms before advertising compatibility.",
+    )
 
 
 def test_internal_bundle_flag_is_rejected():

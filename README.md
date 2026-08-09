@@ -12,7 +12,7 @@
 
 `pyospackage` provides a small, testable planning API for starting a
 replacement for Nion Swift with a focus on scanning transmission electron
-microscope (STEM) instrument control and data analysis.
+microscopy (STEM), instrument control, and data analysis.
 
 The current package captures three concrete outcomes from the issue discussion:
 
