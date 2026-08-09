@@ -21,9 +21,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""
-Planning helpers for a STEM control and analysis application replacement.
-"""
+"""Planning helpers for a STEM control and analysis application replacement."""
 
 from pyospackage.replacement_strategy import (
     LicensingAssessment,

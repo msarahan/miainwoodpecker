@@ -1,6 +1,27 @@
-"""
-Utilities for planning a STEM control and analysis replacement for Nion Swift.
-"""
+# MIT License
+#
+# Copyright (c) 2025 pyOpenSci
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice (including the next
+# paragraph) shall be included in all copies or substantial portions of the
+# Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+"""Utilities for planning a STEM control and analysis replacement for Nion Swift."""
 
 from __future__ import annotations
 
@@ -112,7 +133,6 @@ def build_replacement_plan() -> ReplacementPlan:
         The recommended starting point based on Swift's architecture and the
         surrounding Python ecosystem.
     """
-
     reinventions = (
         ReinventionArea(
             name="UI toolkit",
@@ -175,7 +195,10 @@ def build_replacement_plan() -> ReplacementPlan:
                 "Retire the launcher indirection and align with a maintained Qt "
                 "backend that is easier to package and extend."
             ),
-            leverage="Deletes custom host complexity and unblocks direct rendering work.",
+            leverage=(
+                "Deletes custom host complexity and unblocks direct rendering "
+                "work."
+            ),
         ),
         ModernizationStep(
             title="Move image display to the GPU",
@@ -183,7 +206,10 @@ def build_replacement_plan() -> ReplacementPlan:
                 "Raster imagery should be uploaded once and composited by the GPU "
                 "instead of rebuilt in Python for each frame."
             ),
-            leverage="Directly improves pan, zoom, and live acquisition responsiveness.",
+            leverage=(
+                "Directly improves pan, zoom, and live acquisition "
+                "responsiveness."
+            ),
         ),
         ModernizationStep(
             title="Make library access lazy",
@@ -191,7 +217,10 @@ def build_replacement_plan() -> ReplacementPlan:
                 "Use an index plus chunked array storage so large datasets do not "
                 "have to become Python objects at open time."
             ),
-            leverage="Improves startup time, memory use, and downstream interoperability.",
+            leverage=(
+                "Improves startup time, memory use, and downstream "
+                "interoperability."
+            ),
         ),
         ModernizationStep(
             title="Coalesce reactive updates",
@@ -206,12 +235,18 @@ def build_replacement_plan() -> ReplacementPlan:
     return ReplacementPlan(
         recommended_language="Python",
         language_rationale=(
-            "Existing microscope control and analysis capabilities already have a "
-            "strong Python ecosystem.",
-            "Python keeps the easiest path to reuse of proprietary hardware "
-            "plugins and scientific tooling.",
-            "The main architectural change is to remove Python from rendering hot "
-            "loops, not to abandon Python entirely.",
+            (
+                "Existing microscope control and analysis capabilities already "
+                "have a strong Python ecosystem."
+            ),
+            (
+                "Python keeps the easiest path to reuse of proprietary hardware "
+                "plugins and scientific tooling."
+            ),
+            (
+                "The main architectural change is to remove Python from "
+                "rendering hot loops, not to abandon Python entirely."
+            ),
         ),
         hardware_priorities=(
             "scan control",
@@ -243,7 +278,6 @@ def assess_plugin_adaptation(
     LicensingAssessment
         Guidance for using proprietary plugins with a GPL-based host.
     """
-
     if not distributed:
         return LicensingAssessment(
             may_use_existing_plugins=True,
