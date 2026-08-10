@@ -86,12 +86,29 @@ problem — read their source and docs before designing our own adapters:
 ## 5. Phased plan
 
 **Phase 0 — Groundwork**
-- Stand up `nionswift-usim` and confirm the camera/scan hardware-source
-  classes can be driven headlessly, outside Swift's own process/UI.
-- Stand up a bare napari window with PySide6 as a smoke test.
-- Settle on a package layout beyond the current template scaffold (package
-  is named `miainwoodpecker`; still just the demo `add_numbers` module) and
-  decide the license (see §6).
+- [x] Stand up `nionswift-usim` and confirm the camera/scan device classes
+  can be driven headlessly, outside Swift's own process/UI —
+  [`scripts/phase0_usim_smoke_test.py`](../scripts/phase0_usim_smoke_test.py)
+  (`uv run --extra device python scripts/phase0_usim_smoke_test.py`).
+  Note: it talks to the `nion.device_kit` `Camera`/`Device` objects
+  directly (`acquire_image()`, `get_scan_data()`), not the higher-level
+  `HardwareSource`/`DocumentController` layer — that layer's own headless
+  test harness (`AcquisitionTestContext`) turned out to depend on
+  application-level registration (`WorkspaceManager.register_filter_panel`)
+  that only happens inside a full `nion.swift.Application.initialize()`,
+  so it isn't actually the lighter-weight path outside Swift's UI process
+  it looks like. Also note: usim constructs *two* camera devices
+  (Ronchigram + EELS) up front, each running its own acquisition thread
+  from construction time — close both, or the process hangs on exit.
+- [x] Stand up a bare napari window with PySide6 as a smoke test —
+  [`scripts/phase0_viewer_smoke_test.py`](../scripts/phase0_viewer_smoke_test.py)
+  (`uv run --extra viewer python scripts/phase0_viewer_smoke_test.py`).
+  Passed cleanly with `QT_QPA_PLATFORM=offscreen`, so this also runs in
+  headless CI without a real display.
+- [x] Settle on a package layout beyond the pyOpenSci template scaffold —
+  package is named `miainwoodpecker`.
+- [ ] Decide the license (see §6) and replace the demo `add_numbers`
+  module with the Phase 1 device bridge.
 
 **Phase 1 — Device bridge**
 - Define a vendor-neutral `Camera`/`Scanner` interface (device-kind

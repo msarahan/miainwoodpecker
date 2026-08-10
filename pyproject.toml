@@ -53,6 +53,16 @@ dev = [
 tests = [
     "pytest>=8.4.2",
 ]
+# Nion's STEM device layer (camera/scan hardware sources) and simulator.
+# See docs/migration-plan.md Phase 0/1 - this is kept and reused, not rewritten.
+device = [
+    "nionswift-usim>=5.4.2",
+]
+# Live-viewer shell candidate. See docs/migration-plan.md section 4 - benchmark
+# against ndv before committing further if per-frame overhead is too high.
+viewer = [
+    "napari[pyside6]>=0.5",
+]
 docs = [
     "sphinx>=8.2.3",
     "myst-parser>=4.0.1",
@@ -135,6 +145,10 @@ exclude = [
     "S101",  # 'Use of assert detected' ignored because we are using pytest.
     "INP001",  # 'Insecure input' ignored because we are testing.
     "ANN201",  # 'Missing type annotation for {return}' ignored because all tests return `None`.
+]
+"scripts/**/*.py" = [
+    "INP001",  # standalone entry-point scripts, not a package.
+    "T201",  # these are diagnostic CLI scripts; print is the interface.
 ]
 
 [tool.ruff.lint.isort]
