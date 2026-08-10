@@ -347,11 +347,13 @@ problem — read their source and docs before designing our own adapters:
   plot them without any of our code.
 - [x] Legacy `.ndata` importer —
   [`src/miainwoodpecker/storage/legacy.py`](../src/miainwoodpecker/storage/legacy.py).
-  Uses Nion's own `NDataHandler` rather than re-implementing its zip
-  container, converts to `Frame`, and recovers Swift's naive-UTC
-  timestamps as aware. Tests write fixtures with Nion's *writer*, so the
-  real container format is exercised, and cover the full migration path
-  (old library directory → single NeXus file).
+  Converts to `Frame` and recovers Swift's naive-UTC timestamps as aware.
+  Tests write fixtures with Nion's *writer*, so the real container format is
+  exercised, and cover the full migration path (old library directory →
+  single NeXus file). Originally read via Nion's own `NDataHandler` rather
+  than re-implementing its zip container; that import turned out to breach
+  §6's license boundary and the reader is now standard-library only, which
+  also means this module needs no optional extra — see the end of §6.
 - [x] A session, so an operator can actually keep data —
   [`src/miainwoodpecker/storage/session.py`](../src/miainwoodpecker/storage/session.py),
   wired into the viewer and `app.py`. Phase 3 could already *write* NeXus
@@ -1078,22 +1080,54 @@ that assumed idempotence at the wrong layer; the failure was the correct
 signal.
 
 **One pre-existing breach of this section's own invariant, found while
-auditing the boundary for that work and not yet resolved.**
+auditing the boundary and since closed.**
 [`src/miainwoodpecker/storage/legacy.py`](../src/miainwoodpecker/storage/legacy.py)
-does `from nion.swift.model import NDataHandler` at module scope — an
-in-process import of GPL-3.0 code by an MIT module, which is exactly what
-this section's decision exists to prevent. It predates the subprocess
-isolation work and is arguably a *narrower* exposure than the device layer's
-(a one-shot file-format read, only reachable with the `device` extra
-installed, and the module says so in its docstring), but "arguably narrower"
-is not the same as "on the right side of the boundary". Options in
-increasing cost: document it as a deliberate scoped exception here; move the
-`.ndata` read behind the same subprocess boundary the device layer uses; or
-replace it with **RosettaSciIO**, which §3 already names as this project's
-file-I/O building block and which reads `.ndata` without Nion's code — the
-option that removes the problem rather than managing it. Worth resolving
-before any distribution, since this is the kind of thing that only gets more
-expensive to unpick.
+did `from nion.swift.model import NDataHandler` at module scope — an
+in-process import of GPL-3.0 code by an MIT module, exactly what this
+section's decision exists to prevent. It predated the subprocess isolation
+work and was arguably a *narrower* exposure than the device layer's (a
+one-shot file-format read, only reachable with the `device` extra
+installed), but "arguably narrower" is not "on the right side of the
+boundary", and the original reasoning — reuse a vendor reader rather than
+re-implement a container — was correct in general and the wrong trade here.
+
+**The obvious fix does not exist, which is worth recording so it isn't
+proposed again.** RosettaSciIO looked like the answer: §3 already names it
+as this project's file-I/O building block, so reusing it would have removed
+the problem without new code. It has **no `.ndata` reader** — checked
+directly, 38 IO plugins and none handles the extension. Reading a claim
+like that off a dependency's reputation rather than its plugin list is the
+same shortcut this plan keeps having to correct.
+
+**What shipped instead: a standard-library reader.** Re-implementing turned
+out to be cheap because the format is documented and trivial —
+`NDataHandler`'s own docstring says "ndata files are a zip file consisting
+of data.npy file and a metadata.json file. Both files must be
+uncompressed." Nion hand-rolls a zip parser because *writing* in place needs
+byte offsets into uncompressed members; reading needs none of that, so
+`zipfile` + `numpy.load` + `json.load` is the entire implementation.
+Verified against a genuine Nion-written file before committing to the
+approach: both members are `ZIP_STORED`, the extracted stream is seekable,
+and data and properties round-trip exactly. This is reading a documented
+format, not the bespoke-format invention §3 warns against — and it *removes*
+a dependency rather than adding one: `legacy.py` now needs no optional
+extra at all.
+
+The risk that replaces the old one is a reader validated against our own
+assumptions about the format rather than the format itself, so the existing
+integration tests keep building their fixtures with **Nion's own writer**
+(a test is not the distributed application, and nothing there is imported by
+shipped code), while `tests/unit/test_legacy_reader.py` covers the error and
+edge paths — a non-zip file, a container with no array, a file with no
+metadata member — with hand-built zips in the base environment, which is
+also the standing proof that the reader needs no vendor code. Two behaviours
+worth noting: a file whose `metadata.json` is missing still yields its array
+rather than being refused, because the array is the irreplaceable part; and
+a truncated or unrelated file raises a `ValueError` naming the path instead
+of a `zipfile` traceback.
+
+The invariant now holds mechanically: `nion.*` is imported in
+`nion_server.py` and nowhere else in `src/`.
 
 ## 7. Open questions
 
@@ -1141,9 +1175,11 @@ expensive to unpick.
   Supporting it means restructuring the writer to create NXdata up front —
   a real design change, and the remaining step beyond the per-frame
   `flush()` that already bounds worst-case loss to one frame.
-- **`storage/legacy.py` imports GPL-3.0 code in-process**, breaching §6's
-  central invariant. See the end of §6 for the options; replacing it with
-  RosettaSciIO is the one that removes the problem rather than managing it.
+- ~~**`storage/legacy.py` imports GPL-3.0 code in-process**~~ —
+  **resolved**: re-implemented on the standard library, so `nion.*` is now
+  imported in `nion_server.py` and nowhere else in `src/`. See the end of
+  §6, including why RosettaSciIO (the obvious reuse candidate) could not do
+  it.
 - ~~**Shared-memory threshold precision**~~ — **resolved** by the
   reused-segment redesign (§6), not by fitting a better number for the old
   design. The threshold is now 64KB and sits inside a band the benchmark
