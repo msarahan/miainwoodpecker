@@ -36,6 +36,25 @@ What it checks, and why each check exists
    2 alone would go quiet and CI would go green on an unvalidated file.
    This check declares ``NXem`` *without* the sample group and requires the
    validator to say so.
+4. **Every unit in the calibration vocabulary matches the NeXus unit
+   category it claims.** :mod:`miainwoodpecker.storage.calibration` writes
+   real-space, reciprocal-space, energy, and angular axes, and NeXus has no
+   attribute for *which* of those an axis is - the unit string is the only
+   carrier, so the spelling has to be one the category actually accepts.
+   This is not hypothetical pedantry: measured through ``pynxtools``' own
+   ``NXUnitSet.matches``, ``"1/nm"`` and ``"1/angstrom"`` match
+   ``NX_WAVENUMBER`` while the equally plausible ``"nm-1"`` does **not**,
+   and neither does ``"A^-1"``, the spelling py4DSTEM's ``Q_pixel_units``
+   requires. Getting this wrong would produce files whose axes silently
+   fail their own declared category, which no other check here would
+   notice. The one deliberate exception is asserted as an exception:
+   ``"pixel"`` matches no NeXus unit category at all, which is exactly what
+   makes it an honest way to say "uncalibrated".
+5. **A diffraction and a spectrum recording are both still valid NXem.**
+   The axis-calibration work added ``units`` values the writer never
+   emitted before, on the same ``NXdata`` ``AXISNAME`` fields NXem
+   validates. This proves the new axis kinds cost nothing schema-side, so
+   the appdef claim from check 2 survives them.
 
 Exits non-zero if any check fails, which is the point: ``pynx validate``
 itself exits 0 even when it prints "is NOT valid", so a CI step built on
@@ -54,9 +73,16 @@ from pathlib import Path
 import h5py
 import numpy as np
 from pynxtools.dataconverter.validation import validate_hdf_group_against
+from pynxtools.units import NXUnitSet
 
 from miainwoodpecker.devices.interface import Frame
-from miainwoodpecker.storage import NexusWriter
+from miainwoodpecker.storage import FrameCalibration, NexusWriter
+from miainwoodpecker.storage.calibration import (
+    NEXUS_UNIT_CATEGORIES,
+    PIXEL_UNITS,
+    AxisKind,
+    accepted_units,
+)
 
 _APPDEF = "NXem"
 # NXem's required sampleID fields, per `pynx inspect-appdef NXem`. Real
@@ -210,6 +236,85 @@ def _check_validator_still_detects_a_bad_file(directory: Path) -> str | None:
     return None
 
 
+def _check_calibration_units_match_their_categories(directory: Path) -> str | None:
+    """
+    Check every calibration unit matches the NeXus category it claims.
+
+    Parameters
+    ----------
+    directory : Path
+        Scratch directory, unused — this check reads no files, only the
+        unit vocabulary and ``pynxtools``' own matcher.
+
+    Returns
+    -------
+    str | None
+        A failure description, or None if the check passed.
+    """
+    del directory
+    problems = []
+    for kind, category in NEXUS_UNIT_CATEGORIES.items():
+        for units in accepted_units(kind):
+            matches = NXUnitSet.matches(category, units)
+            # "pixel" is deliberately outside every NeXus category: an
+            # uncalibrated axis is not a physical quantity, and saying so is
+            # the point. Every other unit must match, or a file's axes fail
+            # the category their kind claims.
+            expected = not (kind is AxisKind.UNCALIBRATED and units == PIXEL_UNITS)
+            if matches is not expected:
+                problems.append(
+                    f"{kind.value}'s {units!r} "
+                    f"{'matches' if matches else 'does not match'} {category}"
+                )
+    if problems:
+        return (
+            f"calibration units disagree with their declared NeXus unit "
+            f"categories: {'; '.join(problems)}"
+        )
+    return None
+
+
+def _check_calibrated_recordings_are_still_valid(directory: Path) -> str | None:
+    """
+    Check reciprocal-space and energy recordings still validate as NXem.
+
+    Parameters
+    ----------
+    directory : Path
+        Scratch directory to write into.
+
+    Returns
+    -------
+    str | None
+        A failure description, or None if the check passed.
+    """
+    calibrations = {
+        "diffraction": FrameCalibration.diffraction(0.05, shape=(32, 48)),
+        "spectrum": FrameCalibration.spectrum(0.5, offset=-20.0),
+        "angular": FrameCalibration.diffraction(0.4, units="mrad"),
+    }
+    failures = []
+    for name, calibration in calibrations.items():
+        path = directory / f"{name}.nxs"
+        with NexusWriter(
+            path,
+            title=f"{name} recording",
+            definition=_APPDEF,
+            sample=_SYNTHETIC_SAMPLE,
+            calibration=calibration,
+        ) as writer:
+            for frame in _frames():
+                writer.append(frame)
+        if not _is_valid(path):
+            failures.append(name)
+    if failures:
+        return (
+            f"{', '.join(failures)} recording(s) claiming {_APPDEF!r} with real "
+            f"axis calibration do not validate; see the reported problems above"
+        )
+    return None
+
+
 def main() -> int:
     """
     Run every schema check and report.
@@ -225,6 +330,10 @@ def main() -> int:
          _check_with_sample_is_valid),
         (f"validator still rejects a bare {_APPDEF} claim",
          _check_validator_still_detects_a_bad_file),
+        ("calibration units match their NeXus unit categories",
+         _check_calibration_units_match_their_categories),
+        (f"calibrated camera recordings are still valid {_APPDEF}",
+         _check_calibrated_recordings_are_still_valid),
     )
     failures = []
     with tempfile.TemporaryDirectory() as scratch:

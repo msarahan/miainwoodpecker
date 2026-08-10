@@ -8,7 +8,15 @@ import numpy as np
 import pytest
 
 from miainwoodpecker.devices import Frame
-from miainwoodpecker.storage import NexusWriter, read_series, write_frames
+from miainwoodpecker.storage import (
+    AxisCalibration,
+    AxisKind,
+    FrameCalibration,
+    NexusWriter,
+    read_calibration,
+    read_series,
+    write_frames,
+)
 
 
 def _frame(index: int, shape=(4, 6), *, fov_nm: float | None = None) -> Frame:
@@ -90,6 +98,186 @@ def test_axes_fall_back_to_pixels_without_calibration(tmp_path):
     with h5py.File(path, "r") as handle:
         assert handle["entry/data/x"].attrs["units"] == "pixel"
         assert np.allclose(handle["entry/data/x"][()], [0.0, 1.0, 2.0])
+
+
+def test_a_diffraction_calibration_writes_reciprocal_axes(tmp_path):
+    """
+    A camera frame can now carry a real reciprocal-space axis.
+
+    The gap this closes: before, every camera frame fell back to 'pixel'
+    because only scans reported a field of view. '1/nm' is the spelling
+    NeXus' NX_WAVENUMBER category accepts ('nm-1' does not - see
+    scripts/validate_nexus_schema.py).
+    """
+    path = tmp_path / "diffraction.nxs"
+    write_frames(
+        path,
+        [_frame(0, shape=(4, 4))],
+        calibration=FrameCalibration.diffraction(0.05, shape=(4, 4)),
+    )
+    with h5py.File(path, "r") as handle:
+        x_axis = handle["entry/data/x"]
+        assert x_axis.attrs["units"] == "1/nm"
+        assert x_axis.attrs["long_name"] == "scattering vector"
+        # Centred on the optic axis, not the detector corner.
+        assert np.allclose(x_axis[()], [-0.1, -0.05, 0.0, 0.05])
+
+    recovered = read_calibration(path)
+    assert recovered.x.kind is AxisKind.RECIPROCAL_SPACE
+    assert recovered.x.scale == pytest.approx(0.05)
+    assert recovered.x.offset == pytest.approx(-0.1)
+
+
+def test_a_spectrum_calibration_writes_one_energy_axis_and_one_pixel_axis(tmp_path):
+    """
+    An EELS frame's two axes are different kinds, and the file says so.
+
+    This is the case a single unit per frame could not express: the fast
+    axis is energy-dispersive and the slow axis genuinely is not
+    calibrated, so it keeps the honest 'pixel' fallback rather than
+    borrowing the energy unit.
+    """
+    path = tmp_path / "eels.nxs"
+    write_frames(
+        path,
+        [_frame(0, shape=(4, 8))],
+        calibration=FrameCalibration.spectrum(0.5, offset=-20.0),
+    )
+    with h5py.File(path, "r") as handle:
+        x_axis, y_axis = handle["entry/data/x"], handle["entry/data/y"]
+        assert x_axis.attrs["units"] == "eV"
+        assert x_axis.attrs["long_name"] == "energy"
+        assert np.allclose(x_axis[()][:3], [-20.0, -19.5, -19.0])
+        assert y_axis.attrs["units"] == "pixel"
+        assert np.allclose(y_axis[()], [0.0, 1.0, 2.0, 3.0])
+
+    recovered = read_calibration(path)
+    assert recovered.energy_axis_name() == "x"
+    assert recovered.y.kind is AxisKind.UNCALIBRATED
+
+
+def test_an_angular_camera_axis_round_trips_in_mrad(tmp_path):
+    """
+    A scattering angle is its own kind, because converting needs the HT.
+
+    The one camera calibration that exists in this stack is angular (the
+    simulated Ronchigram camera reports radians), so 'mrad' has to be
+    expressible without inventing an electron wavelength.
+    """
+    path = tmp_path / "angles.nxs"
+    write_frames(
+        path,
+        [_frame(0, shape=(4, 4))],
+        calibration=FrameCalibration.diffraction(0.4, units="mrad"),
+    )
+    with h5py.File(path, "r") as handle:
+        assert handle["entry/data/x"].attrs["units"] == "mrad"
+    assert read_calibration(path).x.kind is AxisKind.ANGLE
+
+
+def test_calibration_can_arrive_through_frame_metadata(tmp_path):
+    """
+    The route fov_nm already travels also carries the other axis kinds.
+
+    This is what lets calibration reach the writer without the device,
+    viewer, or session layers growing a parameter first: a frame's own
+    metadata says what its axes mean.
+    """
+    path = tmp_path / "from-metadata.nxs"
+    frame = Frame(
+        data=np.zeros((4, 6), dtype=np.float32),
+        timestamp=datetime.datetime(2026, 1, 1, tzinfo=datetime.UTC),
+        metadata={
+            "calibration": {
+                "x": {"kind": "energy", "scale": 0.25, "units": "meV"},
+                "y": {"kind": "real_space", "scale": 2.0},
+            },
+        },
+    )
+    write_frames(path, [frame])
+    recovered = read_calibration(path)
+    assert recovered.x.units == "meV"
+    assert recovered.x.scale == pytest.approx(0.25)
+    assert recovered.y.units == "nm"
+    assert recovered.y.scale == pytest.approx(2.0)
+
+
+def test_an_explicit_calibration_overrides_a_frames_fov(tmp_path):
+    """The writer's keyword option wins over what the frames happen to say."""
+    path = tmp_path / "override.nxs"
+    write_frames(
+        path,
+        [_frame(0, shape=(4, 4), fov_nm=20.0)],
+        calibration=FrameCalibration.diffraction(0.05),
+    )
+    assert read_calibration(path).x.kind is AxisKind.RECIPROCAL_SPACE
+
+
+def test_a_malformed_calibration_fails_on_the_first_frame_not_at_close(tmp_path):
+    """
+    A mis-specified calibration aborts before the acquisition, not after.
+
+    Resolving it at the first append rather than in close() means an
+    operator finds out before spending a recording on it.
+    """
+    path = tmp_path / "broken.nxs"
+    frame = Frame(
+        data=np.zeros((4, 4), dtype=np.float32),
+        timestamp=datetime.datetime(2026, 1, 1, tzinfo=datetime.UTC),
+        metadata={"calibration": {"x": {"kind": "energy", "dispersion": 0.5}}},
+    )
+    with NexusWriter(path) as writer, pytest.raises(ValueError, match="unknown key"):
+        writer.append(frame)
+
+
+def test_the_uncalibrated_fallback_still_reads_back_as_uncalibrated(tmp_path):
+    """
+    The honest 'pixel' state survives a full write-and-reread round trip.
+
+    It has to stay a first-class answer rather than degrading into a
+    real-space axis with scale 1 nm, which would be a fabricated claim.
+    """
+    path = tmp_path / "pixels.nxs"
+    write_frames(path, [_frame(0, shape=(2, 3))])
+    recovered = read_calibration(path)
+    assert recovered.is_calibrated is False
+    assert recovered.x.units == "pixel"
+    assert recovered.x.scale == pytest.approx(1.0)
+
+
+def test_reading_a_scan_recordings_calibration_recovers_nanometres(tmp_path):
+    """The pre-existing fov_nm path reads back as a real-space calibration."""
+    path = tmp_path / "scan.nxs"
+    write_frames(path, [_frame(0, shape=(4, 8), fov_nm=20.0)])
+    recovered = read_calibration(path)
+    assert recovered.y.kind is AxisKind.REAL_SPACE
+    assert recovered.y.scale == pytest.approx(5.0)
+    assert recovered.x.scale == pytest.approx(2.5)
+
+
+def test_reading_a_calibration_from_an_empty_recording_is_a_clear_error(tmp_path):
+    """A zero-frame file has no axes to describe, and says so."""
+    path = tmp_path / "empty.nxs"
+    write_frames(path, [])
+    with pytest.raises(ValueError, match="no frames"):
+        read_calibration(path)
+
+
+def test_a_calibration_written_by_axis_objects_needs_no_mapping_form(tmp_path):
+    """FrameCalibration is constructible axis by axis for asymmetric cases."""
+    path = tmp_path / "mixed.nxs"
+    write_frames(
+        path,
+        [_frame(0, shape=(4, 4))],
+        calibration=FrameCalibration(
+            y=AxisCalibration(AxisKind.REAL_SPACE, 1.5),
+            x=AxisCalibration(AxisKind.ENERGY, 0.25, -10.0, "eV"),
+        ),
+    )
+    recovered = read_calibration(path)
+    assert recovered.y.kind is AxisKind.REAL_SPACE
+    assert recovered.x.kind is AxisKind.ENERGY
+    assert recovered.x.offset == pytest.approx(-10.0)
 
 
 def test_vendor_metadata_is_preserved_as_json(tmp_path):

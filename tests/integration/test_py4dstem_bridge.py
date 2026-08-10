@@ -17,7 +17,12 @@ from py4DSTEM.process.calibration import get_probe_size
 
 from miainwoodpecker.analysis.py4dstem_bridge import load_as_diffraction_slice
 from miainwoodpecker.devices import Frame
-from miainwoodpecker.storage import write_frames
+from miainwoodpecker.storage import (
+    AxisCalibration,
+    AxisKind,
+    FrameCalibration,
+    write_frames,
+)
 
 _HEIGHT, _WIDTH = 8, 8
 
@@ -107,6 +112,136 @@ def test_scan_recording_is_rejected_not_silently_miscalibrated(tmp_path):
     """
     path = tmp_path / "scan.nxs"
     write_frames(path, [_frame(0, fov_nm=24.0)])
+
+    with pytest.raises(ValueError, match="diffraction-plane"):
+        load_as_diffraction_slice(path)
+
+
+def test_reciprocal_nm_is_converted_to_inverse_angstrom_not_relabelled(tmp_path):
+    """
+    The factor of ten, asserted numerically because it fails silently.
+
+    py4DSTEM's Q_pixel_units accepts only 'pixels', 'A^-1', or 'mrad' (a
+    hard assert in its own code), and NeXus does not accept 'A^-1' as a
+    NX_WAVENUMBER spelling - so a '1/nm' axis has to be converted. 1 A^-1
+    is 10 nm^-1, so the magnitude divides by ten. Passing the nm^-1 number
+    under the 'A^-1' label would make every downstream py4DSTEM number
+    wrong by exactly 10x with nothing saying so, which is why this is
+    checked against a literal rather than a round trip.
+    """
+    path = tmp_path / "reciprocal.nxs"
+    scale_per_nm = 0.05
+    write_frames(
+        path,
+        [_frame(1)],
+        calibration=FrameCalibration.diffraction(scale_per_nm),
+    )
+
+    diffraction_slice = load_as_diffraction_slice(path)
+
+    assert diffraction_slice.calibration.Q_pixel_units == "A^-1"
+    assert diffraction_slice.calibration.Q_pixel_size == pytest.approx(0.005)
+    assert diffraction_slice.calibration.Q_pixel_size == pytest.approx(
+        scale_per_nm / 10.0
+    )
+
+
+def test_an_inverse_angstrom_recording_needs_no_conversion(tmp_path):
+    """A file already written in 1/angstrom passes through unscaled."""
+    path = tmp_path / "angstrom.nxs"
+    write_frames(
+        path,
+        [_frame(1)],
+        calibration=FrameCalibration.diffraction(0.005, units="1/angstrom"),
+    )
+
+    diffraction_slice = load_as_diffraction_slice(path)
+
+    assert diffraction_slice.calibration.Q_pixel_units == "A^-1"
+    assert diffraction_slice.calibration.Q_pixel_size == pytest.approx(0.005)
+
+
+def test_an_angular_recording_passes_through_as_mrad(tmp_path):
+    """
+    An mrad axis is already one of py4DSTEM's three units, so it passes through.
+
+    This is the second reason AxisKind keeps angles distinct from
+    reciprocal space: turning a scattering angle into a scattering vector
+    needs the electron wavelength, which nothing here knows.
+    """
+    path = tmp_path / "angles.nxs"
+    write_frames(
+        path,
+        [_frame(1)],
+        calibration=FrameCalibration.diffraction(0.4, units="mrad"),
+    )
+
+    diffraction_slice = load_as_diffraction_slice(path)
+
+    assert diffraction_slice.calibration.Q_pixel_units == "mrad"
+    assert diffraction_slice.calibration.Q_pixel_size == pytest.approx(0.4)
+
+
+def test_a_radian_recording_is_converted_to_mrad(tmp_path):
+    """A camera reporting radians (as the simulated one does) scales by 1000."""
+    path = tmp_path / "radians.nxs"
+    write_frames(
+        path,
+        [_frame(1)],
+        calibration=FrameCalibration.diffraction(0.0004, units="rad"),
+    )
+
+    diffraction_slice = load_as_diffraction_slice(path)
+
+    assert diffraction_slice.calibration.Q_pixel_units == "mrad"
+    assert diffraction_slice.calibration.Q_pixel_size == pytest.approx(0.4)
+
+
+def test_a_spectrum_recording_is_rejected_like_a_scan_one(tmp_path):
+    """An energy axis is not a diffraction-plane quantity either."""
+    path = tmp_path / "eels.nxs"
+    write_frames(
+        path,
+        [_frame(0)],
+        calibration=FrameCalibration.spectrum(0.5),
+    )
+
+    with pytest.raises(ValueError, match="diffraction-plane"):
+        load_as_diffraction_slice(path)
+
+
+def test_anisotropic_diffraction_axes_are_refused_not_halved(tmp_path):
+    """
+    Q_pixel_size is one number for both axes, so two scales cannot fit.
+
+    Silently keeping one of them would distort every measured distance in
+    the pattern along the other direction.
+    """
+    path = tmp_path / "anisotropic.nxs"
+    write_frames(
+        path,
+        [_frame(0)],
+        calibration=FrameCalibration(
+            y=AxisCalibration(AxisKind.RECIPROCAL_SPACE, 0.05),
+            x=AxisCalibration(AxisKind.RECIPROCAL_SPACE, 0.06),
+        ),
+    )
+
+    with pytest.raises(ValueError, match="anisotropic"):
+        load_as_diffraction_slice(path)
+
+
+def test_mixed_axis_kinds_are_refused(tmp_path):
+    """A frame with one energy and one reciprocal axis has no single Q scale."""
+    path = tmp_path / "mixed.nxs"
+    write_frames(
+        path,
+        [_frame(0)],
+        calibration=FrameCalibration(
+            y=AxisCalibration(AxisKind.RECIPROCAL_SPACE, 0.05),
+            x=AxisCalibration(AxisKind.ENERGY, 0.5),
+        ),
+    )
 
     with pytest.raises(ValueError, match="diffraction-plane"):
         load_as_diffraction_slice(path)

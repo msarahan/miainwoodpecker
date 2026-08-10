@@ -95,6 +95,31 @@ So it stays opt-in - ``compression=hdf5plugin.Blosc2(cname="zstd")``,
 with ``hdf5plugin`` an optional extra - rather than becoming the default
 and quietly making every file plugin-dependent for a few percent.
 
+Axis calibration is supplied per acquisition, never invented
+-----------------------------------------------------------
+Frames used to get real axes in exactly one case — a scan reporting
+``fov_nm`` — and an honest ``units = "pixel"`` otherwise, which meant every
+camera frame this project wrote carried no physical axis at all
+(docs/migration-plan.md, §7). :mod:`miainwoodpecker.storage.calibration`
+now models that properly, **per axis** (an EELS frame's dispersive
+direction is energy and the other direction is not) and **per
+acquisition** (the same camera is reciprocal space in one microscope mode
+and something else in another). Pass ``calibration=`` here, or attach it to
+a frame's ``metadata`` under ``"calibration"`` — the same route ``fov_nm``
+already travels. Both paths are optional and the ``fov_nm`` and
+``"pixel"`` behaviours are unchanged, so nothing that already writes files
+has to change.
+
+What goes into the file is only what NeXus defines: ``units`` and
+``long_name`` on each ``NXdata`` ``AXISNAME`` field. NeXus has no attribute
+for "what kind of axis is this", so none is invented — the unit string
+carries it (``nm`` -> ``NX_LENGTH``, ``1/nm`` -> ``NX_WAVENUMBER``, ``eV``
+-> ``NX_ENERGY``, ``mrad`` -> ``NX_ANGLE``), which is exactly how
+``NXimage`` and ``NXspectrum`` distinguish real-space, reciprocal-space,
+and energy axes. See the calibration module for the measurements behind the
+unit spellings, including the one that matters: ``pynxtools`` accepts
+``"1/nm"`` for ``NX_WAVENUMBER`` and rejects ``"nm-1"``.
+
 Why ``dtype`` exists, and why it is not the default
 ---------------------------------------------------
 Storing ``float64`` scan frames as ``float32`` is a **2.3x** size win -
@@ -128,12 +153,20 @@ import json
 import typing
 
 import h5py
-import numpy as np
+
+from miainwoodpecker.storage.calibration import (
+    AXIS_NAMES,
+    AxisCalibration,
+    FrameCalibration,
+    axis_kind_for_units,
+    resolve_frame_calibration,
+)
 
 if typing.TYPE_CHECKING:
     import os
     from collections.abc import Iterable, Iterator, Mapping
 
+    import numpy as np
     import numpy.typing as npt
 
     from miainwoodpecker.devices.interface import Frame
@@ -200,6 +233,14 @@ class NexusWriter:
     notes : str | None
         Free-text session notes, written as ``description`` inside an
         ``NXnote`` group at ``/entry/notes``.
+    calibration : FrameCalibration | None
+        Per-axis calibration for the frames this writer will be given —
+        real space, reciprocal space, energy, or the honest pixel fallback,
+        independently per axis. ``None`` (the default) falls back to the
+        frames' own ``metadata``: a ``"calibration"`` entry if present, then
+        ``"fov_nm"`` as before, then bare pixel indices. See
+        :func:`miainwoodpecker.storage.calibration.resolve_frame_calibration`
+        for the precedence, and never expect this writer to guess one.
     compression : CompressionSpec
         h5py compression filter for the frame dataset: a built-in filter
         name (``"gzip"``, ``"lzf"``), ``None`` to disable, or a mapping of
@@ -234,6 +275,7 @@ class NexusWriter:
         sample: Mapping[str, object] | None = None,
         user: Mapping[str, object] | None = None,
         notes: str | None = None,
+        calibration: FrameCalibration | None = None,
         compression: CompressionSpec = _DEFAULT_COMPRESSION,
         compression_opts: object | None = None,
         shuffle: bool | None = None,
@@ -245,6 +287,7 @@ class NexusWriter:
         self._sample = sample
         self._user = user
         self._notes = notes
+        self._calibration = calibration
         self._compression = compression
         self._compression_opts = compression_opts
         self._shuffle = shuffle
@@ -254,6 +297,7 @@ class NexusWriter:
         self._times: h5py.Dataset | None = None
         self._count = 0
         self._first_metadata: typing.Mapping[str, typing.Any] | None = None
+        self._resolved_calibration: FrameCalibration | None = None
         self._start: datetime.datetime | None = None
         self._frame_zero: datetime.datetime | None = None
 
@@ -380,7 +424,13 @@ class NexusWriter:
         RuntimeError
             If the writer is not open.
         ValueError
-            If the frame's shape or dtype differs from the first frame's.
+            If the frame's shape or dtype differs from the first frame's,
+            or if the first frame's ``metadata["calibration"]`` is
+            malformed (an outright wrong type there surfaces as a
+            ``TypeError`` instead). That check happens here, on the *first*
+            append, rather than in :meth:`close`, so a mis-specified
+            calibration fails before an acquisition runs instead of after
+            it.
         """
         if self._file is None:
             msg = "NexusWriter is not open; use it as a context manager."
@@ -389,6 +439,11 @@ class NexusWriter:
         detector = self._file["entry/instrument/detector"]
         if self._data is None:
             self._first_metadata = frame.metadata
+            self._resolved_calibration = resolve_frame_calibration(
+                typing.cast("tuple[int, int]", frame.data.shape),
+                calibration=self._calibration,
+                metadata=frame.metadata,
+            )
             self._frame_zero = frame.timestamp
             self._data = detector.create_dataset(
                 "data",
@@ -449,7 +504,6 @@ class NexusWriter:
         """Create the NXdata group describing how to plot the frame stack."""
         assert self._data is not None  # noqa: S101 - guarded by caller
         height, width = self._data.shape[1], self._data.shape[2]
-        metadata = self._first_metadata or {}
 
         data_group = entry.create_group("data")
         data_group.attrs["NX_class"] = "NXdata"
@@ -457,20 +511,20 @@ class NexusWriter:
         data_group["data"] = self._data
         data_group["frame_time"] = self._file["entry/instrument/detector/frame_time"]  # type: ignore[index]
 
-        # Scan frames know their field of view, so the spatial axes can carry
-        # real calibration in nanometres instead of bare pixel indices.
-        fov_nm = metadata.get("fov_nm")
-        if isinstance(fov_nm, (int, float)) and fov_nm > 0 and width and height:
-            y_values = np.linspace(0.0, float(fov_nm), height, endpoint=False)
-            x_values = np.linspace(0.0, float(fov_nm), width, endpoint=False)
-            units = "nm"
-        else:
-            y_values = np.arange(height, dtype="float64")
-            x_values = np.arange(width, dtype="float64")
-            units = "pixel"
-        for name, values in (("y", y_values), ("x", x_values)):
-            axis = data_group.create_dataset(name, data=values)
-            axis.attrs["units"] = units
+        # Resolved on the first append (so a bad calibration fails early);
+        # falls back to the honest pixel model when nobody supplied one.
+        calibration = self._resolved_calibration or FrameCalibration.uncalibrated()
+        # `units` and `long_name` are the two attributes NXdata itself
+        # defines on an AXISNAME field. The axis *kind* is not written -
+        # NeXus has no attribute for it, and the unit string carries it.
+        for name, length in zip(AXIS_NAMES, (height, width), strict=True):
+            axis_calibration = calibration.axis(name)
+            axis = data_group.create_dataset(
+                name,
+                data=axis_calibration.values(length),
+            )
+            axis.attrs["units"] = axis_calibration.units
+            axis.attrs["long_name"] = axis_calibration.long_name
 
         data_group.attrs["signal"] = "data"
         data_group.attrs["axes"] = ["frame_time", "y", "x"]
@@ -515,6 +569,95 @@ def write_frames(
         for frame in frames:
             writer.append(frame)
         return writer.frame_count
+
+
+def _axis_calibration_from_values(
+    values: npt.NDArray[np.float64],
+    units: str,
+) -> AxisCalibration:
+    """
+    Recover one axis's calibration from the values and units in a file.
+
+    Parameters
+    ----------
+    values : npt.NDArray[np.float64]
+        The axis dataset's values, in acquisition order.
+    units : str
+        The axis dataset's ``units`` attribute.
+
+    Returns
+    -------
+    AxisCalibration
+        The linear calibration those values encode. A single-sample axis
+        carries no spacing information at all, so its scale falls back to
+        1.0 — the same fallback the analysis adapters already made.
+    """
+    kind = axis_kind_for_units(units)
+    offset = float(values[0]) if len(values) else 0.0
+    scale = float(values[1] - values[0]) if len(values) > 1 else 1.0
+    return AxisCalibration(kind, scale, offset, units)
+
+
+def read_calibration(path: os.PathLike[str] | str) -> FrameCalibration:
+    """
+    Read back the per-axis calibration a written file carries.
+
+    The counterpart to what :class:`NexusWriter` writes, and the single
+    place the ``units``-to-kind inference lives, so the three Phase 4
+    analysis adapters do not each re-derive it. It also gives the LiberTEM
+    adapter something to point at: LiberTEM's ``DataSet`` has nowhere to
+    put axis calibration, so a caller who needs it alongside a UDF result
+    reads it from the file with this.
+
+    Parameters
+    ----------
+    path : os.PathLike[str] | str
+        An HDF5 file written by :class:`NexusWriter`.
+
+    Returns
+    -------
+    FrameCalibration
+        The ``y`` and ``x`` axis calibrations, each with its kind recovered
+        from its units.
+
+    Raises
+    ------
+    ValueError
+        If the file has no ``/entry/data`` group (it recorded no frames),
+        or if an axis's units are outside this project's vocabulary, so its
+        kind cannot be recovered rather than guessed.
+    """
+    with h5py.File(path, "r") as handle:
+        if "data" not in handle["entry"]:
+            msg = f"{path} has no /entry/data group; it recorded no frames"
+            raise ValueError(msg)
+        data_group = handle["entry/data"]
+        axes = {
+            name: _axis_calibration_from_values(
+                data_group[name][()],
+                _decoded(data_group[name].attrs["units"]),
+            )
+            for name in AXIS_NAMES
+        }
+    return FrameCalibration(**axes)
+
+
+def _decoded(value: object) -> str:
+    """
+    Return an HDF5 string attribute as ``str``, whether or not it is bytes.
+
+    Parameters
+    ----------
+    value : object
+        An attribute value read from h5py, which may be ``bytes`` or
+        ``str`` depending on how it was written.
+
+    Returns
+    -------
+    str
+        The decoded value.
+    """
+    return value.decode() if isinstance(value, bytes) else str(value)
 
 
 def read_series(path: os.PathLike[str] | str) -> Iterator[tuple[np.ndarray, float]]:
