@@ -119,6 +119,95 @@ def test_live_widget_updates_layers_from_both_sources():
     assert not camera.started
 
 
+def test_analyze_camera_in_hyperspy_adds_a_projection_layer():
+    """
+    Clicking "Analyze in HyperSpy" round-trips a burst through the adapter.
+
+    Exercises the actual wired-in Phase 4 entry point end to end: record a
+    burst from the fake camera to a temporary NeXus file, load it back as
+    a HyperSpy signal, average across frames, and land the result in
+    napari as a new layer. Skipped if the ``analysis`` extra is not
+    installed, since the widget itself does not require it.
+    """
+    pytest.importorskip("hyperspy", reason="requires the 'analysis' extra")
+    viewer = napari.Viewer(show=False)
+    camera = _FakeCamera()
+    widget = LiveInstrumentWidget(viewer, _FakeScanner(), camera=camera)
+    try:
+        widget._analyze_camera_in_hyperspy()  # noqa: SLF001 - simulating a button click
+
+        layer_name = "HyperSpy mean projection (Camera)"
+        assert layer_name in viewer.layers
+        projection_shape = (8, 8)
+        assert viewer.layers[layer_name].data.shape == projection_shape
+        assert not camera.started  # the burst starts and stops the camera itself
+        assert widget._analyze_status.text().startswith("done")  # noqa: SLF001
+    finally:
+        widget.shutdown()
+        viewer.close()
+
+
+def test_analyze_camera_in_libertem_adds_a_sum_projection_layer():
+    """
+    Clicking "Sum in LiberTEM" round-trips a burst through the adapter.
+
+    Exercises the second Phase 4 entry point end to end: record a burst
+    from the fake camera to a temporary NeXus file, load it back as a
+    LiberTEM ``DataSet``, sum across the frame/navigation axis with the
+    real ``SumUDF``, and land the result in napari as a new layer.
+    Skipped if the ``libertem`` extra is not installed, since the widget
+    itself does not require it.
+    """
+    pytest.importorskip("libertem", reason="requires the 'libertem' extra")
+    viewer = napari.Viewer(show=False)
+    camera = _FakeCamera()
+    widget = LiveInstrumentWidget(viewer, _FakeScanner(), camera=camera)
+    try:
+        widget._analyze_camera_in_libertem()  # noqa: SLF001 - simulating a button click
+
+        layer_name = "LiberTEM sum projection (Camera)"
+        assert layer_name in viewer.layers
+        projection_shape = (8, 8)
+        assert viewer.layers[layer_name].data.shape == projection_shape
+        assert not camera.started  # the burst starts and stops the camera itself
+        assert widget._libertem_status.text().startswith("done")  # noqa: SLF001
+    finally:
+        widget.shutdown()
+        viewer.close()
+
+
+def test_fit_central_disk_in_py4dstem_adds_a_frame_and_shapes_layer():
+    """
+    Clicking "Fit central disk (py4DSTEM)" round-trips one frame through the adapter.
+
+    Exercises the py4DSTEM follow-up to Phase 4 end to end: acquire one
+    frame from the fake camera, write it to a temporary NeXus file, load
+    it back as a py4DSTEM ``DiffractionSlice``, run
+    ``py4DSTEM.process.calibration.get_probe_size`` on it, and land both
+    the analyzed frame and a ``Shapes`` ellipse at the fitted disk in
+    napari. Skipped if the ``py4dstem`` extra is not installed, since the
+    widget itself does not require it.
+    """
+    pytest.importorskip("py4DSTEM", reason="requires the 'py4dstem' extra")
+    viewer = napari.Viewer(show=False)
+    camera = _FakeCamera()
+    widget = LiveInstrumentWidget(viewer, _FakeScanner(), camera=camera)
+    try:
+        widget._fit_central_disk_in_py4dstem()  # noqa: SLF001 - simulating a button click
+
+        frame_layer_name = "py4DSTEM disk fit (Camera)"
+        assert frame_layer_name in viewer.layers
+        frame_shape = (8, 8)
+        assert viewer.layers[frame_layer_name].data.shape == frame_shape
+        assert "py4DSTEM disk fit" in viewer.layers
+        assert viewer.layers["py4DSTEM disk fit"].shape_type == ["ellipse"]
+        assert not camera.started  # the acquisition starts and stops the camera itself
+        assert widget._py4dstem_status.text().startswith("done")  # noqa: SLF001
+    finally:
+        widget.shutdown()
+        viewer.close()
+
+
 def test_scan_settings_change_takes_effect_on_next_frames():
     """Changing the size control changes the shape of subsequently scanned frames."""
     viewer = napari.Viewer(show=False)

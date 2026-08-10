@@ -245,14 +245,277 @@ problem — read their source and docs before designing our own adapters:
 - [ ] Revisit compression. gzip level 4 on noisy `float64` scan data
   measured a *1.08× ratio* — i.e. slightly larger than raw — while
   `float32` camera frames compressed to 0.69×. Worth evaluating
-  bitshuffle/blosc, or storing scan data as `float32`.
+  bitshuffle/blosc, or storing scan data as `float32`. Still open for
+  *this* (HDF5 storage) context, but §6 now has a related, resolved data
+  point for the shared-memory IPC context: zstd on the same kind of
+  frames confirms scan data barely compresses (0.95–0.96×) and shows
+  camera frames compress better with zstd than gzip suggested
+  (0.61–0.73×) — consistent with, and a useful cross-check on, this
+  item's numbers, even though that investigation concluded compression
+  doesn't belong on the IPC path regardless of ratio, for reasons
+  (memcpy vs. CPU-bound compression time) specific to shared memory that
+  don't necessarily transfer to the storage question here.
 - [ ] Consider Zarr alongside HDF5 for parallel/cloud-friendly writes.
 
 **Phase 4 — Analysis integration**
-- Wire HyperSpy / py4DSTEM / LiberTEM in as napari plugins or menu actions
-  operating on the new file format.
-- Port only the handful of Swift-specific analyses (if any) that aren't
-  already covered upstream, as small adapter functions — not reimplementations.
+- [x] Wire one analysis library in as a menu action operating on the new
+  file format — [`src/miainwoodpecker/analysis/hyperspy_bridge.py`](../src/miainwoodpecker/analysis/hyperspy_bridge.py),
+  wired into
+  [`src/miainwoodpecker/viewer/live.py`](../src/miainwoodpecker/viewer/live.py).
+  **HyperSpy chosen over py4DSTEM/LiberTEM for this first adapter**: both
+  of the latter are commonly described as 4D-STEM (scan-position ×
+  diffraction-pattern) tools, and the Phase 1 device interface
+  deliberately has no synchronized scan-position/camera-frame
+  acquisition mode yet (`interface.py`'s `Scanner` docstring calls this
+  out directly) — so there is no 4D-STEM data for either to operate on
+  today. What this app actually produces is plain frame stacks from
+  `Scanner`/`Camera`, which is exactly HyperSpy's general case, and it is
+  the lighter of the three: `pip install hyperspy` resolved **~35
+  packages** (dask, matplotlib, scipy, sympy, rosettasciio, traits, …)
+  versus the ~70 the Phase 3 notes measured for `pynxtools-em`. Not free,
+  but not the same order of problem. (This reasoning holds for
+  py4DSTEM specifically — its `DataCube` is a genuine 4D array — but not
+  for LiberTEM; see below.)
+  - **The adapter** (`load_as_hyperspy_signal`) reads a NexusWriter file's
+    `/entry/data` group directly with `h5py` — the frame stack, the `x`/`y`
+    axis datasets and their `units` attributes, and `frame_time` — and
+    hands the arrays to `hyperspy.signals.Signal2D`, setting
+    `axes_manager` scale/offset/units on the navigation (frame) axis and
+    the two signal axes from what NexusWriter already wrote. No axis math
+    is reimplemented; HyperSpy's own `AxesManager` does the bookkeeping.
+    A scan recording's nanometre calibration (§3, Phase 3) survives the
+    round trip; an uncalibrated recording's honest `"pixel"` units survive
+    too, rather than inventing a spurious scale.
+  - **The wired-in action**: a new "Analyze in HyperSpy" button in the
+    live viewer's Camera group. Clicking it stops the camera's live loop
+    if running (the `Camera` protocol implies one driver at a time — see
+    §2), grabs a 5-frame burst via `acquisition.sequence.camera_series`,
+    writes it to a temporary NeXus file with `storage.nexus.write_frames`,
+    reads it back through the adapter, runs one real HyperSpy operation —
+    `Signal2D.mean()` across the frame axis, a temporal-average projection
+    — and pushes the result into napari as a new image layer. This is a
+    genuine round trip end to end: acquire → NeXus file on disk → HyperSpy
+    signal → a HyperSpy method → napari layer, not a mocked-up shortcut.
+    Verified with a real napari widget against a fake camera under a
+    virtual display
+    ([`tests/integration/test_live_widget.py`](../tests/integration/test_live_widget.py)),
+    not yet against real hardware or the actual simulated Ronchigram
+    camera end-to-end through the running app (that path is exercised
+    manually, not by an automated test, since it needs the `device`,
+    `viewer`, and `analysis` extras plus a display all at once).
+  - **Kept deliberately thin**: the `hyperspy` import lives inside the
+    button's click handler, not at module scope, so the viewer (which only
+    needs the `viewer` extra) still imports and runs without the heavier
+    `analysis` extra installed; a missing extra reports "install the
+    'analysis' extra" in the status label instead of an import crash. Only
+    the camera stream is wired up (not the scan stream too) — one
+    demonstrated operation, as scoped, not a general analysis UI; the same
+    adapter and pattern would extend to scan frames with no changes to
+    `hyperspy_bridge.py` itself.
+  - **Real caveat**: the Ronchigram camera's frames still fall back to
+    `"pixel"` units in `nexus.py` (cameras don't report a field of view the
+    way scans do), so a signal built from real camera data carries no
+    physically meaningful diffraction-angle calibration yet — that needs
+    per-camera calibration data the device interface doesn't expose today.
+    The axis-calibration round trip is verified for the case NexusWriter
+    already calibrates (scan `fov_nm`), not invented for the case it
+    doesn't.
+- [x] Wire a second analysis library in as its own menu action —
+  [`src/miainwoodpecker/analysis/libertem_bridge.py`](../src/miainwoodpecker/analysis/libertem_bridge.py),
+  wired into
+  [`src/miainwoodpecker/viewer/live.py`](../src/miainwoodpecker/viewer/live.py).
+  **The assumption above about LiberTEM turned out to be wrong, and
+  checking that (not assuming it generalized the same way py4DSTEM's
+  does) is the actual finding here.** LiberTEM's core abstraction is not
+  a fixed-rank 4D datacube; it's a `DataSet` with an arbitrary-shape
+  "navigation" axis processed by user-defined functions (UDFs), and its
+  HDF5 `DataSet` reader infers that shape directly from the array it is
+  pointed at. Verified directly, not assumed from the docs: pointing
+  `libertem.io.dataset.hdf5.H5DataSet` at a real file written by this
+  app's own `storage.nexus.write_frames` (shape `(n_frames, height,
+  width)` — the same plain frame stack `camera_series`/`scan_series`
+  already produce, no synthetic data) gives `dataset.shape.nav ==
+  (n_frames,)`, a genuinely **one-dimensional** navigation shape, not a
+  padded/reshaped 2-tuple, and `Context.run_udf` runs real built-in UDFs
+  (`SumUDF`, `StdDevUDF`) against it without complaint
+  ([`tests/integration/test_libertem_bridge.py`](../tests/integration/test_libertem_bridge.py)).
+  So a genuine, non-synthetic LiberTEM PoC on today's data model is
+  possible — the Phase 4 note above correctly ruled out py4DSTEM (whose
+  `DataCube` really is a fixed 4D array) but over-generalized that
+  reasoning to LiberTEM without checking it separately.
+  - **The adapter** (`load_as_libertem_dataset`) is thinner than the
+    HyperSpy one: `Context.load("hdf5", path=..., ds_path=...)` already
+    reads the array with `h5py` internally, so this function's only real
+    job is validating the file has frames (mirroring the HyperSpy
+    adapter's own check, and giving a clearer error than LiberTEM's own
+    "unable to infer dataset" message) and naming the dataset path this
+    app's writer actually uses (`/entry/data/data`).
+  - **A real, honest limitation, not carried over from HyperSpy**:
+    LiberTEM's `DataSetMeta` has no per-axis scale/offset/units fields —
+    nothing like HyperSpy's `AxesManager`. There is no native LiberTEM
+    object to hand NexusWriter's `x`/`y`/`frame_time` calibration to, so
+    unlike the HyperSpy adapter, this one does not attempt an
+    axis-calibration round trip. This is a genuine difference between
+    the two libraries' object models, not a gap in this adapter.
+  - **The wired-in action**: a new "Sum in LiberTEM" button alongside
+    "Analyze in HyperSpy" in the live viewer's Camera group, following
+    the identical pattern — stop the camera loop if running, grab a
+    5-frame burst via `camera_series`, write it to a temporary NeXus file,
+    read it back through the adapter, run one real LiberTEM UDF
+    (`libertem.udf.sum.SumUDF`, summing across the frame axis) with an
+    `inline` executor `Context`, and push the sum-projection image into
+    napari. `inline` rather than LiberTEM's default `dask` executor is a
+    deliberate choice: this is one UDF run over one small, already-in-memory
+    burst per click, not the large-out-of-core-dataset workload the
+    default executor's local cluster exists for — spinning one up per
+    click would be pure overhead. Genuine round trip end to end,
+    verified the same way as the HyperSpy button: a real napari widget
+    against a fake camera under a virtual display
+    ([`tests/integration/test_live_widget.py`](../tests/integration/test_live_widget.py)).
+  - **Dependency weight, measured the same way as the HyperSpy
+    comparison above**: `pip install libertem` alone resolves **~102
+    packages** against a 2-package bare-venv baseline — dask,
+    distributed, numba, scikit-learn, scikit-image, matplotlib, and a
+    Jupyter/ipywidgets stack for LiberTEM's own notebook GUI — roughly
+    **3× HyperSpy's ~35**. That weight buys tiled, MapReduce-style
+    processing for pixelated-detector datasets much larger than memory;
+    this PoC's burst is a handful of small in-memory frames, so the
+    adapter exercises LiberTEM's `DataSet`/UDF model genuinely but not
+    the scale of problem most projects reach for LiberTEM to solve.
+    Given that, and unlike HyperSpy, **LiberTEM gets its own `libertem`
+    optional-dependency group rather than joining `analysis`** — a
+    consumer who only wants the general HyperSpy path shouldn't have to
+    pull in dask/distributed/numba to get it.
+  - **Also investigated, with a clean negative result specific to this
+    environment**: whether a real, published 4D-STEM dataset (genuine 2D
+    navigation, the stronger demonstration) could be substituted for the
+    1D-navigation frame stack above. LiberTEM's own documented sample
+    datasets (its `sample_datasets.rst` docs page) are hosted on Zenodo
+    at 177MB–14.2GB (`10.5281/zenodo.*` DOIs; the smallest, a 177MB 4D
+    STO dataset, is in MIB format, which needs its own reader, not the
+    HDF5 one this adapter uses); py4DSTEM's small-sample registry hosts
+    its files on Google
+    Drive. Both hosts, plus HuggingFace, OSF, and Figshare tried as
+    alternatives, returned a blocked `CONNECT` (HTTP 403) through this
+    environment's outbound proxy — its allowlist covers package
+    registries (PyPI, npm, crates.io, the Go proxy) and GitHub, not
+    general data hosting. py4DSTEM's smallest nominal sample
+    (`small_datacube`, meant to be ~4.2MB) also turned out to be an
+    unreliable candidate on its own terms even ignoring reachability:
+    its own source has a `TODO` noting the ID currently resolves to the
+    same file as an unrelated fixture (`vac_probe`), a replacement that
+    was never made. This is a network-reachability finding about *this
+    environment*, not a claim that no such dataset exists or that
+    LiberTEM needs one to be useful here — the 1D-navigation PoC above
+    is real, working, and sufficient to answer the question this item
+    was scoped to answer.
+- [x] Follow-up PoC: py4DSTEM specifically —
+  [`src/miainwoodpecker/analysis/py4dstem_bridge.py`](../src/miainwoodpecker/analysis/py4dstem_bridge.py),
+  wired into
+  [`src/miainwoodpecker/viewer/live.py`](../src/miainwoodpecker/viewer/live.py).
+  **Investigated, rather than assumed, whether the 4D-STEM constraint
+  above had moved** — it hasn't, and the reason is more specific than
+  "the interface doesn't expose it yet." Checked whether the simulated
+  device stack itself exposes any way to move the beam to a single point
+  (option (a) in this investigation's brief), reaching past the
+  vendor-neutral `Scanner`/`Camera` protocols into `nion.usim_device`'s
+  own internals: `nion.device_kit.InstrumentDevice.Instrument` does have
+  a real, public, settable per-point `probe_position`, and the
+  Ronchigram camera simulator's own code
+  (`RonchigramCameraSimulator.get_frame_data`) does read it to offset the
+  simulated aberrations. But the read only happens through
+  `CameraSimulator._get_frame_settings`, which first asks
+  `self.instrument.scan_controller` for a registered
+  `ScanHardwareSource` and silently drops `probe_position` back to a
+  fixed centred default if that resolves to `None` — and it does resolve
+  to `None` here, because that registration only happens inside the full
+  `HardwareSource`/`Application` layer, the exact layer this migration
+  plan's own Phase 0 note already found too heavy to stand up outside
+  Swift's own process. Measured directly against
+  `nion.usim_device.DeviceConfiguration.AcquisitionContextConfiguration`
+  (the same lightweight construction `nion_server.py` uses, with no
+  `HardwareSource` registered anywhere): setting `instrument.probe_position`
+  to different points and re-acquiring a 2048×2048 Ronchigram frame each
+  time changes nothing beyond shot noise — mean absolute difference
+  between frames at *different* probe positions was 12.31 counts,
+  statistically identical to the 12.31-count noise floor from
+  re-acquiring at the *same* fixed position twice, and the disk's
+  brightest pixel jumped to a different, effectively random location call
+  to call even with the probe held perfectly still. So a genuine software
+  step-scan 4D-STEM acquisition is not buildable today, even by going
+  around this project's own device wrapper entirely — not just because
+  the vendor-neutral interface hasn't grown the method, but because the
+  simulator underneath it won't honor a per-point beam position without
+  the heavier application layer this project deliberately avoids.
+  A second possible way around it - option (a)'s escape hatch, real
+  external 4D-STEM data instead of driving the simulator - was checked
+  and is also unavailable in this environment: py4DSTEM ships a
+  Google-Drive-backed downloader with real, non-synthetic sample
+  datacubes (`small_datacube`, `Au_sim`, `Si_SiGe_exp`, …), but the
+  outbound proxy returns a `403` on the CONNECT tunnel to
+  `drive.google.com` for both py4DSTEM's own downloader and a bare
+  `gdown` call to the same file id - confirmed with `curl` and directly
+  with `gdown.download()`, not inferred from py4DSTEM's own wrapper
+  alone. That wrapper is also, independently, broken against the `gdown`
+  release it resolves today (`py4DSTEM 0.14.18` passes a `fuzzy=` keyword
+  `gdown 6.1.0`'s `download()` no longer accepts) - a second, unrelated
+  reason this path doesn't work here, worth recording so it isn't
+  mis-attributed to the network block alone if retried later on an
+  unblocked network with an older `gdown` pin.
+  Landed on option (b): real single Ronchigram frames (genuine
+  acquisitions, shot noise and all - not scan-position-indexed, and not
+  presented as if they were) through py4DSTEM's own single-diffraction-
+  pattern operations, which is exactly what py4DSTEM itself applies
+  per-pattern inside a full datacube.
+  - **The adapter** (`load_as_diffraction_slice`) reads a NexusWriter
+    file's `/entry/data` group with `h5py` — the same pattern
+    `hyperspy_bridge.py` uses, not a second reader implementation — and
+    hands the frame(s) to `py4DSTEM.data.DiffractionSlice`, py4DSTEM's own
+    diffraction-space container, calibrated on its `Calibration` object's
+    `Q_pixel_size`/`Q_pixel_units` from exactly the axis values
+    `nexus.py` already wrote. One real impedance mismatch surfaced and is
+    handled explicitly rather than silently: `Calibration.Q_pixel_units`
+    only accepts the literal strings `"pixels"`, `"A^-1"`, or `"mrad"` (a
+    hard assert in py4DSTEM's own code), so the adapter maps NexusWriter's
+    `"pixel"` (singular) onto `"pixels"` and raises a clear `ValueError`
+    for anything else — in particular, a *scan* recording's nanometre
+    calibration (real-space, Phase 3) is correctly refused rather than
+    mislabelled as a diffraction-plane pixel count, since this adapter is
+    for camera data specifically.
+  - **The wired-in action**: a new "Fit central disk (py4DSTEM)" button in
+    the live viewer's Camera group, alongside "Analyze in HyperSpy".
+    Clicking it stops the camera's live loop if running, acquires **one**
+    real frame via `acquisition.sequence.camera_series` (not a burst —
+    a single-pattern operation needs one representative pattern, not an
+    average), writes it to a temporary NeXus file, reads it back through
+    the adapter, runs one real py4DSTEM operation —
+    `py4DSTEM.process.calibration.get_probe_size`, the central-disk
+    radius/centre fit py4DSTEM runs per-pattern internally even when it
+    does have a full datacube — and pushes both the analyzed frame and a
+    napari `Shapes` ellipse at the fitted disk into the viewer. Genuine
+    round trip end to end: acquire → NeXus file on disk → py4DSTEM
+    `DiffractionSlice` → a real py4DSTEM function → two napari layers.
+    Verified with a real napari widget against a fake camera under a
+    virtual display
+    ([`tests/integration/test_live_widget.py`](../tests/integration/test_live_widget.py)),
+    same caveat as the HyperSpy action about real-hardware/full-app
+    end-to-end coverage.
+  - **Kept deliberately thin and separately gated**: the `py4dstem` import
+    lives inside the button's click handler, not at module scope, exactly
+    like the HyperSpy button; a missing extra reports "install the
+    'py4dstem' extra" instead of an import crash. `py4dstem` is its own
+    optional-dependency extra, not folded into `analysis`: a fresh `pip
+    install py4dstem` resolved **65 packages** (dask, distributed,
+    scikit-image, scikit-learn, scikit-optimize, pylops, mpire, gdown, …)
+    — heavier than HyperSpy's ~35 and close to the ~70 the Phase 3 notes
+    measured for `pynxtools-em` — so installing one analysis library
+    doesn't tax someone who only wanted the other.
+- [ ] Port Swift-specific analyses not already covered upstream, as small
+  adapter functions. **Deferred, not attempted**: this PoC's scope was
+  proving the wiring shape (adapter + one real menu action) works end to
+  end, not auditing Swift's analysis feature set for gaps HyperSpy/
+  py4DSTEM/LiberTEM don't already cover. That audit is real work for a
+  follow-up, not a checkbox to wave through here.
 
 **Phase 5 — Parity and cutover**
 - Audit which Swift features the team actually uses day to day (not the
@@ -389,6 +652,95 @@ interpreter at its own startup including a forked+exec'd tracker daemon,
 is what actually works — set once in `shared_frame.py` and inherited by
 the server subprocess's environment.
 
+**A fourth investigation, with a clean negative result: transparent zstd
+compression of frames moving through shared memory does not pay for
+itself, at any size or level tested.** The question, raised separately
+from the above: since the reused-segment redesign made shared memory a
+plain memcpy, could compressing frames before the write and decompressing
+after the read shrink the bytes moved and reduce end-to-end latency,
+using idle cores for the compression work (`zstandard`'s
+`ZstdCompressor(threads=N)`, which wraps Facebook's zstd with native
+multi-threaded compression)? `zstandard` itself checks out fine as a
+dependency choice, unlike Arrow Plasma earlier in this project's history
+(confirmed dead, deprecated in Arrow 10, removed ~12): PyPI shows a 0.25.0
+release from September 2025, an actively maintained GitHub project, and a
+compiled C-extension backend (not the slower pure-Python fallback) in
+this environment. The reason to suspect it wouldn't help regardless is
+already on record in §5's Phase 3 "Revisit compression" item: gzip
+level 4 on noisy float64 scan data measured a 1.08× ratio (bigger than
+raw) against 0.69× for float32 camera frames — this project's real
+detector data is photon/thermal noise, not the smooth natural images
+generic compressors are tuned for.
+
+Measured with a new script,
+[`scripts/shared_memory_compression_benchmark.py`](../scripts/shared_memory_compression_benchmark.py)
+(same structure as `ipc_overhead_benchmark.py`), against real frames from
+`remote_simulated_instrument()` — scan sizes from 64×64 (32KB, below
+`_SHARED_MEMORY_THRESHOLD_BYTES`) up to 2048×2048 (33.6MB), plus both
+camera frames (EELS 256×1024 float32 ~1.0MB, Ronchigram 2048×2048 float32
+~16.8MB) — at zstd levels 1, 3, 9, and 12, single-threaded and with
+`threads=os.cpu_count()` (4 in this container), timed through the actual
+`SharedFrameWriter`/`SharedFrameReader` classes (the compressed bytes are
+published/read as the payload, so the comparison includes the real memcpy
+cost of whatever is actually moved, not an isolated compression
+microbenchmark):
+
+- **Ratios confirm the gzip finding, and extend it**: scan frames
+  compressed to only 0.954–0.958× regardless of level — statistically
+  indistinguishable from "doesn't compress," same as gzip found. Camera
+  frames compressed better with zstd than the gzip datapoint suggested
+  (Ronchigram 0.73× at level 1 down to 0.61× at level 12; EELS 0.30× down
+  to 0.21×) — zstd's better modeling helps on this data, but not remotely
+  enough to matter given the timings below.
+- **Compression is 5×–300× slower than the memcpy it would replace, at
+  every size and level tested, with no exceptions.** The raw
+  `SharedFrameWriter.publish`+`SharedFrameReader.read` round trip is
+  already fast because it is one memory-bandwidth-bound copy each way:
+  0.02ms at 32KB, 1.25ms at 8.4MB, 3.81ms at 18.9MB, 26.1ms at 33.6MB for
+  scan frames; 0.17ms for the 1.0MB EELS frame; 4.33ms for the 16.8MB
+  Ronchigram frame. zstd compression is CPU-bound and orders of magnitude
+  more expensive per byte than a copy: the *best* result anywhere in the
+  sweep — level 1, `threads=4`, the largest 33.6MB scan frame — still cost
+  117ms round trip against a 26.1ms baseline (4.5× slower). Worse cases
+  are common: the 1.0MB EELS frame at level 12 cost 53ms against a
+  0.17ms baseline (309× slower); the 16.8MB Ronchigram frame at level 12
+  cost 1267ms against 4.33ms (293× slower).
+- **The threading claim is real but bounded, exactly as expected from how
+  zstd multi-threading works (splitting input into independent blocks,
+  trading ratio for parallelism)**: at 64×64–256×256 (32KB–524KB),
+  `threads=4` made no measurable difference or was marginally worse
+  (thread-pool setup cost with too little data to split) than
+  `threads=1`. From ~1MB up, `threads=4` did measurably cut wall time —
+  ~17–40% faster than `threads=1` at the largest scan and Ronchigram
+  sizes — confirming idle cores genuinely engage for frames in the
+  multi-megabyte range. It never closed anywhere near the gap to the raw
+  memcpy path, because that gap is 1–3 orders of magnitude, not the
+  ~2–4× a handful of idle cores can buy back.
+- **Why this differs from the naive-pickle-over-socket case compression
+  might have helped**: that path pays a real "bytes over a wire" cost —
+  serialize, then copy through a kernel socket buffer, on a local
+  loopback connection that still round-trips through the TCP/IP stack.
+  Shared memory has no wire: `SharedFrameWriter`/`SharedFrameReader` are
+  already just `np.ndarray` view assignment and `.copy()` against a
+  `mmap`-backed segment, at whatever memory bandwidth the machine has.
+  Compression only pays off when it removes work that is actually the
+  bottleneck; on this path the bottleneck is memory bandwidth for a copy
+  that is already single-digit-to-tens-of-milliseconds for the largest
+  real frames this project produces, and zstd's decode+encode cost per
+  byte is fundamentally higher than a copy's, no matter how many idle
+  cores run it in parallel.
+
+**Verdict: not implemented.** This is a complete, negative answer to the
+question, not an unfinished feature — `shared_frame.py` is unchanged, and
+`zstandard` was not added to `pyproject.toml` as a dependency (it was
+installed ad hoc, `uv pip install zstandard`, only to run the benchmark
+script; the script's own docstring notes this so it stays reproducible
+without weighing down the shipped dependency set for a capability that
+isn't shipping). The benchmark script is kept in `scripts/` as the record
+of how this was checked, the same way `ipc_overhead_benchmark.py` and the
+Phase 2 live-viewer benchmark are kept regardless of which way their
+results pointed.
+
 ## 7. Open questions
 
 - **Bluesky/ophyd**: the [Bluesky](https://blueskyproject.io/) experiment
@@ -408,6 +760,18 @@ the server subprocess's environment.
 - **Shared-memory threshold precision**: see §6 — 8MB is conservative,
   not precisely fitted; the actual crossover between plain-pickle and
   shared-memory transport is noisier than a single benchmark run resolved.
+- **A real 4D-STEM acquisition mode**: §5's Phase 4 py4DSTEM follow-up
+  measured, rather than assumed, that even the simulated device stack
+  cannot produce scan-position-varying diffraction frames without
+  registering a `ScanHardwareSource` with the simulator's `STEMController`
+  - which needs the full `HardwareSource`/`Application` layer this
+    project has twice now (Phase 0, and this investigation) found too
+    heavy to stand up outside Swift's own process. If py4DSTEM's/
+    LiberTEM's headline `DataCube` type is ever wanted for real
+    (synchronized scan-position × diffraction-pattern) data, that
+    application-layer question needs answering first - it is not solvable
+    by adding a method to the vendor-neutral `Scanner`/`Camera`
+    interface alone.
 
 ## 8. Summary
 
@@ -416,5 +780,18 @@ scratch: napari + PySide6 for the shell and rendering, HDF5/Zarr + NeXus/NXem
 + RosettaSciIO for storage and I/O, and HyperSpy/py4DSTEM/LiberTEM for
 analysis. The actual new code this project needs to write is the device
 bridge (Phase 1), the live-viewer dock widget (Phase 2), the acquisition
-sequencer and legacy-data importer (Phase 3), and plugin wiring (Phase 4) —
-glue, as intended.
+sequencer and legacy-data importer (Phase 3), and analysis wiring (Phase
+4: one adapter function and one menu action each into HyperSpy, LiberTEM,
+and, on single-diffraction-pattern terms, py4DSTEM) — glue, as intended.
+The LiberTEM adapter is also a useful lesson in the plan's own "measure,
+don't assume" principle (§1): an earlier version of this plan grouped
+LiberTEM with py4DSTEM as both needing 4D-STEM data this app doesn't
+produce yet, reasoning by category (“pixelated-detector analysis tool”)
+rather than by checking LiberTEM's actual object model — checking it
+directly found the category-level assumption wrong for one of the two
+libraries, not both. py4DSTEM's own headline `DataCube` type stays out of
+reach for now, not from an unchecked assumption but from a direct
+measurement (§5, §7): the simulated device stack won't vary a
+diffraction frame with beam position without an application layer this
+project has twice found too heavy to stand up outside Swift's own
+process.

@@ -87,6 +87,61 @@ device = [
 viewer = [
     "napari[pyside6]>=0.5",
 ]
+# Phase 4 analysis integration - see docs/migration-plan.md section 5.
+# HyperSpy chosen for this extra: it is the lighter, more general option
+# and matches the plain scan/camera frame stacks this app produces today
+# (no 4D-STEM diffraction-scan mode yet). py4DSTEM and LiberTEM each get
+# their own extra below - py4DSTEM because its core object is a true 4D
+# datacube this app can't produce yet (see the "py4dstem" extra's adapter
+# for what is buildable instead: single-diffraction-pattern operations);
+# LiberTEM because it turned out not to need one at all.
+# A loose ">=" bound is deliberate here, unlike the "device" extra above:
+# HyperSpy is one package (not seven kept in lockstep), its public Signal/AxesManager API
+# is the kind of thing a 2.x release is expected to hold stable, and - most
+# importantly - the pin is loaded via hatch's own independent per-env
+# resolution, so it's exactly the failure mode the "device" comment
+# describes, just judged unlikely to bite for this dependency. Revisit
+# with an exact pin if a hatch env build ever actually resolves a HyperSpy
+# release that breaks this adapter.
+analysis = [
+    "hyperspy>=2.0",
+]
+# LiberTEM: kept as its own extra, not folded into "analysis" above.
+# Measured (docs/migration-plan.md section 5): `pip install libertem` alone
+# resolves ~102 packages against a 2-package bare venv baseline - dask,
+# distributed, numba, scikit-learn, scikit-image, matplotlib, and a
+# Jupyter/ipywidgets stack for its own notebook GUI - roughly 3x HyperSpy's
+# ~35. That weight buys high-throughput, tiled, MapReduce-style processing
+# for datasets much larger than memory; this app's own acquisition path
+# produces plain in-memory frame stacks (Phase 3), so the adapter exercises
+# LiberTEM's UDF/DataSet model genuinely, but not the reason most projects
+# reach for LiberTEM specifically. A loose ">=" bound for the same reason
+# as HyperSpy's above: one package, a stable public Context/DataSet/UDF
+# API, and hatch's per-env resolution is the failure mode to watch for, not
+# assumed to bite.
+libertem = [
+    "libertem>=0.16",
+]
+# Phase 4, follow-up: py4DSTEM specifically - see
+# docs/migration-plan.md section 5's Phase 4 notes and
+# src/miainwoodpecker/analysis/py4dstem_bridge.py's docstring for why this
+# is scoped to single-diffraction-pattern operations, not py4DSTEM's 4D
+# DataCube (no synchronized scan-position/camera-frame acquisition mode
+# exists, and reaching past the device wrapper into the simulator's own
+# probe-position control confirmed that isn't a workaround either - see
+# the adapter module for the measurement). Kept as its own extra, not
+# folded into "analysis": measured with a fresh `pip install py4dstem`,
+# it resolves 65 packages (dask, distributed, scikit-image,
+# scikit-learn, scikit-optimize, pylops, mpire, gdown, ...) - heavier
+# than HyperSpy's ~35 and close to the ~70 the Phase 3 notes measured for
+# pynxtools-em, so a HyperSpy-only install shouldn't pay for it and vice
+# versa. Loose ">=" bound for the same reason as the "analysis" extra
+# above: one package from this project's point of view, and py4DSTEM's
+# public Calibration/DiffractionSlice API is the kind of surface a minor
+# release is expected to hold stable.
+py4dstem = [
+    "py4dstem>=0.14",
+]
 docs = [
     "sphinx>=8.2.3",
     "myst-parser>=4.0.1",
@@ -243,18 +298,22 @@ python = ["3.11", "3.12", "3.13"]
 [tool.hatch.envs.test.scripts]
 run = "pytest {args:--cov=miainwoodpecker --cov-report=term-missing}"
 
-#--------------- Run the full suite, including devices and viewer ---------------#
+#--------------- Run the full suite, including devices, viewer, and analysis ---------------#
 
-# The default "test" env installs only the base package, so device and viewer
-# tests skip themselves. This env installs those extras so they actually run.
+# The default "test" env installs only the base package, so device, viewer,
+# and analysis tests skip themselves. This env installs those extras so they
+# actually run.
 # Viewer tests need a real GL canvas: on Linux, run this under a virtual
 # display and install the system libraries first, e.g.
 #   bash scripts/install-linux-gui-deps.sh
 #   xvfb-run -a -s "-screen 0 1920x1080x24" hatch run integration:run
 [tool.hatch.envs.integration]
-description = """Run the full test suite, including device and viewer tests."""
+description = """Run the full test suite, including device, viewer, and analysis tests."""
 features = [
+    "analysis",
     "device",
+    "libertem",
+    "py4dstem",
     "tests",
     "viewer",
 ]
