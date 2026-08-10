@@ -121,10 +121,28 @@ class RemoteCallError(RuntimeError):
     """Raised client-side when a :class:`Call` failed on the server."""
 
 
+class RemoteCallTimeoutError(RemoteCallError):
+    """
+    Raised client-side when a :class:`Call` produced no reply in time.
+
+    A subclass of :class:`RemoteCallError` so callers that only care
+    "the call did not succeed" need no new ``except`` clause.
+
+    The connection is left **poisoned**: the request was sent, so a reply
+    may still arrive later and would be mistaken for the answer to the
+    *next* call on the same connection. Anything that catches this must
+    stop using the connection. The only caller today is
+    :mod:`miainwoodpecker.devices.remote`'s shutdown handshake, which is
+    about to kill the server process anyway.
+    """
+
+
 def send_call(
     connection: Connection,
     lock: threading.Lock,
     call: Call,
+    *,
+    timeout_s: float | None = None,
 ) -> object:
     """
     Send a call and return its result, raising on a server-side error.
@@ -138,6 +156,13 @@ def send_call(
         send/recv round trip must not interleave with another.
     call : Call
         The call to make.
+    timeout_s : float | None
+        Seconds to wait for the reply, or ``None`` (the default) to wait
+        indefinitely. Waiting forever is right for ordinary device calls
+        — an acquisition genuinely takes as long as it takes, and a
+        wrong guess would abort a good exposure — and wrong only for
+        calls whose whole purpose is to not hang the application, which
+        is why this is opt-in per call rather than a global setting.
 
     Returns
     -------
@@ -148,9 +173,17 @@ def send_call(
     ------
     RemoteCallError
         If the call raised on the server side.
+    RemoteCallTimeoutError
+        If ``timeout_s`` elapsed with no reply.
     """
     with lock:
         connection.send(call)
+        if timeout_s is not None and not connection.poll(timeout_s):
+            msg = (
+                f"remote call {call.target}.{call.method}() did not reply "
+                f"within {timeout_s}s"
+            )
+            raise RemoteCallTimeoutError(msg)
         result = connection.recv()
     if result.error is not None:
         msg = f"remote call {call.target}.{call.method}() failed: {result.error}"
