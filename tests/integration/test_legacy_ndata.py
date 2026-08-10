@@ -20,12 +20,19 @@ from miainwoodpecker.storage.legacy import iter_ndata_directory, read_ndata
 
 
 def _write_ndata(path, data, properties) -> None:
-    """Write a genuine .ndata file using Nion's own writer."""
+    """
+    Write a genuine .ndata file using Nion's own writer.
+
+    ``file_datetime`` is passed by keyword deliberately: the positional
+    form binds on the nionswift build resolved for Python 3.11 but not the
+    one resolved for 3.12, which fails with "missing 1 required positional
+    argument: 'file_datetime'". The keyword form is correct under both.
+    """
     when = datetime.datetime(2020, 5, 6, 7, 8, 9)  # noqa: DTZ001 - Swift writes naive
     handler = NDataHandler.NDataHandler(path)
     try:
-        handler.write_data(data, when)
-        handler.write_properties(properties, when)
+        handler.write_data(data, file_datetime=when)
+        handler.write_properties(properties, file_datetime=when)
     finally:
         handler.close()
 
