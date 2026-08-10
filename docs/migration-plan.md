@@ -101,10 +101,21 @@ problem — read their source and docs before designing our own adapters:
   (Ronchigram + EELS) up front, each running its own acquisition thread
   from construction time — close both, or the process hangs on exit.
 - [x] Stand up a bare napari window with PySide6 as a smoke test —
-  [`scripts/phase0_viewer_smoke_test.py`](../scripts/phase0_viewer_smoke_test.py)
-  (`uv run --extra viewer python scripts/phase0_viewer_smoke_test.py`).
-  Passed cleanly with `QT_QPA_PLATFORM=offscreen`, so this also runs in
-  headless CI without a real display.
+  [`scripts/phase0_viewer_smoke_test.py`](../scripts/phase0_viewer_smoke_test.py).
+  **Requires a real or virtual display**; run it under
+  `xvfb-run -a -s "-screen 0 1920x1080x24"`.
+  Correction to the original Phase 0 note, which claimed this passed under
+  `QT_QPA_PLATFORM=offscreen`: it did, but only because `libEGL` was
+  missing from the container, so no GL canvas was ever attempted. Once
+  the Qt GL libraries are actually installed, the offscreen platform
+  provides no `QOpenGLWidget` and napari's layer teardown raises
+  `KeyError` in `napari/_vispy/canvas.py::_remove_layer`. Offscreen is
+  therefore not a valid headless substitute — it either crashes or passes
+  while proving nothing about the GPU rendering path napari was chosen
+  for. The script now refuses to run without a display rather than
+  offering false confidence. Container prerequisites for a real canvas:
+  `libegl1 libgl1 libxkbcommon0 libxkbcommon-x11-0 libdbus-1-3
+  libfontconfig1 libxcb-cursor0` (plus the other `libxcb-*` plugin deps).
 - [x] Settle on a package layout beyond the pyOpenSci template scaffold —
   package is named `miainwoodpecker`; the demo `add_numbers` module has
   been replaced by the Phase 1 device bridge.
@@ -137,11 +148,39 @@ problem — read their source and docs before designing our own adapters:
 - [ ] Validate against real hardware.
 
 **Phase 2 — Live viewer MVP**
-- A napari + PySide6 shell with a dock widget (napari-micromanager-shaped)
-  showing the live scan/camera feed and basic parameters (FOV, rotation,
-  dwell time) — the core "look at the sample, adjust settings" loop.
-- Benchmark live frame latency against real scan rates; fall back to `ndv`
-  or a custom VisPy canvas if napari's per-frame overhead is too high.
+- [x] Decouple acquisition from display —
+  [`src/miainwoodpecker/acquisition/live.py`](../src/miainwoodpecker/acquisition/live.py).
+  `LiveAcquisition` runs a grab callable on a daemon worker thread and
+  keeps only the newest frame (**latest-frame-wins**); the display polls
+  `latest()` at its own rate. This is the pymmcore-plus pattern and the
+  direct structural fix for what makes Swift slow: a slow display skips
+  frames instead of queueing them, and no per-frame event fan-out ever
+  reaches the UI thread. Deliberately UI-agnostic — it imports no Qt.
+- [x] A napari + PySide6 dock widget with the live scan/camera feed and
+  scan controls (channel, size, dwell, FOV) —
+  [`src/miainwoodpecker/viewer/live.py`](../src/miainwoodpecker/viewer/live.py),
+  launchable as `miainwoodpecker-viewer`. One `QTimer` on the GUI thread
+  drives all display updates. Thread-safety contract: the GUI thread
+  writes scan settings to a plain tuple that the worker only reads, so
+  workers never touch Qt.
+- [x] Benchmark live frame latency —
+  [`scripts/phase2_live_benchmark.py`](../scripts/phase2_live_benchmark.py).
+  **Result on this container (llvmpipe software rasterization), 512×512
+  scan:** acquire 12.7 ms median (79 fps ceiling); display 42.4 ms median,
+  p95 57 ms (23.6 fps) — display costs **3.35× acquire**.
+  *This is not yet a verdict against napari.* Under software rendering the
+  rasterizer competes with acquisition for the same CPU, so the figure is
+  a pessimistic floor; the script detects the GL renderer and says so.
+  Two measurement traps found while building it, either of which makes
+  napari look ~2× faster than it is, and both of which the script now
+  avoids: (1) with `show=False` the canvas is hidden, Qt issues no paint
+  events, and the GPU draw never happens; (2) assigning `layer.data` only
+  *schedules* a repaint, so the event loop must be flushed **inside** the
+  timed region. An honest hidden-vs-shown comparison went 5.3 ms → 22.7 ms
+  for the same operation.
+- [ ] Re-run the benchmark on a GPU workstation at real scan rates. Only a
+  hardware-accelerated result showing display still dominating justifies
+  moving to `ndv` or a custom VisPy canvas.
 
 **Phase 3 — Acquisition and storage**
 - Implement acquisition sequences (single frame, spectrum image, tilt

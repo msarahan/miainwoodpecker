@@ -37,6 +37,10 @@ dependencies = [
     "numpy>=2.2.6",
 ]
 
+[project.scripts]
+# Requires the "device" and "viewer" extras.
+miainwoodpecker-viewer = "miainwoodpecker.viewer.app:main"
+
 [project.urls]
 Homepage = "https://github.com/SuperSTEM/miainwoodpecker"
 "Source Code" = "https://github.com/SuperSTEM/miainwoodpecker"
