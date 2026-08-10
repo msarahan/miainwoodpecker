@@ -88,11 +88,13 @@ viewer = [
     "napari[pyside6]>=0.5",
 ]
 # Phase 4 analysis integration - see docs/migration-plan.md section 5.
-# HyperSpy chosen over py4DSTEM for this extra: it is the lighter, more
-# general option and matches the plain scan/camera frame stacks this app
-# produces today (no 4D-STEM diffraction-scan mode yet). py4DSTEM's core
-# object is a true 4D datacube, so it stays deferred; LiberTEM turned out
-# not to need one (see the "libertem" extra below) and has its own adapter.
+# HyperSpy chosen for this extra: it is the lighter, more general option
+# and matches the plain scan/camera frame stacks this app produces today
+# (no 4D-STEM diffraction-scan mode yet). py4DSTEM and LiberTEM each get
+# their own extra below - py4DSTEM because its core object is a true 4D
+# datacube this app can't produce yet (see the "py4dstem" extra's adapter
+# for what is buildable instead: single-diffraction-pattern operations);
+# LiberTEM because it turned out not to need one at all.
 # A loose ">=" bound is deliberate here, unlike the "device" extra above:
 # HyperSpy is one package (not seven kept in lockstep), its public Signal/AxesManager API
 # is the kind of thing a 2.x release is expected to hold stable, and - most
@@ -119,6 +121,26 @@ analysis = [
 # assumed to bite.
 libertem = [
     "libertem>=0.16",
+]
+# Phase 4, follow-up: py4DSTEM specifically - see
+# docs/migration-plan.md section 5's Phase 4 notes and
+# src/miainwoodpecker/analysis/py4dstem_bridge.py's docstring for why this
+# is scoped to single-diffraction-pattern operations, not py4DSTEM's 4D
+# DataCube (no synchronized scan-position/camera-frame acquisition mode
+# exists, and reaching past the device wrapper into the simulator's own
+# probe-position control confirmed that isn't a workaround either - see
+# the adapter module for the measurement). Kept as its own extra, not
+# folded into "analysis": measured with a fresh `pip install py4dstem`,
+# it resolves 65 packages (dask, distributed, scikit-image,
+# scikit-learn, scikit-optimize, pylops, mpire, gdown, ...) - heavier
+# than HyperSpy's ~35 and close to the ~70 the Phase 3 notes measured for
+# pynxtools-em, so a HyperSpy-only install shouldn't pay for it and vice
+# versa. Loose ">=" bound for the same reason as the "analysis" extra
+# above: one package from this project's point of view, and py4DSTEM's
+# public Calibration/DiffractionSlice API is the kind of surface a minor
+# release is expected to hold stable.
+py4dstem = [
+    "py4dstem>=0.14",
 ]
 docs = [
     "sphinx>=8.2.3",
@@ -291,6 +313,7 @@ features = [
     "analysis",
     "device",
     "libertem",
+    "py4dstem",
     "tests",
     "viewer",
 ]

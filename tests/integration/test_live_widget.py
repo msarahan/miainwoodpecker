@@ -176,6 +176,38 @@ def test_analyze_camera_in_libertem_adds_a_sum_projection_layer():
         viewer.close()
 
 
+def test_fit_central_disk_in_py4dstem_adds_a_frame_and_shapes_layer():
+    """
+    Clicking "Fit central disk (py4DSTEM)" round-trips one frame through the adapter.
+
+    Exercises the py4DSTEM follow-up to Phase 4 end to end: acquire one
+    frame from the fake camera, write it to a temporary NeXus file, load
+    it back as a py4DSTEM ``DiffractionSlice``, run
+    ``py4DSTEM.process.calibration.get_probe_size`` on it, and land both
+    the analyzed frame and a ``Shapes`` ellipse at the fitted disk in
+    napari. Skipped if the ``py4dstem`` extra is not installed, since the
+    widget itself does not require it.
+    """
+    pytest.importorskip("py4DSTEM", reason="requires the 'py4dstem' extra")
+    viewer = napari.Viewer(show=False)
+    camera = _FakeCamera()
+    widget = LiveInstrumentWidget(viewer, _FakeScanner(), camera=camera)
+    try:
+        widget._fit_central_disk_in_py4dstem()  # noqa: SLF001 - simulating a button click
+
+        frame_layer_name = "py4DSTEM disk fit (Camera)"
+        assert frame_layer_name in viewer.layers
+        frame_shape = (8, 8)
+        assert viewer.layers[frame_layer_name].data.shape == frame_shape
+        assert "py4DSTEM disk fit" in viewer.layers
+        assert viewer.layers["py4DSTEM disk fit"].shape_type == ["ellipse"]
+        assert not camera.started  # the acquisition starts and stops the camera itself
+        assert widget._py4dstem_status.text().startswith("done")  # noqa: SLF001
+    finally:
+        widget.shutdown()
+        viewer.close()
+
+
 def test_scan_settings_change_takes_effect_on_next_frames():
     """Changing the size control changes the shape of subsequently scanned frames."""
     viewer = napari.Viewer(show=False)

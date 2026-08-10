@@ -409,6 +409,107 @@ problem — read their source and docs before designing our own adapters:
     LiberTEM needs one to be useful here — the 1D-navigation PoC above
     is real, working, and sufficient to answer the question this item
     was scoped to answer.
+- [x] Follow-up PoC: py4DSTEM specifically —
+  [`src/miainwoodpecker/analysis/py4dstem_bridge.py`](../src/miainwoodpecker/analysis/py4dstem_bridge.py),
+  wired into
+  [`src/miainwoodpecker/viewer/live.py`](../src/miainwoodpecker/viewer/live.py).
+  **Investigated, rather than assumed, whether the 4D-STEM constraint
+  above had moved** — it hasn't, and the reason is more specific than
+  "the interface doesn't expose it yet." Checked whether the simulated
+  device stack itself exposes any way to move the beam to a single point
+  (option (a) in this investigation's brief), reaching past the
+  vendor-neutral `Scanner`/`Camera` protocols into `nion.usim_device`'s
+  own internals: `nion.device_kit.InstrumentDevice.Instrument` does have
+  a real, public, settable per-point `probe_position`, and the
+  Ronchigram camera simulator's own code
+  (`RonchigramCameraSimulator.get_frame_data`) does read it to offset the
+  simulated aberrations. But the read only happens through
+  `CameraSimulator._get_frame_settings`, which first asks
+  `self.instrument.scan_controller` for a registered
+  `ScanHardwareSource` and silently drops `probe_position` back to a
+  fixed centred default if that resolves to `None` — and it does resolve
+  to `None` here, because that registration only happens inside the full
+  `HardwareSource`/`Application` layer, the exact layer this migration
+  plan's own Phase 0 note already found too heavy to stand up outside
+  Swift's own process. Measured directly against
+  `nion.usim_device.DeviceConfiguration.AcquisitionContextConfiguration`
+  (the same lightweight construction `nion_server.py` uses, with no
+  `HardwareSource` registered anywhere): setting `instrument.probe_position`
+  to different points and re-acquiring a 2048×2048 Ronchigram frame each
+  time changes nothing beyond shot noise — mean absolute difference
+  between frames at *different* probe positions was 12.31 counts,
+  statistically identical to the 12.31-count noise floor from
+  re-acquiring at the *same* fixed position twice, and the disk's
+  brightest pixel jumped to a different, effectively random location call
+  to call even with the probe held perfectly still. So a genuine software
+  step-scan 4D-STEM acquisition is not buildable today, even by going
+  around this project's own device wrapper entirely — not just because
+  the vendor-neutral interface hasn't grown the method, but because the
+  simulator underneath it won't honor a per-point beam position without
+  the heavier application layer this project deliberately avoids.
+  A second possible way around it - option (a)'s escape hatch, real
+  external 4D-STEM data instead of driving the simulator - was checked
+  and is also unavailable in this environment: py4DSTEM ships a
+  Google-Drive-backed downloader with real, non-synthetic sample
+  datacubes (`small_datacube`, `Au_sim`, `Si_SiGe_exp`, …), but the
+  outbound proxy returns a `403` on the CONNECT tunnel to
+  `drive.google.com` for both py4DSTEM's own downloader and a bare
+  `gdown` call to the same file id - confirmed with `curl` and directly
+  with `gdown.download()`, not inferred from py4DSTEM's own wrapper
+  alone. That wrapper is also, independently, broken against the `gdown`
+  release it resolves today (`py4DSTEM 0.14.18` passes a `fuzzy=` keyword
+  `gdown 6.1.0`'s `download()` no longer accepts) - a second, unrelated
+  reason this path doesn't work here, worth recording so it isn't
+  mis-attributed to the network block alone if retried later on an
+  unblocked network with an older `gdown` pin.
+  Landed on option (b): real single Ronchigram frames (genuine
+  acquisitions, shot noise and all - not scan-position-indexed, and not
+  presented as if they were) through py4DSTEM's own single-diffraction-
+  pattern operations, which is exactly what py4DSTEM itself applies
+  per-pattern inside a full datacube.
+  - **The adapter** (`load_as_diffraction_slice`) reads a NexusWriter
+    file's `/entry/data` group with `h5py` — the same pattern
+    `hyperspy_bridge.py` uses, not a second reader implementation — and
+    hands the frame(s) to `py4DSTEM.data.DiffractionSlice`, py4DSTEM's own
+    diffraction-space container, calibrated on its `Calibration` object's
+    `Q_pixel_size`/`Q_pixel_units` from exactly the axis values
+    `nexus.py` already wrote. One real impedance mismatch surfaced and is
+    handled explicitly rather than silently: `Calibration.Q_pixel_units`
+    only accepts the literal strings `"pixels"`, `"A^-1"`, or `"mrad"` (a
+    hard assert in py4DSTEM's own code), so the adapter maps NexusWriter's
+    `"pixel"` (singular) onto `"pixels"` and raises a clear `ValueError`
+    for anything else — in particular, a *scan* recording's nanometre
+    calibration (real-space, Phase 3) is correctly refused rather than
+    mislabelled as a diffraction-plane pixel count, since this adapter is
+    for camera data specifically.
+  - **The wired-in action**: a new "Fit central disk (py4DSTEM)" button in
+    the live viewer's Camera group, alongside "Analyze in HyperSpy".
+    Clicking it stops the camera's live loop if running, acquires **one**
+    real frame via `acquisition.sequence.camera_series` (not a burst —
+    a single-pattern operation needs one representative pattern, not an
+    average), writes it to a temporary NeXus file, reads it back through
+    the adapter, runs one real py4DSTEM operation —
+    `py4DSTEM.process.calibration.get_probe_size`, the central-disk
+    radius/centre fit py4DSTEM runs per-pattern internally even when it
+    does have a full datacube — and pushes both the analyzed frame and a
+    napari `Shapes` ellipse at the fitted disk into the viewer. Genuine
+    round trip end to end: acquire → NeXus file on disk → py4DSTEM
+    `DiffractionSlice` → a real py4DSTEM function → two napari layers.
+    Verified with a real napari widget against a fake camera under a
+    virtual display
+    ([`tests/integration/test_live_widget.py`](../tests/integration/test_live_widget.py)),
+    same caveat as the HyperSpy action about real-hardware/full-app
+    end-to-end coverage.
+  - **Kept deliberately thin and separately gated**: the `py4dstem` import
+    lives inside the button's click handler, not at module scope, exactly
+    like the HyperSpy button; a missing extra reports "install the
+    'py4dstem' extra" instead of an import crash. `py4dstem` is its own
+    optional-dependency extra, not folded into `analysis`: a fresh `pip
+    install py4dstem` resolved **65 packages** (dask, distributed,
+    scikit-image, scikit-learn, scikit-optimize, pylops, mpire, gdown, …)
+    — heavier than HyperSpy's ~35 and close to the ~70 the Phase 3 notes
+    measured for `pynxtools-em` — so installing one analysis library
+    doesn't tax someone who only wanted the other.
 - [ ] Port Swift-specific analyses not already covered upstream, as small
   adapter functions. **Deferred, not attempted**: this PoC's scope was
   proving the wiring shape (adapter + one real menu action) works end to
@@ -659,6 +760,18 @@ results pointed.
 - **Shared-memory threshold precision**: see §6 — 8MB is conservative,
   not precisely fitted; the actual crossover between plain-pickle and
   shared-memory transport is noisier than a single benchmark run resolved.
+- **A real 4D-STEM acquisition mode**: §5's Phase 4 py4DSTEM follow-up
+  measured, rather than assumed, that even the simulated device stack
+  cannot produce scan-position-varying diffraction frames without
+  registering a `ScanHardwareSource` with the simulator's `STEMController`
+  - which needs the full `HardwareSource`/`Application` layer this
+    project has twice now (Phase 0, and this investigation) found too
+    heavy to stand up outside Swift's own process. If py4DSTEM's/
+    LiberTEM's headline `DataCube` type is ever wanted for real
+    (synchronized scan-position × diffraction-pattern) data, that
+    application-layer question needs answering first - it is not solvable
+    by adding a method to the vendor-neutral `Scanner`/`Camera`
+    interface alone.
 
 ## 8. Summary
 
@@ -667,12 +780,18 @@ scratch: napari + PySide6 for the shell and rendering, HDF5/Zarr + NeXus/NXem
 + RosettaSciIO for storage and I/O, and HyperSpy/py4DSTEM/LiberTEM for
 analysis. The actual new code this project needs to write is the device
 bridge (Phase 1), the live-viewer dock widget (Phase 2), the acquisition
-sequencer and legacy-data importer (Phase 3), and analysis wiring
-(Phase 4: two adapter functions, HyperSpy and LiberTEM, one menu action
-each driving them) — glue, as intended. The LiberTEM adapter is also a
-useful lesson in the plan's own "measure, don't assume" principle (§1):
-an earlier version of this plan grouped LiberTEM with py4DSTEM as both
-needing 4D-STEM data this app doesn't produce yet, reasoning by category
-(“pixelated-detector analysis tool”) rather than by checking LiberTEM's
-actual object model — checking it directly found the category-level
-assumption wrong for one of the two libraries, not both.
+sequencer and legacy-data importer (Phase 3), and analysis wiring (Phase
+4: one adapter function and one menu action each into HyperSpy, LiberTEM,
+and, on single-diffraction-pattern terms, py4DSTEM) — glue, as intended.
+The LiberTEM adapter is also a useful lesson in the plan's own "measure,
+don't assume" principle (§1): an earlier version of this plan grouped
+LiberTEM with py4DSTEM as both needing 4D-STEM data this app doesn't
+produce yet, reasoning by category (“pixelated-detector analysis tool”)
+rather than by checking LiberTEM's actual object model — checking it
+directly found the category-level assumption wrong for one of the two
+libraries, not both. py4DSTEM's own headline `DataCube` type stays out of
+reach for now, not from an unchecked assumption but from a direct
+measurement (§5, §7): the simulated device stack won't vary a
+diffraction frame with beam position without an application layer this
+project has twice found too heavy to stand up outside Swift's own
+process.

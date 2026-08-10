@@ -14,11 +14,12 @@ whenever a control changes, and the worker thread only reads that
 attribute — no Qt access from workers.
 
 Importing this module requires the ``viewer`` optional dependency group.
-The camera group's "Analyze in HyperSpy" and "Sum in LiberTEM" buttons
-additionally need the ``analysis`` and ``libertem`` groups respectively
-(migration plan, Phase 4); both libraries are imported lazily so this
-module still imports and the buttons still render without them, only
-reporting the missing extra in the status label if clicked.
+The camera group's "Analyze in HyperSpy", "Sum in LiberTEM", and "Fit
+central disk (py4DSTEM)" buttons additionally need the ``analysis``,
+``libertem``, and ``py4dstem`` groups respectively (migration plan,
+Phase 4); all three libraries are imported lazily so this module still
+imports and the buttons still render without them, only reporting the
+missing extra in the status label if clicked.
 """
 
 from __future__ import annotations
@@ -149,10 +150,17 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
             camera_form.addRow(self._libertem_button)
             self._libertem_status = QtWidgets.QLabel("", camera_group)
             camera_form.addRow("LiberTEM", self._libertem_status)
+            self._py4dstem_button = QtWidgets.QPushButton(
+                "Fit central disk (py4DSTEM)", camera_group
+            )
+            camera_form.addRow(self._py4dstem_button)
+            self._py4dstem_status = QtWidgets.QLabel("", camera_group)
+            camera_form.addRow("py4DSTEM", self._py4dstem_status)
             layout.addWidget(camera_group)
             self._camera_button.clicked.connect(self._toggle_camera)
             self._analyze_button.clicked.connect(self._analyze_camera_in_hyperspy)
             self._libertem_button.clicked.connect(self._analyze_camera_in_libertem)
+            self._py4dstem_button.clicked.connect(self._fit_central_disk_in_py4dstem)
 
         layout.addStretch(1)
 
@@ -335,6 +343,76 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
             colormap="viridis",
         )
         self._libertem_status.setText(f"done - sum of {len(frames)} frames")
+
+    def _fit_central_disk_in_py4dstem(self) -> None:
+        """
+        Round-trip one real camera frame through the py4DSTEM adapter.
+
+        Demonstrates the py4DSTEM follow-up to Phase 4 (migration plan,
+        §5) end to end: stop the live camera loop if running, acquire one
+        real frame via :func:`~miainwoodpecker.acquisition.sequence.camera_series`,
+        write it to a temporary NeXus file with
+        :func:`~miainwoodpecker.storage.nexus.write_frames`, read it back
+        as a py4DSTEM ``DiffractionSlice`` with
+        :func:`~miainwoodpecker.analysis.py4dstem_bridge.load_as_diffraction_slice`,
+        run one real py4DSTEM operation on that single diffraction pattern
+        (``py4DSTEM.process.calibration.get_probe_size``, the same
+        central-disk fit py4DSTEM runs per-pattern inside a full
+        datacube), and push both the analyzed frame and a napari ``Shapes``
+        ellipse at the fitted disk into the viewer. Only a single frame is
+        used, not a scan-position-indexed cube - see
+        :mod:`miainwoodpecker.analysis.py4dstem_bridge` for why that cube
+        isn't available yet. Requires the ``py4dstem`` optional dependency
+        group; reports that in the status label rather than crashing the
+        widget if it is missing.
+        """
+        if self._camera is None:
+            return
+        try:
+            from py4DSTEM.process.calibration import get_probe_size  # noqa: PLC0415
+
+            from miainwoodpecker.analysis.py4dstem_bridge import (  # noqa: PLC0415
+                load_as_diffraction_slice,
+            )
+        except ImportError:
+            self._py4dstem_status.setText("install the 'py4dstem' extra")
+            return
+
+        if self._camera_loop is not None and self._camera_loop.is_running:
+            self.stop_camera()
+
+        self._py4dstem_status.setText("acquiring...")
+        try:
+            (frame,) = camera_series(self._camera, 1)
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                frame_path = Path(tmp_dir) / "py4dstem_analysis_frame.nxs"
+                write_frames(frame_path, [frame], title="py4DSTEM analysis frame")
+                diffraction_slice = load_as_diffraction_slice(frame_path)
+                radius, x0, y0 = get_probe_size(diffraction_slice.data)
+        except Exception as exc:  # noqa: BLE001 - surfaced in the status label
+            self._py4dstem_status.setText(f"error: {exc}")
+            return
+
+        self._viewer.add_image(
+            diffraction_slice.data,
+            name="py4DSTEM disk fit (Camera)",
+            colormap="gray",
+        )
+        self._viewer.add_shapes(
+            [
+                [y0 - radius, x0 - radius],
+                [y0 - radius, x0 + radius],
+                [y0 + radius, x0 + radius],
+                [y0 + radius, x0 - radius],
+            ],
+            shape_type="ellipse",
+            name="py4DSTEM disk fit",
+            edge_color="red",
+            face_color="transparent",
+        )
+        self._py4dstem_status.setText(
+            f"done - r={radius:.1f}px center=({x0:.1f}, {y0:.1f})"
+        )
 
     def _maybe_stop_timer(self) -> None:
         scan_running = self._scan_loop is not None and self._scan_loop.is_running
