@@ -228,6 +228,17 @@ problem — read their source and docs before designing our own adapters:
     the client asks `instrument.describe()` before connecting to any device
     target, so it only opens connections for targets that exist — usim
     always has both cameras, a real instrument need not.
+  - **A precedence bug in `--plugin`, found by a sibling change and fixed at
+    the root.** The parser seeded argparse's `action="append"` *default* from
+    `MIAINWOODPECKER_HARDWARE_PLUGINS`, and `append` adds to its default
+    rather than replacing it — so `--plugin foo` with that variable set meant
+    "the environment's plug-ins *and* foo", contradicting the command-line-wins
+    precedence documented above. Now `default=None` with the environment read
+    after parsing, and five tests pin the precedence rather than leaving it
+    assumed. Worth recording because the first fix attempted was a workaround
+    in `viewer/app.py` (clearing the variable for the child process), which
+    would have left the documented behaviour still false at the layer that
+    defines it.
 - [ ] Validate against real hardware. Still open, but no longer
   open-ended: what remains is the enumerated substitution above, and
   `docs/hardware-validation-checklist.md` is the ordered procedure for it,
@@ -252,8 +263,8 @@ problem — read their source and docs before designing our own adapters:
 - [x] Benchmark live frame latency —
   [`scripts/phase2_live_benchmark.py`](../scripts/phase2_live_benchmark.py).
   **Result on this container (llvmpipe software rasterization), 512×512
-  scan:** acquire 12.7 ms median (79 fps ceiling); display 42.4 ms median,
-  p95 57 ms (23.6 fps) — display costs **3.35× acquire**.
+  scan:** acquire ~14.5 ms median; display 33.6–47.7 ms median across four
+  runs — display costs roughly **2.3–3.3× acquire**.
   *This is not yet a verdict against napari.* Under software rendering the
   rasterizer competes with acquisition for the same CPU, so the figure is
   a pessimistic floor; the script detects the GL renderer and says so.
@@ -264,6 +275,36 @@ problem — read their source and docs before designing our own adapters:
   *schedules* a repaint, so the event loop must be flushed **inside** the
   timed region. An honest hidden-vs-shown comparison went 5.3 ms → 22.7 ms
   for the same operation.
+  - **The originally recorded figures were 12.7 ms acquire / 42.4 ms display
+    / "3.35× acquire", and two later corrections matter more than the small
+    numeric drift.** First, the +1.8 ms on acquire is explained rather than
+    mysterious: the old figure was an in-process call, and the script now
+    goes through `remote_simulated_instrument()` — the MIT client the shipped
+    viewer actually uses — so it crosses the IPC boundary. A 512×512 float64
+    frame is 2.1 MB, and §6 independently measured the shared-memory path's
+    overhead at that size as +2.8 ms, which accounts for the difference
+    within noise. (The script had also gone stale rather than wrong: it
+    imported `devices.nion_adapter`, the module §6 split into
+    `nion_server.py` + `remote.py`, so it simply did not run.)
+  - **Second, and the reason the ratio should never have been quoted to
+    three significant figures: display cost is load-dependent, not merely a
+    pessimistic floor.** Across four runs acquire held to a 3% spread
+    (14.2–14.7 ms) while display moved 42% (33.6–47.7 ms), falling
+    monotonically as other work on the machine finished. That is the
+    directly observed signature of what this item originally reasoned about a
+    priori. So "2.3–3.3×" is the honest form; a single number invites being
+    read as a property of napari rather than of a loaded software rasterizer.
+  - **Third, and it qualifies the "display dominates" framing more than a GPU
+    would: at 1024×1024 the ordering reverses on this same box** — acquire
+    48.5 ms, display 30.8 ms, i.e. display is 0.63× acquire and the script
+    prints that napari keeps up with the source. Display cost grows
+    sublinearly with pixel count while usim's scan generation grows about
+    linearly, so **512×512 is close to napari's worst case here rather than
+    representative of it**, and at the larger scans a real experiment is
+    likelier to use, the device is already the bottleneck. Anyone reading the
+    old 3.35× as "napari is 3× too slow" should note it was size-specific.
+    This strengthens rather than weakens the decision to withhold judgement
+    until the GPU re-run.
 - [ ] Re-run the benchmark on a GPU workstation at real scan rates. Only a
   hardware-accelerated result showing display still dominating justifies
   moving to `ndv` or a custom VisPy canvas.
@@ -509,6 +550,87 @@ problem — read their source and docs before designing our own adapters:
     only failure, while `userID` and `noteID` are optional, so `user` and
     `notes` are there for honesty about where session context belongs
     rather than to satisfy the validator.
+- [x] Per-axis calibration for camera frames, configurable per acquisition —
+  [`src/miainwoodpecker/storage/calibration.py`](../src/miainwoodpecker/storage/calibration.py).
+  Closes the gap §7 recorded: camera frames used to fall back to `"pixel"`
+  units because nothing could say what their axes meant. The model is
+  `AxisKind` × `AxisCalibration(kind, scale, offset, units)` ×
+  `FrameCalibration(y, x)` — five kinds (real space `nm`, reciprocal space
+  `1/nm`, energy `eV`/`meV`, angle `mrad`, and uncalibrated `pixel`) with a
+  short frozen unit vocabulary and one exact factor per unit. No units
+  dependency: this is a data model, not a units framework.
+  - **Per *axis*, established by measurement rather than by assumption.**
+    usim's `EELSCameraSimulator.get_dimensional_calibrations` returns
+    `[Calibration(), Calibration(offset=…, scale=…, units="eV")]` — index 0
+    (the 256-row slow axis) carries *nothing*, index 1 (the 1024-column fast
+    axis) is dispersive at 0.5 eV/channel. That is why `dispersive_axis`
+    defaults to `"x"`, and why it stays a parameter; the cross axis defaults
+    to the pixel fallback instead of borrowing the energy unit, because it is
+    not an energy axis.
+  - **Per *acquisition*, not per detector**, because the axis kind is a
+    property of the microscope's mode: the same camera yields reciprocal-space
+    diffraction in one mode and something else in another. Supplied via
+    `NexusWriter(calibration=…)` or through `metadata["calibration"]` — the
+    route `fov_nm` already travels. Nothing new is required, and no existing
+    signature or on-disk layout changed.
+  - **NeXus has no axis-*kind* attribute, so none was invented.** `NXdata`'s
+    `AXISNAME` carries `units` and `long_name`, and the unit string is the
+    whole carrier. Measured through `pynxtools.units.NXUnitSet.matches`:
+    **`"1/nm"` matches `NX_WAVENUMBER`; `"nm-1"` does not, and neither does
+    `"A^-1"`** — so `1/nm` is canonical here and py4DSTEM's spelling is the
+    adapter's problem, not the file's. `"pixel"` matches no category at all,
+    which is exactly what makes it an honest admission rather than a claim.
+  - **Angle is its own kind rather than folded into reciprocal space**, because
+    `RonchigramCameraSimulator` reports `units="rad"` and converting angle to
+    reciprocal space needs the electron wavelength — which would mean
+    inventing a value. Cross-kind conversion is refused outright.
+  - **The uncalibrated state is first-class**: an axis labelled `"pixel"`
+    cannot carry a scale (enforced), a *missing* calibration falls back
+    silently, and a *malformed* one raises on the first `append` rather than at
+    `close()`, so the failure lands where the caller can still act on it.
+  - **Carried into the adapters, each with a different real constraint.**
+    HyperSpy fits natively and every kind round-trips, plus a new
+    `load_as_hyperspy_spectrum` → `Signal1D` that sums along the
+    non-dispersive direction and refuses when no single energy axis is named.
+    py4DSTEM's `Calibration.Q_pixel_units` accepts only `"pixels"`, `"A^-1"`,
+    or `"mrad"`, so **nm⁻¹ must be converted to Å⁻¹ (÷10)** — done explicitly
+    and asserted at the *values* level, not just the label, because that is
+    precisely the class of error that silently makes every downstream number
+    wrong by exactly 10×; real-space, energy, mixed-kind, and anisotropic axes
+    are refused with messages naming why. LiberTEM still has nowhere to put
+    it: re-verified against 0.16 that `DataSetMeta` has no per-axis
+    scale/offset/units and `H5DataSet` takes no metadata parameter, now
+    recorded as a canary test rather than as prose that could quietly go stale.
+- [x] Read a recording back, so the viewer is not write-only —
+  `session.load_recording` / `LoadJob`, wired into a Recordings group in the
+  widget. Files open from the session or an arbitrary path, multi-frame
+  recordings go in as `(frames, h, w)` so napari's own frame slider does the
+  navigation (no bespoke stack UI), and reads are bounded by a frame-data
+  budget that always admits at least one frame and reports truncation. The
+  three Phase 4 analysis buttons can now run against a file on disk instead of
+  a fresh burst, in a defined precedence (opened file → session burst →
+  temporary burst), leaving the original behaviour and its tests intact.
+  Loading runs off the GUI thread on `RecordingJob`'s established shape:
+  measured, the click handler returns in 1.7 ms against a 1.5 s read.
+  - **The degraded cases were measured against a real `SIGKILL`ed writer, and
+    one of them exposed a false error message.** An abandoned-writer file
+    opens and displays *every* frame, because `read_series` reads
+    `/entry/instrument/detector`, which survives — so the UI reports "frames,
+    unfinalized — viewable, not analyzable". Analysis is pre-empted rather
+    than passed through, because the adapters' own message ("has no
+    `/entry/data` group; it recorded no frames") is *false* for such a file:
+    the frames are demonstrably there. A hard-killed file cannot be opened at
+    all, and its `OSError: bad object header version number` is wrapped into
+    one sentence explaining HDF5's buffered object headers and that the frames
+    are unrecoverable — no traceback reaches the UI.
+  - Session notes are multi-line and per-recording notes exist, both reaching
+    `NexusWriter`'s real `sample=`/`user=`/`notes=` parameters, so
+    `NXsample`/`NXuser`/`NXnote` are genuine rather than the `session_`-prefixed
+    stand-in the session work flagged as dishonest. Changing session directory
+    is a button, refused while a recording is in flight — the job would in fact
+    finish correctly into the old directory, but the UI would then describe a
+    directory not receiving the file, and cancelling an acquisition to change a
+    setting is worse.
 - [x] Consider Zarr alongside HDF5 — **evaluated and declined**, on three
   independent grounds, the first decisive on its own. (1) **NeXus is an
   HDF5 convention, so Zarr would mean abandoning it**: `pynxtools` contains
@@ -807,14 +929,21 @@ problem — read their source and docs before designing our own adapters:
     so an operator switching samples after lunch restarts the app.
     `set_session()` is the single path such a button would use, so this is
     small, just not done.
-  - **Nothing reads a session back.** An operator can record and enumerate
-    but cannot reopen yesterday's recording in the viewer, or run the
-    Phase 4 analysis buttons against a file already on disk instead of a
-    fresh burst. For a parallel pilot against Swift, "open the file I just
-    took and look at it again" is close to table stakes.
+  - ~~**Nothing reads a session back**~~ — **done** (§5 Phase 3): recordings
+    open from the session or an arbitrary path, and the analysis buttons run
+    against a file on disk. Two smaller gaps remain in its place: a recording
+    cannot be annotated *after* the fact, and there is no cross-session
+    enumeration, so "find that scan from last Tuesday" is still a file
+    browser's job.
   - **Disk-space and long-run behaviour is unexamined.** A pilot day of
     2048×2048 float32 frames is tens of GB; nothing warns, estimates, or
-    reports free space.
+    reports free space. Note the compression work (§5 Phase 3) improved the
+    per-file arithmetic — a 1024² scan recording is 29.1 MB rather than
+    32.1 MB, or 13.8 MB stored as float32 — but nothing *tracks* the total.
+  - **A large file is read twice on the analyze-from-disk path** — once by
+    the load job for display, once by the adapter — because the adapters take
+    a path rather than an array. Harmless at pilot scale, wasteful at
+    2048×2048.
   - **The analysis buttons still block the GUI thread** for the length of
     their burst — pre-existing, and the obvious next candidate for the
     `RecordingJob` treatment the recording path already uses.
@@ -1079,6 +1208,100 @@ rather than a pointless second SIGTERM. That last one was found by a test
 that assumed idempotence at the wrong layer; the failure was the correct
 signal.
 
+**Telling a live server from a dead or wedged one.** `instrument`'s
+`check_health()` distinguishes three genuinely different conditions with
+three different correct responses: responsive (0.4 ms round trip), exited
+(via `Popen.poll()`, reporting the exit status and naming the signal), and
+alive-but-unresponsive (a bounded 5 s wait). It is meaningful *because* the
+server-side handler reads process state only — no device, no vendor object,
+no lock — so it neither perturbs an acquisition nor queues behind one. Once
+the process is gone, device and control calls raise
+`RemoteConnectionLostError` naming the signal, in under 10 ms both at idle
+and from inside an in-flight 4096×4096 scan. Ordinary device calls still
+wait forever, unchanged and deliberately: a dead server needs no timeout,
+because its socket closes.
+
+**Reconnect was considered and deliberately not built**, and the reason is
+data integrity rather than effort. A fresh server subprocess is a fresh
+instrument construction, so a started camera, the scan settings in use, and
+every instrument control revert to defaults — and a recording in progress
+would keep appending frames to the *same file* from a differently-configured
+instrument, which is a corrupted scientific record rather than an interrupted
+one. Compounding it, a server that died without parking leaves the column in
+a state nothing client-side knows, which warrants operator attention rather
+than silent recovery. An explicit `reconnect()` was rejected too:
+`remote_instrument()` already *is* how a session is obtained, so a second
+entry point could only duplicate it while implying a continuity it cannot
+deliver. Failing fast, with the context manager as the recovery path, is the
+whole design.
+
+**What a hard-killed server actually guarantees — where measuring changed
+the answer, so the correction is worth stating plainly.** This section
+previously assumed a `SIGKILL`-ed server *must* leak its segments, since
+named POSIX segments are tmpfs entries rather than process resources and a
+killed process runs no cleanup. Both premises are true and the conclusion
+still did not follow: `multiprocessing`'s `resource_tracker` is a **separate
+child process** of the server, it auto-registers every segment
+`SharedFrameWriter` creates (the same auto-registration recorded above as a
+warning-noise wart), and it unlinks everything it holds when the server's end
+of its pipe closes. Measured: `SIGKILL` the server alone and the segments are
+gone immediately and stay gone.
+
+That is a CPython implementation detail rather than a documented guarantee,
+and it has an identifiable failure mode — it needs the tracker to outlive the
+server. Kill both (a process-group kill, a cgroup OOM kill, a container stop,
+`kill -9` on a process tree) and the segments genuinely persist; verified by
+killing the tracker first and confirming all three of a session's segments
+survive. So `SharedFrameReader.unlink_orphan()` lets the client reclaim the
+names it attached to — a deliberate, narrow exception to this module's
+writer-owns-unlink rule, sound only because that rule's premise (a live
+writer that keeps recreating the segment) has failed along with the writer's
+process. Teardown sweeps with it once the process is gone, *whatever killed
+it*, rather than conditionally on exit status: the precondition that makes
+unlinking legitimate is a dead writer, not a particular exit code, and
+conditioning on status would strand exactly the segment that needed
+reclaiming when a server exits 0 having *recorded* a shared-memory error.
+
+| How the server ended | What unlinks its segments |
+|---|---|
+| Graceful `shutdown()` handshake | the server itself, before replying |
+| SIGTERM fallback (wedged server) | the client's per-device `close()`, over live connections, before the kill |
+| `SIGKILL` of the server alone | the server's `resource_tracker` child — measured, but a stdlib implementation detail |
+| `SIGKILL` of the server **and** its tracker | the client's `unlink_orphan()`, for every segment it read a frame from |
+
+**The non-guarantees are real and are not bugs the client can fix.** A
+segment whose name never reached the client (killed between `shm_open` and
+the reply carrying its `SharedFrameRef`) is unrecoverable from this side —
+nothing here ever learned its name; the window is one create-publish-send
+sequence per device per resize, narrow but not zero. And if the client dies
+at the same moment as the server and its tracker, nothing runs at all. Both
+residuals are bounded by the reuse design itself — one segment per device
+per shape, not one per frame — so the worst case is a handful of stale
+entries rather than unbounded growth. The tests state exactly this and no
+more, and the tracker-dies-too test asserts in two stages (first that the
+segments *do* survive, then that teardown reclaims them) so it cannot pass
+vacuously if the mitigation were deleted.
+
+**Server-side failures are now diagnosable.** The subprocess inherited the
+parent's stderr, so anything it said interleaved anonymously with the
+application's own output — including, on hardware day, the one diagnostic
+that matters when `--backend=hardware` finds no instrument. It now uses
+stdlib `logging` configured only in `main()`, so importing the module
+in-process (which its own tests do) leaves logging inert in the standard
+way. Covered: startup, per-plug-in load outcome, bound ports, connection
+accepts, per-call failures **with the traceback** (the wire protocol carries
+only a stringified error, so the log is the only place it survives), and the
+shutdown report. Deliberately *not* covered: anything on the frame path — a
+successful call is logged at no level, so the shared-memory publish/read
+path is untouched and this section's benchmarks stand (re-measured after the
+change: acquire median unchanged within run-to-run variance). Quiet by
+default via `MIAINWOODPECKER_DEVICE_LOG_LEVEL` (default `WARNING`), with
+`MIAINWOODPECKER_DEVICE_LOG_FILE` to take it out of a shared terminal; a bad
+level name or unopenable file warns and degrades rather than taking the
+server down over its own diagnostics. Every record carries the pid, and the
+logger is named explicitly rather than from `__name__`, which under `python
+-m` would be the useless `"__main__"`.
+
 **One pre-existing breach of this section's own invariant, found while
 auditing the boundary and since closed.**
 [`src/miainwoodpecker/storage/legacy.py`](../src/miainwoodpecker/storage/legacy.py)
@@ -1151,16 +1374,24 @@ The invariant now holds mechanically: `nion.*` is imported in
   is the ordered procedure. Highest-consequence item on it: sanity-check
   the defocus *magnitude* before trusting it, because a metres/nanometres
   mix-up is a factor of 1e9 sent to the column, not a rounding error.
-- **Per-detector calibration and exposure control are still absent.** §5
-  Phase 4's HyperSpy note flags that camera frames fall back to `"pixel"`
-  units because the device interface exposes no per-camera calibration; the
-  instrument-control work did not change that, and it is a different gap
-  (camera *settings*) from the one it closed (instrument *controls*).
-  `camera_base.CameraSettings` and `camera_module.camera_settings` exist in
-  the nion stack and are read but unused by this adapter — that is where
-  exposure, binning, and diffraction-angle calibration would come from when
-  a phase needs them. It spans `interface.py`, `storage/nexus.py`, and
-  `viewer/live.py`, so it wants its own pass.
+- **Calibration exists as a model but nothing feeds it from the
+  instrument.** §5 Phase 3's calibration work closed the "camera frames have
+  no physical axes" half of this: a per-axis, per-acquisition model now
+  exists and writes correct NeXus units. What remains is the *plumbing* —
+  nothing reads calibration off a device (`camera_base.CameraSettings` and
+  `camera_module.camera_settings` are still read-but-unused in the nion
+  stack), and no UI selects a microscope mode, so today an operator cannot
+  choose between real-space, reciprocal, and energy axes without writing
+  code. Exposure and binning control are also still absent, and want doing
+  *with* calibration rather than after it, since binning changes the pixel
+  scale. This spans `devices/interface.py`, the viewer, and the session
+  layer.
+- **The EELS dispersive-axis default is grounded in the simulator only.**
+  `dispersive_axis="x"` was chosen because usim reports its energy
+  calibration on axis 1 of a 256×1024 frame; a real spectrometer's
+  orientation needs confirming on hardware (it is on the checklist), and it
+  is a parameter precisely so a wrong default is a configuration change
+  rather than a code change.
 - **Scan data arrives as `float64` for no physical reason.** usim's
   `generate_scan_data` is annotated `-> NDArray[float32]` and builds float32
   internally; the promotion happens in its final line, where

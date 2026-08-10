@@ -113,14 +113,43 @@ instrument controls, and §6 for shutdown.
       hardware watchdog or interlock is needed as well. This is a policy
       question the code cannot answer.
 
+- [ ] Poll `instrument.check_health()` through a real acquisition and confirm
+      it stays responsive. It deliberately takes no device lock, so it should
+      answer while a long exposure is in flight; if it blocks on real
+      hardware, something in the vendor path serializes more than usim does.
+
+- [ ] **`SIGKILL` the server with the beam on**, and decide whether the
+      resulting state is acceptable for this instrument. The client will fail
+      fast and name the cause, but nothing parked the column — this is the
+      same policy question as the wedged-server case, and it is the more
+      likely one.
+
+- [ ] After that kill, check `/dev/shm | grep psm_`. Expect nothing, because
+      the server's `resource_tracker` child normally reclaims segments — but
+      that is a CPython implementation detail, not a guarantee. If anything
+      survives here, the tracker died with the server (a process-group or
+      cgroup kill), which is the case the client's `unlink_orphan()` sweep
+      exists for.
+
+- [ ] Confirm a killed server's client-side error names the cause on this
+      platform. Signal reporting via `Popen.poll()` is POSIX-shaped; a Windows
+      instrument-control computer will report differently.
+
+- [ ] Run the server once with `MIAINWOODPECKER_DEVICE_LOG_LEVEL=INFO` and
+      keep the output. On hardware day it records the backend, each plug-in's
+      load outcome, and the bound ports — which is the fastest way to see what
+      the vendor stack actually registered. Use
+      `MIAINWOODPECKER_DEVICE_LOG_FILE` to keep it out of the operator's
+      terminal.
+
 ## Re-benchmark
 
 - [ ] Re-run `scripts/ipc_overhead_benchmark.py` and
       `scripts/phase2_live_benchmark.py` at real frame rates and sizes. The
       64KB shared-memory threshold was fitted against usim's frame sizes and
-      one container's memory bandwidth. (Note `phase2_live_benchmark.py`
-      currently imports the long-removed `devices.nion_adapter` and needs a
-      one-line fix first.)
+      one container's memory bandwidth. Run the live benchmark at more than
+      one scan size: on the development box the display/acquire ordering
+      *reverses* between 512² and 1024², so a single size is not a verdict.
 
 - [ ] Re-run `scripts/nexus_compression_benchmark.py` on real detector
       frames. The gzip+shuffle default was chosen on simulated data whose
@@ -137,3 +166,18 @@ instrument controls, and §6 for shutdown.
 - [ ] Supply real specimen metadata (`sample=`) so files can legitimately
       declare `definition="NXem"`. Until then they deliberately declare no
       application definition rather than claiming one falsely.
+
+- [ ] **Confirm which EELS axis is the dispersive one.** The default assumes
+      the fast (column) axis, because that is where usim reports its energy
+      calibration on a 256×1024 frame. A real spectrometer's orientation may
+      differ, and getting it backwards would put an eV scale on a spatial axis
+      — wrong physics that looks plausible. It is a parameter, so a wrong
+      default is a configuration change, not a code change.
+
+- [ ] Confirm the diffraction-plane scale and units a real camera reports.
+      The calibration model expects reciprocal space as `1/nm` (the spelling
+      NeXus's `NX_WAVENUMBER` actually matches), and converts to Å⁻¹ only at
+      the py4DSTEM boundary. If the vendor reports angle (`rad`/`mrad`)
+      instead, that is a distinct axis kind and converting it to reciprocal
+      space needs the electron wavelength — which the code deliberately
+      refuses to invent.

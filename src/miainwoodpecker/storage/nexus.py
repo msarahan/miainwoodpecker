@@ -96,7 +96,7 @@ with ``hdf5plugin`` an optional extra - rather than becoming the default
 and quietly making every file plugin-dependent for a few percent.
 
 Axis calibration is supplied per acquisition, never invented
------------------------------------------------------------
+------------------------------------------------------------
 Frames used to get real axes in exactly one case — a scan reporting
 ``fov_nm`` — and an honest ``units = "pixel"`` otherwise, which meant every
 camera frame this project wrote carried no physical axis at all

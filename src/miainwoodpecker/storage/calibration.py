@@ -54,7 +54,7 @@ because every downstream number computed from it is wrong by that factor
 and nothing says so.
 
 What NeXus specifies, checked rather than guessed
-------------------------------------------------
+-------------------------------------------------
 NeXus has **no** attribute for "what kind of axis is this". ``NXdata``'s
 ``AXISNAME`` field (base_classes/NXdata.nxdl.xml) carries exactly
 ``units``, ``long_name``, and a few index/range hints; the *unit string* is
