@@ -62,8 +62,25 @@ tests = [
 ]
 # Nion's STEM device layer (camera/scan hardware sources) and simulator.
 # See docs/migration-plan.md Phase 0/1 - this is kept and reused, not rewritten.
+#
+# Pinned exactly, transitively (not just nionswift-usim itself): hatch builds
+# each env (test/integration/style/...) in its own venv under
+# ~/.local/share/hatch, doing its own dependency resolution independent of
+# uv.lock - it never consults our lockfile. With a loose ">=" bound, that
+# resolution floats freely, and nion's own packages do not hold internal
+# APIs like NDataHandler.write_data()'s signature stable across releases:
+# CI hit two different missing-required-argument errors for that one
+# method from two hatch env builds minutes apart, each resolving a
+# different nion-stack release. Exact pins force every resolver - uv.lock
+# or hatch's independent one - onto the same versions.
 device = [
-    "nionswift-usim>=5.4.2",
+    "nionswift-usim==5.4.2",
+    "nionswift-instrumentation==23.6.2",
+    "nionswift==16.16.2",
+    "nionswift-io==15.5.0",
+    "niondata==15.9.1",
+    "nionui==10.2.2",
+    "nionutils==4.14.1",
 ]
 # Live-viewer shell candidate. See docs/migration-plan.md section 4 - benchmark
 # against ndv before committing further if per-frame overhead is too high.

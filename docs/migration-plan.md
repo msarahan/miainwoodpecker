@@ -145,6 +145,22 @@ problem — read their source and docs before designing our own adapters:
   (auto-skipped unless the `device` extra is installed); the
   `simulated_instrument()` context manager owns the both-cameras-closed
   teardown that the Phase 0 note warns about.
+- [x] Pin the whole `device` extra exactly (`nionswift-usim`,
+  `nionswift-instrumentation`, `nionswift`, `nionswift-io`, `niondata`,
+  `nionui`, `nionutils`), not just `nionswift-usim` itself. CI's hatch
+  environments live outside `uv.lock` entirely (their own venvs under
+  `~/.local/share/hatch`, resolved independently by hatch's own uv
+  installer), so a loose `>=` bound floats freely there. It bit twice in
+  one session: two hatch env builds minutes apart resolved two different
+  nion-stack releases, and `NDataHandler.write_data`/`write_properties`
+  do not hold their positional-argument signature stable across
+  releases — CI failed with *two different* "missing required
+  positional argument" errors for the same call, first `file_datetime`
+  then `data_descriptor`, neither reproducible against `uv.lock`'s
+  pinned resolution. Introspecting the signature under the exact pins
+  (`inspect.signature`, rather than guessing again from error text)
+  confirmed the original 2-argument call was correct all along — the
+  bug was resolution nondeterminism, not the call site.
 - [ ] Validate against real hardware.
 
 **Phase 2 — Live viewer MVP**

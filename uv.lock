@@ -1129,7 +1129,13 @@ dev = [
     { name = "ruff" },
 ]
 device = [
+    { name = "niondata" },
+    { name = "nionswift" },
+    { name = "nionswift-instrumentation" },
+    { name = "nionswift-io" },
     { name = "nionswift-usim" },
+    { name = "nionui" },
+    { name = "nionutils" },
 ]
 docs = [
     { name = "myst-parser" },
@@ -1152,7 +1158,13 @@ requires-dist = [
     { name = "h5py", specifier = ">=3.12" },
     { name = "myst-parser", marker = "extra == 'docs'", specifier = ">=4.0.1" },
     { name = "napari", extras = ["pyside6"], marker = "extra == 'viewer'", specifier = ">=0.5" },
-    { name = "nionswift-usim", marker = "extra == 'device'", specifier = ">=5.4.2" },
+    { name = "niondata", marker = "extra == 'device'", specifier = "==15.9.1" },
+    { name = "nionswift", marker = "extra == 'device'", specifier = "==16.16.2" },
+    { name = "nionswift-instrumentation", marker = "extra == 'device'", specifier = "==23.6.2" },
+    { name = "nionswift-io", marker = "extra == 'device'", specifier = "==15.5.0" },
+    { name = "nionswift-usim", marker = "extra == 'device'", specifier = "==5.4.2" },
+    { name = "nionui", marker = "extra == 'device'", specifier = "==10.2.2" },
+    { name = "nionutils", marker = "extra == 'device'", specifier = "==4.14.1" },
     { name = "numpy", specifier = ">=2.2.6" },
     { name = "pre-commit", marker = "extra == 'dev'" },
     { name = "pydata-sphinx-theme", marker = "extra == 'docs'", specifier = "~=0.16" },
