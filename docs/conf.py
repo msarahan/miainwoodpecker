@@ -5,11 +5,11 @@ import subprocess
 from datetime import datetime
 
 current_year = datetime.now().year
-organization_name = "SuperSTEM"
+organization_name = "Michael Sarahan"
 
 project = "miainwoodpecker"
 copyright = f"{current_year}, {organization_name}"
-author = "SuperSTEM"
+author = "Michael Sarahan"
 
 # *********** RELEASE NUMBER **************
 # This is optional - if you want the release of your docs to align with your

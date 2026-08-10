@@ -1,4 +1,4 @@
 # Support
 
-* Start a [discussion topic](https://github.com/SuperSTEM/miainwoodpecker/discussions)
+* Start a [discussion topic](https://github.com/msarahan/miainwoodpecker/discussions)
 * Email the authors or maintainers
