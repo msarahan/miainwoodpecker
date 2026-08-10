@@ -14,16 +14,24 @@ whenever a control changes, and the worker thread only reads that
 attribute — no Qt access from workers.
 
 Importing this module requires the ``viewer`` optional dependency group.
+The camera group's "Analyze in HyperSpy" button additionally needs the
+``analysis`` group (migration plan, Phase 4); it is imported lazily so
+this module still imports and the button still renders without it, only
+reporting the missing extra in the status label if clicked.
 """
 
 from __future__ import annotations
 
+import tempfile
 import typing
+from pathlib import Path
 
 from qtpy import QtCore, QtWidgets
 
 from miainwoodpecker.acquisition.live import LiveAcquisition
+from miainwoodpecker.acquisition.sequence import camera_series
 from miainwoodpecker.devices.interface import ScanParameters
+from miainwoodpecker.storage.nexus import write_frames
 
 if typing.TYPE_CHECKING:
     import napari
@@ -35,6 +43,7 @@ _SCAN_SIZES = (128, 256, 512)
 _DEFAULT_SCAN_SIZE_INDEX = 1  # 256
 _DEFAULT_DWELL_US = 1.0
 _DEFAULT_FOV_NM = 15.0
+_ANALYSIS_BURST_FRAME_COUNT = 5
 
 
 class LiveInstrumentWidget(QtWidgets.QWidget):
@@ -127,8 +136,15 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
             camera_form.addRow(self._camera_button)
             self._camera_status = QtWidgets.QLabel("stopped", camera_group)
             camera_form.addRow("Status", self._camera_status)
+            self._analyze_button = QtWidgets.QPushButton(
+                "Analyze in HyperSpy", camera_group
+            )
+            camera_form.addRow(self._analyze_button)
+            self._analyze_status = QtWidgets.QLabel("", camera_group)
+            camera_form.addRow("Analysis", self._analyze_status)
             layout.addWidget(camera_group)
             self._camera_button.clicked.connect(self._toggle_camera)
+            self._analyze_button.clicked.connect(self._analyze_camera_in_hyperspy)
 
         layout.addStretch(1)
 
@@ -204,6 +220,55 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
             self._camera_button.setText("Start camera")
             self._camera_status.setText("stopped")
         self._maybe_stop_timer()
+
+    def _analyze_camera_in_hyperspy(self) -> None:
+        """
+        Round-trip a short camera burst through the HyperSpy adapter.
+
+        Demonstrates the Phase 4 analysis-integration path end to end:
+        stop the live camera loop (so this button and the loop never
+        drive the same device at once), record a short burst straight to
+        a temporary NeXus file with
+        :func:`~miainwoodpecker.storage.nexus.write_frames`, read it back
+        as a HyperSpy signal with
+        :func:`~miainwoodpecker.analysis.hyperspy_bridge.load_as_hyperspy_signal`,
+        run one real HyperSpy operation
+        (:meth:`hyperspy.signals.Signal2D.mean` over the frame axis), and
+        push the result into napari as a new image layer. Requires the
+        ``analysis`` optional dependency group; reports that in the
+        status label rather than crashing the widget if it is missing.
+        """
+        if self._camera is None:
+            return
+        try:
+            from miainwoodpecker.analysis.hyperspy_bridge import (  # noqa: PLC0415
+                load_as_hyperspy_signal,
+            )
+        except ImportError:
+            self._analyze_status.setText("install the 'analysis' extra")
+            return
+
+        if self._camera_loop is not None and self._camera_loop.is_running:
+            self.stop_camera()
+
+        self._analyze_status.setText("recording...")
+        try:
+            frames = list(camera_series(self._camera, _ANALYSIS_BURST_FRAME_COUNT))
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                burst_path = Path(tmp_dir) / "hyperspy_analysis_burst.nxs"
+                write_frames(burst_path, frames, title="hyperspy analysis burst")
+                signal = load_as_hyperspy_signal(burst_path)
+                projection = signal.mean(axis=signal.axes_manager.navigation_axes[0])
+        except Exception as exc:  # noqa: BLE001 - surfaced in the status label
+            self._analyze_status.setText(f"error: {exc}")
+            return
+
+        self._viewer.add_image(
+            projection.data,
+            name="HyperSpy mean projection (Camera)",
+            colormap="viridis",
+        )
+        self._analyze_status.setText(f"done - mean of {len(frames)} frames")
 
     def _maybe_stop_timer(self) -> None:
         scan_running = self._scan_loop is not None and self._scan_loop.is_running

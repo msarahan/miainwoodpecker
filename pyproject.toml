@@ -87,6 +87,21 @@ device = [
 viewer = [
     "napari[pyside6]>=0.5",
 ]
+# Phase 4 analysis integration - see docs/migration-plan.md section 5.
+# HyperSpy chosen over py4DSTEM/LiberTEM: it is the lighter, more general
+# option and matches the plain scan/camera frame stacks this app produces
+# today (no 4D-STEM diffraction-scan mode yet). A loose ">=" bound is
+# deliberate here, unlike the "device" extra above: HyperSpy is one
+# package (not seven kept in lockstep), its public Signal/AxesManager API
+# is the kind of thing a 2.x release is expected to hold stable, and - most
+# importantly - the pin is loaded via hatch's own independent per-env
+# resolution, so it's exactly the failure mode the "device" comment
+# describes, just judged unlikely to bite for this dependency. Revisit
+# with an exact pin if a hatch env build ever actually resolves a HyperSpy
+# release that breaks this adapter.
+analysis = [
+    "hyperspy>=2.0",
+]
 docs = [
     "sphinx>=8.2.3",
     "myst-parser>=4.0.1",
@@ -243,17 +258,19 @@ python = ["3.11", "3.12", "3.13"]
 [tool.hatch.envs.test.scripts]
 run = "pytest {args:--cov=miainwoodpecker --cov-report=term-missing}"
 
-#--------------- Run the full suite, including devices and viewer ---------------#
+#--------------- Run the full suite, including devices, viewer, and analysis ---------------#
 
-# The default "test" env installs only the base package, so device and viewer
-# tests skip themselves. This env installs those extras so they actually run.
+# The default "test" env installs only the base package, so device, viewer,
+# and analysis tests skip themselves. This env installs those extras so they
+# actually run.
 # Viewer tests need a real GL canvas: on Linux, run this under a virtual
 # display and install the system libraries first, e.g.
 #   bash scripts/install-linux-gui-deps.sh
 #   xvfb-run -a -s "-screen 0 1920x1080x24" hatch run integration:run
 [tool.hatch.envs.integration]
-description = """Run the full test suite, including device and viewer tests."""
+description = """Run the full test suite, including device, viewer, and analysis tests."""
 features = [
+    "analysis",
     "device",
     "tests",
     "viewer",

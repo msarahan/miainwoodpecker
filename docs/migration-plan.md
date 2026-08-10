@@ -249,10 +249,74 @@ problem — read their source and docs before designing our own adapters:
 - [ ] Consider Zarr alongside HDF5 for parallel/cloud-friendly writes.
 
 **Phase 4 — Analysis integration**
-- Wire HyperSpy / py4DSTEM / LiberTEM in as napari plugins or menu actions
-  operating on the new file format.
-- Port only the handful of Swift-specific analyses (if any) that aren't
-  already covered upstream, as small adapter functions — not reimplementations.
+- [x] Wire one analysis library in as a menu action operating on the new
+  file format — [`src/miainwoodpecker/analysis/hyperspy_bridge.py`](../src/miainwoodpecker/analysis/hyperspy_bridge.py),
+  wired into
+  [`src/miainwoodpecker/viewer/live.py`](../src/miainwoodpecker/viewer/live.py).
+  **HyperSpy chosen over py4DSTEM/LiberTEM**: both of the latter target
+  4D-STEM (scan-position × diffraction-pattern) datasets specifically,
+  and the Phase 1 device interface deliberately has no synchronized
+  scan-position/camera-frame acquisition mode yet (`interface.py`'s
+  `Scanner` docstring calls this out directly) — so there is no 4D-STEM
+  data for either to operate on today. What this app actually produces
+  is plain frame stacks from `Scanner`/`Camera`, which is exactly
+  HyperSpy's general case, and it is the lighter of the three: `pip
+  install hyperspy` resolved **~35 packages** (dask, matplotlib, scipy,
+  sympy, rosettasciio, traits, …) versus the ~70 the Phase 3 notes measured
+  for `pynxtools-em`. Not free, but not the same order of problem.
+  Revisiting py4DSTEM/LiberTEM is the right call once/if a real
+  spectrum-imaging-style 4D acquisition mode exists; nothing here forecloses
+  adding either as a second adapter alongside this one.
+  - **The adapter** (`load_as_hyperspy_signal`) reads a NexusWriter file's
+    `/entry/data` group directly with `h5py` — the frame stack, the `x`/`y`
+    axis datasets and their `units` attributes, and `frame_time` — and
+    hands the arrays to `hyperspy.signals.Signal2D`, setting
+    `axes_manager` scale/offset/units on the navigation (frame) axis and
+    the two signal axes from what NexusWriter already wrote. No axis math
+    is reimplemented; HyperSpy's own `AxesManager` does the bookkeeping.
+    A scan recording's nanometre calibration (§3, Phase 3) survives the
+    round trip; an uncalibrated recording's honest `"pixel"` units survive
+    too, rather than inventing a spurious scale.
+  - **The wired-in action**: a new "Analyze in HyperSpy" button in the
+    live viewer's Camera group. Clicking it stops the camera's live loop
+    if running (the `Camera` protocol implies one driver at a time — see
+    §2), grabs a 5-frame burst via `acquisition.sequence.camera_series`,
+    writes it to a temporary NeXus file with `storage.nexus.write_frames`,
+    reads it back through the adapter, runs one real HyperSpy operation —
+    `Signal2D.mean()` across the frame axis, a temporal-average projection
+    — and pushes the result into napari as a new image layer. This is a
+    genuine round trip end to end: acquire → NeXus file on disk → HyperSpy
+    signal → a HyperSpy method → napari layer, not a mocked-up shortcut.
+    Verified with a real napari widget against a fake camera under a
+    virtual display
+    ([`tests/integration/test_live_widget.py`](../tests/integration/test_live_widget.py)),
+    not yet against real hardware or the actual simulated Ronchigram
+    camera end-to-end through the running app (that path is exercised
+    manually, not by an automated test, since it needs the `device`,
+    `viewer`, and `analysis` extras plus a display all at once).
+  - **Kept deliberately thin**: the `hyperspy` import lives inside the
+    button's click handler, not at module scope, so the viewer (which only
+    needs the `viewer` extra) still imports and runs without the heavier
+    `analysis` extra installed; a missing extra reports "install the
+    'analysis' extra" in the status label instead of an import crash. Only
+    the camera stream is wired up (not the scan stream too) — one
+    demonstrated operation, as scoped, not a general analysis UI; the same
+    adapter and pattern would extend to scan frames with no changes to
+    `hyperspy_bridge.py` itself.
+  - **Real caveat**: the Ronchigram camera's frames still fall back to
+    `"pixel"` units in `nexus.py` (cameras don't report a field of view the
+    way scans do), so a signal built from real camera data carries no
+    physically meaningful diffraction-angle calibration yet — that needs
+    per-camera calibration data the device interface doesn't expose today.
+    The axis-calibration round trip is verified for the case NexusWriter
+    already calibrates (scan `fov_nm`), not invented for the case it
+    doesn't.
+- [ ] Port Swift-specific analyses not already covered upstream, as small
+  adapter functions. **Deferred, not attempted**: this PoC's scope was
+  proving the wiring shape (adapter + one real menu action) works end to
+  end, not auditing Swift's analysis feature set for gaps HyperSpy/
+  py4DSTEM/LiberTEM don't already cover. That audit is real work for a
+  follow-up, not a checkbox to wave through here.
 
 **Phase 5 — Parity and cutover**
 - Audit which Swift features the team actually uses day to day (not the
@@ -416,5 +480,6 @@ scratch: napari + PySide6 for the shell and rendering, HDF5/Zarr + NeXus/NXem
 + RosettaSciIO for storage and I/O, and HyperSpy/py4DSTEM/LiberTEM for
 analysis. The actual new code this project needs to write is the device
 bridge (Phase 1), the live-viewer dock widget (Phase 2), the acquisition
-sequencer and legacy-data importer (Phase 3), and plugin wiring (Phase 4) —
+sequencer and legacy-data importer (Phase 3), and analysis wiring
+(Phase 4: one adapter function into HyperSpy, one menu action driving it) —
 glue, as intended.

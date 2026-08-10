@@ -119,6 +119,34 @@ def test_live_widget_updates_layers_from_both_sources():
     assert not camera.started
 
 
+def test_analyze_camera_in_hyperspy_adds_a_projection_layer():
+    """
+    Clicking "Analyze in HyperSpy" round-trips a burst through the adapter.
+
+    Exercises the actual wired-in Phase 4 entry point end to end: record a
+    burst from the fake camera to a temporary NeXus file, load it back as
+    a HyperSpy signal, average across frames, and land the result in
+    napari as a new layer. Skipped if the ``analysis`` extra is not
+    installed, since the widget itself does not require it.
+    """
+    pytest.importorskip("hyperspy", reason="requires the 'analysis' extra")
+    viewer = napari.Viewer(show=False)
+    camera = _FakeCamera()
+    widget = LiveInstrumentWidget(viewer, _FakeScanner(), camera=camera)
+    try:
+        widget._analyze_camera_in_hyperspy()  # noqa: SLF001 - simulating a button click
+
+        layer_name = "HyperSpy mean projection (Camera)"
+        assert layer_name in viewer.layers
+        projection_shape = (8, 8)
+        assert viewer.layers[layer_name].data.shape == projection_shape
+        assert not camera.started  # the burst starts and stops the camera itself
+        assert widget._analyze_status.text().startswith("done")  # noqa: SLF001
+    finally:
+        widget.shutdown()
+        viewer.close()
+
+
 def test_scan_settings_change_takes_effect_on_next_frames():
     """Changing the size control changes the shape of subsequently scanned frames."""
     viewer = napari.Viewer(show=False)
