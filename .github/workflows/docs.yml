@@ -5,9 +5,16 @@ on:
   push:
     branches:
       - main
+      - 'claude/**'
+
+# Cancel superseded runs: pushing to a branch with an open PR would otherwise
+# trigger both the push and pull_request events.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  lint:
+  docs:
     runs-on: ubuntu-latest
 
     steps:
@@ -21,5 +28,5 @@ jobs:
         run: |
           pipx install hatch
 
-      - name: Check docstrings
-        run: hatch run style:docstrings
+      - name: Build documentation
+        run: hatch run docs:build

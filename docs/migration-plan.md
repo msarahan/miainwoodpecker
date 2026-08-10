@@ -124,7 +124,7 @@ problem — read their source and docs before designing our own adapters:
 **Phase 1 — Device bridge**
 - [x] Define a vendor-neutral `Camera`/`Scanner` interface and wrap Nion's
   device objects behind it — implemented in
-  [`src/miainwoodpecker/devices/`](../src/miainwoodpecker/devices/):
+  [`src/miainwoodpecker/devices/`](https://github.com/SuperSTEM/miainwoodpecker/tree/main/src/miainwoodpecker/devices):
   `interface.py` holds runtime-checkable structural `Protocol`s plus the
   neutral data types (`Frame` = data + aware timestamp + metadata;
   `ScanParameters` in operator units — pixels, µs, nm), and

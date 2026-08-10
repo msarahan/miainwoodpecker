@@ -263,7 +263,7 @@ def write_frames(
         Destination HDF5 file.
     frames : Iterable[Frame]
         Frames to persist, in acquisition order.
-    **kwargs : object
+    \*\*kwargs : object
         Passed through to :class:`NexusWriter`.
 
     Returns

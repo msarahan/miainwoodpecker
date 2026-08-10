@@ -52,7 +52,10 @@ Download = "https://pypi.org/project/miainwoodpecker/#files"
 [project.optional-dependencies]
 dev = [
     "pre-commit",
-    "ruff>=0.14.3",
+    # Pinned exactly: with ruff's select = ["ALL"], a minor upgrade enables
+    # newly added rules and can fail CI with no change of ours. Dependabot
+    # bumps this as a reviewable PR.
+    "ruff==0.16.2",
 ]
 tests = [
     "pytest>=8.4.2",
@@ -132,6 +135,11 @@ ignore = [
     "ANN001",  # Missing type annotation for {arg} in function" ignored
     "ANN201",  # 'Missing type annotation for {return}'.
     "COM812",  # 'Missing trailing comma in collection' ignored to comply with black formatting.
+    "CPY001",  # 'Missing copyright notice at top of file'. The license is declared
+               # once in LICENSE and pyproject.toml; per-file notices are redundant,
+               # and the project's license is still an open decision (see
+               # docs/migration-plan.md section 6), so stamping headers into every
+               # file now would be premature.
 ]
 exclude = [
     "src/miainwoodpecker/_version.py",
@@ -262,7 +270,8 @@ serve = ["sphinx-autobuild docs --watch src/miainwoodpecker {args:-b html docs/_
 description = """Check the style of the codebase."""
 dependencies = [
     "pydoclint",
-    "ruff",
+    # Keep in step with the pin in the "dev" extra above.
+    "ruff==0.16.2",
 ]
 detached = true
 
