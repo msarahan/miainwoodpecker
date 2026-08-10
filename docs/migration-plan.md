@@ -26,6 +26,15 @@ Nion microscope hardware (scan coils, cameras, spectrometers). Rewriting
 this would be the highest-risk, highest-effort, least-validated part of the
 project, for a component that already works.
 
+**Scope decision**: hardware is Nion-only for now. The device bridge
+(Phase 1) is still designed behind a vendor-neutral interface (a small
+`Protocol`/ABC per device kind — camera, scanner, etc. — rather than the
+rest of the app importing `HardwareSource` classes directly), so a second
+vendor's SDK could be added later as another implementation of the same
+interface without touching the acquisition, UI, or storage code. This is
+a design constraint to hold to now, not work to do now — no non-Nion
+adapter is being built until it's actually needed.
+
 Reuse directly:
 
 - [`nionswift-instrumentation-kit`](https://github.com/nion-software/nionswift-instrumentation-kit) —
@@ -33,9 +42,6 @@ Reuse directly:
 - [`nionswift-usim`](https://github.com/nion-software/nionswift-usim) — a
   software STEM/scan/camera simulator (GPL-3.0), so device-layer and UI work
   can proceed without live hardware access.
-- Vendor-specific hardware source plugins as needed, if instruments other
-  than Nion's are in scope (see [Open questions](#6-open-questions) — this
-  materially changes the plan below).
 
 These are Python packages already decoupled from Swift's UI process in
 principle (they're driven through Swift's plugin/`HardwareSource` API); the
@@ -87,8 +93,12 @@ problem — read their source and docs before designing our own adapters:
   the generic `pyospackage` scaffold) and decide the license (see §6).
 
 **Phase 1 — Device bridge**
-- Write thin adapters exposing Nion's `HardwareSource` camera/scan objects
-  as plain Python objects usable from a non-Swift process.
+- Define a vendor-neutral `Camera`/`Scanner` interface (device-kind
+  `Protocol`/ABC), then implement it by wrapping Nion's `HardwareSource`
+  camera/scan objects as plain Python objects usable from a non-Swift
+  process. The rest of the app (acquisition, UI, storage) depends only on
+  the interface, not on Nion's classes, so a second vendor's adapter can
+  be added later without touching those layers.
 - Validate against `nionswift-usim` first, then against real hardware.
 
 **Phase 2 — Live viewer MVP**
@@ -118,13 +128,6 @@ problem — read their source and docs before designing our own adapters:
 
 ## 6. Open questions
 
-- **Hardware scope**: is this purely Nion instruments, or is other vendor
-  hardware (e.g. Gatan/DigitalMicrograph, JEOL, Thermo Fisher/FEI) also in
-  play? If it's Nion-only, §2's "keep the existing device layer" plan is
-  low-risk. If other vendors are involved, their SDKs/plugins need their own
-  device-layer adapters, and the licensing question in the original Copilot
-  draft (proprietary plugin redistribution) becomes real rather than
-  hypothetical.
 - **License**: Nion's device-layer packages are GPL-3.0. Depending on how
   tightly the new app links against them, the whole application likely
   needs to be GPL-3.0-compatible too. Worth confirming this is acceptable
