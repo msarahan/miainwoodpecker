@@ -1,80 +1,129 @@
-# pyOpenSci Demo Python Package -- pyospackage
-<!-- ALL-CONTRIBUTORS-BADGE:START - Do not remove or modify this section -->
-[![All Contributors](https://img.shields.io/badge/all_contributors-7-orange.svg?style=flat-square)](#contributors-)
-<!-- ALL-CONTRIBUTORS-BADGE:END -->
+# miainwoodpecker
 
-[![PyPI - Version](https://img.shields.io/pypi/v/pyospackage)](https://pypi.org/project/pyospackage/)
-[![PyPI - Python Version](https://img.shields.io/pypi/pyversions/pyospackage)](https://pypi.org/project/pyospackage)
+## What does this project do?
 
-[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.10594121.svg)](https://doi.org/10.5281/zenodo.10594120)
+This is a Nion Swift replacement: instrument control and data analysis for
+scanning transmission electron microscopes, built as a thin glue layer over
+existing open source projects rather than a from-scratch rewrite. See
+[`docs/migration-plan.md`](docs/migration-plan.md) for the architecture and
+phased migration plan.
 
-## What does pyospackage do?
+The project is early. What exists today:
 
-pyospackage is a demonstration Python package that compliments the pyOpenSci [beginner tutorial series on creating a Python package](https://www.pyopensci.org/python-package-guide/tutorials/intro.html).
+* a **vendor-neutral device interface** (`miainwoodpecker.devices`), with a
+  Nion backend validated against the `nionswift-usim` microscope simulator
+  and run as an isolated subprocess (see "A note on licensing" below),
+* a **live acquisition loop** (`miainwoodpecker.acquisition`) that decouples
+  acquisition rate from display rate, and
+* a **live viewer** (`miainwoodpecker.viewer`) — a napari + PySide6 dock
+  widget with the live scan/camera feed and scan controls,
+* **acquisition sequences** (`miainwoodpecker.acquisition`) that stream to
+  disk as they run, and
+* **NeXus/HDF5 storage** (`miainwoodpecker.storage`), including an importer
+  for legacy Nion Swift `.ndata` files.
 
-## 🔧 About This Template
+### Run the live viewer
 
-This package was built using [pyOpenSci’s Python package Copier template](https://github.com/pyOpenSci/pyos-package-template).l This template makes it easy for anyone to quickly create a Python package following best practices developed by the pyOpenSci community.
+```shell
+# needs both extras, plus a display
+uv run --extra device --extra viewer miainwoodpecker-viewer
+```
 
-The template includes configuration for:
+### Use the device layer directly
 
-* [Standard Python package layout and structure](https://www.pyopensci.org/python-package-guide/package-structure-code/python-package-structure.html)
-* [Code linting and formatting tools like Ruff](https://www.pyopensci.org/python-package-guide/package-structure-code/code-style-linting-format.html)
-* [Setup for a test suite](https://www.pyopensci.org/python-package-guide/tests/index.html)
-* [Basic setup for Continuous Integration and Deployment (CI/CD)](https://www.pyopensci.org/python-package-guide/continuous-integration/ci.html)
-* [Basic documentation infrastructure and files](https://www.pyopensci.org/python-package-guide/documentation/index.html) using mkdocs or sphinx
+```python
+from miainwoodpecker.devices import ScanParameters
+from miainwoodpecker.devices.remote import remote_simulated_instrument
 
-If you're interested in using the template, check out the [Copier Template Repo](https://github.com/pyOpenSci/pyos-package-template).
+# requires the "device" extra: pip install miainwoodpecker[device]
+with remote_simulated_instrument() as microscope:
+    camera = microscope.ronchigram_camera
+    camera.start()
+    try:
+        frame = camera.acquire_frame()  # frame.data is a 2D numpy array
+    finally:
+        camera.stop()
 
-## 📘 Learn More About Python Packaging
+    scan = microscope.scanner.scan_frame(
+        ScanParameters(height=256, width=256, pixel_time_us=1.0, fov_nm=15.0)
+    )
+```
 
-This package accompanies our tutorials and docs on building and publishing high-quality Python packages:
+Everything above the device layer depends only on the protocols in
+`miainwoodpecker.devices`, never on a vendor SDK, so other vendors can be
+added later as new adapters.
 
-* 📦 **Tutorial Series:** [Beginner Python Packaging Tutorials](https://www.pyopensci.org/python-package-guide/tutorials/index.html)
-* 📖 **Overview:** [Python Packaging Overview](https://www.pyopensci.org/python-package-guide/overview.html)
+`remote_simulated_instrument()` spawns a subprocess and talks to it over
+IPC — that's deliberate, not incidental complexity; see "A note on
+licensing" below. Driving the underlying device logic in-process instead
+(useful for debugging, but importing GPL-3.0 code — never do this in the
+shipped application) looks the same, one module over:
 
-These resources cover everything from package layout and versioning to testing, publishing to PyPI, and creating great documentation.
+```python
+from miainwoodpecker.devices.nion_server import simulated_instrument
+
+with simulated_instrument() as microscope:
+    ...  # identical API, no subprocess, no IPC
+```
+
+### Record a series to NeXus HDF5
+
+```python
+from miainwoodpecker.acquisition import record, scan_series
+from miainwoodpecker.devices import ScanParameters
+from miainwoodpecker.devices.remote import remote_simulated_instrument
+
+with remote_simulated_instrument() as microscope:
+    parameters = ScanParameters(
+        height=256, width=256, pixel_time_us=1.0, fov_nm=15.0
+    )
+    # Streams to disk frame by frame rather than buffering in memory.
+    record(scan_series(microscope.scanner, parameters, 10), "series.nxs")
+```
+
+The result is a standard NeXus file — any NeXus-aware tool can plot it,
+with spatial axes calibrated in nanometres. To migrate an existing Swift
+library:
+
+```python
+from miainwoodpecker.storage import write_frames
+from miainwoodpecker.storage.legacy import iter_ndata_directory
+
+write_frames("migrated.nxs", iter_ndata_directory("old_swift_library/"))
+```
+
+### Running the viewer tests headlessly
+
+napari needs a real GL canvas, so viewer tests and scripts must run under a
+virtual display — `QT_QPA_PLATFORM=offscreen` is **not** a valid substitute
+(it provides no `QOpenGLWidget` and breaks napari's layer teardown). Viewer
+tests skip themselves when no display is present.
+
+```shell
+xvfb-run -a -s "-screen 0 1920x1080x24" \
+    uv run --extra device --extra viewer --extra tests pytest
+```
 
 ## How to install
 
-You can install this package using either `pip`, `uv`, or `conda-forge`. We recommend that you create a new Python
-environment to work in when installing this package. Use
-whatever environment manager that you wish!
+You can install this package using either `pip` or `uv`. We recommend that
+you create a new Python environment to work in when installing this
+package. Use whatever environment manager you wish!
 
 To install the package using pip:
 
 ```shell
-pip install pyospackage
-```
-
-To install the package using conda-forge:
-
-```shell
-conda install -c conda-forge pyospackage
+pip install miainwoodpecker
 ```
 
 To install the package using uv:
 
 ```shell
-uv pip install pyospackage
+uv pip install miainwoodpecker
 ```
 
-Or just run `uv run python` in the directory where the package lives and it will install it automatically into the chosen uv venv.
-
-## Get started using packagename
-
-To use this package:
-
-```python
-from pyospackage.add_numbers import add_num
-
-
-a = add_num(1, 2)
-print(a)
-
-```
-
-You can also add any links to this section to tutorials in your documentation.
+Or just run `uv run python` in the directory where the package lives and it
+will install it automatically into the chosen uv venv.
 
 ## Development
 
@@ -86,48 +135,22 @@ All linting and code formatting is implemented in this package using a combinati
 of pre-commit hooks and Ruff. Ruff is a fast, rust-based linter and code
 formatter that covers functionality previously implemented by Black and isort
 (formatters that are commonly used in the Python ecosystem). Ruff simplifies
-your linting and code format setup but running all of the checks and fixes
-using a single tool. As such pyOpenSci encourages new projects to consider
-using Ruff.
-
-## Community
-
-Information here about contributing to your package. links to your code of conduct and development guide.
-
-## How to cite pyospackage
-
-[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.13983940.svg)](https://doi.org/10.5281/zenodo.13983940)
-
-To cite pyospackage please follow the citation instructions on Zenodo.
+your linting and code format setup by running all of the checks and fixes
+using a single tool.
 
 ## License
 
-`pyospackage` is distributed under the terms of the [MIT](https://spdx.org/licenses/MIT.html) license.
+`miainwoodpecker` is distributed under the terms of the [MIT](https://spdx.org/licenses/MIT.html) license.
 
-## Contributors ✨
+### A note on licensing
 
-Thanks goes to these wonderful people ([emoji key](https://allcontributors.org/docs/en/emoji-key)):
-
-<!-- ALL-CONTRIBUTORS-LIST:START - Do not remove or modify this section -->
-<!-- prettier-ignore-start -->
-<!-- markdownlint-disable -->
-<table>
-  <tbody>
-    <tr>
-      <td align="center" valign="top" width="14.28%"><a href="http://batalex.github.io"><img src="https://avatars.githubusercontent.com/u/11004857?v=4?s=100" width="100px;" alt="Alex Batisse"/><br /><sub><b>Alex Batisse</b></sub></a><br /><a href="https://github.com/pyOpenSci/pyosPackage/pulls?q=is%3Apr+reviewed-by%3ABatalex" title="Reviewed Pull Requests">👀</a></td>
-      <td align="center" valign="top" width="14.28%"><a href="https://jon-e.net"><img src="https://avatars.githubusercontent.com/u/12961499?v=4?s=100" width="100px;" alt="Jonny Saunders"/><br /><sub><b>Jonny Saunders</b></sub></a><br /><a href="https://github.com/pyOpenSci/pyosPackage/commits?author=sneakers-the-rat" title="Code">💻</a> <a href="https://github.com/pyOpenSci/pyosPackage/pulls?q=is%3Apr+reviewed-by%3Asneakers-the-rat" title="Reviewed Pull Requests">👀</a></td>
-      <td align="center" valign="top" width="14.28%"><a href="https://www.sckaiser.com"><img src="https://avatars.githubusercontent.com/u/6486256?v=4?s=100" width="100px;" alt="Sarah Kaiser"/><br /><sub><b>Sarah Kaiser</b></sub></a><br /><a href="https://github.com/pyOpenSci/pyosPackage/commits?author=crazy4pi314" title="Code">💻</a> <a href="https://github.com/pyOpenSci/pyosPackage/pulls?q=is%3Apr+reviewed-by%3Acrazy4pi314" title="Reviewed Pull Requests">👀</a></td>
-      <td align="center" valign="top" width="14.28%"><a href="http://cimss.ssec.wisc.edu/"><img src="https://avatars.githubusercontent.com/u/3578659?v=4?s=100" width="100px;" alt="Geoff Cureton"/><br /><sub><b>Geoff Cureton</b></sub></a><br /><a href="https://github.com/pyOpenSci/pyosPackage/commits?author=gpcureton" title="Code">💻</a> <a href="https://github.com/pyOpenSci/pyosPackage/pulls?q=is%3Apr+reviewed-by%3Agpcureton" title="Reviewed Pull Requests">👀</a></td>
-      <td align="center" valign="top" width="14.28%"><a href="https://www.linkedin.com/in/steven-silvester-90318721/"><img src="https://avatars.githubusercontent.com/u/2096628?v=4?s=100" width="100px;" alt="Steven Silvester"/><br /><sub><b>Steven Silvester</b></sub></a><br /><a href="https://github.com/pyOpenSci/pyosPackage/commits?author=blink1073" title="Code">💻</a> <a href="https://github.com/pyOpenSci/pyosPackage/pulls?q=is%3Apr+reviewed-by%3Ablink1073" title="Reviewed Pull Requests">👀</a></td>
-      <td align="center" valign="top" width="14.28%"><a href="https://github.com/jameslamb"><img src="https://avatars.githubusercontent.com/u/7608904?v=4?s=100" width="100px;" alt="James Lamb"/><br /><sub><b>James Lamb</b></sub></a><br /><a href="https://github.com/pyOpenSci/pyosPackage/commits?author=jameslamb" title="Code">💻</a> <a href="https://github.com/pyOpenSci/pyosPackage/pulls?q=is%3Apr+reviewed-by%3Ajameslamb" title="Reviewed Pull Requests">👀</a> <a href="https://github.com/pyOpenSci/pyosPackage/commits?author=jameslamb" title="Documentation">📖</a></td>
-      <td align="center" valign="top" width="14.28%"><a href="https://github.com/stevenrayhinojosa-gmail-com"><img src="https://avatars.githubusercontent.com/u/17886818?v=4?s=100" width="100px;" alt="steven"/><br /><sub><b>steven</b></sub></a><br /><a href="https://github.com/pyOpenSci/pyosPackage/commits?author=stevenrayhinojosa-gmail-com" title="Documentation">📖</a></td>
-    </tr>
-  </tbody>
-</table>
-
-<!-- markdownlint-restore -->
-<!-- prettier-ignore-end -->
-
-<!-- ALL-CONTRIBUTORS-LIST:END -->
-
-This project follows the [all-contributors](https://github.com/all-contributors/all-contributors) specification. Contributions of any kind welcome!
+Nion's own device stack (`nionswift-usim`, `nionswift-instrumentation`,
+`nionswift`, and friends — the `device` extra) is GPL-3.0. This project
+never imports it into its own process. `miainwoodpecker.devices.nion_server`
+is a separate GPL-3.0 program (it says so in its own module header) that
+only ever runs as a subprocess, launched via
+`python -m miainwoodpecker.devices.nion_server`; the rest of this
+project — including the shipped `miainwoodpecker-viewer` entry point —
+talks to it only through the plain-data message protocol in
+`miainwoodpecker.devices.rpc`, never by importing it directly. See
+[`docs/migration-plan.md`](docs/migration-plan.md), §6, for the reasoning.

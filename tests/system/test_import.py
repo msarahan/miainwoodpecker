@@ -1,6 +1,6 @@
 # MIT License
 #
-# Copyright (c) 2025 pyOpenSci
+# Copyright (c) 2026 SuperSTEM
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
 # of this software and associated documentation files (the "Software"), to deal
@@ -26,4 +26,4 @@
 
 def test_import():
     """Test that the package can be imported."""
-    import pyospackage  # noqa: F401, PLC0415
+    import miainwoodpecker  # noqa: F401, PLC0415

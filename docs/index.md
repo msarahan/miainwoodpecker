@@ -1,4 +1,4 @@
-# Welcome to pyosPackage's documentation
+# Welcome to miainwoodpecker's documentation
 
 :::{toctree}
 :maxdepth: 2
@@ -6,16 +6,17 @@
 :caption: Contents:
 
 Home <self>
+Migration plan <migration-plan>
 Documentation <documentation/index>
 :::
 
-This documentation example uses myst as the primary documentation syntax.
+This documentation uses myst as the primary documentation syntax.
 
-:::{button-link} <https://www.pyopensci.org/python-package-guide/documentation/hosting-tools/myst-markdown-rst-doc-syntax.html>
+:::{button-link} <https://myst-parser.readthedocs.io/en/latest/syntax/syntax.html>
 :color: primary
 :class: sd-rounded-pill float-left
 
-Learn more about myst in our pyOpenSci packaging guide.
+Learn more about myst markdown syntax.
 
 :::
 

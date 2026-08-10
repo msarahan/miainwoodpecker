@@ -1,31 +1,20 @@
 cff-version: 1.2.0
-title: pyospackage
+title: miainwoodpecker
 message: >-
   If you use this software, please cite it using the
   metadata from this file.
 type: software
 authors:
-  - given-names: Leah
-    family-names: Wasser
-    email: leah@pyopensci.org
-    affiliation: pyOPenSci
-    orcid: 'https://orcid.org/0000-0002-8177-6550'
-  - name: pyOpenSci
-    location: Boulder
-    region: Colorado
-    email: pyopensci@pyopensci.org
-identifiers:
-  - type: doi
-    value: 10.5281/zenodo.10594120
-    description: Citation information from Zenodo
-repository-code: 'https://www.github.com/pyopensci/pyospackage'
-url: 'https://www.pyopensci.org'
+  - name: SuperSTEM
+repository-code: 'https://github.com/SuperSTEM/miainwoodpecker'
 abstract: >-
-  An example Python package used in pyOpenSci training
-  events and tutorials.
+  Instrument control and data analysis for scanning transmission electron
+  microscopes, built as a thin glue layer over existing open source
+  projects.
 keywords:
-  - openscience
+  - microscopy
+  - stem
+  - instrument-control
   - python
   - opensource
-  - science
-license: BSD-3-Clause
+license: MIT

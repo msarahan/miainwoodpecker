@@ -5,6 +5,13 @@ on:
   push:
     branches:
       - main
+      - 'claude/**'
+
+# Cancel superseded runs: pushing to a branch with an open PR would otherwise
+# trigger both the push and pull_request events.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   lint:

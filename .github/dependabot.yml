@@ -12,3 +12,16 @@ updates:
       include: "scope"
     open-pull-requests-limit: 5
     rebase-strategy: auto
+
+  # Python dependencies were not covered at all, which meant the exact ruff
+  # pin in pyproject.toml (needed because select = ["ALL"] makes ruff
+  # upgrades breaking) would never be bumped.
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: monthly
+    commit-message:
+      prefix: "chore: bump Python deps"
+      include: "scope"
+    open-pull-requests-limit: 5
+    rebase-strategy: auto
