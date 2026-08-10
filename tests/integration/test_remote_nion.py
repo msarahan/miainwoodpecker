@@ -166,8 +166,17 @@ def test_no_shared_memory_segments_leak_after_teardown():
 
     Uses a fresh instrument rather than the module fixture, since the
     check is only meaningful across a full spawn-to-teardown lifecycle.
+
+    Asserts against the specific segment names this session used rather
+    than comparing whole-directory ``/dev/shm`` snapshots before and
+    after. A snapshot diff was order-dependently flaky under
+    ``pytest-randomly``: ``/dev/shm`` is machine-global and also holds
+    POSIX semaphores and segments created by anything else running in the
+    same interpreter (napari/Qt thread pools, numpy, other test modules),
+    so unrelated churn between the two snapshots failed a test that was
+    only ever meant to check *our* segments. Naming them directly is both
+    immune to that and a stricter statement of the actual property.
     """
-    before = _shm_names()
     with remote_simulated_instrument() as instrument:
         parameters = ScanParameters(
             height=_LARGE_SIZE,
@@ -186,5 +195,20 @@ def test_no_shared_memory_segments_leak_after_teardown():
             instrument.eels_camera.acquire_frame()
         finally:
             instrument.eels_camera.stop()
-    after = _shm_names()
-    assert after == before
+        # Collected while the session is still alive: once it tears down,
+        # the readers have detached and no longer know the names.
+        used_names = {
+            reader._segment.name  # noqa: SLF001
+            for reader in (
+                instrument.scanner._reader,  # noqa: SLF001
+                instrument.ronchigram_camera._reader,  # noqa: SLF001
+                instrument.eels_camera._reader,  # noqa: SLF001
+            )
+            if reader._segment is not None  # noqa: SLF001
+        }
+
+    # Guards against this test passing vacuously if the shared-memory
+    # path was never actually taken (e.g. a threshold change).
+    expected_segment_count = 3  # scanner + both cameras
+    assert len(used_names) == expected_segment_count
+    assert used_names.isdisjoint(_shm_names())
