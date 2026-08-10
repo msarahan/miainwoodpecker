@@ -99,7 +99,12 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
 
     def _build_ui(self) -> None:
         layout = QtWidgets.QVBoxLayout(self)
+        layout.addWidget(self._build_scan_group())
+        if self._camera is not None:
+            layout.addWidget(self._build_camera_group())
+        layout.addStretch(1)
 
+    def _build_scan_group(self) -> QtWidgets.QGroupBox:
         scan_group = QtWidgets.QGroupBox("Scan", self)
         scan_form = QtWidgets.QFormLayout(scan_group)
         self._channel_combo = QtWidgets.QComboBox(scan_group)
@@ -123,46 +128,43 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         scan_form.addRow(self._scan_button)
         self._scan_status = QtWidgets.QLabel("stopped", scan_group)
         scan_form.addRow("Status", self._scan_status)
-        layout.addWidget(scan_group)
 
         self._channel_combo.currentIndexChanged.connect(self._on_scan_settings_changed)
         self._size_combo.currentIndexChanged.connect(self._on_scan_settings_changed)
         self._dwell_spin.valueChanged.connect(self._on_scan_settings_changed)
         self._fov_spin.valueChanged.connect(self._on_scan_settings_changed)
         self._scan_button.clicked.connect(self._toggle_scan)
+        return scan_group
 
-        if self._camera is not None:
-            camera_group = QtWidgets.QGroupBox("Camera", self)
-            camera_form = QtWidgets.QFormLayout(camera_group)
-            self._camera_button = QtWidgets.QPushButton("Start camera", camera_group)
-            camera_form.addRow(self._camera_button)
-            self._camera_status = QtWidgets.QLabel("stopped", camera_group)
-            camera_form.addRow("Status", self._camera_status)
-            self._analyze_button = QtWidgets.QPushButton(
-                "Analyze in HyperSpy", camera_group
-            )
-            camera_form.addRow(self._analyze_button)
-            self._analyze_status = QtWidgets.QLabel("", camera_group)
-            camera_form.addRow("Analysis", self._analyze_status)
-            self._libertem_button = QtWidgets.QPushButton(
-                "Sum in LiberTEM", camera_group
-            )
-            camera_form.addRow(self._libertem_button)
-            self._libertem_status = QtWidgets.QLabel("", camera_group)
-            camera_form.addRow("LiberTEM", self._libertem_status)
-            self._py4dstem_button = QtWidgets.QPushButton(
-                "Fit central disk (py4DSTEM)", camera_group
-            )
-            camera_form.addRow(self._py4dstem_button)
-            self._py4dstem_status = QtWidgets.QLabel("", camera_group)
-            camera_form.addRow("py4DSTEM", self._py4dstem_status)
-            layout.addWidget(camera_group)
-            self._camera_button.clicked.connect(self._toggle_camera)
-            self._analyze_button.clicked.connect(self._analyze_camera_in_hyperspy)
-            self._libertem_button.clicked.connect(self._analyze_camera_in_libertem)
-            self._py4dstem_button.clicked.connect(self._fit_central_disk_in_py4dstem)
+    def _build_camera_group(self) -> QtWidgets.QGroupBox:
+        camera_group = QtWidgets.QGroupBox("Camera", self)
+        camera_form = QtWidgets.QFormLayout(camera_group)
+        self._camera_button = QtWidgets.QPushButton("Start camera", camera_group)
+        camera_form.addRow(self._camera_button)
+        self._camera_status = QtWidgets.QLabel("stopped", camera_group)
+        camera_form.addRow("Status", self._camera_status)
+        self._analyze_button = QtWidgets.QPushButton(
+            "Analyze in HyperSpy", camera_group
+        )
+        camera_form.addRow(self._analyze_button)
+        self._analyze_status = QtWidgets.QLabel("", camera_group)
+        camera_form.addRow("Analysis", self._analyze_status)
+        self._libertem_button = QtWidgets.QPushButton("Sum in LiberTEM", camera_group)
+        camera_form.addRow(self._libertem_button)
+        self._libertem_status = QtWidgets.QLabel("", camera_group)
+        camera_form.addRow("LiberTEM", self._libertem_status)
+        self._py4dstem_button = QtWidgets.QPushButton(
+            "Fit central disk (py4DSTEM)", camera_group
+        )
+        camera_form.addRow(self._py4dstem_button)
+        self._py4dstem_status = QtWidgets.QLabel("", camera_group)
+        camera_form.addRow("py4DSTEM", self._py4dstem_status)
 
-        layout.addStretch(1)
+        self._camera_button.clicked.connect(self._toggle_camera)
+        self._analyze_button.clicked.connect(self._analyze_camera_in_hyperspy)
+        self._libertem_button.clicked.connect(self._analyze_camera_in_libertem)
+        self._py4dstem_button.clicked.connect(self._fit_central_disk_in_py4dstem)
+        return camera_group
 
     def _on_scan_settings_changed(self) -> None:
         size = int(self._size_combo.currentText())
