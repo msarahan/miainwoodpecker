@@ -58,3 +58,36 @@ jobs:
     - name: Report coverage
       shell: bash
       run: bash <(curl -s https://codecov.io/bash)
+
+  # The matrix job above installs only the base package, so the device and
+  # viewer tests skip themselves there. This job installs those extras and
+  # runs the full suite under a virtual display, because napari needs a real
+  # GL canvas (QT_QPA_PLATFORM=offscreen is not a valid substitute).
+  integration:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+    - name: Set up Python
+      uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v5
+      with:
+        python-version: "3.11"
+
+    - name: Install hatch
+      uses: pypa/hatch@install
+
+    - name: Install GL and Qt system libraries
+      run: bash scripts/install-linux-gui-deps.sh
+
+    - name: Full test suite (device + viewer) under a virtual display
+      run: |
+        xvfb-run -a -s "-screen 0 1920x1080x24" \
+          hatch run integration:run
+
+    - name: Phase 0 and Phase 1 device smoke test
+      run: hatch run integration:python scripts/phase0_usim_smoke_test.py
+
+    - name: Phase 0 viewer smoke test under a virtual display
+      run: |
+        xvfb-run -a -s "-screen 0 1920x1080x24" \
+          hatch run integration:python scripts/phase0_viewer_smoke_test.py

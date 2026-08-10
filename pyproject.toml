@@ -215,6 +215,28 @@ python = ["3.11", "3.12", "3.13"]
 [tool.hatch.envs.test.scripts]
 run = "pytest {args:--cov=miainwoodpecker --cov-report=term-missing}"
 
+#--------------- Run the full suite, including devices and viewer ---------------#
+
+# The default "test" env installs only the base package, so device and viewer
+# tests skip themselves. This env installs those extras so they actually run.
+# Viewer tests need a real GL canvas: on Linux, run this under a virtual
+# display and install the system libraries first, e.g.
+#   bash scripts/install-linux-gui-deps.sh
+#   xvfb-run -a -s "-screen 0 1920x1080x24" hatch run integration:run
+[tool.hatch.envs.integration]
+description = """Run the full test suite, including device and viewer tests."""
+features = [
+    "device",
+    "tests",
+    "viewer",
+]
+extra-dependencies = [
+    "pytest-cov",
+]
+
+[tool.hatch.envs.integration.scripts]
+run = "pytest {args:--cov=miainwoodpecker --cov-report=term-missing}"
+
 #--------------- Build and preview your documentation ---------------#
 
 # This sets up a hatch environment with associated dependencies that need to be installed

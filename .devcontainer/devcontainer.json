@@ -14,16 +14,19 @@
 		"ghcr.io/devcontainers-extra/features/pre-commit:2.0.18": {
 			"version": "4.3.0"
 		},
-		"ghcr.io/devcontainers-extra/features/black:2.0.18": {
-			"version": "25.9.0"
-		},
-		"ghcr.io/devcontainers-extra/features/isort:2.0.18": {
-			"version": "6.0.1"
-		},
 		"ghcr.io/va-h/devcontainers-features/uv:1": {
 			"version": "0.8.22"
-		},
+		}
 	},
-	"extensions": [
-		"ms-vscode.live-server",
-	]
+	// Qt/napari need system GL libraries that this image omits; without them
+	// PySide6 fails to import. See the script's header for details.
+	"postCreateCommand": "bash scripts/install-linux-gui-deps.sh",
+	"customizations": {
+		"vscode": {
+			"extensions": [
+				"ms-vscode.live-server",
+				"charliermarsh.ruff"
+			]
+		}
+	}
+}
