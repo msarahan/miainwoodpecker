@@ -1,14 +1,20 @@
 """
-Unit tests for the session abstraction: naming, context, and partial writes.
+Unit tests for the session abstraction: naming, context, partial writes, readback.
 
 No GUI and no device extra needed — these run in the base test env against
 in-memory fake frames and real files on disk, including reading written
 files back so the metadata round trip is exercised for real rather than
-mocked.
+mocked. The two degraded-file cases are produced rather than simulated: an
+abandoned writer is really abandoned, and a hard-killed acquisition really
+sends itself ``SIGKILL`` in a child process, because what those leave on
+disk is the thing under test.
 """
 
 import datetime
 import json
+import subprocess
+import sys
+import textwrap
 import threading
 from collections.abc import Iterator
 
@@ -17,13 +23,19 @@ import numpy as np
 import pytest
 
 from miainwoodpecker.devices import Frame
-from miainwoodpecker.storage.nexus import read_series
+from miainwoodpecker.storage.nexus import NexusWriter, read_series
 from miainwoodpecker.storage.session import (
+    LoadJob,
     RecordingJob,
+    RecordingReadError,
     Session,
     default_root,
+    describe,
+    load_recording,
     read_session_context,
 )
+
+_SIGKILL_RETURNCODE = -9
 
 
 def make_frame(value: float = 1.0, size: int = 4) -> Frame:
@@ -33,6 +45,58 @@ def make_frame(value: float = 1.0, size: int = 4) -> Frame:
         timestamp=datetime.datetime.now(tz=datetime.UTC),
         metadata={"frame_number": int(value), "fov_nm": 10.0},
     )
+
+
+def abandon_a_writer(path, frame_count: int = 3) -> None:
+    """
+    Leave the file an abandoned-but-cleanly-exited writer leaves.
+
+    All frames present, no ``/entry/data``, no ``end_time``, no metadata —
+    the second interruption mode in the migration plan's Phase 3 table.
+    """
+    writer = NexusWriter(path, title="abandoned")
+    # Deliberately entered without ever being __exit__ed or closed.
+    writer.__enter__()
+    for value in range(frame_count):
+        writer.append(make_frame(float(value)))
+    writer.flush()
+
+
+def kill_a_writer_mid_acquisition(path) -> None:
+    """
+    Leave the file a ``SIGKILL``-ed acquisition leaves, by really killing one.
+
+    A child process appends frames and then sends itself ``SIGKILL`` without
+    flushing, so HDF5's buffered object headers never reach disk. Done for
+    real rather than by writing plausible garbage: that the container is
+    unrecoverable is the claim under test.
+    """
+    script = textwrap.dedent(
+        """
+        import datetime, os, signal, sys
+        import numpy as np
+        from miainwoodpecker.devices.interface import Frame
+        from miainwoodpecker.storage.nexus import NexusWriter
+
+        writer = NexusWriter(sys.argv[1], title="killed")
+        writer.__enter__()
+        for value in range(3):
+            writer.append(
+                Frame(
+                    data=np.full((64, 64), float(value), dtype=np.float32),
+                    timestamp=datetime.datetime.now(tz=datetime.UTC),
+                    metadata={},
+                )
+            )
+        os.kill(os.getpid(), signal.SIGKILL)
+        """
+    )
+    result = subprocess.run(  # noqa: S603 - fixed argv, no shell
+        [sys.executable, "-c", script, str(path)],
+        check=False,
+        capture_output=True,
+    )
+    assert result.returncode == _SIGKILL_RETURNCODE, result.stderr.decode()
 
 
 def test_session_creates_its_root_and_sidecar(tmp_path):
@@ -348,6 +412,261 @@ def test_recording_job_captures_a_failure_instead_of_raising(tmp_path):
     (recording,) = session.recordings()
     assert recording.readable
     assert recording.frame_count == 1
+
+
+def test_a_finished_recording_reports_itself_finalized(tmp_path):
+    """A normal recording has the /entry/data group its writer's close() creates."""
+    session = Session(tmp_path / "s")
+
+    recording = session.record([make_frame(), make_frame()], label="scan")
+
+    assert recording.readable
+    assert recording.finalized
+
+
+def test_an_abandoned_writer_keeps_every_frame_but_is_not_finalized(tmp_path):
+    """
+    The measured abandoned-writer case: frames intact, finalization missing.
+
+    This is the state that matters for reading back, because it separates
+    what the viewer can show from what the Phase 4 adapters can analyze.
+    """
+    session = Session(tmp_path / "s")
+    target = session.reserve_path("scan")
+
+    abandon_a_writer(target)
+
+    (recording,) = session.recordings()
+    expected_count = 3
+    assert recording.readable
+    assert recording.frame_count == expected_count
+    assert not recording.finalized
+    with h5py.File(target, "r") as handle:
+        assert "data" not in handle["entry"]
+        assert "end_time" not in handle["entry"]
+
+
+def test_an_abandoned_recording_still_loads_every_frame(tmp_path):
+    """
+    load_recording reads the detector group, so an unfinalized file opens.
+
+    The Phase 4 adapters read ``/entry/data`` and cannot; this path reads
+    ``/entry/instrument/detector``, which is where the frames actually are.
+    """
+    session = Session(tmp_path / "s")
+    target = session.reserve_path("scan")
+    abandon_a_writer(target)
+
+    loaded = load_recording(target)
+
+    expected_shape = (3, 4, 4)
+    assert loaded.data.shape == expected_shape
+    assert not loaded.truncated
+    assert not loaded.recording.finalized
+    assert loaded.data[2][0, 0] == pytest.approx(2.0)
+
+
+def test_a_hard_killed_recording_reports_a_reason_instead_of_an_h5py_error(tmp_path):
+    """A SIGKILL-ed acquisition leaves a file that cannot be opened at all."""
+    target = tmp_path / "0001-killed-20260810T120000Z.nxs"
+    kill_a_writer_mid_acquisition(target)
+
+    described = describe(target)
+    assert not described.readable
+    assert not described.finalized
+    assert described.frame_count == 0
+
+    with pytest.raises(RecordingReadError, match="does not open as an HDF5 file"):
+        load_recording(target)
+
+
+def test_load_recording_returns_a_stack_even_for_one_frame(tmp_path):
+    """A recording is a series, so its data model stays three-dimensional."""
+    session = Session(tmp_path / "s")
+    recording = session.record([make_frame()], label="scan")
+
+    loaded = load_recording(recording.path)
+
+    expected_shape = (1, 4, 4)
+    assert loaded.data.shape == expected_shape
+    assert len(loaded.frame_times) == 1
+
+
+def test_load_recording_reports_elapsed_times_from_the_file(tmp_path):
+    """Frame times come back with the frames, not recomputed from the clock."""
+    session = Session(tmp_path / "s")
+    recording = session.record([make_frame(), make_frame(), make_frame()], label="scan")
+
+    loaded = load_recording(recording.path)
+
+    expected_count = 3
+    assert len(loaded.frame_times) == expected_count
+    assert loaded.frame_times[0] == pytest.approx(0.0)
+    assert all(elapsed >= 0.0 for elapsed in loaded.frame_times)
+
+
+def test_load_recording_stops_at_its_byte_budget_and_says_so(tmp_path):
+    """A long recording loads as many frames as fit rather than exhausting memory."""
+    session = Session(tmp_path / "s")
+    recording = session.record([make_frame(float(i)) for i in range(5)], label="scan")
+    one_frame_bytes = 4 * 4 * 4
+
+    loaded = load_recording(recording.path, budget_bytes=2 * one_frame_bytes)
+
+    expected_shown = 2
+    assert loaded.truncated
+    assert loaded.data.shape[0] == expected_shown
+    assert loaded.recording.frame_count == 5  # noqa: PLR2004 - the file's real count
+
+
+def test_load_recording_always_reads_at_least_one_frame(tmp_path):
+    """A frame bigger than the whole budget still displays rather than failing."""
+    session = Session(tmp_path / "s")
+    recording = session.record([make_frame(), make_frame()], label="scan")
+
+    loaded = load_recording(recording.path, budget_bytes=1)
+
+    assert loaded.truncated
+    assert loaded.data.shape[0] == 1
+
+
+def test_load_recording_refuses_an_empty_recording_with_a_reason(tmp_path):
+    """Opening a file whose acquisition produced nothing says that, not "no data"."""
+    session = Session(tmp_path / "s")
+    recording = session.record([], label="scan")
+
+    with pytest.raises(RecordingReadError, match="holds no frames"):
+        load_recording(recording.path)
+
+
+def test_describe_handles_a_file_no_session_minted(tmp_path):
+    """A file copied from elsewhere is described from its stem, not refused."""
+    session = Session(tmp_path / "s")
+    recording = session.record([make_frame()], label="scan")
+    foreign = tmp_path / "from-the-other-microscope.nxs"
+    foreign.write_bytes(recording.path.read_bytes())
+
+    described = describe(foreign)
+
+    assert described.index == 0
+    assert described.label == "from-the-other-microscope"
+    assert described.readable
+    assert described.finalized
+    assert described.frame_count == 1
+    assert described.started_at.tzinfo is not None
+
+
+def test_load_job_reads_off_the_calling_thread(tmp_path):
+    """The load job mirrors RecordingJob: worker thread, polled result, no raising."""
+    session = Session(tmp_path / "s")
+    recording = session.record([make_frame() for _ in range(4)], label="scan")
+    job = LoadJob(recording.path)
+
+    job.start()
+    job.join()
+
+    assert not job.is_running
+    assert job.error is None
+    assert job.result is not None
+    expected_count = 4
+    assert job.result.data.shape[0] == expected_count
+    assert job.frames_loaded == expected_count
+
+
+def test_load_job_captures_an_unreadable_file_instead_of_raising(tmp_path):
+    """A damaged file lands in .error for a caller to display, like LiveAcquisition."""
+    damaged = tmp_path / "0001-damaged-20260810T120000Z.nxs"
+    damaged.write_bytes(b"not hdf5")
+    job = LoadJob(damaged)
+
+    job.start()
+    job.join()
+
+    assert isinstance(job.error, RecordingReadError)
+    assert job.result is None
+
+
+def test_session_context_lands_in_real_nexus_groups(tmp_path):
+    """Sample and operator go into NXsample/NXuser, not only a metadata blob."""
+    session = Session(tmp_path / "s", operator="M. Sarahan", sample="Au on C")
+
+    recording = session.record([make_frame()], label="scan")
+
+    with h5py.File(recording.path, "r") as handle:
+        assert handle["entry/sample"].attrs["NX_class"] == "NXsample"
+        assert handle["entry/sample/name"][()].decode("utf-8") == "Au on C"
+        assert handle["entry/user"].attrs["NX_class"] == "NXuser"
+        assert handle["entry/user/name"][()].decode("utf-8") == "M. Sarahan"
+
+
+def test_a_session_without_context_writes_no_empty_nexus_groups(tmp_path):
+    """An unfilled field means no group, rather than a group claiming nothing."""
+    session = Session(tmp_path / "s")
+
+    recording = session.record([make_frame()], label="scan")
+
+    with h5py.File(recording.path, "r") as handle:
+        assert "sample" not in handle["entry"]
+        assert "user" not in handle["entry"]
+        assert "notes" not in handle["entry"]
+
+
+def test_multi_line_session_notes_survive_to_the_file_and_the_sidecar(tmp_path):
+    """A shift's worth of notes is many lines, and stays many lines."""
+    notes = "09:10 grid loaded\n09:40 LN2 topped up\n10:15 drift settled"
+    session = Session(tmp_path / "s", notes=notes)
+
+    recording = session.record([make_frame()], label="scan")
+
+    stored = json.loads((session.root / "session.json").read_text(encoding="utf-8"))
+    assert stored["notes"] == notes
+    with h5py.File(recording.path, "r") as handle:
+        assert handle["entry/notes"].attrs["NX_class"] == "NXnote"
+        description = handle["entry/notes/description"][()].decode("utf-8")
+    assert description == f"session: {notes}"
+    assert read_session_context(recording.path)["notes"] == notes
+
+
+def test_a_per_recording_note_is_labelled_apart_from_the_session_notes(tmp_path):
+    """
+    Both note scopes reach the one NXnote, each saying which it is.
+
+    A single description field mixing them would leave a reader unable to
+    tell a shift-long observation from a statement about this one file.
+    """
+    session = Session(tmp_path / "s", notes="Au on C, 200kV")
+
+    recording = session.record([make_frame()], label="scan", note="hole 4, after tilt")
+
+    with h5py.File(recording.path, "r") as handle:
+        description = handle["entry/notes/description"][()].decode("utf-8")
+    assert description == "session: Au on C, 200kV\n\nrecording: hole 4, after tilt"
+    assert read_session_context(recording.path)["note"] == "hole 4, after tilt"
+
+
+def test_a_per_recording_note_applies_only_to_the_recording_given_it(tmp_path):
+    """The next recording does not inherit the previous one's note."""
+    session = Session(tmp_path / "s")
+
+    first = session.record([make_frame()], label="scan", note="hole 4")
+    second = session.record([make_frame()], label="scan")
+
+    assert read_session_context(first.path)["note"] == "hole 4"
+    assert "note" not in read_session_context(second.path)
+    with h5py.File(second.path, "r") as handle:
+        assert "notes" not in handle["entry"]
+
+
+def test_recording_job_passes_a_per_recording_note_through(tmp_path):
+    """The worker-thread path carries the note, not just the direct call."""
+    session = Session(tmp_path / "s")
+    job = RecordingJob(session, [make_frame()], label="scan", note="hole 4")
+
+    job.start()
+    job.join()
+
+    assert job.result is not None
+    assert read_session_context(job.result.path)["note"] == "hole 4"
 
 
 def test_default_root_is_a_dated_directory(tmp_path):
