@@ -245,7 +245,16 @@ problem — read their source and docs before designing our own adapters:
 - [ ] Revisit compression. gzip level 4 on noisy `float64` scan data
   measured a *1.08× ratio* — i.e. slightly larger than raw — while
   `float32` camera frames compressed to 0.69×. Worth evaluating
-  bitshuffle/blosc, or storing scan data as `float32`.
+  bitshuffle/blosc, or storing scan data as `float32`. Still open for
+  *this* (HDF5 storage) context, but §6 now has a related, resolved data
+  point for the shared-memory IPC context: zstd on the same kind of
+  frames confirms scan data barely compresses (0.95–0.96×) and shows
+  camera frames compress better with zstd than gzip suggested
+  (0.61–0.73×) — consistent with, and a useful cross-check on, this
+  item's numbers, even though that investigation concluded compression
+  doesn't belong on the IPC path regardless of ratio, for reasons
+  (memcpy vs. CPU-bound compression time) specific to shared memory that
+  don't necessarily transfer to the storage question here.
 - [ ] Consider Zarr alongside HDF5 for parallel/cloud-friendly writes.
 
 **Phase 4 — Analysis integration**
@@ -452,6 +461,95 @@ a `KeyError` instead of merely warning. `PYTHONWARNINGS`, read by every
 interpreter at its own startup including a forked+exec'd tracker daemon,
 is what actually works — set once in `shared_frame.py` and inherited by
 the server subprocess's environment.
+
+**A fourth investigation, with a clean negative result: transparent zstd
+compression of frames moving through shared memory does not pay for
+itself, at any size or level tested.** The question, raised separately
+from the above: since the reused-segment redesign made shared memory a
+plain memcpy, could compressing frames before the write and decompressing
+after the read shrink the bytes moved and reduce end-to-end latency,
+using idle cores for the compression work (`zstandard`'s
+`ZstdCompressor(threads=N)`, which wraps Facebook's zstd with native
+multi-threaded compression)? `zstandard` itself checks out fine as a
+dependency choice, unlike Arrow Plasma earlier in this project's history
+(confirmed dead, deprecated in Arrow 10, removed ~12): PyPI shows a 0.25.0
+release from September 2025, an actively maintained GitHub project, and a
+compiled C-extension backend (not the slower pure-Python fallback) in
+this environment. The reason to suspect it wouldn't help regardless is
+already on record in §5's Phase 3 "Revisit compression" item: gzip
+level 4 on noisy float64 scan data measured a 1.08× ratio (bigger than
+raw) against 0.69× for float32 camera frames — this project's real
+detector data is photon/thermal noise, not the smooth natural images
+generic compressors are tuned for.
+
+Measured with a new script,
+[`scripts/shared_memory_compression_benchmark.py`](../scripts/shared_memory_compression_benchmark.py)
+(same structure as `ipc_overhead_benchmark.py`), against real frames from
+`remote_simulated_instrument()` — scan sizes from 64×64 (32KB, below
+`_SHARED_MEMORY_THRESHOLD_BYTES`) up to 2048×2048 (33.6MB), plus both
+camera frames (EELS 256×1024 float32 ~1.0MB, Ronchigram 2048×2048 float32
+~16.8MB) — at zstd levels 1, 3, 9, and 12, single-threaded and with
+`threads=os.cpu_count()` (4 in this container), timed through the actual
+`SharedFrameWriter`/`SharedFrameReader` classes (the compressed bytes are
+published/read as the payload, so the comparison includes the real memcpy
+cost of whatever is actually moved, not an isolated compression
+microbenchmark):
+
+- **Ratios confirm the gzip finding, and extend it**: scan frames
+  compressed to only 0.954–0.958× regardless of level — statistically
+  indistinguishable from "doesn't compress," same as gzip found. Camera
+  frames compressed better with zstd than the gzip datapoint suggested
+  (Ronchigram 0.73× at level 1 down to 0.61× at level 12; EELS 0.30× down
+  to 0.21×) — zstd's better modeling helps on this data, but not remotely
+  enough to matter given the timings below.
+- **Compression is 5×–300× slower than the memcpy it would replace, at
+  every size and level tested, with no exceptions.** The raw
+  `SharedFrameWriter.publish`+`SharedFrameReader.read` round trip is
+  already fast because it is one memory-bandwidth-bound copy each way:
+  0.02ms at 32KB, 1.25ms at 8.4MB, 3.81ms at 18.9MB, 26.1ms at 33.6MB for
+  scan frames; 0.17ms for the 1.0MB EELS frame; 4.33ms for the 16.8MB
+  Ronchigram frame. zstd compression is CPU-bound and orders of magnitude
+  more expensive per byte than a copy: the *best* result anywhere in the
+  sweep — level 1, `threads=4`, the largest 33.6MB scan frame — still cost
+  117ms round trip against a 26.1ms baseline (4.5× slower). Worse cases
+  are common: the 1.0MB EELS frame at level 12 cost 53ms against a
+  0.17ms baseline (309× slower); the 16.8MB Ronchigram frame at level 12
+  cost 1267ms against 4.33ms (293× slower).
+- **The threading claim is real but bounded, exactly as expected from how
+  zstd multi-threading works (splitting input into independent blocks,
+  trading ratio for parallelism)**: at 64×64–256×256 (32KB–524KB),
+  `threads=4` made no measurable difference or was marginally worse
+  (thread-pool setup cost with too little data to split) than
+  `threads=1`. From ~1MB up, `threads=4` did measurably cut wall time —
+  ~17–40% faster than `threads=1` at the largest scan and Ronchigram
+  sizes — confirming idle cores genuinely engage for frames in the
+  multi-megabyte range. It never closed anywhere near the gap to the raw
+  memcpy path, because that gap is 1–3 orders of magnitude, not the
+  ~2–4× a handful of idle cores can buy back.
+- **Why this differs from the naive-pickle-over-socket case compression
+  might have helped**: that path pays a real "bytes over a wire" cost —
+  serialize, then copy through a kernel socket buffer, on a local
+  loopback connection that still round-trips through the TCP/IP stack.
+  Shared memory has no wire: `SharedFrameWriter`/`SharedFrameReader` are
+  already just `np.ndarray` view assignment and `.copy()` against a
+  `mmap`-backed segment, at whatever memory bandwidth the machine has.
+  Compression only pays off when it removes work that is actually the
+  bottleneck; on this path the bottleneck is memory bandwidth for a copy
+  that is already single-digit-to-tens-of-milliseconds for the largest
+  real frames this project produces, and zstd's decode+encode cost per
+  byte is fundamentally higher than a copy's, no matter how many idle
+  cores run it in parallel.
+
+**Verdict: not implemented.** This is a complete, negative answer to the
+question, not an unfinished feature — `shared_frame.py` is unchanged, and
+`zstandard` was not added to `pyproject.toml` as a dependency (it was
+installed ad hoc, `uv pip install zstandard`, only to run the benchmark
+script; the script's own docstring notes this so it stays reproducible
+without weighing down the shipped dependency set for a capability that
+isn't shipping). The benchmark script is kept in `scripts/` as the record
+of how this was checked, the same way `ipc_overhead_benchmark.py` and the
+Phase 2 live-viewer benchmark are kept regardless of which way their
+results pointed.
 
 ## 7. Open questions
 
