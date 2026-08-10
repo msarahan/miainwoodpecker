@@ -22,8 +22,9 @@
 # SOFTWARE.
 
 """
-Add a docstring here for the init module.
+Instrument control and data analysis for STEM.
 
-This might include a very brief description of the package,
-its purpose, and any important notes.
+Built as a thin glue layer over existing open source projects; see
+docs/migration-plan.md for the architecture. The device layer lives in
+:mod:`miainwoodpecker.devices`.
 """

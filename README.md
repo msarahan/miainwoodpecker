@@ -8,8 +8,31 @@ existing open source projects rather than a from-scratch rewrite. See
 [`docs/migration-plan.md`](docs/migration-plan.md) for the architecture and
 phased migration plan.
 
-The project is early — most of what's here today is packaging, linting,
-testing, and documentation scaffolding rather than application code.
+The project is early. What exists today is the Phase 1 device bridge: a
+vendor-neutral device interface (`miainwoodpecker.devices`) and a Nion
+adapter validated against the `nionswift-usim` microscope simulator.
+
+```python
+from miainwoodpecker.devices import ScanParameters
+from miainwoodpecker.devices.nion_adapter import simulated_instrument
+
+# requires the "device" extra: pip install miainwoodpecker[device]
+with simulated_instrument() as microscope:
+    camera = microscope.ronchigram_camera
+    camera.start()
+    try:
+        frame = camera.acquire_frame()  # frame.data is a 2D numpy array
+    finally:
+        camera.stop()
+
+    scan = microscope.scanner.scan_frame(
+        ScanParameters(height=256, width=256, pixel_time_us=1.0, fov_nm=15.0)
+    )
+```
+
+Everything above the device layer depends only on the protocols in
+`miainwoodpecker.devices`, never on a vendor SDK, so other vendors can be
+added later as new adapters.
 
 ## How to install
 

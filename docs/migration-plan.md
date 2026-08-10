@@ -106,18 +106,35 @@ problem — read their source and docs before designing our own adapters:
   Passed cleanly with `QT_QPA_PLATFORM=offscreen`, so this also runs in
   headless CI without a real display.
 - [x] Settle on a package layout beyond the pyOpenSci template scaffold —
-  package is named `miainwoodpecker`.
-- [ ] Decide the license (see §6) and replace the demo `add_numbers`
-  module with the Phase 1 device bridge.
+  package is named `miainwoodpecker`; the demo `add_numbers` module has
+  been replaced by the Phase 1 device bridge.
+- [ ] Decide the license (see §6).
 
 **Phase 1 — Device bridge**
-- Define a vendor-neutral `Camera`/`Scanner` interface (device-kind
-  `Protocol`/ABC), then implement it by wrapping Nion's `HardwareSource`
-  camera/scan objects as plain Python objects usable from a non-Swift
-  process. The rest of the app (acquisition, UI, storage) depends only on
-  the interface, not on Nion's classes, so a second vendor's adapter can
-  be added later without touching those layers.
-- Validate against `nionswift-usim` first, then against real hardware.
+- [x] Define a vendor-neutral `Camera`/`Scanner` interface and wrap Nion's
+  device objects behind it — implemented in
+  [`src/miainwoodpecker/devices/`](../src/miainwoodpecker/devices/):
+  `interface.py` holds runtime-checkable structural `Protocol`s plus the
+  neutral data types (`Frame` = data + aware timestamp + metadata;
+  `ScanParameters` in operator units — pixels, µs, nm), and
+  `nion_adapter.py` wraps the `nion.device_kit` camera/scan objects
+  directly (per the Phase 0 finding, *not* the
+  `HardwareSource`/`AcquisitionTestContext` layer, which needs a full
+  `Application`). The rest of the app depends only on the interface, so a
+  second vendor's adapter can be added later without touching those
+  layers; the base `devices` package imports with no vendor SDK
+  installed. Design notes: structural protocols (not ABCs) so vendor
+  adapters and test fakes satisfy the interface by shape; smallest
+  interface that supports the Phase 2 viewer — exposure/settings modeling
+  and synchronized multi-signal acquisition deferred to the phases that
+  need them; the `(height, width)` scan convention is pinned empirically
+  by a non-square scan in the integration tests.
+- [x] Validate against `nionswift-usim` —
+  [`tests/integration/test_nion_usim_adapter.py`](../tests/integration/test_nion_usim_adapter.py)
+  (auto-skipped unless the `device` extra is installed); the
+  `simulated_instrument()` context manager owns the both-cameras-closed
+  teardown that the Phase 0 note warns about.
+- [ ] Validate against real hardware.
 
 **Phase 2 — Live viewer MVP**
 - A napari + PySide6 shell with a dock widget (napari-micromanager-shaped)

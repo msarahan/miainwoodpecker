@@ -35,7 +35,6 @@ keywords = ["microscopy", "stem", "instrument-control", "data-analysis"]
 
 dependencies = [
     "numpy>=2.2.6",
-    "requests>=2.32.5",
 ]
 
 [project.urls]
@@ -145,6 +144,7 @@ exclude = [
     "S101",  # 'Use of assert detected' ignored because we are using pytest.
     "INP001",  # 'Insecure input' ignored because we are testing.
     "ANN201",  # 'Missing type annotation for {return}' ignored because all tests return `None`.
+    "E402",  # imports after pytest.importorskip in integration tests.
 ]
 "scripts/**/*.py" = [
     "INP001",  # standalone entry-point scripts, not a package.
