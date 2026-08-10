@@ -10,8 +10,9 @@ phased migration plan.
 
 The project is early. What exists today:
 
-* a **vendor-neutral device interface** (`miainwoodpecker.devices`) with a
-  Nion adapter validated against the `nionswift-usim` microscope simulator,
+* a **vendor-neutral device interface** (`miainwoodpecker.devices`), with a
+  Nion backend validated against the `nionswift-usim` microscope simulator
+  and run as an isolated subprocess (see "A note on licensing" below),
 * a **live acquisition loop** (`miainwoodpecker.acquisition`) that decouples
   acquisition rate from display rate, and
 * a **live viewer** (`miainwoodpecker.viewer`) — a napari + PySide6 dock
@@ -32,10 +33,10 @@ uv run --extra device --extra viewer miainwoodpecker-viewer
 
 ```python
 from miainwoodpecker.devices import ScanParameters
-from miainwoodpecker.devices.nion_adapter import simulated_instrument
+from miainwoodpecker.devices.remote import remote_simulated_instrument
 
 # requires the "device" extra: pip install miainwoodpecker[device]
-with simulated_instrument() as microscope:
+with remote_simulated_instrument() as microscope:
     camera = microscope.ronchigram_camera
     camera.start()
     try:
@@ -52,14 +53,27 @@ Everything above the device layer depends only on the protocols in
 `miainwoodpecker.devices`, never on a vendor SDK, so other vendors can be
 added later as new adapters.
 
+`remote_simulated_instrument()` spawns a subprocess and talks to it over
+IPC — that's deliberate, not incidental complexity; see "A note on
+licensing" below. Driving the underlying device logic in-process instead
+(useful for debugging, but importing GPL-3.0 code — never do this in the
+shipped application) looks the same, one module over:
+
+```python
+from miainwoodpecker.devices.nion_server import simulated_instrument
+
+with simulated_instrument() as microscope:
+    ...  # identical API, no subprocess, no IPC
+```
+
 ### Record a series to NeXus HDF5
 
 ```python
 from miainwoodpecker.acquisition import record, scan_series
 from miainwoodpecker.devices import ScanParameters
-from miainwoodpecker.devices.nion_adapter import simulated_instrument
+from miainwoodpecker.devices.remote import remote_simulated_instrument
 
-with simulated_instrument() as microscope:
+with remote_simulated_instrument() as microscope:
     parameters = ScanParameters(
         height=256, width=256, pixel_time_us=1.0, fov_nm=15.0
     )
@@ -127,3 +141,16 @@ using a single tool.
 ## License
 
 `miainwoodpecker` is distributed under the terms of the [MIT](https://spdx.org/licenses/MIT.html) license.
+
+### A note on licensing
+
+Nion's own device stack (`nionswift-usim`, `nionswift-instrumentation`,
+`nionswift`, and friends — the `device` extra) is GPL-3.0. This project
+never imports it into its own process. `miainwoodpecker.devices.nion_server`
+is a separate GPL-3.0 program (it says so in its own module header) that
+only ever runs as a subprocess, launched via
+`python -m miainwoodpecker.devices.nion_server`; the rest of this
+project — including the shipped `miainwoodpecker-viewer` entry point —
+talks to it only through the plain-data message protocol in
+`miainwoodpecker.devices.rpc`, never by importing it directly. See
+[`docs/migration-plan.md`](docs/migration-plan.md), §6, for the reasoning.

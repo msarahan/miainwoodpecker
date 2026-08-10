@@ -1,5 +1,12 @@
 """
-Integration tests: the Nion adapter against the nionswift-usim simulator.
+Integration tests: nion_server's in-process device logic against usim.
+
+Imports ``nion_server`` directly rather than going through
+:mod:`miainwoodpecker.devices.remote`, so this validates the underlying
+device wrapping itself (GPL-3.0-encumbered, dev/test-only — never
+imported by the shipped application). See
+``tests/integration/test_remote_nion.py`` for the same devices exercised
+over the actual IPC boundary the application uses.
 
 Skipped automatically unless the ``device`` optional dependency group is
 installed (``uv run --extra device --extra tests pytest tests/integration``).
@@ -10,7 +17,7 @@ import pytest
 pytest.importorskip("nion.usim_device", reason="requires the 'device' extra")
 
 from miainwoodpecker.devices import Camera, ScanParameters, Scanner
-from miainwoodpecker.devices.nion_adapter import simulated_instrument
+from miainwoodpecker.devices.nion_server import simulated_instrument
 
 
 def test_simulated_devices_satisfy_the_protocols():

@@ -152,11 +152,13 @@ ignore = [
     "ANN001",  # Missing type annotation for {arg} in function" ignored
     "ANN201",  # 'Missing type annotation for {return}'.
     "COM812",  # 'Missing trailing comma in collection' ignored to comply with black formatting.
-    "CPY001",  # 'Missing copyright notice at top of file'. The license is declared
-               # once in LICENSE and pyproject.toml; per-file notices are redundant,
-               # and the project's license is still an open decision (see
-               # docs/migration-plan.md section 6), so stamping headers into every
-               # file now would be premature.
+    "CPY001",  # 'Missing copyright notice at top of file'. The project's MIT
+               # license is declared once in LICENSE and pyproject.toml; per-file
+               # notices are redundant for it. The one exception,
+               # devices/nion_server.py, is GPL-3.0 (it imports Nion's GPL-3.0
+               # device stack directly - see docs/migration-plan.md section 6)
+               # and states that in its own module docstring instead of a
+               # ruff-style copyright stamp.
 ]
 exclude = [
     "src/miainwoodpecker/_version.py",

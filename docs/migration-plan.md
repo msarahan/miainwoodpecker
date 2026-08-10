@@ -45,9 +45,9 @@ Reuse directly:
 
 These are Python packages already decoupled from Swift's UI process in
 principle (they're driven through Swift's plugin/`HardwareSource` API); the
-work here is a thin adapter, not a rewrite. **All of this is GPL-3.0**, which
-in practice means the new application inherits that license unless the
-device layer is kept fully isolated behind a process boundary.
+work here is a thin adapter, not a rewrite. **All of this is GPL-3.0**;
+see §6 for how the rest of the application avoids inheriting that license
+by isolating this layer behind a process boundary.
 
 ## 3. What gets replaced with existing open source projects
 
@@ -119,7 +119,9 @@ problem — read their source and docs before designing our own adapters:
 - [x] Settle on a package layout beyond the pyOpenSci template scaffold —
   package is named `miainwoodpecker`; the demo `add_numbers` module has
   been replaced by the Phase 1 device bridge.
-- [ ] Decide the license (see §6).
+- [x] Decide the license (see §6): the application stays MIT; the GPL-3.0
+  device layer is isolated behind a subprocess boundary rather than
+  imported in-process.
 
 **Phase 1 — Device bridge**
 - [x] Define a vendor-neutral `Camera`/`Scanner` interface and wrap Nion's
@@ -127,24 +129,28 @@ problem — read their source and docs before designing our own adapters:
   [`src/miainwoodpecker/devices/`](https://github.com/SuperSTEM/miainwoodpecker/tree/main/src/miainwoodpecker/devices):
   `interface.py` holds runtime-checkable structural `Protocol`s plus the
   neutral data types (`Frame` = data + aware timestamp + metadata;
-  `ScanParameters` in operator units — pixels, µs, nm), and
-  `nion_adapter.py` wraps the `nion.device_kit` camera/scan objects
+  `ScanParameters` in operator units — pixels, µs, nm). Device wrapping
+  originally lived in one `nion_adapter.py` importing `nion.device_kit`
   directly (per the Phase 0 finding, *not* the
   `HardwareSource`/`AcquisitionTestContext` layer, which needs a full
-  `Application`). The rest of the app depends only on the interface, so a
-  second vendor's adapter can be added later without touching those
-  layers; the base `devices` package imports with no vendor SDK
-  installed. Design notes: structural protocols (not ABCs) so vendor
-  adapters and test fakes satisfy the interface by shape; smallest
+  `Application`); §6 splits that into `nion_server.py` (the same wrapping
+  logic, GPL-3.0, subprocess-only) plus `remote.py` (MIT, IPC client) once
+  the license decision required it. The rest of the app depends only on
+  the interface, so a second vendor's adapter can be added later without
+  touching those layers; the base `devices` package imports with no
+  vendor SDK installed. Design notes: structural protocols (not ABCs) so
+  vendor adapters and test fakes satisfy the interface by shape; smallest
   interface that supports the Phase 2 viewer — exposure/settings modeling
   and synchronized multi-signal acquisition deferred to the phases that
   need them; the `(height, width)` scan convention is pinned empirically
   by a non-square scan in the integration tests.
-- [x] Validate against `nionswift-usim` —
-  [`tests/integration/test_nion_usim_adapter.py`](../tests/integration/test_nion_usim_adapter.py)
-  (auto-skipped unless the `device` extra is installed); the
+- [x] Validate against `nionswift-usim` — directly, in-process, in
+  [`tests/integration/test_nion_server.py`](../tests/integration/test_nion_server.py)
+  (auto-skipped unless the `device` extra is installed; the
   `simulated_instrument()` context manager owns the both-cameras-closed
-  teardown that the Phase 0 note warns about.
+  teardown that the Phase 0 note warns about), and over the actual IPC
+  boundary the application uses in
+  [`tests/integration/test_remote_nion.py`](../tests/integration/test_remote_nion.py).
 - [x] Pin the whole `device` extra exactly (`nionswift-usim`,
   `nionswift-instrumentation`, `nionswift`, `nionswift-io`, `niondata`,
   `nionui`, `nionutils`), not just `nionswift-usim` itself. CI's hatch
@@ -253,14 +259,101 @@ problem — read their source and docs before designing our own adapters:
   full feature surface) and build a parity checklist from that.
 - Pilot the new app in parallel with Swift on one instrument before cutover.
 
-## 6. Open questions
+## 6. License — resolved: process-boundary isolation
 
-- **License**: Nion's device-layer packages are GPL-3.0. Depending on how
-  tightly the new app links against them, the whole application likely
-  needs to be GPL-3.0-compatible too. Worth confirming this is acceptable
-  before committing to reusing that code directly (vs. isolating it behind
-  a process boundary, e.g. a small RPC service, if a more permissive license
-  is required for the rest of the app).
+Nion's device-layer packages are GPL-3.0. A Python `import` of a GPL-3.0
+library into the same process is generally treated as linking under the
+FSF's own interpretation of the GPL (the criterion is forming a combined
+work — shared process/address space, calling into each other's internals —
+not compile-time vs. runtime binding, which is a common but incorrect
+intuition for why this wouldn't apply to an interpreted language). Two
+separate programs communicating over a well-defined protocol, rather than
+one importing the other's internals, is the boundary that reading doesn't
+reach across — the standard answer for exactly this shape of problem (it's
+why tools have long shelled out to GPL command-line programs rather than
+linking their libraries directly).
+
+**Decision: isolate.** The device layer runs as a separate subprocess; the
+main MIT-licensed application never imports `nion.*`.
+
+- [`src/miainwoodpecker/devices/rpc.py`](../src/miainwoodpecker/devices/rpc.py) —
+  the entire license boundary. A minimal `Call`/`Result` wire protocol
+  (not a general RPC framework — one call shape, dispatch by
+  `getattr` + `callable()` check, since properties like `camera_id` are
+  evaluated, not invoked). MIT, imports nothing from either side.
+- [`src/miainwoodpecker/devices/nion_server.py`](../src/miainwoodpecker/devices/nion_server.py) —
+  GPL-3.0 (states so in its own header), imports `nion.*` directly. Holds
+  the `NionCamera`/`NionScanner`/`simulated_instrument()` logic unchanged
+  from the old in-process adapter, plus a serving loop: one
+  `multiprocessing.connection.Listener` per target
+  (`ronchigram_camera`/`eels_camera`/`scanner`/`instrument`), one handler
+  thread per accepted connection. Runs only via
+  `python -m miainwoodpecker.devices.nion_server`; never imported by the
+  application.
+- [`src/miainwoodpecker/devices/remote.py`](../src/miainwoodpecker/devices/remote.py) —
+  MIT, no `nion.*` import. `RemoteCamera`/`RemoteScanner` implement the
+  same `Camera`/`Scanner` protocols by sending `Call`s over IPC.
+  `remote_simulated_instrument()` spawns the server subprocess, connects
+  with a generated authkey, and tears down with `Popen.terminate()`
+  (SIGTERM) rather than a graceful RPC shutdown — sufficient here because
+  the whole *process* being killed reclaims its threads and sockets
+  regardless of Python-level cleanup; a real-hardware backend would likely
+  need a gentler path to park the instrument safely, simulated hardware
+  does not.
+- [`src/miainwoodpecker/viewer/app.py`](../src/miainwoodpecker/viewer/app.py)
+  imports `remote`, not `nion_server` — the actual, shipped application
+  never links GPL-3.0 code into its own process. Verified, not assumed:
+  launching the real `main()` entry point end-to-end (napari window +
+  remote subprocess) and confirming no `nion_server` process survives
+  after clean shutdown.
+
+**Raised concern, addressed with data, not assumption**: STEM frames are
+large (this project's own simulated Ronchigram camera is already
+2048×2048 float32, ~16.8MB), and naive pickle-over-socket serializes and
+copies the array twice per round trip. Measured with
+[`scripts/ipc_overhead_benchmark.py`](../scripts/ipc_overhead_benchmark.py)
+(direct in-process call vs. the same call over IPC, scan frames so the
+camera's 1-second simulated exposure doesn't mask the transport cost):
+overhead was negligible at 0.1MB (+0.7ms) but grew to +74% at 2.1MB
+(+7.4ms) and more than doubled total latency at 33.6MB (+168ms on a
+163ms baseline) — squarely the size range real detector data lives in.
+
+Fix: [`src/miainwoodpecker/devices/shared_frame.py`](../src/miainwoodpecker/devices/shared_frame.py)
+copies a `Frame`'s array into a `multiprocessing.shared_memory` segment
+instead of pickling it; the wire message becomes a small `SharedFrameRef`
+(name/shape/dtype), and the client does one memcpy out of shared memory
+instead of a serialize/deserialize pass plus a socket copy. This is
+*not* uniformly better, though — it has real fixed per-call cost
+(shm_open/mmap/munmap/close/unlink, twice each), which made it measurably
+*worse* than plain pickling at 2.1MB (+17.6ms vs. +7.4ms) before it was
+gated by size. `nion_server.py` only routes `Frame` results through
+shared memory above `_SHARED_MEMORY_THRESHOLD_BYTES` (8MB currently); the
+exact crossover is noisier than that number suggests — one probe near
+8MB measured *more* overhead than a larger one near 19MB, almost
+certainly cold-subprocess/paging variance rather than a real
+non-monotonic effect, since the benchmark launches a fresh subprocess per
+size. 8MB is a deliberately conservative choice given that noise, not a
+precisely fitted one; worth revisiting with a less noisy methodology
+(many frames per warm subprocess, per size) if a size in the disputed
+middle range turns out to matter in practice.
+
+One stdlib wart surfaced along the way and is worth recording: each
+process's `resource_tracker` auto-registers any `SharedMemory` handle it
+touches (create *or* attach-by-name) and tries to clean it up again at
+exit, which — since we manage each segment's lifecycle explicitly — just
+finds it already gone and warns, once per segment, on every run. The
+documented fix (`resource_tracker.unregister()`) assumes register and
+unregister land on the same tracker daemon, true within one
+`multiprocessing.Process` tree but not here (server and client are
+independent `subprocess.Popen` processes, each with their own daemon);
+trying it made things worse, crashing the *other* daemon's main loop with
+a `KeyError` instead of merely warning. `PYTHONWARNINGS`, read by every
+interpreter at its own startup including a forked+exec'd tracker daemon,
+is what actually works — set once in `shared_frame.py` and inherited by
+the server subprocess's environment.
+
+## 7. Open questions
+
 - **Bluesky/ophyd**: the [Bluesky](https://blueskyproject.io/) experiment
   orchestration framework (device abstraction via `ophyd`/`ophyd-async`,
   scripted acquisition via a `RunEngine`) is a real, actively developed
@@ -270,8 +363,16 @@ problem — read their source and docs before designing our own adapters:
   operators actually work moment to moment. Recommendation: skip it for v1
   (Phases 1–2), and revisit only if/when scripted multi-step acquisitions
   (automated tilt series, autotuning) become a priority.
+- **Real hardware validation** (§2's remaining open item): the device
+  server's serving loop, shared-memory transport, and threshold have only
+  been exercised against `nionswift-usim`. Real hardware may have
+  different frame-rate/size characteristics worth re-benchmarking against
+  once available.
+- **Shared-memory threshold precision**: see §6 — 8MB is conservative,
+  not precisely fitted; the actual crossover between plain-pickle and
+  shared-memory transport is noisier than a single benchmark run resolved.
 
-## 7. Summary
+## 8. Summary
 
 Beyond the device layer, almost nothing here needs to be built from
 scratch: napari + PySide6 for the shell and rendering, HDF5/Zarr + NeXus/NXem
