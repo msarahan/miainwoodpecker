@@ -49,7 +49,6 @@ def test_nexus_structure_and_plotting_hints(tmp_path):
         entry = handle["entry"]
         assert entry.attrs["NX_class"] == "NXentry"
         assert entry.attrs["default"] == "data"
-        assert entry["definition"][()].decode() == "NXem"
         assert entry["title"][()].decode() == "my scan"
         # start/end times must be ISO 8601 parseable.
         datetime.datetime.fromisoformat(entry["start_time"][()].decode())
@@ -130,3 +129,181 @@ def test_empty_series_still_writes_a_valid_readable_file(tmp_path):
         assert handle["entry"].attrs["NX_class"] == "NXentry"
         assert "data" not in handle["entry"]
     assert list(read_series(path)) == []
+
+
+def test_no_application_definition_is_claimed_by_default(tmp_path):
+    """
+    A default recording claims no application definition.
+
+    Validated against the real NXDL schema (see
+    scripts/validate_nexus_schema.py): a recording without specimen
+    metadata is *not* valid NXem, so declaring it would be a false claim.
+    """
+    path = tmp_path / "unclaimed.nxs"
+    write_frames(path, [_frame(0)])
+    with h5py.File(path, "r") as handle:
+        assert "definition" not in handle["entry"]
+        assert "sample" not in handle["entry"]
+
+
+def test_sample_metadata_becomes_an_nxsample_group(tmp_path):
+    """Operator-supplied specimen metadata lands in NXsample, verbatim."""
+    path = tmp_path / "claimed.nxs"
+    write_frames(
+        path,
+        [_frame(0)],
+        definition="NXem",
+        sample={
+            "is_simulation": True,
+            "preparation_date": "2026-01-01T00:00:00+00:00",
+            "atom_types": "Si,O",
+        },
+    )
+    with h5py.File(path, "r") as handle:
+        entry = handle["entry"]
+        assert entry["definition"][()].decode() == "NXem"
+        sample = entry["sample"]
+        assert sample.attrs["NX_class"] == "NXsample"
+        assert bool(sample["is_simulation"][()]) is True
+        assert sample["atom_types"][()].decode() == "Si,O"
+
+
+def test_session_context_becomes_real_nexus_classes(tmp_path):
+    """
+    Operator and notes land in NXuser/NXnote, not in the vendor JSON blob.
+
+    Verified against the real schema (scripts/validate_nexus_schema.py):
+    NXem documents both groups at entry level, so a file carrying them
+    still validates. Unlike `sample` they are optional in NXem — measured
+    from the NXDL, where `userID`/`noteID` are minOccurs="0" while
+    `sampleID` is minOccurs="1".
+    """
+    path = tmp_path / "context.nxs"
+    write_frames(
+        path,
+        [_frame(0)],
+        user={"name": "A. Operator", "affiliation": "SuperSTEM"},
+        notes="aligned at 200 kV",
+    )
+    with h5py.File(path, "r") as handle:
+        entry = handle["entry"]
+        assert entry["user"].attrs["NX_class"] == "NXuser"
+        assert entry["user/name"][()].decode() == "A. Operator"
+        assert entry["notes"].attrs["NX_class"] == "NXnote"
+        assert entry["notes/description"][()].decode() == "aligned at 200 kV"
+
+
+def test_session_context_groups_are_absent_when_not_supplied(tmp_path):
+    """No operator or notes means no empty NXuser/NXnote stubs."""
+    path = tmp_path / "bare.nxs"
+    write_frames(path, [_frame(0)])
+    with h5py.File(path, "r") as handle:
+        assert "user" not in handle["entry"]
+        assert "notes" not in handle["entry"]
+
+
+def test_flush_makes_appended_frames_readable_before_close(tmp_path):
+    """
+    flush() gets frames onto disk without finalizing the file.
+
+    This is what bounds worst-case loss if an acquisition is killed: a
+    SIGKILL without flushing leaves a file that will not open at all.
+    """
+    path = tmp_path / "flushed.nxs"
+    with NexusWriter(path) as writer:
+        writer.append(_frame(0))
+        writer.append(_frame(1))
+        writer.flush()
+        # A second, independent handle sees the flushed frames even though
+        # close() has not run yet.
+        with h5py.File(path, "r") as handle:
+            data = handle["entry/instrument/detector/data"]
+            expected_count = 2
+            assert data.shape[0] == expected_count
+            assert np.array_equal(data[1], np.full((4, 6), 1, dtype=np.float32))
+
+
+def test_flush_before_opening_is_harmless(tmp_path):
+    """flush() on an unopened writer is a no-op, not a crash."""
+    NexusWriter(tmp_path / "unused.nxs").flush()
+
+
+def test_gzip_default_now_includes_the_byte_shuffle_filter(tmp_path):
+    """
+    The measured winner is on by default, and `compression` still works.
+
+    gzip + shuffle beat plain gzip on ratio, write time, *and* read time on
+    every dataset benchmarked, so it needs no opt-in - but the public
+    `compression` parameter has to keep behaving.
+    """
+    path = tmp_path / "shuffled.nxs"
+    write_frames(path, [_frame(0)], compression="gzip")
+    with h5py.File(path, "r") as handle:
+        filters = handle["entry/instrument/detector/data"]._filters  # noqa: SLF001
+        assert "gzip" in filters
+        assert "shuffle" in filters
+
+
+def test_compression_can_still_be_disabled_entirely(tmp_path):
+    """`compression=None` leaves the frame dataset unfiltered."""
+    path = tmp_path / "raw.nxs"
+    write_frames(path, [_frame(0)], compression=None)
+    with h5py.File(path, "r") as handle:
+        dataset = handle["entry/instrument/detector/data"]
+        assert dataset.compression is None
+        assert dataset.shuffle is False
+
+
+def test_explicit_dtype_stores_narrower_frames(tmp_path):
+    """
+    An explicit `dtype` downcasts on write; it is never applied implicitly.
+
+    float32 storage is a 2.3x size win on this project's float64 scan
+    frames, but it is lossy, so it stays opt-in - see the module docstring.
+    """
+    path = tmp_path / "narrow.nxs"
+    frame = Frame(
+        data=np.full((4, 6), 1.5, dtype=np.float64),
+        timestamp=datetime.datetime(2026, 1, 1, tzinfo=datetime.UTC),
+        metadata={},
+    )
+    write_frames(path, [frame], dtype="float32")
+    with h5py.File(path, "r") as handle:
+        assert handle["entry/instrument/detector/data"].dtype == np.float32
+
+    default_path = tmp_path / "wide.nxs"
+    write_frames(default_path, [frame])
+    with h5py.File(default_path, "r") as handle:
+        assert handle["entry/instrument/detector/data"].dtype == np.float64
+
+
+def test_plugin_codecs_are_accepted_as_a_filter_mapping(tmp_path):
+    """
+    An hdf5plugin filter object can be passed straight to `compression`.
+
+    Skipped without the `compression` extra: the *default* codec is a pure
+    HDF5 built-in precisely so that plugin is never required to read a file
+    this project writes.
+    """
+    hdf5plugin = pytest.importorskip(
+        "hdf5plugin",
+        reason="requires the 'compression' extra",
+    )
+    path = tmp_path / "blosc2.nxs"
+    write_frames(
+        path,
+        [_frame(index) for index in range(2)],
+        compression=hdf5plugin.Blosc2(
+            cname="zstd",
+            clevel=5,
+            filters=hdf5plugin.Blosc2.BITSHUFFLE,
+        ),
+    )
+    # Round trips through the plugin, and HDF5's own shuffle is not stacked
+    # in front of a codec that bit-shuffles internally.
+    recovered = list(read_series(path))
+    expected_count = 2
+    assert len(recovered) == expected_count
+    assert np.array_equal(recovered[1][0], np.full((4, 6), 1, dtype=np.float32))
+    with h5py.File(path, "r") as handle:
+        assert handle["entry/instrument/detector/data"].shuffle is False

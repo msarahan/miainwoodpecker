@@ -142,6 +142,22 @@ libertem = [
 py4dstem = [
     "py4dstem>=0.14",
 ]
+# Phase 3, storage compression - see docs/migration-plan.md section 5 and
+# src/miainwoodpecker/storage/nexus.py's module docstring for the measurements.
+# An extra, deliberately not a base dependency, and the reason is
+# interoperability rather than weight (hdf5plugin is one wheel of bundled
+# codecs, not a 70-package stack): a file written with a blosc2/bitshuffle
+# filter cannot be opened *at all* without this plugin present in the
+# reading environment, and the readers that matter here are other people's
+# - nexusformat, HyperSpy, LiberTEM, py4DSTEM. So NexusWriter's default
+# codec is a pure HDF5 built-in (gzip + shuffle), which measured within a
+# few percent of blosc2's ratio, and every file this project writes by
+# default is readable by a bare h5py. Installing this extra buys the faster
+# plugin codecs for someone who has weighed that trade for their own data;
+# scripts/nexus_compression_benchmark.py needs it to run the comparison.
+compression = [
+    "hdf5plugin>=5",
+]
 docs = [
     "sphinx>=8.2.3",
     "myst-parser>=4.0.1",
@@ -311,6 +327,7 @@ run = "pytest {args:--cov=miainwoodpecker --cov-report=term-missing}"
 description = """Run the full test suite, including device, viewer, and analysis tests."""
 features = [
     "analysis",
+    "compression",
     "device",
     "libertem",
     "py4dstem",
@@ -323,6 +340,26 @@ extra-dependencies = [
 
 [tool.hatch.envs.integration.scripts]
 run = "pytest {args:--cov=miainwoodpecker --cov-report=term-missing}"
+
+#--------------- Validate written files against the NeXus schema ---------------#
+
+# docs/migration-plan.md section 5, Phase 3: validating our output against the
+# official NXem NXDL belongs in CI, not the runtime. pynxtools is a ~90-package
+# stack that ships the NXDL definitions inside the wheel, so the check runs
+# fully offline (the NeXus/FAIRmat spec sites are unreachable here) - but it
+# gets its own env so nothing in that stack can reach the shipped package or
+# the other test environments.
+# Loose ">=" bound: this env's only job is to fail when our files stop
+# validating, and a pynxtools upgrade tightening the schema is a signal worth
+# receiving rather than pinning away.
+[tool.hatch.envs.validate]
+description = """Validate written NeXus files against the NXem NXDL schema."""
+extra-dependencies = [
+    "pynxtools[em]>=0.15",
+]
+
+[tool.hatch.envs.validate.scripts]
+schema = "python scripts/validate_nexus_schema.py"
 
 #--------------- Build and preview your documentation ---------------#
 
