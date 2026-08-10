@@ -47,6 +47,7 @@ from miainwoodpecker.devices.nion_server import (
     HARDWARE_BACKEND,
     SIMULATED_BACKEND,
     HardwareNotAvailableError,
+    _parse_args,
     hardware_instrument,
     open_instrument,
     simulated_instrument,
@@ -125,6 +126,55 @@ def _camera_frame(camera) -> np.ndarray:
         return camera.acquire_frame().data
     finally:
         camera.stop()
+
+
+# ------------------------------------------------------- command line
+#
+# The documented precedence is "each defaulting to an environment
+# variable, with the command line winning" (docs/migration-plan.md, §5
+# Phase 1). Asserted rather than assumed, because the natural argparse
+# spelling of it is silently wrong: ``action="append"`` appends to its
+# default instead of replacing it, so seeding that default from the
+# environment made ``--plugin foo`` mean "the environment's plug-ins *and*
+# foo". On a hardware backend that loads vendor plug-ins nobody asked for.
+
+_PORTS = ["5001", "5002", "5003", "5004"]
+
+
+def test_named_plugins_override_the_environment(monkeypatch):
+    """``--plugin`` replaces ``$MIAINWOODPECKER_HARDWARE_PLUGINS``, not adds to it."""
+    monkeypatch.setenv("MIAINWOODPECKER_HARDWARE_PLUGINS", "from_environment")
+    arguments = _parse_args(["--plugin", "from_command_line", *_PORTS])
+    assert arguments.plugin == ["from_command_line"]
+
+
+def test_repeated_plugin_flags_accumulate(monkeypatch):
+    """Repeating the flag is still how you ask for several plug-ins."""
+    monkeypatch.delenv("MIAINWOODPECKER_HARDWARE_PLUGINS", raising=False)
+    arguments = _parse_args(["--plugin", "first", "--plugin", "second", *_PORTS])
+    assert arguments.plugin == ["first", "second"]
+
+
+def test_plugins_fall_back_to_the_environment(monkeypatch):
+    """With no flag, the comma-separated environment variable is used."""
+    monkeypatch.setenv("MIAINWOODPECKER_HARDWARE_PLUGINS", "one, two")
+    arguments = _parse_args(_PORTS)
+    assert arguments.plugin == ["one", "two"]
+
+
+def test_plugins_default_to_autodiscovery(monkeypatch):
+    """Neither flag nor environment means an empty list, i.e. autodiscovery."""
+    monkeypatch.delenv("MIAINWOODPECKER_HARDWARE_PLUGINS", raising=False)
+    arguments = _parse_args(_PORTS)
+    assert arguments.plugin == []
+
+
+def test_backend_flag_overrides_the_environment(monkeypatch):
+    """The same precedence for --backend, which argparse gets right on its own."""
+    monkeypatch.setenv("MIAINWOODPECKER_BACKEND", HARDWARE_BACKEND)
+    assert _parse_args(_PORTS).backend == HARDWARE_BACKEND
+    overridden = _parse_args(["--backend", SIMULATED_BACKEND, *_PORTS])
+    assert overridden.backend == SIMULATED_BACKEND
 
 
 # ---------------------------------------------------------------- backends

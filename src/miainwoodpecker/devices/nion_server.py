@@ -48,6 +48,30 @@ exist on Nion's own ``device_kit`` reference implementation.
 stops detectors, parks the instrument, releases devices (which retires
 their shared-memory segments), acknowledges, and only then lets the
 process exit. SIGTERM remains the client's fallback for a wedged server.
+
+**A health check, alongside it on the same target.** ``health`` answers
+from server-process state alone — pid, uptime, backend, which targets are
+served, which devices are still open — and deliberately touches no vendor
+object and no device. That is what makes it both cheap enough to poll
+routinely and unable to perturb an acquisition in flight: it takes no
+device lock, and it is served on its own connection's handler thread, so
+a blocked ``acquire_frame`` on the camera target does not delay it. The
+consequence the client relies on is the useful one: if ``health`` does
+not answer within its (bounded) timeout, the server really is wedged, not
+merely busy. See :mod:`miainwoodpecker.devices.remote` for how the client
+turns that into a three-way verdict.
+
+**Logging.** Structured stdlib logging, off unless asked for, because
+this process's stderr is inherited by whoever launched it and its output
+would otherwise interleave anonymously with the application's. Startup
+and backend selection, plug-in load notes, per-target connection accepts,
+per-call failures (naming the target and method), and shutdown are all
+logged; nothing on the frame path is, so the shared-memory publish/read
+hot path pays nothing. ``MIAINWOODPECKER_DEVICE_LOG_LEVEL`` sets the
+level (default ``WARNING``, i.e. quiet) and
+``MIAINWOODPECKER_DEVICE_LOG_FILE`` redirects it out of the shared
+terminal entirely. Configured only in :func:`main`, so importing this
+module in-process (as the tests do) leaves logging inert.
 """
 
 from __future__ import annotations
@@ -56,10 +80,12 @@ import argparse
 import contextlib
 import datetime
 import importlib
+import logging
 import os
 import pkgutil
 import sys
 import threading
+import time
 import typing
 from dataclasses import dataclass
 
@@ -110,11 +136,22 @@ if typing.TYPE_CHECKING:
 _AUTHKEY_ENV_VAR = "MIAINWOODPECKER_AUTHKEY"
 _BACKEND_ENV_VAR = "MIAINWOODPECKER_BACKEND"
 _PLUGINS_ENV_VAR = "MIAINWOODPECKER_HARDWARE_PLUGINS"
-# Test-only hook, honoured by the shutdown handler so the client's SIGTERM
-# fallback can be exercised against a genuinely unresponsive server rather
-# than a mocked-out one. Never set in normal operation; see
+_LOG_LEVEL_ENV_VAR = "MIAINWOODPECKER_DEVICE_LOG_LEVEL"
+_LOG_FILE_ENV_VAR = "MIAINWOODPECKER_DEVICE_LOG_FILE"
+# Test-only hooks, honoured by the shutdown and health handlers so the
+# client's timeout paths can be exercised against a genuinely unresponsive
+# server rather than a mocked-out one. Never set in normal operation; see
 # tests/integration/test_remote_nion.py.
 _WEDGE_SHUTDOWN_ENV_VAR = "MIAINWOODPECKER_WEDGE_SHUTDOWN"
+_WEDGE_HEALTH_ENV_VAR = "MIAINWOODPECKER_WEDGE_HEALTH"
+
+# Named rather than taken from ``__name__``: this module's usual entry
+# point is ``python -m miainwoodpecker.devices.nion_server``, under which
+# ``__name__`` is ``"__main__"`` — a logger name that tells an operator
+# reading interleaved stderr nothing about which program emitted the line,
+# which is the whole problem this logging exists to solve.
+_LOGGER = logging.getLogger("miainwoodpecker.devices.nion_server")
+_DEFAULT_LOG_LEVEL = "WARNING"
 
 _TARGET_NAMES = ("ronchigram_camera", "eels_camera", "scanner", "instrument")
 _DEVICE_TARGET_NAMES = ("ronchigram_camera", "eels_camera", "scanner")
@@ -184,6 +221,11 @@ class NionCamera:
         self._closed = False
 
     @property
+    def is_closed(self) -> bool:
+        """Return whether this device has been released."""
+        return self._closed
+
+    @property
     def camera_id(self) -> str:
         """Return the wrapped device's camera id."""
         return self._device.camera_id
@@ -224,6 +266,11 @@ class NionScanner:
     def __init__(self, scan_device: _DeviceKitScanDevice) -> None:
         self._device = scan_device
         self._closed = False
+
+    @property
+    def is_closed(self) -> bool:
+        """Return whether this device has been released."""
+        return self._closed
 
     @property
     def scanner_id(self) -> str:
@@ -417,6 +464,45 @@ class NionInstrument:
             "controls": list(self.available_controls()),
             "stage_size_nm": self.stage_size_nm(),
         }
+
+    def health(self) -> dict[str, object]:
+        """
+        Answer "is this server alive and working?" without touching any device.
+
+        Deliberately reports only server-process state — pid, uptime,
+        backend, served targets, which devices are still open, whether a
+        shutdown has run. No vendor object is consulted and no device lock
+        is taken, which is what makes this safe to call while an
+        acquisition is in flight *and* meaningful as a liveness probe: the
+        answer cannot be delayed by a long exposure, so a client that
+        waits a bounded time and gets nothing has learned the server is
+        wedged rather than merely busy. Probing the instrument's controls
+        here instead (``available_controls``, a defocus read) would trade
+        that away for information the client already has from
+        ``describe``.
+
+        Returns
+        -------
+        dict[str, object]
+            ``ok``, ``pid``, ``backend``, ``uptime_s``, ``targets``,
+            ``open_devices``, and ``shutting_down`` — all plain data, so
+            it crosses the RPC boundary unchanged.
+        """
+        session = self._session
+        if session is None:
+            # In-process use: nothing is being served, so there is no
+            # session state to report, but "this object is alive" is still
+            # a true and useful answer.
+            return {
+                "ok": True,
+                "pid": os.getpid(),
+                "backend": "",
+                "uptime_s": 0.0,
+                "targets": [],
+                "open_devices": [],
+                "shutting_down": False,
+            }
+        return session.health()
 
     def shutdown(self) -> dict[str, object]:
         """
@@ -656,6 +742,8 @@ def _load_device_plugins(
             continue
         notes.append(f"{module_name}: loaded")
         loaded.append(module)
+    for note in notes:
+        _LOGGER.info("plug-in: %s", note)
     return loaded, notes
 
 
@@ -864,6 +952,7 @@ class _ServerSession:
         self.stop_event = threading.Event()
         self._lock = threading.Lock()
         self._report: dict[str, object] | None = None
+        self._started_monotonic = time.monotonic()
         self.targets: dict[str, object] = {}
         self.writers: dict[str, SharedFrameWriter | None] = {}
         for name, camera in devices.cameras():
@@ -875,6 +964,45 @@ class _ServerSession:
         self.targets["instrument"] = devices.instrument
         self.writers["instrument"] = None
         devices.instrument.bind_session(self)
+
+    def health(self) -> dict[str, object]:
+        """
+        Report this session's liveness as plain data, without touching a device.
+
+        Takes no lock — not even this session's own, which
+        :meth:`park_and_release` holds for the duration of a park. Waiting
+        on it would make the health check block for exactly as long as a
+        slow park, which is precisely the situation the client needs an
+        answer about. ``shutting_down`` conveys that instead, and every
+        field read here is either immutable for the session's life or a
+        single attribute whose torn read is harmless.
+
+        Returns
+        -------
+        dict[str, object]
+            See :meth:`NionInstrument.health`, which is the RPC entry
+            point and documents the fields.
+        """
+        if os.environ.get(_WEDGE_HEALTH_ENV_VAR):
+            # Test hook: behave like a server wedged with its listeners
+            # still bound, so the client's bounded-wait path is exercised
+            # against a genuinely unresponsive server rather than a mock.
+            threading.Event().wait()
+        open_devices = [
+            name
+            for name in _DEVICE_TARGET_NAMES
+            if (device := self.targets.get(name)) is not None
+            and not device.is_closed  # type: ignore[attr-defined]
+        ]
+        return {
+            "ok": True,
+            "pid": os.getpid(),
+            "backend": self.backend,
+            "uptime_s": time.monotonic() - self._started_monotonic,
+            "targets": [name for name in _DEVICE_TARGET_NAMES if name in self.targets],
+            "open_devices": open_devices,
+            "shutting_down": self._report is not None or self.stop_event.is_set(),
+        }
 
     def park_and_release(self) -> dict[str, object]:
         """
@@ -926,6 +1054,22 @@ class _ServerSession:
                 "devices_released": released,
                 "errors": errors,
             }
+            if errors:
+                # Above the default level on purpose: a half-successful
+                # park is the case where the client falls back to SIGTERM,
+                # and its reasons must not need an env var to be seen.
+                _LOGGER.warning(
+                    "shutdown: parked with %d error(s): %s",
+                    len(errors),
+                    "; ".join(errors),
+                )
+            else:
+                _LOGGER.info(
+                    "shutdown: stopped %s, beam_blanked=%s, released %s",
+                    ", ".join(stopped) or "(no cameras)",
+                    blanked,
+                    ", ".join(released),
+                )
             return self._report
 
     def _release_devices(self, errors: list[str]) -> list[str]:
@@ -953,6 +1097,7 @@ class _ServerSession:
 
 def _serve_connection(
     connection: object,
+    name: str,
     target: object,
     writer: SharedFrameWriter | None,
     stop_event: threading.Event,
@@ -960,11 +1105,21 @@ def _serve_connection(
     """
     Handle Calls on one accepted connection until the client disconnects.
 
+    Logging here is deliberately failure-only. A successful call is not
+    logged at all, at any level: the frame path runs through this loop, so
+    even a disabled ``debug()`` call would sit between the client's request
+    and its frame, and §6's shared-memory benchmarks are the standard this
+    must not move.
+
     Parameters
     ----------
     connection : object
         The accepted connection, typed loosely to avoid importing
         ``multiprocessing.connection`` for a type-only reference.
+    name : str
+        This connection's server-side target name, used to attribute log
+        records. Taken from the server's own binding rather than from
+        ``call.target``, which is whatever the client claimed.
     target : object
         The device (or ``NionInstrument``) this connection's calls dispatch to.
     writer : SharedFrameWriter | None
@@ -980,8 +1135,12 @@ def _serve_connection(
             try:
                 call: Call = connection.recv()
             except EOFError:
+                _LOGGER.debug("target %s: client disconnected", name)
                 return
             if not hasattr(target, call.method):
+                _LOGGER.warning(
+                    "target %s: unknown method %r requested", name, call.method,
+                )
                 connection.send(
                     Result(error=f"unknown method {call.method!r} on {call.target!r}"),
                 )
@@ -1011,7 +1170,13 @@ def _serve_connection(
                 # process dies, unlike its threads or anonymous memory.
                 if call.method == "close" and writer is not None:
                     writer.close()
-            except Exception as exc:  # noqa: BLE001 - reported to the client, not raised here
+            except Exception as exc:
+                # The client gets the message; the log gets the traceback,
+                # which is the only place it survives - Result carries a
+                # string, so a stringified error is all that crosses the
+                # boundary. This is the per-call diagnostic the whole
+                # logging setup exists for.
+                _LOGGER.exception("target %s: call %s() raised", name, call.method)
                 connection.send(Result(error=f"{type(exc).__name__}: {exc}"))
             else:
                 connection.send(Result(value=value))
@@ -1024,6 +1189,7 @@ def _serve_connection(
 
 def _accept_loop(
     listener: Listener,
+    name: str,
     target: object,
     writer: SharedFrameWriter | None,
     stop_event: threading.Event,
@@ -1033,11 +1199,13 @@ def _accept_loop(
         try:
             connection = listener.accept()
         except OSError:
+            _LOGGER.debug("target %s: listener closed, no longer accepting", name)
             return  # listener.close() from elsewhere unblocks accept() this way.
+        _LOGGER.info("target %s: accepted a connection", name)
         disable_nagle(connection)
         thread = threading.Thread(
             target=_serve_connection,
-            args=(connection, target, writer, stop_event),
+            args=(connection, name, target, writer, stop_event),
             daemon=True,
         )
         thread.start()
@@ -1076,17 +1244,29 @@ def serve(
     """
     from multiprocessing.connection import Listener as _Listener  # noqa: PLC0415
 
+    _LOGGER.info(
+        "starting: pid=%d backend=%s plugins=%s",
+        os.getpid(),
+        backend,
+        list(plugin_names) or "(autodiscover)",
+    )
     with open_instrument(backend, plugin_names) as devices:
         session = _ServerSession(devices, backend)
         names = list(session.targets)
         listeners = [
             _Listener(("localhost", ports[name]), authkey=authkey) for name in names
         ]
+        _LOGGER.info(
+            "serving %s on ports %s",
+            ", ".join(names),
+            ", ".join(str(ports[name]) for name in names),
+        )
         for listener, name in zip(listeners, names, strict=True):
             thread = threading.Thread(
                 target=_accept_loop,
                 args=(
                     listener,
+                    name,
                     session.targets[name],
                     session.writers[name],
                     session.stop_event,
@@ -1095,8 +1275,25 @@ def serve(
             )
             thread.start()
         session.stop_event.wait()
+        _LOGGER.info("shutdown acknowledged; closing listeners and exiting")
         for listener in listeners:
             listener.close()
+
+
+def _plugins_from_environment() -> list[str]:
+    """
+    Read the comma-separated plug-in list out of the environment.
+
+    Returns
+    -------
+    list[str]
+        Plug-in module names, empty if the variable is unset or blank.
+    """
+    return [
+        name.strip()
+        for name in os.environ.get(_PLUGINS_ENV_VAR, "").split(",")
+        if name.strip()
+    ]
 
 
 def _parse_args(argv: Sequence[str]) -> argparse.Namespace:
@@ -1104,8 +1301,18 @@ def _parse_args(argv: Sequence[str]) -> argparse.Namespace:
     Parse the server's command line.
 
     Ports stay positional, in ``_TARGET_NAMES`` order, as they have been
-    since this module gained a serving loop; the backend selector is a
-    flag defaulting to the environment so a launcher can set it either way.
+    since this module gained a serving loop; the backend selector and the
+    plug-in list are flags falling back to the environment, so a launcher
+    can set either one either way, **with the command line winning**.
+
+    That last part needs code rather than an argparse ``default`` for
+    ``--plugin``, and getting it wrong is silent: ``action="append"``
+    appends to its default rather than replacing it, so seeding the default
+    from ``$MIAINWOODPECKER_HARDWARE_PLUGINS`` made ``--plugin foo`` mean
+    "the environment's plug-ins *and* foo". On a hardware backend that is
+    not a cosmetic difference — it loads vendor plug-ins the operator
+    explicitly did not ask for. So the flag defaults to ``None`` and the
+    environment is consulted afterwards, only when nothing was passed.
 
     Parameters
     ----------
@@ -1137,19 +1344,74 @@ def _parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser.add_argument(
         "--plugin",
         action="append",
-        default=[
-            name
-            for name in os.environ.get(_PLUGINS_ENV_VAR, "").split(",")
-            if name
-        ],
+        default=None,  # see this function's docstring: append() adds to its default
         metavar="MODULE",
         help=(
             "nionswift_plugin module providing hardware devices; repeatable. "
-            f"Defaults to ${_PLUGINS_ENV_VAR} (comma separated), else "
-            "autodiscovery."
+            f"If not given at all, falls back to ${_PLUGINS_ENV_VAR} (comma "
+            "separated); if neither, autodiscovery. Passing this overrides "
+            "the environment rather than adding to it."
         ),
     )
-    return parser.parse_args(list(argv))
+    arguments = parser.parse_args(list(argv))
+    if arguments.plugin is None:
+        arguments.plugin = _plugins_from_environment()
+    return arguments
+
+
+def _configure_logging() -> None:
+    """
+    Attach this process's log handler, quiet by default.
+
+    Called only from :func:`main`, never at import: a library that
+    configures logging on import steals the decision from whoever imported
+    it, and this module *is* imported in-process by its own tests.
+
+    Two things the default format buys, both of which the plain inherited
+    stderr this replaces did not have: the pid, so a server's lines can be
+    told from the application's in one interleaved terminal, and the logger
+    name, so they can be told from any other library's.
+    ``MIAINWOODPECKER_DEVICE_LOG_FILE`` avoids the interleaving entirely by
+    sending the log somewhere else; a path that cannot be opened falls back
+    to stderr with a warning rather than taking the server down over its
+    own diagnostics.
+    """
+    level_name = os.environ.get(_LOG_LEVEL_ENV_VAR, _DEFAULT_LOG_LEVEL).upper()
+    level = logging.getLevelNamesMapping().get(level_name)
+    handler: logging.Handler | None = None
+    log_path = os.environ.get(_LOG_FILE_ENV_VAR)
+    open_error: OSError | None = None
+    if log_path:
+        try:
+            handler = logging.FileHandler(log_path, encoding="utf-8")
+        except OSError as error:
+            open_error = error
+    if handler is None:
+        handler = logging.StreamHandler(sys.stderr)
+    handler.setFormatter(
+        logging.Formatter(
+            fmt="%(asctime)s %(levelname)s [nion_server pid=%(process)d] "
+                "%(name)s: %(message)s",
+        ),
+    )
+    _LOGGER.handlers.clear()
+    _LOGGER.addHandler(handler)
+    _LOGGER.propagate = False
+    _LOGGER.setLevel(level if level is not None else logging.WARNING)
+    if level is None:
+        _LOGGER.warning(
+            "%s=%r is not a logging level name; using %s",
+            _LOG_LEVEL_ENV_VAR,
+            level_name,
+            _DEFAULT_LOG_LEVEL,
+        )
+    if open_error is not None:
+        _LOGGER.warning(
+            "cannot write %s=%r (%s); logging to stderr instead",
+            _LOG_FILE_ENV_VAR,
+            log_path,
+            open_error,
+        )
 
 
 def main(argv: Sequence[str] | None = None) -> None:
@@ -1174,6 +1436,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         nothing attached, so it exits with a message rather than a
         traceback.
     """
+    _configure_logging()
     arguments = _parse_args(argv if argv is not None else sys.argv[1:])
     ports = dict(zip(_TARGET_NAMES, arguments.ports, strict=True))
     authkey = bytes.fromhex(os.environ[_AUTHKEY_ENV_VAR])
@@ -1181,10 +1444,12 @@ def main(argv: Sequence[str] | None = None) -> None:
         serve(ports, authkey, backend=arguments.backend, plugin_names=arguments.plugin)
     except HardwareNotAvailableError as error:
         # The expected failure on a machine with no instrument attached, so
-        # it gets its own message on stderr rather than a traceback. stderr
-        # is inherited by whoever launched this, which is how the operator
-        # actually sees it - the client only learns that the process died.
-        sys.stderr.write(f"{type(error).__name__}: {error}\n")
+        # it gets a message rather than a traceback. Logged at ERROR so it
+        # is visible at the default level, and so it follows
+        # MIAINWOODPECKER_DEVICE_LOG_FILE if the operator redirected the
+        # log - the client only ever learns that the process died with
+        # status 2, so this text is the whole diagnostic.
+        _LOGGER.error("%s: %s", type(error).__name__, error)  # noqa: TRY400 - a traceback adds nothing here
         raise SystemExit(NO_HARDWARE_EXIT_STATUS) from error
 
 

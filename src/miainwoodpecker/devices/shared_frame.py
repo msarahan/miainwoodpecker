@@ -37,6 +37,21 @@ see :mod:`miainwoodpecker.devices.remote`'s teardown for why that method
 is now called explicitly rather than relying on the server process being
 killed.
 
+That leaves the case no writer-side discipline can cover, and measuring it
+corrected the expectation. A ``SIGKILL``-ed server runs no cleanup of its
+own — but ``multiprocessing``'s ``resource_tracker`` is a *separate child
+process*, it auto-registers every segment created here (the same
+auto-registration the warning note below is about), and it unlinks
+everything it holds when the server's end of its pipe closes. So killing
+the server alone leaks nothing. Measured, not assumed — and it is a
+CPython implementation detail rather than a guarantee, which fails
+precisely when the tracker dies alongside the server: a process-group
+kill, a cgroup OOM kill, a container stop.
+:meth:`SharedFrameReader.unlink_orphan` is the client-side mitigation for
+that case — the reader remembers the names it attached to and can unlink
+them once the writer's process is confirmed dead — and its docstring is
+explicit about the narrow window even that cannot reach.
+
 MIT, no ``nion.*`` import — used by both
 :mod:`miainwoodpecker.devices.nion_server` and
 :mod:`miainwoodpecker.devices.remote`.
@@ -44,6 +59,7 @@ MIT, no ``nion.*`` import — used by both
 
 from __future__ import annotations
 
+import contextlib
 import os
 import threading
 import typing
@@ -180,10 +196,19 @@ class SharedFrameWriter:
 
 
 class SharedFrameReader:
-    """Client-side: read frames from a writer's reused, possibly-resized segment."""
+    """
+    Client-side: read frames from a writer's reused, possibly-resized segment.
+
+    Remembers the name of the last segment it attached to even after
+    detaching, which is not bookkeeping for its own sake: it is the only
+    thing that makes :meth:`unlink_orphan` possible after the writer's
+    process has been hard-killed. See that method for the ownership
+    exception it represents.
+    """
 
     def __init__(self) -> None:
         self._segment: shared_memory.SharedMemory | None = None
+        self._last_name: str | None = None
 
     def read(self, reference: SharedFrameRef) -> Frame:
         """
@@ -203,6 +228,7 @@ class SharedFrameReader:
             if self._segment is not None:
                 self._segment.close()  # detach only: the writer owns unlink()
             self._segment = shared_memory.SharedMemory(name=reference.shm_name)
+            self._last_name = reference.shm_name
         view = np.ndarray(
             reference.shape,
             dtype=np.dtype(reference.dtype),
@@ -220,3 +246,57 @@ class SharedFrameReader:
         if self._segment is not None:
             self._segment.close()
             self._segment = None
+
+    def unlink_orphan(self) -> str | None:
+        """
+        Detach and *unlink* the last segment, for a writer that died uncleanly.
+
+        A deliberate, narrow exception to this module's ownership rule
+        (the writer creates, resizes, and unlinks; the reader only ever
+        attaches and detaches). The rule exists because the writer keeps
+        recreating the segment, so the reader must not pull it out from
+        under a live writer. That premise fails in exactly one situation:
+        the writer's *process* is gone. A named POSIX segment is a tmpfs
+        entry rather than a process resource, so it persists until
+        something unlinks it by name — and after the writer is dead, the
+        reader holds the only remaining record of those names.
+
+        Usually something else gets there first: the writer's
+        ``resource_tracker`` child survives a ``SIGKILL`` of the server and
+        cleans up on its behalf (see this module's header). This method is
+        for when it does not — the tracker killed alongside the server, as
+        a process-group or cgroup OOM kill does.
+
+        ``shm_unlink`` needs the name and filesystem permission, not
+        creator identity, so this genuinely reclaims the segment. It is
+        only sound to call once the writer's process has been confirmed
+        dead; :mod:`miainwoodpecker.devices.remote`'s teardown is the only
+        caller and checks ``Popen.returncode`` first.
+
+        Note what this cannot cover, which is a real residual limitation
+        rather than an oversight: a segment the writer created but whose
+        name never reached this reader (killed between ``shm_open`` and
+        the reply carrying its :class:`SharedFrameRef`) is unrecoverable
+        from here, because nothing on this side ever learned its name.
+
+        Returns
+        -------
+        str | None
+            The name unlinked, or ``None`` if this reader never attached
+            to a segment.
+        """
+        name = self._last_name
+        self.close()
+        if name is None:
+            return None
+        self._last_name = None
+        try:
+            segment = shared_memory.SharedMemory(name=name)
+        except FileNotFoundError:
+            # Already gone: the writer got to unlink it after all (a
+            # graceful shutdown, or the per-device close() fallback).
+            return name
+        segment.close()
+        with contextlib.suppress(FileNotFoundError):
+            segment.unlink()
+        return name

@@ -131,9 +131,31 @@ class RemoteCallTimeoutError(RemoteCallError):
     The connection is left **poisoned**: the request was sent, so a reply
     may still arrive later and would be mistaken for the answer to the
     *next* call on the same connection. Anything that catches this must
-    stop using the connection. The only caller today is
-    :mod:`miainwoodpecker.devices.remote`'s shutdown handshake, which is
-    about to kill the server process anyway.
+    stop using the connection. Both callers today
+    (:mod:`miainwoodpecker.devices.remote`'s shutdown handshake and its
+    health check) honour that — the first is about to kill the server
+    process anyway, and the second retires its own dedicated connection.
+    """
+
+
+class RemoteConnectionLostError(RemoteCallError):
+    """
+    Raised client-side when the connection broke around a :class:`Call`.
+
+    Exists because the raw symptom is unhelpful: a device server that dies
+    mid-call leaves the client's ``connection.recv()`` raising a bare
+    ``EOFError`` with no message, no indication of which target was being
+    called, and nothing to distinguish "the server process is gone" from
+    a bug in this code. This names the call and the underlying socket
+    error instead; :mod:`miainwoodpecker.devices.remote` re-raises it with
+    the server process's exit status added, since only the client-side
+    owner of the subprocess can look that up.
+
+    A subclass of :class:`RemoteCallError` for the same reason
+    :class:`RemoteCallTimeoutError` is — "the call did not succeed" needs
+    only one ``except`` clause — but worth catching separately when the
+    distinction matters, because this one means the session is over
+    rather than that one call failed.
     """
 
 
@@ -175,16 +197,32 @@ def send_call(
         If the call raised on the server side.
     RemoteCallTimeoutError
         If ``timeout_s`` elapsed with no reply.
+    RemoteConnectionLostError
+        If the connection broke while sending the call or awaiting its
+        reply — which is what a device server dying mid-call looks like
+        from here.
     """
     with lock:
-        connection.send(call)
-        if timeout_s is not None and not connection.poll(timeout_s):
+        try:
+            connection.send(call)
+            if timeout_s is not None and not connection.poll(timeout_s):
+                msg = (
+                    f"remote call {call.target}.{call.method}() did not reply "
+                    f"within {timeout_s}s"
+                )
+                raise RemoteCallTimeoutError(msg)
+            result = connection.recv()
+        except (EOFError, OSError) as error:
+            # EOFError is what recv() raises when the peer's socket closed,
+            # which for a subprocess means "it died"; OSError covers the
+            # send side (a broken pipe) and an already-closed connection.
+            # Both arrive with no message at all, hence the wrapping.
+            detail = str(error) or type(error).__name__
             msg = (
-                f"remote call {call.target}.{call.method}() did not reply "
-                f"within {timeout_s}s"
+                f"remote call {call.target}.{call.method}() lost its "
+                f"connection to the device server ({detail})"
             )
-            raise RemoteCallTimeoutError(msg)
-        result = connection.recv()
+            raise RemoteConnectionLostError(msg) from error
     if result.error is not None:
         msg = f"remote call {call.target}.{call.method}() failed: {result.error}"
         raise RemoteCallError(msg)
