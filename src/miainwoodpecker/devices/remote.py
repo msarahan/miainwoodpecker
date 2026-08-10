@@ -12,15 +12,20 @@ module, and by extension on Nion hardware, without the running
 application ever linking GPL-3.0 code into its own process (see
 docs/migration-plan.md, §6).
 
-Process lifecycle: the server is torn down with ``Popen.terminate()``
-(SIGTERM) rather than a graceful RPC shutdown handshake. That is
-sufficient here because the *process* being killed, not the interpreter
-reaching normal shutdown, is what reclaims its threads and sockets — the
-"un-closed camera thread hangs the process" failure mode from Phase 0
-only applies to an interpreter trying to exit on its own; it does not
-apply to the OS tearing the whole process down from outside. A real
-hardware backend would likely need a graceful path instead, to park the
-instrument safely; simulated hardware has no such requirement.
+Process lifecycle: ``remote_simulated_instrument()`` explicitly calls
+``.close()`` on each device before terminating the server subprocess.
+That call matters more than it looks: it is what triggers the server's
+``SharedFrameWriter`` to ``unlink()`` that device's reused shared-memory
+segment (see :mod:`miainwoodpecker.devices.shared_frame`). Unlike a
+thread or a socket, a named POSIX shared-memory segment is *not*
+reclaimed when the process that created it dies — ``Popen.terminate()``
+alone would leak one segment per device that ever crossed the
+shared-memory threshold, silently, in ``/dev/shm``, surviving even a
+restart of this application. The subprocess is still hard-terminated
+afterwards as a backstop (e.g. if a `.close()` call itself fails), which
+remains fine for everything *except* those segments - threads and
+sockets really are reclaimed by the OS killing the process; shared
+memory segments are the one resource that specifically is not.
 """
 
 from __future__ import annotations
@@ -36,11 +41,8 @@ import time
 import typing
 from dataclasses import dataclass
 
-from miainwoodpecker.devices.rpc import Call, send_call
-from miainwoodpecker.devices.shared_frame import (
-    SharedFrameRef,
-    read_frame_from_shared_memory,
-)
+from miainwoodpecker.devices.rpc import Call, disable_nagle, send_call
+from miainwoodpecker.devices.shared_frame import SharedFrameReader, SharedFrameRef
 
 if typing.TYPE_CHECKING:
     from collections.abc import Iterator
@@ -66,11 +68,14 @@ def _connect_with_retry(port: int, authkey: bytes, deadline: float) -> Connectio
 
     while True:
         try:
-            return Client(("localhost", port), authkey=authkey)
+            connection = Client(("localhost", port), authkey=authkey)
         except (ConnectionRefusedError, OSError):
             if time.monotonic() > deadline:
                 raise
             time.sleep(0.02)
+        else:
+            disable_nagle(connection)
+            return connection
 
 
 class RemoteCamera:
@@ -80,6 +85,7 @@ class RemoteCamera:
         self._connection = connection
         self._target = target
         self._lock = threading.Lock()
+        self._reader = SharedFrameReader()
 
     def _call(self, method: str, *args: object, **kwargs: object) -> object:
         return send_call(
@@ -105,12 +111,13 @@ class RemoteCamera:
         """Return the next available frame from the remote device."""
         result = self._call("acquire_frame")
         if isinstance(result, SharedFrameRef):
-            return read_frame_from_shared_memory(result)
+            return self._reader.read(result)
         return typing.cast("Frame", result)
 
     def close(self) -> None:
-        """Release the remote device."""
+        """Release the remote device and detach from its shared segment."""
         self._call("close")
+        self._reader.close()
 
 
 class RemoteScanner:
@@ -120,6 +127,7 @@ class RemoteScanner:
         self._connection = connection
         self._target = target
         self._lock = threading.Lock()
+        self._reader = SharedFrameReader()
 
     def _call(self, method: str, *args: object, **kwargs: object) -> object:
         return send_call(
@@ -142,12 +150,13 @@ class RemoteScanner:
         """Scan and return a single frame from the remote device."""
         result = self._call("scan_frame", parameters, channel)
         if isinstance(result, SharedFrameRef):
-            return read_frame_from_shared_memory(result)
+            return self._reader.read(result)
         return typing.cast("Frame", result)
 
     def close(self) -> None:
-        """Release the remote device."""
+        """Release the remote device and detach from its shared segment."""
         self._call("close")
+        self._reader.close()
 
 
 @dataclass(frozen=True)
@@ -219,14 +228,27 @@ def remote_simulated_instrument() -> Iterator[RemoteSimulatedInstrument]:
             ),
         )
 
-        yield RemoteSimulatedInstrument(
-            ronchigram_camera=RemoteCamera(
-                connections["ronchigram_camera"], "ronchigram_camera",
-            ),
-            eels_camera=RemoteCamera(connections["eels_camera"], "eels_camera"),
-            scanner=RemoteScanner(connections["scanner"], "scanner"),
-            stage_size_nm=stage_size_nm,
+        ronchigram_camera = RemoteCamera(
+            connections["ronchigram_camera"], "ronchigram_camera",
         )
+        eels_camera = RemoteCamera(connections["eels_camera"], "eels_camera")
+        scanner = RemoteScanner(connections["scanner"], "scanner")
+        try:
+            yield RemoteSimulatedInstrument(
+                ronchigram_camera=ronchigram_camera,
+                eels_camera=eels_camera,
+                scanner=scanner,
+                stage_size_nm=stage_size_nm,
+            )
+        finally:
+            # Load-bearing, not just polite: each close() tells the server to
+            # unlink() that device's reused shared-memory segment. Skipping
+            # this and only terminating the subprocess would leak one
+            # /dev/shm segment per device that ever crossed the
+            # shared-memory threshold - see this module's docstring.
+            for device in (ronchigram_camera, eels_camera, scanner):
+                with contextlib.suppress(Exception):
+                    device.close()
     finally:
         for connection in connections.values():
             with contextlib.suppress(Exception):

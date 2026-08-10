@@ -318,24 +318,61 @@ overhead was negligible at 0.1MB (+0.7ms) but grew to +74% at 2.1MB
 (+7.4ms) and more than doubled total latency at 33.6MB (+168ms on a
 163ms baseline) — squarely the size range real detector data lives in.
 
-Fix: [`src/miainwoodpecker/devices/shared_frame.py`](../src/miainwoodpecker/devices/shared_frame.py)
-copies a `Frame`'s array into a `multiprocessing.shared_memory` segment
-instead of pickling it; the wire message becomes a small `SharedFrameRef`
-(name/shape/dtype), and the client does one memcpy out of shared memory
-instead of a serialize/deserialize pass plus a socket copy. This is
-*not* uniformly better, though — it has real fixed per-call cost
-(shm_open/mmap/munmap/close/unlink, twice each), which made it measurably
-*worse* than plain pickling at 2.1MB (+17.6ms vs. +7.4ms) before it was
-gated by size. `nion_server.py` only routes `Frame` results through
-shared memory above `_SHARED_MEMORY_THRESHOLD_BYTES` (8MB currently); the
-exact crossover is noisier than that number suggests — one probe near
-8MB measured *more* overhead than a larger one near 19MB, almost
-certainly cold-subprocess/paging variance rather than a real
-non-monotonic effect, since the benchmark launches a fresh subprocess per
-size. 8MB is a deliberately conservative choice given that noise, not a
-precisely fitted one; worth revisiting with a less noisy methodology
-(many frames per warm subprocess, per size) if a size in the disputed
-middle range turns out to matter in practice.
+First fix (superseded below): [`src/miainwoodpecker/devices/shared_frame.py`](../src/miainwoodpecker/devices/shared_frame.py)
+copied a `Frame`'s array into a fresh `multiprocessing.shared_memory`
+segment per frame instead of pickling it — but creating and destroying a
+named POSIX segment is its own syscall pair (shm_open/mmap, then
+munmap/close/unlink), paid on *every* frame, and that fixed cost made it
+measurably *worse* than plain pickling at 2.1MB (+17.6ms vs. +7.4ms)
+before it was gated by size.
+
+**Second fix, checked against the same benchmark rather than assumed
+better**: `SharedFrameWriter`/`SharedFrameReader` now reuse *one*
+persistent segment per source, resized only when the frame's shape/dtype
+actually changes, instead of one-shot per frame. Reuse is safe without
+double-buffering specifically because `rpc.py`'s protocol is strictly
+synchronous request/response — the server cannot start writing frame
+N+1 until it receives the client's next `Call`, which the client only
+sends after it has already copied frame N out, so the two sides are
+never touching the buffer at once. Result: pickle and shared memory are
+within noise of each other from ~30KB to ~500KB (both +0.3–0.5ms over a
+direct in-process call), and shared memory pulls smoothly ahead above
+that — +2.8ms at 2.1MB, +9.5ms at 8.4MB, +25ms at 33.6MB, versus the
+one-shot design's +72ms or naive pickle's +168ms at that same largest
+size. `_SHARED_MEMORY_THRESHOLD_BYTES` (64KB) sits in the
+"doesn't matter much either way" band this measured, so it's kept
+rather than tuned further — the earlier "revisit the exact crossover"
+open item is resolved by the redesign, not by finding a better number
+for the old one.
+
+Reuse creates a real correctness obligation the one-shot design didn't
+have: a named POSIX segment is *not* reclaimed when its creating process
+dies (unlike its threads or its anonymous memory) — it is a persistent
+tmpfs entry until explicitly `unlink()`-ed. The one-shot design was
+already leak-safe under `Popen.terminate()`, because the *reader*
+unlinked immediately after every single read, and readers are ordinary
+long-running processes that get to run their own cleanup normally. A
+reused, writer-owned segment is not: `remote.py`'s teardown now
+explicitly calls `.close()` on each device (triggering the server's
+`SharedFrameWriter.close()` → `unlink()`) *before* terminating the
+subprocess, rather than relying on the hard kill alone. Verified with a
+dedicated leak test (`test_no_shared_memory_segments_leak_after_teardown`)
+that snapshots `/dev/shm` before and after a full spawn-to-teardown
+session and asserts nothing new remains.
+
+**A third, unrelated bug the same benchmark surfaced**: two scan sizes
+among eleven tested (64×64 and 90×90, both on the plain-pickle path)
+showed a strikingly consistent ~44ms stall — p95 within 0.2ms of the
+median, not the shape ordinary scheduling noise produces. 44ms is close
+enough to Linux's ~40ms delayed-ACK timer to be the signature of Nagle's
+algorithm and the receiver's delayed ACK waiting on each other.
+Confirmed directly: a plain `multiprocessing.connection` socket pair has
+`TCP_NODELAY` unset on both ends by default. `rpc.disable_nagle()` sets
+it on every connection either side opens, not just the two sizes that
+happened to reproduce the stall in one run — Nagle/delayed-ACK
+interactions are inherently data-pattern-dependent, which is exactly why
+only 2 of 11 tested sizes hit it. Confirmed fixed: both anomalous sizes
+dropped to +0.4ms after the change.
 
 One stdlib wart surfaced along the way and is worth recording: each
 process's `resource_tracker` auto-registers any `SharedMemory` handle it

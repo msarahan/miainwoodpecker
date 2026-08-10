@@ -246,3 +246,6 @@ _version.py
 
 # IDEs and editors
 .vscode/
+
+# Claude Code local state (e.g. agent worktrees) — never project content
+.claude/

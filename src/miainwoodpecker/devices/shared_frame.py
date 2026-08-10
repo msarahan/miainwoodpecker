@@ -1,5 +1,5 @@
 """
-Cross-process frame transfer via shared memory, not pickle-over-socket.
+Cross-process frame transfer via a reused shared memory segment.
 
 Benchmarked need (``scripts/ipc_overhead_benchmark.py``): pickling a
 :class:`~miainwoodpecker.devices.interface.Frame` through
@@ -9,20 +9,33 @@ negligible for a 128x128 scan (+0.7ms) but added 74% at 512x512 (+7.4ms)
 and more than doubled total latency at 2048x2048 (+168ms on a 163ms
 baseline) — squarely the size range real detector data lives in.
 
-:func:`write_frame_to_shared_memory` (server side) copies a frame's array
-into a named OS-backed shared memory segment and returns a small
-:class:`SharedFrameRef` in its place — that reference is what actually
-crosses the small control connection.
-:func:`read_frame_from_shared_memory` (client side) attaches to that
-segment, copies the data into a private array it owns, and releases the
-segment. One memcpy replaces a serialize/deserialize pass plus a socket
-copy.
+A first version (create a fresh segment per frame) fixed the large-frame
+case but was *worse* than plain pickling at 2.1MB: creating and
+destroying a named POSIX segment is its own syscall pair
+(shm_open/mmap, then munmap/close/unlink), paid on every single frame,
+and that fixed cost dominates at moderate sizes.
 
-Ownership is deliberately simple rather than a persistent ring buffer: a
-fresh segment per frame, created and detached (not destroyed) by the
-server, then attached, copied, and destroyed by the client. Simple to
-reason about; a create/destroy syscall pair per frame is the cost this
-trades for.
+This version instead reuses one persistent segment per source
+(:class:`SharedFrameWriter` server-side, :class:`SharedFrameReader`
+client-side), paying that setup cost once instead of per frame. Reuse is
+safe without double-buffering specifically because the RPC protocol in
+:mod:`miainwoodpecker.devices.rpc` is strictly synchronous request/response:
+the server cannot start writing frame N+1 until it receives the client's
+next :class:`~miainwoodpecker.devices.rpc.Call`, which the client only
+sends after it has already copied frame N out. There is never a moment
+where both sides are touching the buffer at once.
+
+Ownership: unlike a one-shot segment (which the reader could safely
+destroy immediately after copying out), a *reused* segment must be
+destroyed by whoever keeps recreating it - the writer - once it is
+retired (resized, or the source closes), not by the reader on every read.
+Named POSIX shared memory segments are not reclaimed when a process
+dies (unlike its threads or its anonymous memory): they are persistent
+tmpfs entries until explicitly ``unlink()``-ed. This makes the writer's
+:meth:`SharedFrameWriter.close` genuinely load-bearing, not a nicety -
+see :mod:`miainwoodpecker.devices.remote`'s teardown for why that method
+is now called explicitly rather than relying on the server process being
+killed.
 
 MIT, no ``nion.*`` import — used by both
 :mod:`miainwoodpecker.devices.nion_server` and
@@ -32,6 +45,7 @@ MIT, no ``nion.*`` import — used by both
 from __future__ import annotations
 
 import os
+import threading
 import typing
 from dataclasses import dataclass
 from multiprocessing import shared_memory
@@ -45,26 +59,19 @@ if typing.TYPE_CHECKING:
 
 # Every SharedMemory handle - created or attached by name - auto-registers
 # with *this process's* resource_tracker, which tries to unlink it again at
-# exit. We manage each segment's lifecycle explicitly (server creates and
-# closes; client attaches, copies, closes, and unlinks), so that automatic
-# cleanup only ever finds the segment already gone and warns.
+# exit. We manage each segment's lifecycle explicitly (the writer creates,
+# resizes, and unlinks; the reader only ever attaches and detaches), so that
+# automatic cleanup only ever finds the segment already gone (or, now that
+# segments are reused rather than one-shot, still legitimately in use by its
+# writer) and warns.
 #
-# Two things that do NOT fix this, tried first: a `warnings.filterwarnings`
-# call here only touches this interpreter's own filter state, but the
-# warning is `warnings.warn()`-ed inside the resource_tracker daemon's own
-# separate process, so it's invisible to that call entirely. And the
-# documented `resource_tracker.unregister()` workaround assumes
-# register/unregister land on the same tracker daemon, which is true within
-# one multiprocessing.Process tree but not here: server and client are
-# independent subprocess.Popen processes, each with their own daemon, so
-# unregister() reached a daemon that never registered that name and crashed
-# its main loop with a KeyError instead of merely warning.
-#
-# What does work: PYTHONWARNINGS is read by *every* interpreter at its own
-# startup, including the tracker daemon's (it's forked+exec'd, which
-# inherits the environment). Setting it here, before any SharedMemory use
-# in this process, suppresses the client side; remote.py sets the same
-# variable in the server subprocess's env for the same reason on that side.
+# The documented workaround (resource_tracker.unregister on the segment's
+# name) was tried and made things worse: writer and reader are independent
+# subprocess.Popen processes, each with their own resource_tracker daemon,
+# and unregister() can land on a daemon that never registered that name,
+# crashing its main loop with a KeyError instead of merely warning.
+# PYTHONWARNINGS, read by every interpreter at its own startup including a
+# forked+exec'd tracker daemon, is what actually works.
 os.environ.setdefault(
     "PYTHONWARNINGS",
     "ignore:resource_tracker:UserWarning:multiprocessing.resource_tracker",
@@ -74,7 +81,7 @@ os.environ.setdefault(
 @dataclass(frozen=True)
 class SharedFrameRef:
     """
-    A reference to a frame's array living in shared memory.
+    A reference to a frame's array living in a (possibly reused) shared segment.
 
     Attributes
     ----------
@@ -97,63 +104,119 @@ class SharedFrameRef:
     metadata: typing.Mapping[str, typing.Any]
 
 
-def write_frame_to_shared_memory(frame: Frame) -> SharedFrameRef:
+class SharedFrameWriter:
     """
-    Copy a frame's array into a new shared memory segment.
+    Server-side: publish frames into one reused, resized-on-demand segment.
 
-    Parameters
-    ----------
-    frame : Frame
-        The frame to publish.
-
-    Returns
-    -------
-    SharedFrameRef
-        A reference the reader can use to retrieve the array.
+    Not shared between threads concurrently in this project (each RPC
+    target is served by exactly one connection's handler thread at a
+    time), but guarded by a lock anyway - the cost is negligible and it
+    turns a latent concurrency bug into a well-defined one if that
+    assumption ever stops holding.
     """
-    data = np.ascontiguousarray(frame.data)
-    segment = shared_memory.SharedMemory(create=True, size=max(data.nbytes, 1))
-    try:
-        destination = np.ndarray(data.shape, dtype=data.dtype, buffer=segment.buf)
-        destination[:] = data
-    finally:
-        segment.close()  # detach this process's mapping; the segment persists
-    return SharedFrameRef(
-        shm_name=segment.name,
-        shape=data.shape,
-        dtype=str(data.dtype),
-        timestamp=frame.timestamp,
-        metadata=frame.metadata,
-    )
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._segment: shared_memory.SharedMemory | None = None
+        self._shape: tuple[int, ...] | None = None
+        self._dtype: np.dtype | None = None
+
+    def publish(self, frame: Frame) -> SharedFrameRef:
+        """
+        Copy a frame's array into the reused segment, resizing if needed.
+
+        Parameters
+        ----------
+        frame : Frame
+            The frame to publish.
+
+        Returns
+        -------
+        SharedFrameRef
+            A reference the reader can use to retrieve the array. Its
+            ``shm_name`` is stable across calls until a resize forces a
+            new segment.
+        """
+        data = np.ascontiguousarray(frame.data)
+        with self._lock:
+            if (
+                self._segment is None
+                or self._shape != data.shape
+                or self._dtype != data.dtype
+            ):
+                self._replace_segment(data.nbytes)
+                self._shape = data.shape
+                self._dtype = data.dtype
+            assert self._segment is not None  # noqa: S101 - just created above
+            destination = np.ndarray(
+                data.shape, dtype=data.dtype, buffer=self._segment.buf,
+            )
+            destination[:] = data
+            shm_name = self._segment.name
+        return SharedFrameRef(
+            shm_name=shm_name,
+            shape=data.shape,
+            dtype=str(data.dtype),
+            timestamp=frame.timestamp,
+            metadata=frame.metadata,
+        )
+
+    def _replace_segment(self, size: int) -> None:
+        """Destroy the current segment, if any, and create a right-sized one."""
+        if self._segment is not None:
+            self._segment.close()
+            self._segment.unlink()
+        self._segment = shared_memory.SharedMemory(create=True, size=max(size, 1))
+
+    def close(self) -> None:
+        """Destroy the current segment, if any. Call when the source closes."""
+        with self._lock:
+            if self._segment is not None:
+                self._segment.close()
+                self._segment.unlink()
+                self._segment = None
+                self._shape = None
+                self._dtype = None
 
 
-def read_frame_from_shared_memory(reference: SharedFrameRef) -> Frame:
-    """
-    Copy a referenced frame's array out of shared memory and release it.
+class SharedFrameReader:
+    """Client-side: read frames from a writer's reused, possibly-resized segment."""
 
-    Parameters
-    ----------
-    reference : SharedFrameRef
-        A reference returned by :func:`write_frame_to_shared_memory`.
+    def __init__(self) -> None:
+        self._segment: shared_memory.SharedMemory | None = None
 
-    Returns
-    -------
-    Frame
-        The frame, with its own private copy of the array.
-    """
-    segment = shared_memory.SharedMemory(name=reference.shm_name)
-    try:
+    def read(self, reference: SharedFrameRef) -> Frame:
+        """
+        Copy a referenced frame's array out of the writer's shared segment.
+
+        Parameters
+        ----------
+        reference : SharedFrameRef
+            A reference returned by :meth:`SharedFrameWriter.publish`.
+
+        Returns
+        -------
+        Frame
+            The frame, with its own private copy of the array.
+        """
+        if self._segment is None or self._segment.name != reference.shm_name:
+            if self._segment is not None:
+                self._segment.close()  # detach only: the writer owns unlink()
+            self._segment = shared_memory.SharedMemory(name=reference.shm_name)
         view = np.ndarray(
             reference.shape,
             dtype=np.dtype(reference.dtype),
-            buffer=segment.buf,
+            buffer=self._segment.buf,
         )
         owned = view.copy()
-    finally:
-        segment.close()
-        segment.unlink()
-    return Frame(
-        data=owned,
-        timestamp=reference.timestamp,
-        metadata=reference.metadata,
-    )
+        return Frame(
+            data=owned,
+            timestamp=reference.timestamp,
+            metadata=reference.metadata,
+        )
+
+    def close(self) -> None:
+        """Detach from the current segment, if any. Never unlinks it."""
+        if self._segment is not None:
+            self._segment.close()
+            self._segment = None
