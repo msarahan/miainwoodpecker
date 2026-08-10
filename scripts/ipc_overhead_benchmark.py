@@ -80,7 +80,7 @@ def _time_scan(scanner: object, parameters: ScanParameters, frames: int) -> list
 def main() -> None:
     """Run the direct vs. IPC comparison and print a verdict."""
     frames = 20
-    scan_sizes = (128, 512, 1024, 1536, 2048)
+    scan_sizes = (32, 64, 90, 128, 181, 256, 362, 512, 1024, 1536, 2048)
 
     print("camera (Ronchigram, 2048x2048 float32 = ~16.8MB/frame):")
     with local_instrument() as local:

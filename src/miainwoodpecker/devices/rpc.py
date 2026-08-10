@@ -21,12 +21,54 @@ one result shape, dispatch by looking up ``target`` then ``getattr`` for
 
 from __future__ import annotations
 
+import socket
 import typing
 from dataclasses import dataclass, field
 
 if typing.TYPE_CHECKING:
     import threading
     from multiprocessing.connection import Connection
+
+
+def disable_nagle(connection: Connection) -> None:
+    """
+    Disable Nagle's algorithm (set ``TCP_NODELAY``) on a connection's socket.
+
+    Measured with ``scripts/ipc_overhead_benchmark.py``: two scan sizes
+    among eleven tested (64x64 and 90x90, both on the plain-pickle path)
+    showed a strikingly consistent ~44ms overhead spike - p95 within
+    0.2ms of the median, not the kind of spread ordinary scheduling noise
+    produces. 44ms is close enough to Linux's ~40ms delayed-ACK timer to
+    be the signature of Nagle's algorithm (buffer a small write, hoping to
+    coalesce it with the next one) interacting with the receiver's
+    delayed ACK (wait, hoping to piggyback the ACK on outgoing data) -
+    each waiting on the other. Confirmed directly: a plain
+    ``multiprocessing.connection.Listener``/``Client`` pair has
+    ``TCP_NODELAY`` unset (0) on both ends by default; this module does
+    not do it for you. The exact message sizes/timing that trigger it are
+    inherently data-pattern-dependent (that unpredictability is what
+    Nagle+delayed-ACK stalls are known for), so this is applied to every
+    connection this project opens, not just the sizes that happened to
+    reproduce it in one benchmark run.
+
+    Parameters
+    ----------
+    connection : Connection
+        A connection returned by ``Client(...)`` or ``Listener.accept()``.
+        Must be a real socket (``AF_INET``/``AF_UNIX``); silently a no-op
+        for other families (e.g. Windows named pipes, which don't have
+        this concept and don't need it).
+    """
+    try:
+        raw = socket.socket(fileno=connection.fileno())
+    except (OSError, ValueError):
+        return
+    try:
+        raw.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    except OSError:
+        pass
+    finally:
+        raw.detach()  # we don't own this fd; multiprocessing.connection does
 
 
 @dataclass(frozen=True)
