@@ -1,5 +1,21 @@
 # miainwoodpecker
 
+## What's in the name?
+
+This project name goes back to my (@msarahan) time first at SuperSTEM, working
+with Iain Godfrey on some instrument control electronics. It is a play on "Nion"
+which is a portmanteau of Niklas Delby and Ondrej Krivanek, founders of that
+microscope company (acquired by Bruker). Nion produced a software suite they
+called "Swift" around 2013. I worked at Nion around 2014-2015, with some 
+contribution to Swift. In an effort to avoid confusion and/or legal issues
+with Apple's Swift programming language, Nion renamed the project to "nionswift."
+Working on/with nionswift often felt like banging one's head against a tree.
+I am told by current microscopists who use nionswift that the experience
+hasn't changed much. It so happens that there's a bird (not a swift) that
+bashes its head against trees, in search of bugs. Here we are. This history is my
+(Michael Sarahan) personal take, not the official stance or sentiment of anyone
+else. If this project is even remotely successful, it might need a less tongue-in-cheek name.
+
 ## What does this project do?
 
 This is a Nion Swift replacement: instrument control and data analysis for
@@ -92,18 +108,6 @@ from miainwoodpecker.storage.legacy import iter_ndata_directory
 write_frames("migrated.nxs", iter_ndata_directory("old_swift_library/"))
 ```
 
-### Running the viewer tests headlessly
-
-napari needs a real GL canvas, so viewer tests and scripts must run under a
-virtual display — `QT_QPA_PLATFORM=offscreen` is **not** a valid substitute
-(it provides no `QOpenGLWidget` and breaks napari's layer teardown). Viewer
-tests skip themselves when no display is present.
-
-```shell
-xvfb-run -a -s "-screen 0 1920x1080x24" \
-    uv run --extra device --extra viewer --extra tests pytest
-```
-
 ## How to install
 
 You can install this package using either `pip` or `uv`. We recommend that
@@ -128,15 +132,6 @@ will install it automatically into the chosen uv venv.
 ## Development
 
 Development documentation can be found in the [DEVELOPMENT.md](DEVELOPMENT.md) file.
-
-### Linting & Code Formatting
-
-All linting and code formatting is implemented in this package using a combination
-of pre-commit hooks and Ruff. Ruff is a fast, rust-based linter and code
-formatter that covers functionality previously implemented by Black and isort
-(formatters that are commonly used in the Python ecosystem). Ruff simplifies
-your linting and code format setup by running all of the checks and fixes
-using a single tool.
 
 ## License
 
