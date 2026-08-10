@@ -149,7 +149,7 @@ def record(
         Frames to record, typically one of the series generators above.
     path : os.PathLike[str] | str
         Destination HDF5 file.
-    \*\*kwargs : object
+    **kwargs : object
         Passed through to :class:`~miainwoodpecker.storage.nexus.NexusWriter`.
 
     Returns
