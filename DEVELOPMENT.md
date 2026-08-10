@@ -4,7 +4,7 @@ Welcome to your shiny new package. This page will help you get started with usin
 
 If you look at your project, you will see that a `pyproject.toml` file. This file stores both your package configuration and settings for development tools like Hatch that you will use to work on your package.
 
-This file is written using a `.toml` format. [You can learn more about toml here.](https://www.pyopensci.org/python-package-guide/package-structure-code/pyproject-toml-python-package-metadata.html) Here's the TL&DR:
+This file is written using a `.toml` format. [You can learn more about toml here.](https://toml.io/en/) Here's the TL&DR:
 
 * Each `[]` section in the toml file is called a table.
 * You can nest tables with double brackets like this`[[]]`
@@ -143,12 +143,12 @@ To run this script , use:
 If you have a Hatch matrix setup for tests, it will both install the necessary Python version using UV and run your tests on each version of the Python versions that you declare in the matrix table. In this case, there are 4 Python versions in the environment, so your tests will run 4 times, once in each Python version listed in the matrix table.
 
 ```
-@lwasser ➜ /workspaces/pyopensci-scipy25-create-python-package (main) $ hatch run test:run
+you ➜ /workspaces/miainwoodpecker (main) $ hatch run test:run
 ──────────────────────────────────────────────────────────────────────── test.py3.10 ────────────────────────────────────────────────────────────────────────
 ==================================================================== test session starts ====================================================================
 platform linux -- Python 3.10.16, pytest-8.4.1, pluggy-1.6.0
 Using --randomly-seed=1490740387
-rootdir: /workspaces/pyopensci-scipy25-create-python-package
+rootdir: /workspaces/miainwoodpecker
 configfile: pyproject.toml
 testpaths: tests
 plugins: xdist-3.8.0, randomly-3.16.0, raises-0.11, cov-6.2.1
@@ -171,7 +171,7 @@ TOTAL                              2      0      0      0  100.00%
 ==================================================================== test session starts ====================================================================
 platform linux -- Python 3.11.12, pytest-8.4.1, pluggy-1.6.0
 Using --randomly-seed=1596865075
-rootdir: /workspaces/pyopensci-scipy25-create-python-package
+rootdir: /workspaces/miainwoodpecker
 configfile: pyproject.toml
 testpaths: tests
 plugins: xdist-3.8.0, randomly-3.16.0, raises-0.11, cov-6.2.1

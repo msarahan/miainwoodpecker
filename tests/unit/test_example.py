@@ -7,7 +7,7 @@ is up to you. This test example provides a single test for the example.py
 module.
 """
 
-from pyospackage.add_numbers import add_numbers
+from miainwoodpecker.add_numbers import add_numbers
 
 
 def test_add_numbers():

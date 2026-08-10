@@ -1,7 +1,6 @@
 # Linting and Code Formatting
 
-In our [packaging guide](https://www.pyopensci.org/python-package-guide/package-structure-code/code-style-linting-format.html), we
-discuss various linters and code formatters used in the scientific Python
+There are several linters and code formatters used in the scientific Python
 ecosystem, including tools like:
 
 * [black](https://github.com/psf/black)

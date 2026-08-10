@@ -1,4 +1,4 @@
 # Support
 
-* Start a [discussion topic](https://github.com/pyopensci/pyospackage/discussions)
+* Start a [discussion topic](https://github.com/SuperSTEM/miainwoodpecker/discussions)
 * Email the authors or maintainers

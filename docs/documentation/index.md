@@ -44,9 +44,9 @@ Either, you use a directory "_build" within the root path, or you separate
 > Separate source and build directories (y/n) [n]: n
 
 The project name will occur in several places in the built documentation.
-> Project name: pyosPackage
-> Author name(s): pyOpenSci Community
-> Project release []: 1.10
+> Project name: miainwoodpecker
+> Author name(s): SuperSTEM
+> Project release []: 0.1
 
 If the documents are to be written in a language other than English,
 you can select a language here by its language code. Sphinx will then

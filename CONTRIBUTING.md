@@ -15,7 +15,7 @@ You can contribute in many ways, for example:
 
 ### Report Bugs
 
-Report bugs at https://github.com/pyopensci/pyospackage/issues.
+Report bugs at https://github.com/SuperSTEM/miainwoodpecker/issues.
 
 **If you are reporting a bug, please follow the template guidelines. The more
 detailed your report, the easier and thus faster we can help you.**
@@ -39,30 +39,30 @@ happy for any support that they can get.
 
 ### Write Documentation
 
-pyospackage could always use more documentation, whether as
+miainwoodpecker could always use more documentation, whether as
 part of the official documentation, in docstrings, or even on the web in blog
 posts, articles, and such. Just
-[open an issue](https://github.com/pyopensci/pyospackage/issues)
+[open an issue](https://github.com/SuperSTEM/miainwoodpecker/issues)
 to let us know what you will be working on so that we can provide you with guidance.
 
 ### Submit Feedback
 
 The best way to send feedback is to file an issue at
-https://github.com/pyopensci/pyospackage/issues. If your feedback fits the format of one of
+https://github.com/SuperSTEM/miainwoodpecker/issues. If your feedback fits the format of one of
 the issue templates, please use that. Remember that this is a volunteer-driven
 project and everybody has limited time.
 
 ## Get Started!
 
-Ready to contribute? Here's how to set up pyospackage for
+Ready to contribute? Here's how to set up miainwoodpecker for
 local development.
 
-1. Fork the https://github.com/pyopensci/pyospackage
+1. Fork the https://github.com/SuperSTEM/miainwoodpecker
    repository on GitHub.
 2. Clone your fork locally (*if you want to work locally*)
 
     ```shell
-    git clone git@github.com:your_name_here/pyospackage.git
+    git clone git@github.com:your_name_here/miainwoodpecker.git
     ```
 
 3. [Install hatch](https://hatch.pypa.io/latest/install/).

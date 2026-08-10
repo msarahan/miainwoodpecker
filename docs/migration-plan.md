@@ -89,8 +89,9 @@ problem — read their source and docs before designing our own adapters:
 - Stand up `nionswift-usim` and confirm the camera/scan hardware-source
   classes can be driven headlessly, outside Swift's own process/UI.
 - Stand up a bare napari window with PySide6 as a smoke test.
-- Settle on a real package name/repo layout (the current template is still
-  the generic `pyospackage` scaffold) and decide the license (see §6).
+- Settle on a package layout beyond the current template scaffold (package
+  is named `miainwoodpecker`; still just the demo `add_numbers` module) and
+  decide the license (see §6).
 
 **Phase 1 — Device bridge**
 - Define a vendor-neutral `Camera`/`Scanner` interface (device-kind

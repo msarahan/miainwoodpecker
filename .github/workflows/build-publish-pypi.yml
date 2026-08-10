@@ -49,13 +49,13 @@ jobs:
         with:
           name: python-package-distributions
           path: dist/
-  # The publish step will only run on a release from the pyopensci repository
+  # The publish step will only run on a release from the SuperSTEM repository
   # There are several checks in place including setting up the pypi environment in
   # GitHub so that only people on your maintainer team can allow the deployment
   publish:
     name: >-
       Publish Python 🐍 distribution 📦 to PyPI
-    if: github.repository_owner == 'pyopensci' && github.event_name == 'release'
+    if: github.repository_owner == 'SuperSTEM' && github.event_name == 'release'
     needs:
       - build
     runs-on: ubuntu-latest
@@ -63,7 +63,7 @@ jobs:
     # that is the name that you will use in your pypi configuration
     environment:
       name: pypi
-      url: https://pypi.org/p/pyospackage
+      url: https://pypi.org/p/miainwoodpecker
     permissions:
       id-token: write  # this permission is mandatory for pypi publishing
     steps:

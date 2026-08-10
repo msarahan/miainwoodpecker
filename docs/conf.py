@@ -5,11 +5,11 @@ import subprocess
 from datetime import datetime
 
 current_year = datetime.now().year
-organization_name = "pyOpenSci"
+organization_name = "SuperSTEM"
 
-project = "pyosPackage"
+project = "miainwoodpecker"
 copyright = f"{current_year}, {organization_name}"
-author = "pyOpenSci Community"
+author = "SuperSTEM"
 
 # *********** RELEASE NUMBER **************
 # This is optional - if you want the release of your docs to align with your
