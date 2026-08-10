@@ -6,6 +6,7 @@
 :caption: Contents:
 
 Home <self>
+Migration plan <migration-plan>
 Documentation <documentation/index>
 :::
 

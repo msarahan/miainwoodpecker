@@ -8,9 +8,17 @@
 
 [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.10594121.svg)](https://doi.org/10.5281/zenodo.10594120)
 
-## What does pyospackage do?
+## What does this project do?
 
-pyospackage is a demonstration Python package that compliments the pyOpenSci [beginner tutorial series on creating a Python package](https://www.pyopensci.org/python-package-guide/tutorials/intro.html).
+This repository is scaffolded from the pyOpenSci package template and is
+being turned into a Nion Swift replacement: instrument control and data
+analysis for scanning transmission electron microscopes, built as a thin
+glue layer over existing open source projects rather than a from-scratch
+rewrite. See [`docs/migration-plan.md`](docs/migration-plan.md) for the
+architecture and phased migration plan.
+
+The package still carries its original template name (`pyospackage`) and
+demo module pending the rename called for in Phase 0 of the migration plan.
 
 ## 🔧 About This Template
 
