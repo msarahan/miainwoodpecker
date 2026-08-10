@@ -147,6 +147,35 @@ def test_analyze_camera_in_hyperspy_adds_a_projection_layer():
         viewer.close()
 
 
+def test_analyze_camera_in_libertem_adds_a_sum_projection_layer():
+    """
+    Clicking "Sum in LiberTEM" round-trips a burst through the adapter.
+
+    Exercises the second Phase 4 entry point end to end: record a burst
+    from the fake camera to a temporary NeXus file, load it back as a
+    LiberTEM ``DataSet``, sum across the frame/navigation axis with the
+    real ``SumUDF``, and land the result in napari as a new layer.
+    Skipped if the ``libertem`` extra is not installed, since the widget
+    itself does not require it.
+    """
+    pytest.importorskip("libertem", reason="requires the 'libertem' extra")
+    viewer = napari.Viewer(show=False)
+    camera = _FakeCamera()
+    widget = LiveInstrumentWidget(viewer, _FakeScanner(), camera=camera)
+    try:
+        widget._analyze_camera_in_libertem()  # noqa: SLF001 - simulating a button click
+
+        layer_name = "LiberTEM sum projection (Camera)"
+        assert layer_name in viewer.layers
+        projection_shape = (8, 8)
+        assert viewer.layers[layer_name].data.shape == projection_shape
+        assert not camera.started  # the burst starts and stops the camera itself
+        assert widget._libertem_status.text().startswith("done")  # noqa: SLF001
+    finally:
+        widget.shutdown()
+        viewer.close()
+
+
 def test_scan_settings_change_takes_effect_on_next_frames():
     """Changing the size control changes the shape of subsequently scanned frames."""
     viewer = napari.Viewer(show=False)

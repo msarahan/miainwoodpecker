@@ -262,20 +262,20 @@ problem — read their source and docs before designing our own adapters:
   file format — [`src/miainwoodpecker/analysis/hyperspy_bridge.py`](../src/miainwoodpecker/analysis/hyperspy_bridge.py),
   wired into
   [`src/miainwoodpecker/viewer/live.py`](../src/miainwoodpecker/viewer/live.py).
-  **HyperSpy chosen over py4DSTEM/LiberTEM**: both of the latter target
-  4D-STEM (scan-position × diffraction-pattern) datasets specifically,
-  and the Phase 1 device interface deliberately has no synchronized
-  scan-position/camera-frame acquisition mode yet (`interface.py`'s
-  `Scanner` docstring calls this out directly) — so there is no 4D-STEM
-  data for either to operate on today. What this app actually produces
-  is plain frame stacks from `Scanner`/`Camera`, which is exactly
-  HyperSpy's general case, and it is the lighter of the three: `pip
-  install hyperspy` resolved **~35 packages** (dask, matplotlib, scipy,
-  sympy, rosettasciio, traits, …) versus the ~70 the Phase 3 notes measured
-  for `pynxtools-em`. Not free, but not the same order of problem.
-  Revisiting py4DSTEM/LiberTEM is the right call once/if a real
-  spectrum-imaging-style 4D acquisition mode exists; nothing here forecloses
-  adding either as a second adapter alongside this one.
+  **HyperSpy chosen over py4DSTEM/LiberTEM for this first adapter**: both
+  of the latter are commonly described as 4D-STEM (scan-position ×
+  diffraction-pattern) tools, and the Phase 1 device interface
+  deliberately has no synchronized scan-position/camera-frame
+  acquisition mode yet (`interface.py`'s `Scanner` docstring calls this
+  out directly) — so there is no 4D-STEM data for either to operate on
+  today. What this app actually produces is plain frame stacks from
+  `Scanner`/`Camera`, which is exactly HyperSpy's general case, and it is
+  the lighter of the three: `pip install hyperspy` resolved **~35
+  packages** (dask, matplotlib, scipy, sympy, rosettasciio, traits, …)
+  versus the ~70 the Phase 3 notes measured for `pynxtools-em`. Not free,
+  but not the same order of problem. (This reasoning holds for
+  py4DSTEM specifically — its `DataCube` is a genuine 4D array — but not
+  for LiberTEM; see below.)
   - **The adapter** (`load_as_hyperspy_signal`) reads a NexusWriter file's
     `/entry/data` group directly with `h5py` — the frame stack, the `x`/`y`
     axis datasets and their `units` attributes, and `frame_time` — and
@@ -320,6 +320,95 @@ problem — read their source and docs before designing our own adapters:
     The axis-calibration round trip is verified for the case NexusWriter
     already calibrates (scan `fov_nm`), not invented for the case it
     doesn't.
+- [x] Wire a second analysis library in as its own menu action —
+  [`src/miainwoodpecker/analysis/libertem_bridge.py`](../src/miainwoodpecker/analysis/libertem_bridge.py),
+  wired into
+  [`src/miainwoodpecker/viewer/live.py`](../src/miainwoodpecker/viewer/live.py).
+  **The assumption above about LiberTEM turned out to be wrong, and
+  checking that (not assuming it generalized the same way py4DSTEM's
+  does) is the actual finding here.** LiberTEM's core abstraction is not
+  a fixed-rank 4D datacube; it's a `DataSet` with an arbitrary-shape
+  "navigation" axis processed by user-defined functions (UDFs), and its
+  HDF5 `DataSet` reader infers that shape directly from the array it is
+  pointed at. Verified directly, not assumed from the docs: pointing
+  `libertem.io.dataset.hdf5.H5DataSet` at a real file written by this
+  app's own `storage.nexus.write_frames` (shape `(n_frames, height,
+  width)` — the same plain frame stack `camera_series`/`scan_series`
+  already produce, no synthetic data) gives `dataset.shape.nav ==
+  (n_frames,)`, a genuinely **one-dimensional** navigation shape, not a
+  padded/reshaped 2-tuple, and `Context.run_udf` runs real built-in UDFs
+  (`SumUDF`, `StdDevUDF`) against it without complaint
+  ([`tests/integration/test_libertem_bridge.py`](../tests/integration/test_libertem_bridge.py)).
+  So a genuine, non-synthetic LiberTEM PoC on today's data model is
+  possible — the Phase 4 note above correctly ruled out py4DSTEM (whose
+  `DataCube` really is a fixed 4D array) but over-generalized that
+  reasoning to LiberTEM without checking it separately.
+  - **The adapter** (`load_as_libertem_dataset`) is thinner than the
+    HyperSpy one: `Context.load("hdf5", path=..., ds_path=...)` already
+    reads the array with `h5py` internally, so this function's only real
+    job is validating the file has frames (mirroring the HyperSpy
+    adapter's own check, and giving a clearer error than LiberTEM's own
+    "unable to infer dataset" message) and naming the dataset path this
+    app's writer actually uses (`/entry/data/data`).
+  - **A real, honest limitation, not carried over from HyperSpy**:
+    LiberTEM's `DataSetMeta` has no per-axis scale/offset/units fields —
+    nothing like HyperSpy's `AxesManager`. There is no native LiberTEM
+    object to hand NexusWriter's `x`/`y`/`frame_time` calibration to, so
+    unlike the HyperSpy adapter, this one does not attempt an
+    axis-calibration round trip. This is a genuine difference between
+    the two libraries' object models, not a gap in this adapter.
+  - **The wired-in action**: a new "Sum in LiberTEM" button alongside
+    "Analyze in HyperSpy" in the live viewer's Camera group, following
+    the identical pattern — stop the camera loop if running, grab a
+    5-frame burst via `camera_series`, write it to a temporary NeXus file,
+    read it back through the adapter, run one real LiberTEM UDF
+    (`libertem.udf.sum.SumUDF`, summing across the frame axis) with an
+    `inline` executor `Context`, and push the sum-projection image into
+    napari. `inline` rather than LiberTEM's default `dask` executor is a
+    deliberate choice: this is one UDF run over one small, already-in-memory
+    burst per click, not the large-out-of-core-dataset workload the
+    default executor's local cluster exists for — spinning one up per
+    click would be pure overhead. Genuine round trip end to end,
+    verified the same way as the HyperSpy button: a real napari widget
+    against a fake camera under a virtual display
+    ([`tests/integration/test_live_widget.py`](../tests/integration/test_live_widget.py)).
+  - **Dependency weight, measured the same way as the HyperSpy
+    comparison above**: `pip install libertem` alone resolves **~102
+    packages** against a 2-package bare-venv baseline — dask,
+    distributed, numba, scikit-learn, scikit-image, matplotlib, and a
+    Jupyter/ipywidgets stack for LiberTEM's own notebook GUI — roughly
+    **3× HyperSpy's ~35**. That weight buys tiled, MapReduce-style
+    processing for pixelated-detector datasets much larger than memory;
+    this PoC's burst is a handful of small in-memory frames, so the
+    adapter exercises LiberTEM's `DataSet`/UDF model genuinely but not
+    the scale of problem most projects reach for LiberTEM to solve.
+    Given that, and unlike HyperSpy, **LiberTEM gets its own `libertem`
+    optional-dependency group rather than joining `analysis`** — a
+    consumer who only wants the general HyperSpy path shouldn't have to
+    pull in dask/distributed/numba to get it.
+  - **Also investigated, with a clean negative result specific to this
+    environment**: whether a real, published 4D-STEM dataset (genuine 2D
+    navigation, the stronger demonstration) could be substituted for the
+    1D-navigation frame stack above. LiberTEM's own documented sample
+    datasets (its `sample_datasets.rst` docs page) are hosted on Zenodo
+    at 177MB–14.2GB (`10.5281/zenodo.*` DOIs; the smallest, a 177MB 4D
+    STO dataset, is in MIB format, which needs its own reader, not the
+    HDF5 one this adapter uses); py4DSTEM's small-sample registry hosts
+    its files on Google
+    Drive. Both hosts, plus HuggingFace, OSF, and Figshare tried as
+    alternatives, returned a blocked `CONNECT` (HTTP 403) through this
+    environment's outbound proxy — its allowlist covers package
+    registries (PyPI, npm, crates.io, the Go proxy) and GitHub, not
+    general data hosting. py4DSTEM's smallest nominal sample
+    (`small_datacube`, meant to be ~4.2MB) also turned out to be an
+    unreliable candidate on its own terms even ignoring reachability:
+    its own source has a `TODO` noting the ID currently resolves to the
+    same file as an unrelated fixture (`vac_probe`), a replacement that
+    was never made. This is a network-reachability finding about *this
+    environment*, not a claim that no such dataset exists or that
+    LiberTEM needs one to be useful here — the 1D-navigation PoC above
+    is real, working, and sufficient to answer the question this item
+    was scoped to answer.
 - [ ] Port Swift-specific analyses not already covered upstream, as small
   adapter functions. **Deferred, not attempted**: this PoC's scope was
   proving the wiring shape (adapter + one real menu action) works end to
@@ -579,5 +668,11 @@ scratch: napari + PySide6 for the shell and rendering, HDF5/Zarr + NeXus/NXem
 analysis. The actual new code this project needs to write is the device
 bridge (Phase 1), the live-viewer dock widget (Phase 2), the acquisition
 sequencer and legacy-data importer (Phase 3), and analysis wiring
-(Phase 4: one adapter function into HyperSpy, one menu action driving it) —
-glue, as intended.
+(Phase 4: two adapter functions, HyperSpy and LiberTEM, one menu action
+each driving them) — glue, as intended. The LiberTEM adapter is also a
+useful lesson in the plan's own "measure, don't assume" principle (§1):
+an earlier version of this plan grouped LiberTEM with py4DSTEM as both
+needing 4D-STEM data this app doesn't produce yet, reasoning by category
+(“pixelated-detector analysis tool”) rather than by checking LiberTEM's
+actual object model — checking it directly found the category-level
+assumption wrong for one of the two libraries, not both.

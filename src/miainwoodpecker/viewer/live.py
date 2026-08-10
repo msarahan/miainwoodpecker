@@ -14,9 +14,10 @@ whenever a control changes, and the worker thread only reads that
 attribute — no Qt access from workers.
 
 Importing this module requires the ``viewer`` optional dependency group.
-The camera group's "Analyze in HyperSpy" button additionally needs the
-``analysis`` group (migration plan, Phase 4); it is imported lazily so
-this module still imports and the button still renders without it, only
+The camera group's "Analyze in HyperSpy" and "Sum in LiberTEM" buttons
+additionally need the ``analysis`` and ``libertem`` groups respectively
+(migration plan, Phase 4); both libraries are imported lazily so this
+module still imports and the buttons still render without them, only
 reporting the missing extra in the status label if clicked.
 """
 
@@ -142,9 +143,16 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
             camera_form.addRow(self._analyze_button)
             self._analyze_status = QtWidgets.QLabel("", camera_group)
             camera_form.addRow("Analysis", self._analyze_status)
+            self._libertem_button = QtWidgets.QPushButton(
+                "Sum in LiberTEM", camera_group
+            )
+            camera_form.addRow(self._libertem_button)
+            self._libertem_status = QtWidgets.QLabel("", camera_group)
+            camera_form.addRow("LiberTEM", self._libertem_status)
             layout.addWidget(camera_group)
             self._camera_button.clicked.connect(self._toggle_camera)
             self._analyze_button.clicked.connect(self._analyze_camera_in_hyperspy)
+            self._libertem_button.clicked.connect(self._analyze_camera_in_libertem)
 
         layout.addStretch(1)
 
@@ -269,6 +277,64 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
             colormap="viridis",
         )
         self._analyze_status.setText(f"done - mean of {len(frames)} frames")
+
+    def _analyze_camera_in_libertem(self) -> None:
+        """
+        Round-trip a short camera burst through the LiberTEM adapter.
+
+        The second half of the Phase 4 analysis-integration path: stop the
+        live camera loop if running, record a short burst to a temporary
+        NeXus file with
+        :func:`~miainwoodpecker.storage.nexus.write_frames`, read it back
+        as a LiberTEM ``DataSet`` with
+        :func:`~miainwoodpecker.analysis.libertem_bridge.load_as_libertem_dataset`,
+        run one real LiberTEM UDF (``libertem.udf.sum.SumUDF``, summing
+        across the frame/navigation axis) with an inline ``Context``, and
+        push the result into napari as a new image layer. Requires the
+        ``libertem`` optional dependency group; reports that in the status
+        label rather than crashing the widget if it is missing.
+        """
+        if self._camera is None:
+            return
+        try:
+            from libertem.api import Context  # noqa: PLC0415
+            from libertem.udf.sum import SumUDF  # noqa: PLC0415
+
+            from miainwoodpecker.analysis.libertem_bridge import (  # noqa: PLC0415
+                load_as_libertem_dataset,
+            )
+        except ImportError:
+            self._libertem_status.setText("install the 'libertem' extra")
+            return
+
+        if self._camera_loop is not None and self._camera_loop.is_running:
+            self.stop_camera()
+
+        self._libertem_status.setText("recording...")
+        try:
+            frames = list(camera_series(self._camera, _ANALYSIS_BURST_FRAME_COUNT))
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                burst_path = Path(tmp_dir) / "libertem_analysis_burst.nxs"
+                write_frames(burst_path, frames, title="libertem analysis burst")
+                # Inline executor: this is a single UDF run over one small,
+                # already-in-memory burst, not the large-dataset workload
+                # LiberTEM's default dask executor is built for - spinning
+                # up a local cluster per button click would be pure
+                # overhead here.
+                with Context.make_with("inline") as ctx:
+                    dataset = load_as_libertem_dataset(ctx, burst_path)
+                    result = ctx.run_udf(dataset=dataset, udf=SumUDF())
+                    sum_projection = result["intensity"].data
+        except Exception as exc:  # noqa: BLE001 - surfaced in the status label
+            self._libertem_status.setText(f"error: {exc}")
+            return
+
+        self._viewer.add_image(
+            sum_projection,
+            name="LiberTEM sum projection (Camera)",
+            colormap="viridis",
+        )
+        self._libertem_status.setText(f"done - sum of {len(frames)} frames")
 
     def _maybe_stop_timer(self) -> None:
         scan_running = self._scan_loop is not None and self._scan_loop.is_running

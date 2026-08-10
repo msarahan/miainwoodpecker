@@ -88,11 +88,13 @@ viewer = [
     "napari[pyside6]>=0.5",
 ]
 # Phase 4 analysis integration - see docs/migration-plan.md section 5.
-# HyperSpy chosen over py4DSTEM/LiberTEM: it is the lighter, more general
-# option and matches the plain scan/camera frame stacks this app produces
-# today (no 4D-STEM diffraction-scan mode yet). A loose ">=" bound is
-# deliberate here, unlike the "device" extra above: HyperSpy is one
-# package (not seven kept in lockstep), its public Signal/AxesManager API
+# HyperSpy chosen over py4DSTEM for this extra: it is the lighter, more
+# general option and matches the plain scan/camera frame stacks this app
+# produces today (no 4D-STEM diffraction-scan mode yet). py4DSTEM's core
+# object is a true 4D datacube, so it stays deferred; LiberTEM turned out
+# not to need one (see the "libertem" extra below) and has its own adapter.
+# A loose ">=" bound is deliberate here, unlike the "device" extra above:
+# HyperSpy is one package (not seven kept in lockstep), its public Signal/AxesManager API
 # is the kind of thing a 2.x release is expected to hold stable, and - most
 # importantly - the pin is loaded via hatch's own independent per-env
 # resolution, so it's exactly the failure mode the "device" comment
@@ -101,6 +103,22 @@ viewer = [
 # release that breaks this adapter.
 analysis = [
     "hyperspy>=2.0",
+]
+# LiberTEM: kept as its own extra, not folded into "analysis" above.
+# Measured (docs/migration-plan.md section 5): `pip install libertem` alone
+# resolves ~102 packages against a 2-package bare venv baseline - dask,
+# distributed, numba, scikit-learn, scikit-image, matplotlib, and a
+# Jupyter/ipywidgets stack for its own notebook GUI - roughly 3x HyperSpy's
+# ~35. That weight buys high-throughput, tiled, MapReduce-style processing
+# for datasets much larger than memory; this app's own acquisition path
+# produces plain in-memory frame stacks (Phase 3), so the adapter exercises
+# LiberTEM's UDF/DataSet model genuinely, but not the reason most projects
+# reach for LiberTEM specifically. A loose ">=" bound for the same reason
+# as HyperSpy's above: one package, a stable public Context/DataSet/UDF
+# API, and hatch's per-env resolution is the failure mode to watch for, not
+# assumed to bite.
+libertem = [
+    "libertem>=0.16",
 ]
 docs = [
     "sphinx>=8.2.3",
@@ -272,6 +290,7 @@ description = """Run the full test suite, including device, viewer, and analysis
 features = [
     "analysis",
     "device",
+    "libertem",
     "tests",
     "viewer",
 ]
