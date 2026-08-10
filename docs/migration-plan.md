@@ -183,11 +183,48 @@ problem — read their source and docs before designing our own adapters:
   moving to `ndv` or a custom VisPy canvas.
 
 **Phase 3 — Acquisition and storage**
-- Implement acquisition sequences (single frame, spectrum image, tilt
-  series) writing to HDF5/Zarr with NXem metadata via `pynxtools-em`.
-- Build a one-time importer for existing Swift libraries/`.ndata` files
-  using Nion's own `niondata`/IO code plus RosettaSciIO as the target-side
-  writer, so existing data isn't orphaned by the migration.
+- [x] Acquisition sequences —
+  [`src/miainwoodpecker/acquisition/sequence.py`](../src/miainwoodpecker/acquisition/sequence.py).
+  Plain lazy generators over the device protocols (`scan_series`,
+  `camera_series`, `focal_series`) plus `record()`, which streams them to
+  disk as they arrive rather than buffering. `camera_series` stops the
+  camera in a `finally`, so abandoning a series early still releases the
+  device. `focal_series` currently sweeps field of view: sweeping focus or
+  stage tilt needs instrument controls the Phase 1 interface deliberately
+  does not expose yet, but the generator shape carries over.
+- [x] NeXus/HDF5 storage —
+  [`src/miainwoodpecker/storage/nexus.py`](../src/miainwoodpecker/storage/nexus.py).
+  **Deliberately written with `h5py` alone, not `pynxtools-em`.** NeXus is
+  a *convention over HDF5* (typed `NX_class` groups, `signal`/`axes`
+  plotting hints, `units` everywhere); `pynxtools-em` is a
+  vendor-format→NXem *reader/converter* and pulls ~70 packages (hyperspy,
+  scikit-learn, sympy, xraydb…) to supply, for our purposes, a schema
+  convention. Following a documented format is not reinventing one — this
+  is precisely what avoids a bespoke project format. `NexusWriter` streams
+  into a resizable per-frame-chunked, gzip dataset so long acquisitions
+  persist incrementally, and scan frames reporting `fov_nm` get real
+  spatial axes in nanometres (cameras correctly fall back to `pixel`).
+  **Independently validated**: files load in `nexusformat` (the NeXpy
+  reference library), which resolves the class hierarchy, `nxsignal`,
+  `nxaxes`, and reports `plottable_data` — so standard NeXus tooling can
+  plot them without any of our code.
+- [x] Legacy `.ndata` importer —
+  [`src/miainwoodpecker/storage/legacy.py`](../src/miainwoodpecker/storage/legacy.py).
+  Uses Nion's own `NDataHandler` rather than re-implementing its zip
+  container, converts to `Frame`, and recovers Swift's naive-UTC
+  timestamps as aware. Tests write fixtures with Nion's *writer*, so the
+  real container format is exercised, and cover the full migration path
+  (old library directory → single NeXus file).
+- [ ] Validate output against the official NXem NXDL schema with
+  `pynxtools`. Files declare `definition = "NXem"` to state intent, but
+  that claim is currently unverified — the NeXus/FAIRmat spec sites are
+  unreachable from this environment, so the required-field list could not
+  be checked. This belongs in a CI validation step, not the runtime.
+- [ ] Revisit compression. gzip level 4 on noisy `float64` scan data
+  measured a *1.08× ratio* — i.e. slightly larger than raw — while
+  `float32` camera frames compressed to 0.69×. Worth evaluating
+  bitshuffle/blosc, or storing scan data as `float32`.
+- [ ] Consider Zarr alongside HDF5 for parallel/cloud-friendly writes.
 
 **Phase 4 — Analysis integration**
 - Wire HyperSpy / py4DSTEM / LiberTEM in as napari plugins or menu actions

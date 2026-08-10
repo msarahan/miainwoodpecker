@@ -1118,6 +1118,7 @@ wheels = [
 name = "miainwoodpecker"
 source = { editable = "." }
 dependencies = [
+    { name = "h5py" },
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.14'" },
     { name = "numpy", version = "2.5.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.14'" },
 ]
@@ -1148,6 +1149,7 @@ viewer = [
 
 [package.metadata]
 requires-dist = [
+    { name = "h5py", specifier = ">=3.12" },
     { name = "myst-parser", marker = "extra == 'docs'", specifier = ">=4.0.1" },
     { name = "napari", extras = ["pyside6"], marker = "extra == 'viewer'", specifier = ">=0.5" },
     { name = "nionswift-usim", marker = "extra == 'device'", specifier = ">=5.4.2" },

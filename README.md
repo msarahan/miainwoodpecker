@@ -15,7 +15,11 @@ The project is early. What exists today:
 * a **live acquisition loop** (`miainwoodpecker.acquisition`) that decouples
   acquisition rate from display rate, and
 * a **live viewer** (`miainwoodpecker.viewer`) — a napari + PySide6 dock
-  widget with the live scan/camera feed and scan controls.
+  widget with the live scan/camera feed and scan controls,
+* **acquisition sequences** (`miainwoodpecker.acquisition`) that stream to
+  disk as they run, and
+* **NeXus/HDF5 storage** (`miainwoodpecker.storage`), including an importer
+  for legacy Nion Swift `.ndata` files.
 
 ### Run the live viewer
 
@@ -47,6 +51,32 @@ with simulated_instrument() as microscope:
 Everything above the device layer depends only on the protocols in
 `miainwoodpecker.devices`, never on a vendor SDK, so other vendors can be
 added later as new adapters.
+
+### Record a series to NeXus HDF5
+
+```python
+from miainwoodpecker.acquisition import record, scan_series
+from miainwoodpecker.devices import ScanParameters
+from miainwoodpecker.devices.nion_adapter import simulated_instrument
+
+with simulated_instrument() as microscope:
+    parameters = ScanParameters(
+        height=256, width=256, pixel_time_us=1.0, fov_nm=15.0
+    )
+    # Streams to disk frame by frame rather than buffering in memory.
+    record(scan_series(microscope.scanner, parameters, 10), "series.nxs")
+```
+
+The result is a standard NeXus file — any NeXus-aware tool can plot it,
+with spatial axes calibrated in nanometres. To migrate an existing Swift
+library:
+
+```python
+from miainwoodpecker.storage import write_frames
+from miainwoodpecker.storage.legacy import iter_ndata_directory
+
+write_frames("migrated.nxs", iter_ndata_directory("old_swift_library/"))
+```
 
 ### Running the viewer tests headlessly
 
