@@ -315,15 +315,39 @@ problem — read their source and docs before designing our own adapters:
   2048² one. There is no scanned-imaging regime in which changing viewer
   would be measurable.
 
-  **Where it would still bite, and only there:** a source producing
-  *small* frames *fast*, since 11 ms is a hard ~85 fps ceiling
-  independent of size. A 256² detector at 200 fps would be viewer-bound.
-  That is the one case for `ndv` — and it is already the case this
-  project routes to LiberTEM-live rather than through `Camera`
-  (docs/vendor-support.md), so it is covered by a decision already taken.
+  **Camera live views are the cheaper path, not a separate risk.** Scan
+  and camera refresh differ deliberately in `viewer/live.py`: the scan
+  view runs `autocontrast_every_frame=True`, which walks the whole array
+  twice per frame, and the camera view does not. So the figures above —
+  measured on the *scan* loop — are the pessimistic side, and a
+  Ronchigram or spectrometer live view costs no more. That the two full
+  walks are invisible in the size sweep is itself consistent: two passes
+  over 33.5 MB is ~0.7 ms at this memory bandwidth, inside the run-to-run
+  spread.
 
-  **Verdict: keep napari. Revisit only if a live view needs sustained
-  high-rate small frames.** Phase 2's open question is closed.
+  **The axis that matters is not scan-versus-camera; it is
+  display-for-a-human versus process-every-frame.** A live view exists
+  for an operator's eye, which does not resolve past ~30 fps and calls
+  anything under ~100 ms instant. Against that, 11 ms and a ~85 fps
+  ceiling are comfortable for any live view worth showing: a Ronchigram
+  at a 20 ms exposure is 32 fps end-to-end, a spectrometer at 10 ms is
+  47 fps. Processing *every* frame from a fast detector is a different
+  job with a different answer (LiberTEM-live, docs/vendor-support.md),
+  and it is not a viewer question at all.
+
+  **Verdict: keep napari.** Phase 2's open question is closed for both
+  scanned and camera live views.
+
+- [ ] **Unmeasured: display responsiveness while analysis runs.** napari's
+  per-update cost is CPU-side, and this measurement is demonstrably
+  sensitive to contention — the spread was 42% under software rendering
+  against a few percent on an idle GPU. Whether a HyperSpy or LiberTEM
+  job on the same machine degrades a live view is therefore a real
+  question and an unanswered one. `phase2_live_benchmark.py --load N`
+  now runs N CPU-saturating numpy workers during the display measurement
+  (numpy, so it competes for cores the way analysis does rather than for
+  the GIL), and `--source camera` times the camera path directly. Both
+  want running on real GPU hardware.
 
   Earlier figures on this container (llvmpipe software rasterization)
   were acquire ~14.5 ms, display 33.6–47.7 ms across four runs. Real GPU

@@ -65,11 +65,14 @@ decides that, not the architecture.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import statistics
+import threading
 import time
 import typing
 
 import napari
+import numpy as np
 from qtpy import QtWidgets
 
 from miainwoodpecker.devices.interface import ScanParameters
@@ -149,6 +152,22 @@ def benchmark_display(
 
     Each sample covers ``refresh_display()`` plus an event-loop flush, so
     the GPU repaint is inside the measurement rather than after it.
+
+    Parameters
+    ----------
+    widget : LiveInstrumentWidget
+        The dock widget whose ``refresh_display`` is being timed.
+    loop : LiveAcquisition
+        The live loop supplying frames, polled for genuinely new ones.
+    app : QtWidgets.QApplication
+        The running application, flushed inside each timed region.
+    frames : int
+        How many samples to collect.
+
+    Returns
+    -------
+    list[float]
+        One elapsed time per frame, in milliseconds.
     """
     samples_ms: list[float] = []
     seen: object = None
@@ -169,15 +188,92 @@ def benchmark_display(
     return samples_ms
 
 
+@contextlib.contextmanager
+def _background_load(threads: int) -> typing.Iterator[None]:
+    """
+    Saturate ``threads`` CPUs for the duration, or do nothing for zero.
+
+    Stands in for analysis running on the same machine, which is not a
+    hypothetical: napari's per-update cost is CPU-side, and the spread on
+    this measurement widened from a few percent to 42% under the CPU
+    contention of software rendering. Whether a HyperSpy or LiberTEM job
+    degrades a live view is therefore a real question, and a measurable
+    one.
+
+    The load is numpy work rather than a Python spin loop, deliberately -
+    numpy releases the GIL, so this competes for *cores* the way real
+    analysis does rather than for the interpreter, which would be a
+    harsher and less representative test.
+
+    Parameters
+    ----------
+    threads : int
+        How many workers to run. Zero yields immediately.
+
+    Yields
+    ------
+    None
+        For the duration of the load.
+    """
+    if threads <= 0:
+        yield
+        return
+    stop = threading.Event()
+
+    def burn() -> None:
+        block = np.random.default_rng().standard_normal((512, 512))
+        while not stop.is_set():
+            block @ block
+
+    workers = [
+        threading.Thread(target=burn, name=f"load-{index}", daemon=True)
+        for index in range(threads)
+    ]
+    for worker in workers:
+        worker.start()
+    try:
+        yield
+    finally:
+        stop.set()
+        for worker in workers:
+            worker.join(timeout=5.0)
+
+
 def main() -> None:
     """Run the acquire and display benchmarks and print a verdict."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--size", type=int, default=512, help="scan size in pixels")
     parser.add_argument("--frames", type=int, default=50, help="frames per benchmark")
     parser.add_argument("--dwell-us", type=float, default=1.0, help="pixel dwell time")
+    parser.add_argument(
+        "--source",
+        choices=("scan", "camera"),
+        default="scan",
+        help=(
+            "which live view to time. 'scan' also pays a per-frame "
+            "autocontrast pass (two full array walks); 'camera' does not, "
+            "so it is the cheaper path and the one a Ronchigram or "
+            "spectrometer live view uses"
+        ),
+    )
+    parser.add_argument(
+        "--load",
+        type=int,
+        default=0,
+        help=(
+            "CPU-saturating threads to run during the display measurement, "
+            "standing in for analysis on the same machine. napari's "
+            "per-update cost is CPU-side, so this is the question 'how "
+            "responsive is the viewer while something else is running'"
+        ),
+    )
     args = parser.parse_args()
 
-    print(f"scan {args.size}x{args.size} px, dwell {args.dwell_us} us\n")
+    print(f"scan {args.size}x{args.size} px, dwell {args.dwell_us} us")
+    print(f"display source: {args.source}")
+    if args.load:
+        print(f"background load: {args.load} CPU-saturating thread(s)")
+    print()
 
     with remote_simulated_instrument() as microscope:
         parameters = ScanParameters(
@@ -192,19 +288,24 @@ def main() -> None:
         app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
         # show=True is required: a hidden canvas never receives paint events.
         viewer = napari.Viewer(show=True)
-        widget = LiveInstrumentWidget(viewer, microscope.scanner)
+        widget = LiveInstrumentWidget(
+            viewer,
+            microscope.scanner,
+            camera=microscope.ronchigram_camera,
+        )
         try:
             widget._size_combo.setCurrentText(str(args.size))  # noqa: SLF001
             widget._dwell_spin.setValue(args.dwell_us)  # noqa: SLF001
-            widget.start_scan()
+            if args.source == "camera":
+                widget.start_camera()
+                loop = widget._camera_loop  # noqa: SLF001
+            else:
+                widget.start_scan()
+                loop = widget._scan_loop  # noqa: SLF001
             app.processEvents()
             renderer = _gl_renderer(viewer)
-            display_ms = benchmark_display(
-                widget,
-                widget._scan_loop,  # noqa: SLF001
-                app,
-                args.frames,
-            )
+            with _background_load(args.load):
+                display_ms = benchmark_display(widget, loop, app, args.frames)
         finally:
             widget.shutdown()
             viewer.close()
