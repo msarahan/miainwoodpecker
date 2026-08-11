@@ -922,13 +922,17 @@ problem — read their source and docs before designing our own adapters:
     against usim, and how long a real detector's write actually takes is
     what decides whether the per-frame `flush()` is a nicety or a
     requirement.
-  - **Multi-line and per-recording notes.** A single-line per-session field
-    is enough to prove the wiring and not enough for a shift's worth of
-    observations.
-  - **No way to change session directory from the UI** — chosen at launch,
-    so an operator switching samples after lunch restarts the app.
-    `set_session()` is the single path such a button would use, so this is
-    small, just not done.
+  - ~~**Multi-line and per-recording notes**~~ — **done**: session notes are
+    a `QPlainTextEdit` rather than a single line, and `Session.record()`
+    takes a per-recording `note=` that lands in the file's `NXnote` labelled
+    with its scope. What is *not* done is annotating a recording after the
+    fact, tracked below.
+  - ~~**No way to change session directory from the UI**~~ — **done**:
+    `change_session_directory()` picks a directory and routes through
+    `set_session()`, so a switched-to directory behaves exactly like one
+    named at launch — reused if it exists, numbering resumed, context read
+    from its own `session.json`, and no context carried across. A recording
+    in flight blocks the switch rather than being silently redirected.
   - ~~**Nothing reads a session back**~~ — **done** (§5 Phase 3): recordings
     open from the session or an arbitrary path, and the analysis buttons run
     against a file on disk. Two smaller gaps remain in its place: a recording
@@ -1354,6 +1358,31 @@ The invariant now holds mechanically: `nion.*` is imported in
 
 ## 7. Open questions
 
+- **Is "session" the right concept at all?** Raised by @msarahan from
+  operator experience: people tend to use plain filesystem folders to
+  represent a session and keep the data for one grouped in that folder, so
+  a named abstraction risks being ceremony over something the filesystem
+  already does. Worth noting how little separates the two positions —
+  `storage/session.py`'s own docstring already says "the filesystem is the
+  index and NeXus files are the records", and a `Session` *is* a directory.
+  Over a bare folder it adds exactly three things: a collision-free naming
+  rule, a `session.json` sidecar, and background jobs so slow I/O does not
+  freeze the GUI. The first and third are plumbing any design needs. So the
+  live question is narrower than the framing suggests: **does the sidecar
+  earn its place?** Since the writer grew `sample=`/`user=`/`notes=`, every
+  fact it holds is also written into each file as real NeXus groups, which
+  argues for demoting it from a second source of truth to remembered
+  defaults for the next recording in that folder. Not yet acted on — the
+  sidecar is still what makes reopening a directory mid-shift restore its
+  context, and cross-session enumeration (below) would lean on it too.
+- **Grouping analyses with the data they came from**, also from @msarahan:
+  at some point it may be worth keeping a derived result in the same
+  container as its source rather than as a loose sibling file. NeXus needs
+  no invention for this — multiple `NXentry` groups in one file is the
+  standard shape, and `NXprocess` exists for exactly "this was derived, by
+  this program, from that". Deliberately not designed yet: Phase 4's
+  adapters are proofs of concept, and the right container layout follows
+  from a real analysis workflow rather than preceding one.
 - **Bluesky/ophyd**: the [Bluesky](https://blueskyproject.io/) experiment
   orchestration framework (device abstraction via `ophyd`/`ophyd-async`,
   scripted acquisition via a `RunEngine`) is a real, actively developed
