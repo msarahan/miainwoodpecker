@@ -93,6 +93,9 @@ _SYNTHETIC_SAMPLE = {
     "is_simulation": True,
     "preparation_date": "2026-01-01T00:00:00+00:00",
     "atom_types": "Si,O",
+    # NXsample's own free-text field, which the session layer maps its
+    # `sample_area` onto. Included so the mapping is schema-checked.
+    "description": "hole 4, upper left of the grid",
 }
 # Session context, which NXem documents at entry level but does *not*
 # require (`userID`/`noteID` are minOccurs="0", unlike `sampleID`'s
@@ -101,6 +104,8 @@ _SYNTHETIC_SAMPLE = {
 # of the check is that a real file validates - not a minimal one.
 _SYNTHETIC_USER = {"name": "A. Operator", "affiliation": "SuperSTEM"}
 _SYNTHETIC_NOTES = "synthetic frames written by the schema validation step"
+# NXinstrument's only defined field, carrying the session's `instrument`.
+_SYNTHETIC_INSTRUMENT = "Nion UltraSTEM 200 (synthetic)"
 
 
 def _frames() -> list[Frame]:
@@ -202,6 +207,7 @@ def _check_with_sample_is_valid(directory: Path) -> str | None:
         definition=_APPDEF,
         sample=_SYNTHETIC_SAMPLE,
         user=_SYNTHETIC_USER,
+        instrument=_SYNTHETIC_INSTRUMENT,
         notes=_SYNTHETIC_NOTES,
     ) as writer:
         for frame in _frames():

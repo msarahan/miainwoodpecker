@@ -90,6 +90,15 @@
   camera's own calibration already tracks, so the recorded energy axis
   follows the sweep for free.
 
+- Session context adopts Nion Swift's own documented vocabulary:
+  `instrument`, `site`, `sample_area`, and `task` join `operator`,
+  `sample`, and `notes`. Four map onto real NeXus fields — sample and
+  sample area to `NXsample`, the operator to `NXuser`, the microscope to
+  `NXinstrument/name`, which had been sitting empty — and are
+  schema-checked in CI. `site` and `task` deliberately do not: no NeXus
+  field means what they mean, and an approximate one would be a
+  confidently wrong claim.
+
 ### Changed
 
 - CI's `integration` job runs its tests in parallel (`pytest -n auto`),

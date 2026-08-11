@@ -31,6 +31,12 @@ if typing.TYPE_CHECKING:
 ENTRY = "entry"
 """The single ``NXentry`` group every file this project writes has."""
 
+INSTRUMENT_GROUP = "entry/instrument"
+"""``NXinstrument`` — the microscope everything below was measured on."""
+
+INSTRUMENT_NAME = f"{INSTRUMENT_GROUP}/name"
+"""Which microscope, written when a session names one. ``NXinstrument``'s only field."""
+
 DETECTOR_GROUP = "entry/instrument/detector"
 """
 ``NXdetector`` holding the frames as they are appended.

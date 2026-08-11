@@ -178,6 +178,24 @@ recording = session.record(
 print(recording.path, recording.frame_count)
 ```
 
+The context fields are Nion Swift's own six, so a habit carries over:
+`operator` (Swift calls it *microscopist*), `instrument`, `site`,
+`sample`, `sample_area`, and `task`, plus free-text `notes`. Fill in what
+you know — anything left out is simply absent rather than blank:
+
+```python
+session.update_context(instrument="Nion UltraSTEM 200",
+                       site="SuperSTEM",
+                       sample_area="hole 4, upper left",
+                       task="ADF survey before EELS")
+```
+
+Four of them land in real NeXus fields, so a file that travels away from
+its folder still says what it was: sample and sample area in `NXsample`,
+the operator in `NXuser`, the microscope in `NXinstrument`. `site` and
+`task` have no NeXus field that means what they mean, so they stay in the
+session's own JSON rather than being written into an approximate one.
+
 A script and the viewer can share one session directory — point the
 viewer at it and your scripted recordings appear in its file list, and
 vice versa. Reading back:

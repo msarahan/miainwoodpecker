@@ -248,19 +248,34 @@ The energy offset is the fourth control on `InstrumentController`, and it
 arrived the way that module says controls should: with the caller that
 needed it, not before.
 
-### 7. Adopt Nion's session vocabulary
+### 7. Adopt Nion's session vocabulary — **done**
 
 Their scripting documentation names six session fields:
 `stem.session.instrument`, `microscopist`, `sample`, `sample_area`,
 `site`, and `task`. This project's sidecar has three: sample, user,
 notes.
 
-Adopting the names is a small change with two payoffs. `instrument` and
-`site` are the facts that make a recording identifiable a year later, and
-both map onto NeXus groups the writer already creates. And it moves the
+All six are now there, with two deliberate divergences. `microscopist`
+stays `operator` — the same field in plainer English, and what the
+viewer, the sidecar files already on disk, and this API all already say.
+And `notes` is ours: Nion has no free-text session field, and `NXnote` is
+the obvious home for one.
+
+The payoff is partly that these are the facts making a recording
+identifiable a year later, and partly that it moves the
 "[does the sidecar earn its place](migration-plan.md)" question onto
 firmer ground: a vocabulary someone else maintains is easier to defend
 than one invented here.
+
+**Four of the six get real NeXus fields, and two do not.** Sample and
+sample area map onto `NXsample`'s `name` and `description`, the operator
+onto `NXuser/name`, and the microscope onto `NXinstrument/name` —
+`NXinstrument`'s only defined field, which had been sitting empty. All
+four are schema-checked in CI. `site` and `task` have no NeXus field that
+means what they mean (`NXuser/affiliation` is who the *operator* belongs
+to, not where the microscope is), so they stay in the session JSON rather
+than being written into an approximate one — the same rule this project
+applies to an uncalibrated axis.
 
 ## Also worth stealing: the shape of their scripting docs
 

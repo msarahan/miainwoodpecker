@@ -26,6 +26,7 @@ import numpy as np
 import pytest
 
 from miainwoodpecker.devices import Frame
+from miainwoodpecker.storage import layout
 from miainwoodpecker.storage.nexus import NexusWriter, read_series
 from miainwoodpecker.storage.session import (
     LoadJob,
@@ -120,7 +121,11 @@ def test_session_creates_its_root_and_sidecar(tmp_path):
     assert stored["notes"] == "test grid"
     assert session.context == {
         "operator": "M. Sarahan",
+        "instrument": "",
+        "site": "",
         "sample": "Au on C",
+        "sample_area": "",
+        "task": "",
         "notes": "test grid",
     }
 
@@ -996,3 +1001,86 @@ def test_joining_a_job_that_never_started_succeeds(tmp_path):
     """Nothing to wait for is a finished job, not a failure."""
     session = Session(tmp_path / "s")
     assert RecordingJob(session, iter([]), label="scan").join(timeout=0.01) is True
+
+
+def test_the_full_session_vocabulary_reaches_its_nexus_groups(tmp_path):
+    """
+    Four of the seven context fields land in real NeXus fields.
+
+    The vocabulary is Nion's, from its scripting guide; the point of
+    adopting it rather than inventing one is that these are the facts
+    that make a recording identifiable a year later. Each mapping is to a
+    field that means what the value means — the sample area really is
+    ``NXsample``'s ``description``, and the microscope really is
+    ``NXinstrument``'s ``name``.
+    """
+    session = Session(
+        tmp_path / "session",
+        operator="M. Sarahan",
+        instrument="Nion UltraSTEM 200",
+        site="SuperSTEM",
+        sample="Au on C",
+        sample_area="hole 4",
+        task="ADF survey",
+        notes="grid 3",
+    )
+    recording = session.record([make_frame()], label="survey")
+
+    with h5py.File(recording.path, "r") as handle:
+        assert handle[f"{layout.SAMPLE_GROUP}/name"][()].decode() == "Au on C"
+        assert handle[f"{layout.SAMPLE_GROUP}/description"][()].decode() == "hole 4"
+        assert handle[f"{layout.USER_GROUP}/name"][()].decode() == "M. Sarahan"
+        assert (
+            handle[layout.INSTRUMENT_NAME][()].decode() == "Nion UltraSTEM 200"
+        )
+
+
+def test_site_and_task_are_not_written_into_an_approximate_nexus_field(tmp_path):
+    """
+    The three fields NeXus has no home for stay out of its groups.
+
+    ``NXuser/affiliation`` is who the *operator* belongs to, not where the
+    microscope is, so writing ``site`` there would be a confidently wrong
+    claim in a standard field — worse, by this project's standing rule,
+    than an honest absence. Both still round-trip through the JSON blob,
+    which is what that blob is for.
+    """
+    session = Session(
+        tmp_path / "session",
+        site="SuperSTEM",
+        task="ADF survey",
+        operator="M. Sarahan",
+    )
+    recording = session.record([make_frame()], label="survey")
+
+    with h5py.File(recording.path, "r") as handle:
+        assert "affiliation" not in handle[layout.USER_GROUP]
+        assert layout.INSTRUMENT_NAME not in handle
+
+    context = read_session_context(recording.path)
+    assert context["site"] == "SuperSTEM"
+    assert context["task"] == "ADF survey"
+
+
+def test_context_read_back_prefers_the_nexus_groups_for_what_they_hold(tmp_path):
+    """
+    A file carries its own context, readable without the session directory.
+
+    The reason the groups are written at all: a recording that travels
+    away from its session folder must still say what it was. All four
+    mapped fields come back from the file's own groups.
+    """
+    session = Session(
+        tmp_path / "session",
+        operator="M. Sarahan",
+        instrument="Nion UltraSTEM 200",
+        sample="Au on C",
+        sample_area="hole 4",
+    )
+    recording = session.record([make_frame()], label="survey")
+
+    context = read_session_context(recording.path)
+    assert context["operator"] == "M. Sarahan"
+    assert context["instrument"] == "Nion UltraSTEM 200"
+    assert context["sample"] == "Au on C"
+    assert context["sample_area"] == "hole 4"

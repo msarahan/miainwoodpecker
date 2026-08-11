@@ -241,6 +241,10 @@ class NexusWriter:
         Fields for an ``NXuser`` group at ``/entry/user``, written
         verbatim — ``name``, ``affiliation``, ``email``, ``orcid`` are the
         base class's own fields. Optional in ``NXem``, unlike ``sample``.
+    instrument : str | None
+        Which microscope this came from, written as
+        ``/entry/instrument/name`` — the single field ``NXinstrument``
+        defines, and the first question asked of a file a year later.
     notes : str | None
         Free-text session notes, written as ``description`` inside an
         ``NXnote`` group at ``/entry/notes``.
@@ -285,6 +289,7 @@ class NexusWriter:
         definition: str | None = None,
         sample: Mapping[str, object] | None = None,
         user: Mapping[str, object] | None = None,
+        instrument: str | None = None,
         notes: str | None = None,
         calibration: FrameCalibration | None = None,
         compression: CompressionSpec = _DEFAULT_COMPRESSION,
@@ -297,6 +302,7 @@ class NexusWriter:
         self._definition = definition
         self._sample = sample
         self._user = user
+        self._instrument = instrument
         self._notes = notes
         self._calibration = calibration
         self._compression = compression
@@ -355,6 +361,12 @@ class NexusWriter:
 
         instrument = entry.create_group("instrument")
         instrument.attrs["NX_class"] = "NXinstrument"
+        if self._instrument:
+            # NXinstrument's single defined field. Written here rather than
+            # left to the vendor-metadata blob because "which microscope
+            # was this" is the first question asked of a file a year later,
+            # and NeXus has a place for the answer.
+            instrument["name"] = self._instrument
         detector = instrument.create_group("detector")
         detector.attrs["NX_class"] = "NXdetector"
         return self
