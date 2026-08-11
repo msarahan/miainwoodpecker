@@ -939,3 +939,60 @@ def test_lock_messages_are_recognized(message):
 def test_corruption_messages_are_not_mistaken_for_locks(message):
     """A hard-killed writer's file must not be mistaken for a live one."""
     assert not _is_locked(OSError(message))
+
+
+def test_join_reports_whether_the_worker_actually_finished(tmp_path):
+    """
+    A timed-out join must not look like a completed one.
+
+    join() returned None either way, so a caller polling result/error
+    afterwards saw (None, None) - the same state as "still running" -
+    with no way to tell which had happened.
+    """
+    release = threading.Event()
+
+    def blocking_frames() -> Iterator[Frame]:
+        release.wait(10.0)
+        yield make_frame()
+
+    session = Session(tmp_path / "s")
+    job = RecordingJob(session, blocking_frames(), label="scan")
+    job.start()
+    try:
+        assert job.join(timeout=0.05) is False
+        assert job.result is None
+    finally:
+        release.set()
+    assert job.join(timeout=10.0) is True
+    assert job.result is not None
+
+
+def test_a_cancelled_job_can_be_started_again(tmp_path):
+    """
+    start() clears cancellation, so a restarted job is not born cancelled.
+
+    _cancelled was never reset, so a cancelled-then-restarted job
+    returned on its first frame and wrote an empty file while reporting
+    success.
+    """
+    session = Session(tmp_path / "s")
+    job = RecordingJob(session, iter([make_frame()]), label="scan")
+    job.cancel()
+    job.start()
+    assert job.join(timeout=10.0)
+    assert job.is_cancelled is False
+
+    # And a genuine run after the restart records its frame.
+    job = RecordingJob(session, iter([make_frame(), make_frame()]), label="scan")
+    job.cancel()
+    job._frames = iter([make_frame(), make_frame()])  # noqa: SLF001 - fresh generator
+    job.start()
+    assert job.join(timeout=10.0)
+    assert job.result is not None
+    assert job.result.frame_count == 2  # noqa: PLR2004
+
+
+def test_joining_a_job_that_never_started_succeeds(tmp_path):
+    """Nothing to wait for is a finished job, not a failure."""
+    session = Session(tmp_path / "s")
+    assert RecordingJob(session, iter([]), label="scan").join(timeout=0.01) is True

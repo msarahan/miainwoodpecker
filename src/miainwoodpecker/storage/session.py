@@ -93,6 +93,7 @@ import h5py
 import numpy as np
 
 from miainwoodpecker.acquisition.sequence import record as record_frames
+from miainwoodpecker.jobs import BackgroundJob
 from miainwoodpecker.storage import layout
 from miainwoodpecker.storage.nexus import read_series
 
@@ -110,7 +111,6 @@ _STAMP_FORMAT = "%Y%m%dT%H%M%SZ"
 _INDEX_DIGITS = 4
 _CONTEXT_PREFIX = "session_"
 _CONTEXT_FIELDS = ("operator", "sample", "notes")
-_JOIN_TIMEOUT_S = 30.0
 # 1000, not 1024: operators compare this against what the OS file manager
 # and `df -h` report, and those use decimal units.
 _BYTES_PER_UNIT = 1000.0
@@ -575,7 +575,7 @@ class Session:
             raise
 
 
-class RecordingJob:
+class RecordingJob(BackgroundJob):
     """
     Run one :meth:`Session.record` on a worker thread, cancellably.
 
@@ -615,47 +615,24 @@ class RecordingJob:
         title: str | None = None,
         note: str | None = None,
     ) -> None:
+        super().__init__("recording")
         self._session = session
         self._frames = frames
         self._label = label
         self._title = title
         self._note = note
-        self._lock = threading.Lock()
         self._cancelled = threading.Event()
-        self._thread: threading.Thread | None = None
-        self._result: Recording | None = None
-        self._error: Exception | None = None
         self._frames_seen = 0
 
-    def start(self) -> None:
-        """Start the worker thread; a no-op if it is already running."""
-        if self.is_running:
-            return
-        self._thread = threading.Thread(target=self._run, name="recording", daemon=True)
-        self._thread.start()
+    def _reset(self) -> None:
+        """Clear cancellation and the frame count before a fresh run."""
+        self._cancelled.clear()
+        with self._lock:
+            self._frames_seen = 0
 
     def cancel(self) -> None:
         """Ask the worker to stop after the current frame, keeping the file."""
         self._cancelled.set()
-
-    def join(self, timeout: float = _JOIN_TIMEOUT_S) -> None:
-        """
-        Wait for the worker thread to finish.
-
-        Parameters
-        ----------
-        timeout : float
-            Seconds to wait before giving up.
-        """
-        thread = self._thread
-        if thread is not None:
-            thread.join(timeout)
-
-    @property
-    def is_running(self) -> bool:
-        """Return whether the worker thread is currently alive."""
-        thread = self._thread
-        return thread is not None and thread.is_alive()
 
     @property
     def is_cancelled(self) -> bool:
@@ -672,13 +649,7 @@ class RecordingJob:
     def result(self) -> Recording | None:
         """Return the finished recording, or None until the job completes."""
         with self._lock:
-            return self._result
-
-    @property
-    def error(self) -> Exception | None:
-        """Return the exception that ended the job, if any."""
-        with self._lock:
-            return self._error
+            return typing.cast("Recording | None", self._raw_result)
 
     def _counted(self) -> Iterator[Frame]:
         """Yield frames until cancelled, counting them as they pass."""
@@ -689,24 +660,24 @@ class RecordingJob:
                 self._frames_seen += 1
             yield frame
 
-    def _run(self) -> None:
-        """Record on the worker thread, capturing any failure."""
-        try:
-            recording = self._session.record(
-                self._counted(),
-                label=self._label,
-                title=self._title,
-                note=self._note,
-            )
-        except Exception as exc:  # noqa: BLE001 - surfaced to callers via .error
-            with self._lock:
-                self._error = exc
-            return
-        with self._lock:
-            self._result = recording
+    def _work(self) -> object:
+        """
+        Record on the worker thread.
+
+        Returns
+        -------
+        object
+            The finished :class:`Recording`.
+        """
+        return self._session.record(
+            self._counted(),
+            label=self._label,
+            title=self._title,
+            note=self._note,
+        )
 
 
-class LoadJob:
+class LoadJob(BackgroundJob):
     """
     Read one recording off disk on a worker thread.
 
@@ -739,44 +710,20 @@ class LoadJob:
         *,
         budget_bytes: int = _DEFAULT_LOAD_BUDGET_BYTES,
     ) -> None:
+        super().__init__("loading")
         self._path = Path(path)
         self._budget_bytes = budget_bytes
-        self._lock = threading.Lock()
-        self._thread: threading.Thread | None = None
-        self._result: LoadedRecording | None = None
-        self._error: Exception | None = None
         self._frames_seen = 0
 
-    def start(self) -> None:
-        """Start the worker thread; a no-op if it is already running."""
-        if self.is_running:
-            return
-        self._thread = threading.Thread(target=self._run, name="loading", daemon=True)
-        self._thread.start()
-
-    def join(self, timeout: float = _JOIN_TIMEOUT_S) -> None:
-        """
-        Wait for the worker thread to finish.
-
-        Parameters
-        ----------
-        timeout : float
-            Seconds to wait before giving up.
-        """
-        thread = self._thread
-        if thread is not None:
-            thread.join(timeout)
+    def _reset(self) -> None:
+        """Clear the frame count before a fresh run."""
+        with self._lock:
+            self._frames_seen = 0
 
     @property
     def path(self) -> Path:
         """Return the file being read."""
         return self._path
-
-    @property
-    def is_running(self) -> bool:
-        """Return whether the worker thread is currently alive."""
-        thread = self._thread
-        return thread is not None and thread.is_alive()
 
     @property
     def frames_loaded(self) -> int:
@@ -788,33 +735,27 @@ class LoadJob:
     def result(self) -> LoadedRecording | None:
         """Return the loaded recording, or None until the job completes."""
         with self._lock:
-            return self._result
-
-    @property
-    def error(self) -> Exception | None:
-        """Return the exception that ended the job, if any."""
-        with self._lock:
-            return self._error
+            return typing.cast("LoadedRecording | None", self._raw_result)
 
     def _count(self, loaded: int) -> None:
         """Record progress from the worker thread."""
         with self._lock:
             self._frames_seen = loaded
 
-    def _run(self) -> None:
-        """Read on the worker thread, capturing any failure."""
-        try:
-            loaded = load_recording(
-                self._path,
-                budget_bytes=self._budget_bytes,
-                progress=self._count,
-            )
-        except Exception as exc:  # noqa: BLE001 - surfaced to callers via .error
-            with self._lock:
-                self._error = exc
-            return
-        with self._lock:
-            self._result = loaded
+    def _work(self) -> object:
+        """
+        Read on the worker thread.
+
+        Returns
+        -------
+        object
+            The loaded recording.
+        """
+        return load_recording(
+            self._path,
+            budget_bytes=self._budget_bytes,
+            progress=self._count,
+        )
 
 
 def describe(path: os.PathLike[str] | str) -> Recording:

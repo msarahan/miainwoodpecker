@@ -301,8 +301,8 @@ in the display/UI layer and a few hot-path details:
   Similarly, status labels are rewritten 30×/s with unchanged text, and
   each `loop.stats` call copies a 30-element list to use its two
   endpoints.
-- ⬜ **Deferred (§7) — the analysis buttons do acquire → compress → write →
-  re-read on the GUI thread** (`viewer/live.py:984-1041`), against the module's own
+- ✅ **Fixed on `main` (#11) — the analysis buttons did acquire → compress →
+  write → re-read on the GUI thread** (`viewer/live.py:984-1041`), against the module's own
   stated reason for `LoadJob` existing; the burst is also materialized
   via `list(camera_series(...))`, the exact pattern the streaming design
   exists to avoid, and the "working..." label never paints. Give them
@@ -351,7 +351,7 @@ These matter little against usim and a lot against a real column:
   cleanup fails too. **Fix**: a SIGTERM/SIGINT handler that runs
   `park_and_release` with a short bound then `os._exit`, plus
   `start_new_session=True`.
-- ⬜ **Deferred (§7) — a dead client leaves the server holding the instrument
+- ✅ **Fixed — a dead client left the server holding the instrument
   forever**
   (`serve()` blocks on `stop_event` with no orphan detection). An idle
   watchdog or `PR_SET_PDEATHSIG` is cheap.
@@ -431,12 +431,12 @@ Worth stating so a cleanup pass doesn't flatten it:
 | 10 | 4 unit tests for `rpc.py`/`shared_frame.py` | coverage of the boundary | ✅ fixed |
 | 11 | 3 segment shrink/alternate thrash, `recordings()` cache | perf | ✅ fixed |
 | 12 | 3 analysis buttons still block the GUI thread | UX | ✅ fixed on `main` (#11) |
-| 13 | 4 orphan watchdog for a dead client | robustness | ⬜ §7 |
-| 14 | 2 layout helper, session-context read path, `_Job` base, boundary constants | maintainability | ⬜ §7 |
-| 15 | 4 error identity across RPC, test-hook gating, `iter_ndata_directory`, sidecar atomicity, `_inspect` lock/damage | robustness | ⬜ §7 |
+| 13 | 4 orphan watchdog for a dead client | robustness | ✅ fixed |
+| 14 | 2 layout helper, session-context read path, `_Job` base, boundary constants | maintainability | ✅ fixed |
+| 15 | 4 error identity across RPC, test-hook gating, `iter_ndata_directory`, sidecar atomicity, `_inspect` lock/damage | robustness | ✅ fixed |
 
-Items 1–11 are done, verified by the suite below. Everything a pilot
-cannot discover gently is in that set.
+Every item is now done except the deliberate one in §7 (`Session.record`
+re-reading what it wrote, kept for the verification it buys).
 
 **Verification.** 198 tests pass (172 base + 26 viewer under
 `xvfb-run`); `ruff check`, `pydoclint`, the NXem schema job, and the
@@ -456,40 +456,64 @@ where the first round of fixes broke.
 
 ## 7. What was not done, and why
 
-Not oversights — each is a decision, listed so it can be revisited
-deliberately.
+Everything §7 originally deferred has since been done, except one entry
+that was a decision rather than unfinished work. Kept here with its
+reasoning so the record shows what was weighed.
 
 - ~~**The analysis buttons still block the GUI thread**~~ — **done
   independently on `main` (#11)**, and this branch merged it rather than
-  duplicating it. The reasoning for deferring it here still stands (a
-  refactor of three handlers plus the tests that drive them
-  synchronously, alongside seven correctness fixes, would have made both
-  harder to review); #11 did it as its own piece of work, which is the
-  better outcome. Worth recording how the two met: #11 centralised the
+  duplicating it. Worth recording how the two met: #11 centralised the
   camera stop into a single `_start_analysis`, so this branch's refusal
   to start when the live loop will not release the device — previously
   three copies, one per button — became one guard in one place. The
   merge left the fix strictly smaller than it was written.
-- **No orphan watchdog** for a server whose client died (§4). Worth
-  doing, but it needs a policy decision that should be made with
-  hardware in view: how long an instrument may sit idle-but-held before
-  the server parks it and exits is a question about the instrument, not
-  about this code, and a wrong guess parks a column someone is still
-  using.
-- **`Session.record` still reopens the file it just wrote.** Flagged as
-  a redundant open, and it is — but it is one HDF5 open per *recording*
-  against a write measured in seconds, and what it buys is reading the
-  frame count and finalized flag back from disk rather than trusting
-  what the writer reported. That verification is worth more than the
-  open costs. The `recordings()` cache addressed the case that actually
-  scaled badly (one open per file per UI refresh).
-- **The coherence debt in §2** — a shared layout helper, the
-  session-context read path, a `_Job` base class, moving the protocol
-  constants to the MIT side — is real and none of it is urgent. It wants
-  doing as one deliberate pass rather than folded into a correctness
-  commit, precisely so the diff that changes behaviour stays legible.
-- **The smaller §4 robustness items** (error identity across the RPC
-  boundary, gating the test hooks behind a flag, `iter_ndata_directory`
-  aborting on one bad file, the non-atomic sidecar write, `_inspect`
-  conflating a locked file with a damaged one) are each small and each
-  independent. They are the natural next batch.
+- ~~**No orphan watchdog**~~ — **done**, and the policy question that
+  had deferred it turned out not to need answering. The worry was
+  choosing how long an instrument may sit idle-but-held, where a wrong
+  guess parks a column someone is still using. But no idle timeout is
+  needed: reconnect is deliberately unsupported (§6), so a live client
+  holds its connections for its entire life, and *every connection
+  closing* is that life ending. An idle client is still a connected one
+  and cannot trip it. The grace period that remains guards a
+  disconnect/reconnect race, not a judgement about instrument use.
+- ~~**The coherence debt in §2**~~ — **done**: `storage/layout.py` holds
+  the on-disk paths and the one `NoFramesError` that four modules used
+  to spell out by hand; `nexus.read_frames` is the single reader the
+  three analysis adapters share (which also halves the opens they made);
+  the protocol vocabulary moved to `rpc.py`; and `BackgroundJob` in
+  `miainwoodpecker/jobs.py` is the one threading contract the three
+  one-shot jobs now share. `LiveAcquisition` deliberately stayed
+  outside it — it is a loop with a latest-frame-wins buffer, not a
+  one-shot with a result, and widening the base to cover both would
+  have described neither well.
+- ~~**The smaller §4 robustness items**~~ — **done**: error identity
+  crosses the RPC boundary, the test hooks need `--enable-test-hooks`,
+  `iter_ndata_directory` grew `skip_unreadable`, the sidecar write is
+  atomic, and `_inspect` tells a locked file from a damaged one.
+- **`Session.record` still reopens the file it just wrote** — the one
+  item deliberately left. It is one HDF5 open per *recording* against a
+  write measured in seconds, and what it buys is reading the frame count
+  and finalized flag back from disk rather than trusting what the writer
+  reported. That verification is worth more than the open costs. The
+  `recordings()` cache addressed the case that actually scaled badly
+  (one open per file per UI refresh).
+
+Two findings came out of doing this work rather than out of the original
+review, and both are the kind that only surface on contact:
+
+- **`NXnote` is a rendering, not a field.** Reading session context back
+  from the real NeXus groups looked like a uniform fix, but
+  `_compose_notes` merges the session's standing notes with the
+  recording's own and prefixes each with its scope — so recovering
+  `notes` from `NXnote/description` hands back `"session: grid 3"` where
+  the session holds `"grid 3"`. `NXsample` and `NXuser` round-trip
+  faithfully; the note does not, and the group reader covers the two
+  that do.
+- **A second vacuous test, caught the same way as the first.** The
+  locked-file test opened a file twice and asserted the good answer —
+  and passed without the fix, because HDF5 locking does not engage in
+  this environment at all. It now injects the error the library raises
+  elsewhere and tests the classification, which is the part this project
+  owns. Both this and the display tests were only found by reverting the
+  fix and re-running; that check is now the habit rather than the
+  exception.
