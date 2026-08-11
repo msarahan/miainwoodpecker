@@ -83,6 +83,7 @@ import importlib
 import logging
 import os
 import pkgutil
+import signal
 import sys
 import threading
 import time
@@ -1111,12 +1112,84 @@ class _ServerSession:
         return released
 
 
-def _serve_connection(
+def _invoke(
+    target: object,
+    call: Call,
+    writer: SharedFrameWriter | None,
+    name: str,
+) -> Result:
+    """
+    Run one call against a target and package the outcome as a Result.
+
+    Split out of :func:`_serve_connection` so the socket loop reads as a
+    socket loop; the dispatch rules (properties are read rather than
+    invoked, large frames go around the pickle channel, a device's close
+    retires its segment) all live here.
+
+    Parameters
+    ----------
+    target : object
+        The device or ``NionInstrument`` the call dispatches to.
+    call : Call
+        The client's request.
+    writer : SharedFrameWriter | None
+        This target's reused shared-memory writer, or ``None`` for a
+        target that never returns a ``Frame``.
+    name : str
+        Server-side target name, for log attribution.
+
+    Returns
+    -------
+    Result
+        The value, or a stringified error - never a raised exception, so
+        one failing call cannot take down the connection or the server.
+    """
+    if not hasattr(target, call.method):
+        _LOGGER.warning("target %s: unknown method %r requested", name, call.method)
+        return Result(error=f"unknown method {call.method!r} on {call.target!r}")
+    try:
+        # getattr already evaluates properties (camera_id, scanner_id,
+        # channel_names): call the result only when it's a bound
+        # method, or a property's value gets invoked as a function.
+        attribute = getattr(target, call.method)
+        value = (
+            attribute(*call.args, **call.kwargs) if callable(attribute) else attribute
+        )
+        # Only frames worth the round trip are routed around the
+        # pickle-over-socket channel; everything else returned here
+        # is small (a string, a list of names, None).
+        if (
+            writer is not None
+            and isinstance(value, Frame)
+            and value.data.nbytes >= _SHARED_MEMORY_THRESHOLD_BYTES
+        ):
+            value = writer.publish(value)
+        # The device's own close() just stopped its acquisition
+        # thread; retire its shared-memory segment too, or it leaks
+        # in /dev/shm - named segments aren't reclaimed when a
+        # process dies, unlike its threads or anonymous memory.
+        if call.method == "close" and writer is not None:
+            writer.close()
+    except Exception as exc:
+        # The client gets the message; the log gets the traceback,
+        # which is the only place it survives - Result carries a
+        # string, so a stringified error is all that crosses the
+        # boundary. This is the per-call diagnostic the whole
+        # logging setup exists for.
+        _LOGGER.exception("target %s: call %s() raised", name, call.method)
+        return Result(error=f"{type(exc).__name__}: {exc}")
+    return Result(value=value)
+
+
+def _serve_connection(  # noqa: PLR0913 - one dispatch loop, not a call signature
     connection: object,
     name: str,
     target: object,
     writer: SharedFrameWriter | None,
     stop_event: threading.Event,
+    *,
+    rejected: str | None = None,
+    release: threading.Lock | None = None,
 ) -> None:
     """
     Handle Calls on one accepted connection until the client disconnects.
@@ -1145,62 +1218,45 @@ def _serve_connection(
         Set after a ``shutdown`` call's reply has been sent, to let
         :func:`serve` return. Setting it only *after* the send is what
         keeps the acknowledgement from racing the listener teardown.
+    rejected : str | None
+        When set, this connection lost the race for an exclusive target:
+        every call is answered with this message instead of reaching the
+        device. Answering rather than hanging up means the client raises
+        ``RemoteCallError`` naming the real reason on its first call.
+    release : threading.Lock | None
+        The exclusivity lock this connection holds, released when it ends
+        so the next client can take the target over.
     """
     try:
         while True:
             try:
                 call: Call = connection.recv()
-            except EOFError:
+            except (EOFError, ConnectionError):
+                # ConnectionError (reset/broken pipe) is an abortive close
+                # rather than a clean one; both mean "the client is gone",
+                # and letting it escape would kill this thread with a
+                # traceback on the stderr the parent shares.
                 _LOGGER.debug("target %s: client disconnected", name)
                 return
-            if not hasattr(target, call.method):
-                _LOGGER.warning(
-                    "target %s: unknown method %r requested", name, call.method,
-                )
-                connection.send(
-                    Result(error=f"unknown method {call.method!r} on {call.target!r}"),
-                )
-                continue
-            try:
-                # getattr already evaluates properties (camera_id, scanner_id,
-                # channel_names): call the result only when it's a bound
-                # method, or a property's value gets invoked as a function.
-                attribute = getattr(target, call.method)
-                value = (
-                    attribute(*call.args, **call.kwargs)
-                    if callable(attribute)
-                    else attribute
-                )
-                # Only frames worth the round trip are routed around the
-                # pickle-over-socket channel; everything else returned here
-                # is small (a string, a list of names, None).
-                if (
-                    writer is not None
-                    and isinstance(value, Frame)
-                    and value.data.nbytes >= _SHARED_MEMORY_THRESHOLD_BYTES
-                ):
-                    value = writer.publish(value)
-                # The device's own close() just stopped its acquisition
-                # thread; retire its shared-memory segment too, or it leaks
-                # in /dev/shm - named segments aren't reclaimed when a
-                # process dies, unlike its threads or anonymous memory.
-                if call.method == "close" and writer is not None:
-                    writer.close()
-            except Exception as exc:
-                # The client gets the message; the log gets the traceback,
-                # which is the only place it survives - Result carries a
-                # string, so a stringified error is all that crosses the
-                # boundary. This is the per-call diagnostic the whole
-                # logging setup exists for.
-                _LOGGER.exception("target %s: call %s() raised", name, call.method)
-                connection.send(Result(error=f"{type(exc).__name__}: {exc}"))
-            else:
-                connection.send(Result(value=value))
-                if call.method == "shutdown":
-                    stop_event.set()
-                    return
+            result = (
+                Result(error=rejected)
+                if rejected is not None
+                else _invoke(target, call, writer, name)
+            )
+            connection.send(result)
+            if result.error is None and call.method == "shutdown":
+                stop_event.set()
+                return
+    except OSError:
+        # A client that vanished mid-reply breaks send() the same way.
+        # Same reasoning as the recv() guard above: this is the client's
+        # departure, not a server fault worth a thread-death traceback.
+        _LOGGER.debug("target %s: connection broke while replying", name)
     finally:
-        connection.close()
+        with contextlib.suppress(OSError):
+            connection.close()
+        if release is not None:
+            release.release()
 
 
 def _accept_loop(
@@ -1210,21 +1266,113 @@ def _accept_loop(
     writer: SharedFrameWriter | None,
     stop_event: threading.Event,
 ) -> None:
-    """Accept connections for one target, one handler thread per connection."""
+    """
+    Accept connections for one target, one handler thread per connection.
+
+    A frame-producing target (one with a ``writer``) admits **one**
+    connection at a time. Its ``SharedFrameWriter`` reuses a single
+    segment per shape, which is safe only while exactly one
+    request/response is in flight: two clients interleaving calls would
+    have the second's publish overwrite the segment while the first is
+    still copying out of it, silently splicing two frames together. That
+    invariant used to rest on client convention alone — one
+    ``_RemoteDevice`` per target — which nothing server-side could check
+    and a second viewer pointed at these ports would break. A rejected
+    connection is served, not dropped, so the client gets a diagnosis on
+    its first call rather than a bare EOF.
+    """
+    in_use = threading.Lock() if writer is not None else None
     while True:
         try:
             connection = listener.accept()
         except OSError:
             _LOGGER.debug("target %s: listener closed, no longer accepting", name)
             return  # listener.close() from elsewhere unblocks accept() this way.
-        _LOGGER.info("target %s: accepted a connection", name)
+        rejected: str | None = None
+        if in_use is not None and not in_use.acquire(blocking=False):
+            rejected = (
+                f"target {name!r} is already driven by another connection; "
+                f"a frame-producing device admits one client at a time"
+            )
+            _LOGGER.warning("target %s: refused a second connection", name)
+        else:
+            _LOGGER.info("target %s: accepted a connection", name)
         disable_nagle(connection)
         thread = threading.Thread(
             target=_serve_connection,
             args=(connection, name, target, writer, stop_event),
+            kwargs={
+                "rejected": rejected,
+                "release": None if rejected is not None else in_use,
+            },
             daemon=True,
         )
         thread.start()
+
+
+@contextlib.contextmanager
+def _parking_signal_handlers(session: _ServerSession) -> Iterator[None]:
+    """
+    Park the instrument on SIGTERM/SIGINT instead of dying with the beam on.
+
+    The client's teardown falls back to ``terminate()`` whenever the
+    graceful ``shutdown`` RPC times out or reports errors — which is
+    precisely the wedged-server case the fallback exists for — and a
+    signal-less server answers that by dying with the column live. The
+    same applies to a Ctrl-C reaching the process group. Parking is the
+    one thing :meth:`InstrumentController.park` promises for exactly this
+    situation, so it should not be reachable only through the RPC that a
+    wedged server cannot serve.
+
+    The handler must finish inside the client's escalation window (5 s
+    between ``terminate()`` and ``kill()``), which blanking a beam
+    comfortably does; :meth:`_ServerSession.park_and_release` is
+    individually guarded per step and memoized, so a signal arriving
+    during a graceful shutdown returns the existing report rather than
+    parking twice.
+
+    Handlers are restored on the way out, and installation is skipped off
+    the main thread, so an in-process caller of :func:`serve` does not
+    inherit process-wide signal behaviour it never asked for.
+
+    Parameters
+    ----------
+    session : _ServerSession
+        The session to park and stop.
+
+    Yields
+    ------
+    None
+        With the handlers installed for the duration.
+    """
+
+    def _handle(signum: int, _frame: object) -> None:
+        name = signal.Signals(signum).name
+        _LOGGER.warning("received %s: parking the instrument before exit", name)
+        try:
+            report = session.park_and_release()
+        except Exception:
+            _LOGGER.exception("park on %s failed", name)
+        else:
+            _LOGGER.info("parked on %s: %s", name, report)
+        # Unblocks serve()'s wait, so the process exits through its normal
+        # path (listeners closed, devices released) rather than abruptly.
+        session.stop_event.set()
+
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+
+    previous: list[tuple[int, object]] = []
+    try:
+        for signum in (signal.SIGTERM, signal.SIGINT):
+            with contextlib.suppress(OSError, ValueError):
+                previous.append((signum, signal.signal(signum, _handle)))
+        yield
+    finally:
+        for signum, handler in previous:
+            with contextlib.suppress(OSError, ValueError, TypeError):
+                signal.signal(signum, handler)  # type: ignore[arg-type]
 
 
 def serve(
@@ -1277,20 +1425,21 @@ def serve(
             ", ".join(names),
             ", ".join(str(ports[name]) for name in names),
         )
-        for listener, name in zip(listeners, names, strict=True):
-            thread = threading.Thread(
-                target=_accept_loop,
-                args=(
-                    listener,
-                    name,
-                    session.targets[name],
-                    session.writers[name],
-                    session.stop_event,
-                ),
-                daemon=True,
-            )
-            thread.start()
-        session.stop_event.wait()
+        with _parking_signal_handlers(session):
+            for listener, name in zip(listeners, names, strict=True):
+                thread = threading.Thread(
+                    target=_accept_loop,
+                    args=(
+                        listener,
+                        name,
+                        session.targets[name],
+                        session.writers[name],
+                        session.stop_event,
+                    ),
+                    daemon=True,
+                )
+                thread.start()
+            session.stop_event.wait()
         _LOGGER.info("shutdown acknowledged; closing listeners and exiting")
         for listener in listeners:
             listener.close()

@@ -899,6 +899,15 @@ def _spawn_server(
             *(str(ports[name]) for name in _TARGET_NAMES),
         ],
         env=env,
+        # Its own process group, so a Ctrl-C in the launching terminal
+        # does not SIGINT the server alongside the application. Sharing
+        # one meant an interrupt raced the client's orderly teardown: the
+        # server could die mid-acquisition before anything parked the
+        # instrument, and a process-group kill is also the one case where
+        # the resource_tracker cannot reclaim the shared-memory segments
+        # (it dies in the same sweep). Teardown reaches the server by
+        # signalling the process directly, which is unaffected.
+        start_new_session=True,
     )
 
 

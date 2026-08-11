@@ -994,7 +994,10 @@ def resolve_frame_calibration(
     if (
         isinstance(fov_size_nm, (tuple, list))
         and len(fov_size_nm) == len(AXIS_NAMES)
-        and all(isinstance(extent, (int, float)) and extent > 0 for extent in fov_size_nm)
+        and all(
+            isinstance(extent, (int, float)) and extent > 0
+            for extent in fov_size_nm
+        )
         and height
         and width
     ):

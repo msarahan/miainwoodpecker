@@ -134,12 +134,22 @@ class SharedFrameWriter:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._segment: shared_memory.SharedMemory | None = None
-        self._shape: tuple[int, ...] | None = None
-        self._dtype: np.dtype | None = None
 
     def publish(self, frame: Frame) -> SharedFrameRef:
         """
-        Copy a frame's array into the reused segment, resizing if needed.
+        Copy a frame's array into the reused segment, growing it if needed.
+
+        The segment is replaced only when the frame does not *fit*, not
+        whenever its shape or dtype changes. That distinction is the whole
+        point of reuse: replacing means ``shm_open``/``mmap`` plus
+        ``munmap``/``unlink``, the per-frame syscall pair this design
+        exists to avoid, and keying on exact shape equality paid it for
+        every *smaller* frame and on every frame of an alternating
+        workload (an operator toggling 512² and 1024², or a benchmark
+        sweeping sizes) — reverting to the regime measured as worse than
+        plain pickling. Shape and dtype need no tracking here because they
+        travel in the returned :class:`SharedFrameRef`; the segment is
+        just bytes, and a larger one holds a smaller frame perfectly well.
 
         Parameters
         ----------
@@ -150,19 +160,13 @@ class SharedFrameWriter:
         -------
         SharedFrameRef
             A reference the reader can use to retrieve the array. Its
-            ``shm_name`` is stable across calls until a resize forces a
-            new segment.
+            ``shm_name`` is stable across calls until a frame too large
+            for the current segment forces a new one.
         """
         data = np.ascontiguousarray(frame.data)
         with self._lock:
-            if (
-                self._segment is None
-                or self._shape != data.shape
-                or self._dtype != data.dtype
-            ):
+            if self._segment is None or data.nbytes > self._segment.size:
                 self._replace_segment(data.nbytes)
-                self._shape = data.shape
-                self._dtype = data.dtype
             assert self._segment is not None  # noqa: S101 - just created above
             destination = np.ndarray(
                 data.shape, dtype=data.dtype, buffer=self._segment.buf,
@@ -191,8 +195,6 @@ class SharedFrameWriter:
                 self._segment.close()
                 self._segment.unlink()
                 self._segment = None
-                self._shape = None
-                self._dtype = None
 
 
 class SharedFrameReader:
