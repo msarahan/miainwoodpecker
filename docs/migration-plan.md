@@ -932,31 +932,80 @@ problem — read their source and docs before designing our own adapters:
     against usim, and how long a real detector's write actually takes is
     what decides whether the per-frame `flush()` is a nicety or a
     requirement.
-  - **Multi-line and per-recording notes.** A single-line per-session field
-    is enough to prove the wiring and not enough for a shift's worth of
-    observations.
-  - **No way to change session directory from the UI** — chosen at launch,
-    so an operator switching samples after lunch restarts the app.
-    `set_session()` is the single path such a button would use, so this is
-    small, just not done.
+  - ~~**Multi-line and per-recording notes**~~ — **done**: session notes are
+    a `QPlainTextEdit` rather than a single line, and `Session.record()`
+    takes a per-recording `note=` that lands in the file's `NXnote` labelled
+    with its scope. What is *not* done is annotating a recording after the
+    fact, tracked below.
+  - ~~**No way to change session directory from the UI**~~ — **done**:
+    `change_session_directory()` picks a directory and routes through
+    `set_session()`, so a switched-to directory behaves exactly like one
+    named at launch — reused if it exists, numbering resumed, context read
+    from its own `session.json`, and no context carried across. A recording
+    in flight blocks the switch rather than being silently redirected.
   - ~~**Nothing reads a session back**~~ — **done** (§5 Phase 3): recordings
     open from the session or an arbitrary path, and the analysis buttons run
-    against a file on disk. Two smaller gaps remain in its place: a recording
-    cannot be annotated *after* the fact, and there is no cross-session
-    enumeration, so "find that scan from last Tuesday" is still a file
-    browser's job.
-  - **Disk-space and long-run behaviour is unexamined.** A pilot day of
-    2048×2048 float32 frames is tens of GB; nothing warns, estimates, or
-    reports free space. Note the compression work (§5 Phase 3) improved the
-    per-file arithmetic — a 1024² scan recording is 29.1 MB rather than
-    32.1 MB, or 13.8 MB stored as float32 — but nothing *tracks* the total.
+    against a file on disk. Both gaps this left behind are now closed too:
+    - ~~*A recording cannot be annotated after the fact*~~ — `annotate()`
+      appends into the file's real `NXnote`, so an after-the-fact note lands
+      in the same place as one written at acquisition time and nothing
+      downstream needs to know the difference. Appended and labelled with
+      when it was added, never overwriting the acquisition note, for the
+      same reason the session and recording scopes are labelled: a reader
+      has to be able to tell an observation made during the shift from one
+      added a week later. The button acts on the *opened* recording rather
+      than the combo selection, which removes the way to annotate the wrong
+      file by leaving the combo elsewhere.
+    - ~~*No cross-session enumeration*~~ — `find_recordings()` walks the
+      session directories under a base and the Recordings combo can list
+      that scope instead of just this session, so "find that scan from last
+      Tuesday" no longer means leaving the app. Entries are then qualified
+      by directory, because per-session numbering restarts at `0001` and the
+      filename alone is ambiguous across sessions. Deliberately a directory
+      walk and not an index: the filesystem is already the index, and a
+      catalogue would be a second source of truth to keep in sync with a
+      directory an operator also moves and renames files in by hand.
+  - ~~**Disk-space and long-run behaviour is unexamined**~~ — **done** for
+    the reporting half. `free_space()` and `estimate_size()` back a Disk row
+    in the Session group that shows what is free and warns when the planned
+    frame count would not fit. The estimate is the *uncompressed* size on
+    purpose: erring high means warning slightly early, which is the right
+    direction to be wrong about running out of disk mid-acquisition, and the
+    real ratio depends on data that does not exist yet. What is still not
+    done is tracking cumulative usage across a shift, or doing anything
+    about it beyond saying so.
   - **A large file is read twice on the analyze-from-disk path** — once by
     the load job for display, once by the adapter — because the adapters take
     a path rather than an array. Harmless at pilot scale, wasteful at
-    2048×2048.
-  - **The analysis buttons still block the GUI thread** for the length of
-    their burst — pre-existing, and the obvious next candidate for the
-    `RecordingJob` treatment the recording path already uses.
+    2048×2048. **Still open, and deliberately**: fixing it means changing
+    what `load_as_hyperspy_signal`, `load_as_libertem_dataset`, and
+    `load_as_diffraction_slice` accept, which is a Phase 4 adapter API
+    change rather than the Phase 5 wiring the rest of this list is. Each has
+    an in-memory constructor to target (`Signal2D`, `MemoryDataSet`,
+    `DiffractionSlice`), so the shape is known; it is scoped, not blocked.
+  - ~~**The analysis buttons still block the GUI thread**~~ — **done**. All
+    three now hand off to
+    [`AnalysisJob`](../src/miainwoodpecker/viewer/jobs.py), which has
+    `LoadJob`'s exact shape: daemon thread, state behind a lock, exceptions
+    captured rather than raised, no Qt, polled from the same display timer
+    that already collects the recording and load jobs.
+    - The split is what makes it safe, and it is the caller's job rather
+      than the job class's: `_start_analysis` resolves the Recordings
+      checkbox and the note field *before* the thread starts, and defers
+      every layer and label update to `_poll_analysis`. `_analysis_input`
+      correspondingly takes `existing`/`note` as arguments instead of
+      reading the widgets itself, and no longer refreshes the session
+      labels from inside the worker.
+    - Each button supplies a `compute` (runs on the worker, must not touch
+      Qt) and a `display` (runs on the GUI thread, draws and returns the
+      status text). That is the whole difference between them; everything
+      else — stopping the live camera, acquiring or opening, error
+      reporting, refusing a second concurrent run — is now shared.
+    - Covered by a race-free test rather than a timing one: layers and
+      status text are only ever touched by the poll path, so asserting
+      straight after the click that the layer is absent and the label reads
+      "working..." holds regardless of how fast the worker finishes, and
+      fails every time for a handler that works inline.
 
 ## 6. License — resolved: process-boundary isolation
 
@@ -1378,7 +1427,7 @@ The invariant now holds mechanically: `nion.*` is imported in
     shape. `fov_nm` was documented as "field of view of the scanned
     region" without saying *which axis*, and storage had picked the
     reading Nion does not use — so every non-square scan was written with
-    a slow-axis scale wrong by the aspect ratio, with two of this
+    a slow-axis scale wrong by the aspect ratio, with three of this
     project's own tests asserting the bug. And the per-frame `flush()`
     above was made public, described as the fix, and then never called by
     any shipped code path. Neither would have surfaced from tests,
@@ -1388,6 +1437,31 @@ The invariant now holds mechanically: `nion.*` is imported in
     reliably not applied to claims already written down. Both new
     findings came from checking a stated claim against the thing it was a
     claim about — Nion's own calibration source, and a grep for callers.
+- **Is "session" the right concept at all?** Raised by @msarahan from
+  operator experience: people tend to use plain filesystem folders to
+  represent a session and keep the data for one grouped in that folder, so
+  a named abstraction risks being ceremony over something the filesystem
+  already does. Worth noting how little separates the two positions —
+  `storage/session.py`'s own docstring already says "the filesystem is the
+  index and NeXus files are the records", and a `Session` *is* a directory.
+  Over a bare folder it adds exactly three things: a collision-free naming
+  rule, a `session.json` sidecar, and background jobs so slow I/O does not
+  freeze the GUI. The first and third are plumbing any design needs. So the
+  live question is narrower than the framing suggests: **does the sidecar
+  earn its place?** Since the writer grew `sample=`/`user=`/`notes=`, every
+  fact it holds is also written into each file as real NeXus groups, which
+  argues for demoting it from a second source of truth to remembered
+  defaults for the next recording in that folder. Not yet acted on — the
+  sidecar is still what makes reopening a directory mid-shift restore its
+  context, and cross-session enumeration (below) would lean on it too.
+- **Grouping analyses with the data they came from**, also from @msarahan:
+  at some point it may be worth keeping a derived result in the same
+  container as its source rather than as a loose sibling file. NeXus needs
+  no invention for this — multiple `NXentry` groups in one file is the
+  standard shape, and `NXprocess` exists for exactly "this was derived, by
+  this program, from that". Deliberately not designed yet: Phase 4's
+  adapters are proofs of concept, and the right container layout follows
+  from a real analysis workflow rather than preceding one.
 - **Bluesky/ophyd**: the [Bluesky](https://blueskyproject.io/) experiment
   orchestration framework (device abstraction via `ophyd`/`ophyd-async`,
   scripted acquisition via a `RunEngine`) is a real, actively developed

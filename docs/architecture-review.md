@@ -430,7 +430,7 @@ Worth stating so a cleanup pass doesn't flatten it:
 | 9 | 3 viewer frame-identity check, label churn, timer-on-error | perf/UX | ✅ fixed |
 | 10 | 4 unit tests for `rpc.py`/`shared_frame.py` | coverage of the boundary | ✅ fixed |
 | 11 | 3 segment shrink/alternate thrash, `recordings()` cache | perf | ✅ fixed |
-| 12 | 3 analysis buttons still block the GUI thread | UX | ⬜ §7 |
+| 12 | 3 analysis buttons still block the GUI thread | UX | ✅ fixed on `main` (#11) |
 | 13 | 4 orphan watchdog for a dead client | robustness | ⬜ §7 |
 | 14 | 2 layout helper, session-context read path, `_Job` base, boundary constants | maintainability | ⬜ §7 |
 | 15 | 4 error identity across RPC, test-hook gating, `iter_ndata_directory`, sidecar atomicity, `_inspect` lock/damage | robustness | ⬜ §7 |
@@ -459,15 +459,17 @@ where the first round of fixes broke.
 Not oversights — each is a decision, listed so it can be revisited
 deliberately.
 
-- **The analysis buttons still block the GUI thread** (§3). This is the
-  largest remaining item and the one the migration plan itself already
-  names as "the obvious next candidate for the `RecordingJob`
-  treatment". It was left because the fix is a genuine refactor of three
-  handlers *plus* their tests — `test_live_widget.py` drives them
-  synchronously and asserts on the result immediately — and doing that
-  at the same time as seven correctness fixes would have made both
-  harder to review. It is a PoC/demo path, not the operator's data path,
-  which is what puts it after everything above.
+- ~~**The analysis buttons still block the GUI thread**~~ — **done
+  independently on `main` (#11)**, and this branch merged it rather than
+  duplicating it. The reasoning for deferring it here still stands (a
+  refactor of three handlers plus the tests that drive them
+  synchronously, alongside seven correctness fixes, would have made both
+  harder to review); #11 did it as its own piece of work, which is the
+  better outcome. Worth recording how the two met: #11 centralised the
+  camera stop into a single `_start_analysis`, so this branch's refusal
+  to start when the live loop will not release the device — previously
+  three copies, one per button — became one guard in one place. The
+  merge left the fix strictly smaller than it was written.
 - **No orphan watchdog** for a server whose client died (§4). Worth
   doing, but it needs a policy decision that should be made with
   hardware in view: how long an instrument may sit idle-but-held before
