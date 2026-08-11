@@ -10,6 +10,7 @@ from miainwoodpecker.devices import (
     DEFOCUS_CONTROL,
     STAGE_POSITION_CONTROL,
     Camera,
+    CameraParameters,
     Frame,
     InstrumentController,
     ScanParameters,
@@ -23,11 +24,38 @@ class _FakeCamera:
     def __init__(self) -> None:
         self.running = False
         self.closed = False
+        self._parameters = CameraParameters(exposure_ms=10.0)
 
     @property
     def camera_id(self) -> str:
         """Return the fake camera's id."""
         return "fake_camera"
+
+    @property
+    def binning_values(self) -> tuple[int, ...]:
+        """Return the binning factors this fake supports."""
+        return (1, 2)
+
+    def parameters(self) -> CameraParameters:
+        """Return the settings the next frame would use."""
+        return self._parameters
+
+    def configure(self, parameters: CameraParameters) -> CameraParameters:
+        """
+        Record new settings and report them back.
+
+        Parameters
+        ----------
+        parameters : CameraParameters
+            The requested exposure and binning.
+
+        Returns
+        -------
+        CameraParameters
+            The same settings; this fake rounds nothing.
+        """
+        self._parameters = parameters
+        return self._parameters
 
     def start(self) -> None:
         """Mark acquisition as running."""

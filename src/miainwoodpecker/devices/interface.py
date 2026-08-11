@@ -194,6 +194,41 @@ class ScanParameters:
         return (self.height * pixel_nm, self.width * pixel_nm)
 
 
+@dataclass(frozen=True)
+class CameraParameters:
+    """
+    Settings for a camera acquisition, in vendor-neutral units.
+
+    The camera's counterpart to :class:`ScanParameters`, and a value
+    object for the same reason: a camera has two settings that must change
+    together to stay coherent, since binning changes both the frame shape
+    and the calibration scale. Setting them one at a time leaves a window
+    in which the two disagree.
+
+    Attributes
+    ----------
+    exposure_ms : float
+        Integration time per frame, in milliseconds. Must be positive.
+    binning : int
+        How many sensor pixels are combined per stored pixel, in each
+        direction. A binned pixel spans proportionally more of the axis,
+        so this multiplies the calibration scale — which is why the two
+        are one type. Must be one of the camera's ``binning_values``.
+    """
+
+    exposure_ms: float
+    binning: int = 1
+
+    def __post_init__(self) -> None:
+        """Reject values no camera could act on."""
+        if not self.exposure_ms > 0:
+            msg = f"exposure_ms must be positive, got {self.exposure_ms!r}"
+            raise ValueError(msg)
+        if self.binning < 1:
+            msg = f"binning must be at least 1, got {self.binning!r}"
+            raise ValueError(msg)
+
+
 @typing.runtime_checkable
 class Camera(typing.Protocol):
     """
@@ -204,11 +239,35 @@ class Camera(typing.Protocol):
     ``close`` exactly once when the device will not be used again.
     Implementations may own background threads that keep the process
     alive until ``close`` is called.
+
+    ``configure`` may be called at any point, including while started;
+    which frame first shows the change is the device's business, and the
+    contract is only that a later frame does.
     """
 
     @property
     def camera_id(self) -> str:
         """Return the stable identifier for this camera."""
+        ...
+
+    @property
+    def binning_values(self) -> typing.Sequence[int]:
+        """Return the binning factors this camera supports, ascending."""
+        ...
+
+    def parameters(self) -> CameraParameters:
+        """Return the settings the next frame will be acquired with."""
+        ...
+
+    def configure(self, parameters: CameraParameters) -> CameraParameters:
+        """
+        Apply new settings and return the ones the device actually took.
+
+        Returned rather than assumed, because a device may round an
+        exposure to its own precision. Callers that care what a frame was
+        taken under should read the return value or the frame's metadata,
+        not the request.
+        """
         ...
 
     def start(self) -> None:

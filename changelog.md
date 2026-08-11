@@ -71,6 +71,15 @@
   `Frame`. The accelerating voltage is additionally written as
   `NXsource.voltage`, the one piece of it NeXus specifies a home for.
 
+- Camera exposure and binning control: `CameraParameters(exposure_ms,
+  binning)`, `Camera.binning_values`/`parameters()`/`configure()`, through
+  the device server and over IPC. `configure` reports what the device took
+  rather than echoing the request, and refuses a binning the camera does
+  not advertise instead of rounding it. Binning multiplies the calibration
+  scale, and the binning a *frame* reports is recovered from its shape, so
+  a camera reconfigured mid-acquisition cannot mislabel the frame already
+  in flight.
+
 ### Changed
 
 - CI's `integration` job runs its tests in parallel (`pytest -n auto`),

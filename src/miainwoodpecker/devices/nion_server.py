@@ -101,6 +101,7 @@ from miainwoodpecker.devices.interface import (
     BEAM_BLANKER_CONTROL,
     DEFOCUS_CONTROL,
     STAGE_POSITION_CONTROL,
+    CameraParameters,
     Frame,
     ScanParameters,
 )
@@ -382,6 +383,15 @@ class NionCamera:
         self._controller = controller
         self._closed = False
         self._frame_index = 0
+        # The vendor's own defaults, read rather than assumed: a bare
+        # CameraFrameParameters is what the device starts from, so this
+        # reports what the next frame really will be taken with before
+        # anyone has configured anything.
+        defaults = _camera_base.CameraFrameParameters()
+        self._parameters = CameraParameters(
+            exposure_ms=float(defaults.exposure_ms),
+            binning=int(defaults.binning),
+        )
 
     @property
     def is_closed(self) -> bool:
@@ -392,6 +402,75 @@ class NionCamera:
     def camera_id(self) -> str:
         """Return the wrapped device's camera id."""
         return self._device.camera_id
+
+    @property
+    def binning_values(self) -> Sequence[int]:
+        """Return the binning factors the wrapped device supports, ascending."""
+        return sorted(int(value) for value in self._device.binning_values)
+
+    def parameters(self) -> CameraParameters:
+        """Return the settings the next frame will be acquired with."""
+        return self._parameters
+
+    def configure(self, parameters: CameraParameters) -> CameraParameters:
+        """
+        Apply exposure and binning to the device, and report what it took.
+
+        Binning is checked against the device's own ``binning_values``
+        here rather than left to the vendor. Nion's ``CameraDevice``
+        protocol has a ``validate_frame_parameters`` for this, but usim's
+        is a pass-through — measured: it returns ``binning=3`` unchanged
+        on a camera advertising ``[1, 2, 4, 8]``. An unsupported factor
+        that reaches the device produces frames of an unexpected shape
+        and a calibration scale wrong by the ratio, neither of which
+        announces itself, so it is refused rather than silently rounded
+        to a neighbour the caller did not ask for.
+
+        **When the change takes effect is the device's business.**
+        Measured against usim: configured while running, the frame
+        already in flight completes at the old settings and the one after
+        that is the first to change; configured while stopped, the first
+        frame after ``start`` is already correct. So a caller who needs a
+        frame taken at known settings should configure before starting,
+        and one configuring live should expect a frame or two of overlap.
+        The frames themselves stay honest about binning either way, since
+        it is recovered from their shape.
+
+        Parameters
+        ----------
+        parameters : CameraParameters
+            The requested exposure and binning.
+
+        Returns
+        -------
+        CameraParameters
+            What the device accepted, after its own validation.
+
+        Raises
+        ------
+        ValueError
+            If ``binning`` is not one the device advertises.
+        """
+        supported = self.binning_values
+        if parameters.binning not in supported:
+            msg = (
+                f"binning {parameters.binning} is not supported by "
+                f"{self.camera_id}; it accepts {supported}"
+            )
+            raise ValueError(msg)
+        frame_parameters = _camera_base.CameraFrameParameters(
+            exposure_ms=parameters.exposure_ms,
+            binning=parameters.binning,
+        )
+        validate = getattr(self._device, "validate_frame_parameters", None)
+        if callable(validate):
+            frame_parameters = validate(frame_parameters)
+        self._device.set_frame_parameters(frame_parameters)
+        self._parameters = CameraParameters(
+            exposure_ms=float(frame_parameters.exposure_ms),
+            binning=int(frame_parameters.binning),
+        )
+        return self._parameters
 
     def calibration_metadata(
         self,
@@ -471,13 +550,11 @@ class NionCamera:
         data_element = self._device.acquire_image()
         data = data_element["data"]
         metadata = dict(data_element.get("properties") or {})
-        calibration = self.calibration_metadata(
-            data.shape,
-            float(metadata.get("binning", 1) or 1),
-        )
+        binning = self._binning_of(data.shape)
+        calibration = self.calibration_metadata(data.shape, float(binning))
         if calibration is not None:
             metadata[_calibration.METADATA_KEY] = calibration
-        metadata.update(self._frame_metadata())
+        metadata.update(self._frame_metadata(binning))
         self._frame_index += 1
         return Frame(
             data=data,
@@ -485,12 +562,66 @@ class NionCamera:
             metadata=metadata,
         )
 
-    def _frame_metadata(self) -> dict[str, object]:
-        """Return the identity, instrument state, and detector labels for a frame."""
+    def _binning_of(self, shape: tuple[int, ...]) -> int:
+        """
+        Return the binning this frame was actually taken at, from its shape.
+
+        Not simply the configured binning, because a camera configured
+        while it is running finishes the frame already in flight at the
+        old settings first — measured against usim: the frame *after* a
+        ``configure`` is still unbinned, and the one after that is not.
+        Labelling that frame with the new binning would put a calibration
+        scale on it that is wrong by the whole binning factor, which is
+        not a label problem but a wrong axis on stored data.
+
+        The device's own ``get_expected_dimensions`` is the mapping used,
+        so a camera that bins asymmetrically is handled by its own rules
+        rather than by dividing and hoping.
+
+        Parameters
+        ----------
+        shape : tuple[int, ...]
+            The acquired frame's shape.
+
+        Returns
+        -------
+        int
+            The matching supported binning, or the configured one if no
+            supported factor produces this shape.
+        """
+        expected = getattr(self._device, "get_expected_dimensions", None)
+        if callable(expected):
+            for value in self.binning_values:
+                with contextlib.suppress(Exception):
+                    if tuple(expected(value)) == tuple(shape):
+                        return value
+        return self._parameters.binning
+
+    def _frame_metadata(self, binning: int) -> dict[str, object]:
+        """
+        Return the identity, instrument state, and detector labels for a frame.
+
+        Parameters
+        ----------
+        binning : int
+            The binning the frame was taken at, from :meth:`_binning_of`.
+
+        Returns
+        -------
+        dict[str, object]
+            The metadata to merge into the frame's own.
+        """
         device = self._device
         metadata: dict[str, object] = {
             "device_id": self.camera_id,
             "frame_index": self._frame_index,
+            "binning": binning,
+            # The configured exposure, which the frame in flight during a
+            # `configure` was *not* taken at. Unlike binning that leaves
+            # no trace in the data to recover it from, so a caller who
+            # needs certainty should configure before start(); see
+            # `configure`.
+            "exposure_ms": self._parameters.exposure_ms,
         }
         for key, attribute in (
             ("camera_name", "camera_name"),

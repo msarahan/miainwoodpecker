@@ -154,21 +154,33 @@ Three decisions came out of building it.
   field justifies. Everything else stays in the per-frame JSON, which is
   what that column is for.
 
-### 3. Exposure and binning control
+### 3. Exposure and binning control — **done**
 
-Absent from the device interface, and §7 already says they want doing
-*with* calibration rather than after it. The reason is now precise:
-`build_calibration` takes `relative_scale=binning`, so binning multiplies
-the calibration scale. Adding binning without wiring it into item 1
-produces frames whose axes are wrong by an integer factor.
+§7 said these wanted doing *with* calibration rather than after it, and
+the reason turned out to be mechanical: `build_calibration` takes
+`relative_scale=binning`, so binning multiplies the calibration scale.
 
-Contracts to port: `test_changing_binning_is_reflected_in_new_acquisition`,
-`test_record_acquires_properly_binned_data`,
-`test_first_view_uses_correct_exposure`,
-`test_view_followed_by_frame_uses_correct_exposure`, and
-`test_changing_frame_parameters_during_view_does_not_affect_current_acquisition`
-— the last being the one that says a parameter change must not tear a
-frame in half.
+`CameraParameters(exposure_ms, binning)` is a value object for the same
+reason `ScanParameters` is — the two settings must change together to
+stay coherent — and `configure` returns what the device *took* rather
+than echoing the request.
+
+Two things the simulator taught, both now load-bearing:
+
+- **usim's `validate_frame_parameters` validates nothing.** Measured: it
+  returns `binning=3` unchanged on a camera advertising `[1, 2, 4, 8]`.
+  So an unsupported factor is refused here, naming what the camera
+  accepts, rather than rounded to a neighbour — a caller asking for 3 has
+  a bug, and silently giving them 2 makes every axis wrong by a third.
+- **A camera configured while running finishes the frame in flight at the
+  old settings.** That is Nion's
+  `test_changing_frame_parameters_during_view_does_not_affect_current_acquisition`,
+  and it has teeth here that it does not have there: labelling that frame
+  with the new binning would put an axis on stored data wrong by the whole
+  factor. So the binning a frame reports is recovered from its *shape*
+  via the device's own `get_expected_dimensions`, not from the setting.
+  Configuring a stopped camera has the first frame already correct, which
+  is the path to use when it matters.
 
 ### 4. Two frame-identity contracts we do not test at all
 

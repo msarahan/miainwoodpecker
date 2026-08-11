@@ -39,6 +39,7 @@ from miainwoodpecker.devices import (
     DEFOCUS_CONTROL,
     STAGE_POSITION_CONTROL,
     Camera,
+    CameraParameters,
     InstrumentController,
     ScanParameters,
     Scanner,
@@ -677,3 +678,123 @@ def test_an_instrument_that_reports_nothing_contributes_no_keys():
     """
     assert _instrument_state(None) == {}
     assert _instrument_state(_ControllerWithoutControls()) == {}
+
+
+# ------------------------------------------------- exposure and binning
+#
+# §7 wanted these done *with* calibration rather than after it, and the
+# reason is now mechanical rather than stylistic: binning multiplies the
+# calibration scale (build_calibration's relative_scale), so a binning
+# control that did not reach the calibration would write axes wrong by an
+# integer factor on every binned frame.
+
+_UNSUPPORTED_BINNING = 3
+# A supported factor big enough that a wrongly-scaled axis is unmistakable.
+_TEST_BINNING = 4
+
+
+def test_binning_values_are_reported_and_not_empty():
+    """A camera says what binning it supports, so a caller need not guess."""
+    with simulated_instrument() as microscope:
+        values = microscope.eels_camera.binning_values
+        assert values
+        assert list(values) == sorted(values)
+        assert values[0] == 1
+
+
+def test_configuring_before_start_takes_effect_on_the_first_frame():
+    """
+    Settings applied to a stopped camera are in force from its first frame.
+
+    This is the path a caller who needs a frame taken at known settings
+    should use, and the reason it is worth stating: configuring a camera
+    that is already running does *not* affect the frame already in
+    flight — see the test below.
+    """
+    with simulated_instrument() as microscope:
+        camera = microscope.eels_camera
+        binned = camera.configure(
+            CameraParameters(exposure_ms=20.0, binning=_TEST_BINNING),
+        )
+        assert binned.binning == _TEST_BINNING
+        assert camera.parameters() == binned
+        camera.start()
+        try:
+            frame = camera.acquire_frame()
+        finally:
+            camera.stop()
+        assert frame.data.shape == camera._device.get_expected_dimensions(_TEST_BINNING)  # noqa: SLF001
+        assert frame.metadata["binning"] == _TEST_BINNING
+        assert frame.metadata["exposure_ms"] == pytest.approx(20.0)
+
+
+def test_a_frame_in_flight_keeps_the_settings_it_was_started_with():
+    """
+    Reconfiguring a running camera does not relabel the frame already begun.
+
+    Nion asserts the same thing one layer up
+    (``test_changing_frame_parameters_during_view_does_not_affect_current_acquisition``).
+    What makes it matter here is the calibration: binning multiplies the
+    axis scale, so labelling an unbinned frame with the new binning would
+    put an axis on stored data that is wrong by the whole factor. The
+    binning a frame reports is therefore recovered from its shape, not
+    from the setting.
+    """
+    with simulated_instrument() as microscope:
+        camera = microscope.eels_camera
+        camera.start()
+        try:
+            unbinned = camera.acquire_frame()
+            camera.configure(CameraParameters(exposure_ms=20.0, binning=_TEST_BINNING))
+            in_flight = camera.acquire_frame()
+            settled = camera.acquire_frame()
+        finally:
+            camera.stop()
+        assert in_flight.data.shape == unbinned.data.shape
+        assert in_flight.metadata["binning"] == 1
+        assert settled.data.shape != unbinned.data.shape
+        assert settled.metadata["binning"] == _TEST_BINNING
+
+
+def test_binning_multiplies_the_axis_scale_of_the_frame_it_applied_to():
+    """
+    A binned frame's calibration scale grows with the binning, per frame.
+
+    The whole reason binning and calibration are one piece of work: a
+    binned pixel spans proportionally more of the axis, and the frame
+    that was *not* binned must not be scaled as though it were.
+    """
+    with simulated_instrument() as microscope:
+        camera = microscope.eels_camera
+        camera.start()
+        try:
+            unbinned = camera.acquire_frame()
+            camera.configure(CameraParameters(exposure_ms=20.0, binning=_TEST_BINNING))
+            camera.acquire_frame()  # the in-flight frame, still unbinned
+            binned = camera.acquire_frame()
+        finally:
+            camera.stop()
+        unbinned_scale = unbinned.metadata["calibration"]["x"]["scale"]
+        binned_scale = binned.metadata["calibration"]["x"]["scale"]
+        assert binned_scale == pytest.approx(float(_TEST_BINNING) * unbinned_scale)
+
+
+def test_an_unsupported_binning_is_refused_rather_than_rounded():
+    """
+    A binning the camera does not advertise raises, naming what it accepts.
+
+    usim's ``validate_frame_parameters`` is a pass-through — measured, it
+    returns ``binning=3`` unchanged on a camera advertising [1, 2, 4, 8] —
+    so nothing downstream would have caught it. Refused rather than
+    rounded to a neighbour, because a caller asking for 3 has a bug and
+    silently giving them 2 makes every axis wrong by a third.
+    """
+    with simulated_instrument() as microscope:
+        camera = microscope.eels_camera
+        assert _UNSUPPORTED_BINNING not in camera.binning_values
+        with pytest.raises(ValueError, match="not supported"):
+            camera.configure(
+                CameraParameters(exposure_ms=10.0, binning=_UNSUPPORTED_BINNING),
+            )
+        # And the camera is unchanged, not left half-configured.
+        assert camera.parameters().binning == 1

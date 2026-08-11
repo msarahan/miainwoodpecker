@@ -36,6 +36,7 @@ from miainwoodpecker.devices import (
     DEFOCUS_CONTROL,
     STAGE_POSITION_CONTROL,
     Camera,
+    CameraParameters,
     InstrumentController,
     ScanParameters,
     Scanner,
@@ -83,6 +84,9 @@ _HEALTH_LATENCY_BUDGET_MS = 500.0
 # Enough polls to be a meaningful sample while a scan runs, capped so a fast
 # machine cannot spin here indefinitely.
 _MAX_HEALTH_POLLS = 20
+# A supported camera binning big enough that the frame shape change is
+# unmistakable, and enough to force the shared segment to be replaced.
+_TEST_BINNING = 4
 
 
 def _shm_names() -> set[str]:
@@ -163,6 +167,45 @@ def test_camera_round_trip_over_ipc(microscope):
     assert frame.data.nbytes >= _SHARED_MEMORY_THRESHOLD_BYTES
     assert frame.timestamp.tzinfo is not None
     assert frame.metadata["frame_number"] >= 1
+
+
+def test_camera_settings_configure_over_ipc_and_resize_the_segment(microscope):
+    """
+    Exposure and binning cross the boundary, and a shape change is survived.
+
+    Binning is the one camera setting that changes the *shape* of every
+    subsequent frame, which on this transport means the shared-memory
+    segment the frames arrive through has to be replaced. Configured
+    while the camera is stopped, so the first frame afterwards is already
+    at the new settings.
+    """
+    camera = microscope.ronchigram_camera
+    assert _TEST_BINNING in camera.binning_values
+    original = camera.parameters()
+    camera.start()
+    try:
+        unbinned = camera.acquire_frame()
+    finally:
+        camera.stop()
+    binned_settings = camera.configure(
+        CameraParameters(exposure_ms=20.0, binning=_TEST_BINNING),
+    )
+    assert binned_settings.binning == _TEST_BINNING
+    assert camera.parameters() == binned_settings
+    camera.start()
+    try:
+        binned = camera.acquire_frame()
+    finally:
+        camera.stop()
+        camera.configure(original)
+    assert binned.metadata["binning"] == _TEST_BINNING
+    assert binned.metadata["exposure_ms"] == pytest.approx(20.0)
+    calibration = resolve_frame_calibration(binned.data.shape, metadata=binned.metadata)
+    assert calibration.x.kind is AxisKind.ANGLE
+    # A quarter the size in each direction, so the frames no longer fill
+    # the segment the unbinned ones sized - the reader has to follow the
+    # writer's rather than read the old shape out of the old one.
+    assert binned.data.shape[0] * _TEST_BINNING == unbinned.data.shape[0]
 
 
 def test_camera_calibration_crosses_the_boundary_on_the_shared_memory_path(

@@ -1489,7 +1489,7 @@ The invariant now holds mechanically: `nion.*` is imported in
   publishes a `calibration_controls` mapping naming the *instrument
   controls* that hold them, because a camera's angular scale depends on the
   projector lenses and is therefore instrument state. `nion_server`'s
-  `_camera_calibration_metadata` resolves them with Nion's own
+  `NionCamera.calibration_metadata` resolves them with Nion's own
   `camera_base.build_calibration` and returns per-axis
   `{kind, scale, offset, units}` as plain data in the frame metadata, which
   `resolve_frame_calibration` already reads. No reimplementation, no
@@ -1500,11 +1500,17 @@ The invariant now holds mechanically: `nion.*` is imported in
   length rather than the other axis's when centring, and an axis whose units
   fall outside this project's closed vocabulary degrades to pixels rather
   than propagating a unit nothing downstream can interpret.
+  Exposure and binning control landed with it, for the mechanical reason
+  the two want doing together: binning multiplies the calibration scale
+  (`build_calibration`'s `relative_scale`). `CameraParameters` and
+  `Camera.configure` carry them, and the binning a frame *reports* is
+  recovered from its shape rather than from the setting, because a camera
+  reconfigured while running finishes the frame in flight at the old
+  settings — measured against usim, and a frame mislabelled there would
+  carry an axis wrong by the whole binning factor.
   What remains of this bullet is the *operator-facing* half: no UI selects a
-  microscope mode, so a mode the device does not describe still needs code.
-  Exposure and binning control are also still absent; binning multiplies the
-  calibration scale (`build_calibration`'s `relative_scale`), which is the
-  mechanical reason the two want doing together.
+  microscope mode or exposes these controls, so a mode the device does not
+  describe still needs code.
 - ~~**The EELS dispersive-axis default is grounded in the simulator only.**~~
   **Closed, by removal.** `dispersive_axis="x"` remains a parameter of
   `FrameCalibration.spectrum` for hand-built calibrations, but no acquired
