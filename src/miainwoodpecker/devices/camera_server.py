@@ -421,14 +421,52 @@ def _open_capture(device: str) -> typing.Any:  # noqa: ANN401 - cv2.VideoCapture
     capture = cv2.VideoCapture(target)
     if not capture.isOpened():
         msg = (
-            f"could not open capture device {device!r}. On Linux, check "
-            f"that /dev/video* exists and this user can read it; a camera "
-            f"index is the number in that path. Pass the device with "
-            f"--plugin, and use --backend {SIMULATED_BACKEND} to run "
-            f"without one."
+            f"could not open capture device {device!r}. {_open_failure_hint()} "
+            f"Pass the device with --plugin, and use "
+            f"--backend {SIMULATED_BACKEND} to run without one."
         )
         raise CameraOpenError(msg)
     return capture
+
+
+def _open_failure_hint() -> str:
+    """
+    Return the platform's most likely reason a capture device would not open.
+
+    Worth the branch because the three platforms fail for entirely
+    different reasons, and the macOS one is genuinely obscure: camera
+    access is granted per *responsible process*, which for a server
+    launched from a shell is the terminal application rather than
+    Python, so the permission dialog may never appear and the failure
+    looks like absent hardware.
+
+    Returns
+    -------
+    str
+        A sentence naming what to check on this platform.
+    """
+    if sys.platform == "darwin":
+        return (
+            "On macOS, camera access is granted to the application "
+            "*responsible* for the process - your terminal (Terminal, "
+            "iTerm, VS Code), not Python - so check System Settings > "
+            "Privacy & Security > Camera and confirm it is listed and "
+            "enabled. A denied camera can also open successfully and "
+            "then deliver black frames, so check the pixel values too. "
+            "The built-in camera is index 0; a Continuity Camera iPhone "
+            "usually appears alongside it."
+        )
+    if sys.platform == "win32":
+        return (
+            "On Windows, check Settings > Privacy & security > Camera, "
+            "and that no other application currently holds the device - "
+            "DirectShow admits one consumer at a time."
+        )
+    return (
+        "On Linux, check that /dev/video* exists and this user can read "
+        "it (usually membership of the 'video' group); a camera index is "
+        "the number in that path."
+    )
 
 
 class ServerInstrument:

@@ -198,6 +198,16 @@ A **video file is a first-class device**, which is more useful than it
 sounds: it is how a capture becomes a regression fixture, and it is how
 the hardware backend is tested here with no camera in the room.
 
+**On macOS, expect the permission dance first.** Camera access is granted
+to the application *responsible* for the process — your terminal, not
+Python — so a server launched from a shell may never raise the dialog,
+and a denied camera can open successfully and then deliver black frames.
+Grant your terminal camera access in System Settings ▸ Privacy & Security
+▸ Camera, and check pixel values rather than only that frames arrived.
+The open-failure message says this; the black-frame case it cannot
+detect for you. A Continuity Camera iPhone shows up as another index, and
+is a much better sensor than the built-in one.
+
 **One adapter buys hundreds more cameras.**
 [`pymmcore`](https://pypi.org/project/pymmcore/) is pip-installable
 Python bindings to Micro-Manager's MMCore, with no Java and no GUI, and
