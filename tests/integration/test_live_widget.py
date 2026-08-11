@@ -126,6 +126,33 @@ def _finish_load(widget: LiveInstrumentWidget) -> None:
     assert _wait_until(done)
 
 
+def _finish_analysis(widget: LiveInstrumentWidget) -> None:
+    """
+    Drive the widget's own poll path until its analysis job completes.
+
+    Same reasoning as :func:`_finish_recording`: the analysis buttons hand
+    their work to a worker thread and only the poll path, on the GUI
+    thread, adds the layers and writes the status label. A test that
+    asserted straight after the click would be asserting on a job that had
+    barely started.
+    """
+
+    def done() -> bool:
+        widget.refresh_display()
+        return widget._analysis_job is None  # noqa: SLF001
+
+    assert _wait_until(done)
+
+
+def _a_frame() -> Frame:
+    """Return one small constant frame, for tests that just need a recording."""
+    return Frame(
+        data=np.ones((8, 8), dtype=np.float32),
+        timestamp=datetime.datetime.now(tz=datetime.UTC),
+        metadata={},
+    )
+
+
 def _abandon_a_writer(path, frame_count: int = 3) -> None:
     """
     Leave the file an abandoned-but-cleanly-exited writer leaves.
@@ -194,12 +221,50 @@ def test_analyze_camera_in_hyperspy_adds_a_projection_layer():
     widget = LiveInstrumentWidget(viewer, _FakeScanner(), camera=camera)
     try:
         widget._analyze_camera_in_hyperspy()  # noqa: SLF001 - simulating a button click
+        _finish_analysis(widget)
 
         layer_name = "HyperSpy mean projection (Camera)"
         assert layer_name in viewer.layers
         projection_shape = (8, 8)
         assert viewer.layers[layer_name].data.shape == projection_shape
         assert not camera.started  # the burst starts and stops the camera itself
+        assert widget._analyze_status.text().startswith("done")  # noqa: SLF001
+    finally:
+        widget.shutdown()
+        viewer.close()
+
+
+def test_analysis_click_returns_before_the_work_is_done():
+    """
+    The handler hands off to a worker thread instead of doing the work inline.
+
+    This is the property the ``AnalysisJob`` change exists for: an analysis
+    used to run to completion inside the click handler, so the window did
+    not repaint and "Stop scan" did not answer for its duration.
+
+    The assertions are deliberately race-free rather than timing-based.
+    Layers and the status text are only ever touched by ``_poll_analysis``,
+    which only runs from ``refresh_display`` — so as long as the test does
+    not call that, it does not matter whether the worker has already
+    finished: the layer cannot exist yet and the label must still read
+    "working...". A handler that did the work inline would fail both, every
+    time, regardless of machine speed.
+    """
+    pytest.importorskip("hyperspy", reason="requires the 'analysis' extra")
+    viewer = napari.Viewer(show=False)
+    widget = LiveInstrumentWidget(viewer, _FakeScanner(), camera=_FakeCamera())
+    try:
+        widget._analyze_camera_in_hyperspy()  # noqa: SLF001 - simulating a button click
+
+        # Returned to the caller with the work outstanding, and nothing
+        # drawn: the GUI thread is free.
+        assert widget._analysis_job is not None  # noqa: SLF001
+        assert widget._analyze_status.text() == "working..."  # noqa: SLF001
+        assert "HyperSpy mean projection (Camera)" not in viewer.layers
+
+        _finish_analysis(widget)
+
+        assert "HyperSpy mean projection (Camera)" in viewer.layers
         assert widget._analyze_status.text().startswith("done")  # noqa: SLF001
     finally:
         widget.shutdown()
@@ -223,6 +288,7 @@ def test_analyze_camera_in_libertem_adds_a_sum_projection_layer():
     widget = LiveInstrumentWidget(viewer, _FakeScanner(), camera=camera)
     try:
         widget._analyze_camera_in_libertem()  # noqa: SLF001 - simulating a button click
+        _finish_analysis(widget)
 
         layer_name = "LiberTEM sum projection (Camera)"
         assert layer_name in viewer.layers
@@ -253,6 +319,7 @@ def test_fit_central_disk_in_py4dstem_adds_a_frame_and_shapes_layer():
     widget = LiveInstrumentWidget(viewer, _FakeScanner(), camera=camera)
     try:
         widget._fit_central_disk_in_py4dstem()  # noqa: SLF001 - simulating a button click
+        _finish_analysis(widget)
 
         frame_layer_name = "py4DSTEM disk fit (Camera)"
         assert frame_layer_name in viewer.layers
@@ -596,6 +663,7 @@ def test_analysis_runs_against_a_file_on_disk_without_acquiring(tmp_path):
         widget._analyze_from_file_check.setChecked(True)  # noqa: SLF001 - user input
 
         widget._analyze_camera_in_hyperspy()  # noqa: SLF001 - simulating a button click
+        _finish_analysis(widget)
 
         assert "HyperSpy mean projection (Camera)" in viewer.layers
         status = widget._analyze_status.text()  # noqa: SLF001
@@ -631,6 +699,7 @@ def test_analysis_against_an_unfinalized_file_is_refused_with_the_reason(tmp_pat
         widget._analyze_from_file_check.setChecked(True)  # noqa: SLF001 - user input
 
         widget._analyze_camera_in_hyperspy()  # noqa: SLF001 - simulating a button click
+        _finish_analysis(widget)
 
         status = widget._analyze_status.text()  # noqa: SLF001
         assert "never finalized" in status
@@ -766,6 +835,7 @@ def test_analysis_burst_is_kept_in_the_session_when_one_is_attached(tmp_path):
     try:
         widget.set_session(Session(tmp_path / "shift", operator="M. Sarahan"))
         widget._analyze_camera_in_hyperspy()  # noqa: SLF001 - simulating a button click
+        _finish_analysis(widget)
 
         assert "HyperSpy mean projection (Camera)" in viewer.layers
         assert widget._analyze_status.text().startswith("done")  # noqa: SLF001
@@ -774,6 +844,113 @@ def test_analysis_burst_is_kept_in_the_session_when_one_is_attached(tmp_path):
         assert recording.label == "hyperspy-burst"
         assert recording.frame_count == burst_frames
         assert read_session_context(recording.path)["operator"] == "M. Sarahan"
+    finally:
+        widget.shutdown()
+        viewer.close()
+
+
+def test_annotating_the_opened_recording_writes_into_its_note(tmp_path):
+    """The button annotates what is on screen, and clears the field on success."""
+    viewer = napari.Viewer(show=False)
+    widget = LiveInstrumentWidget(viewer, _FakeScanner(), camera=_FakeCamera())
+    try:
+        session = Session(tmp_path / "shift")
+        widget.set_session(session)
+        recording = session.record([_a_frame()], label="scan", note="at acquisition")
+        widget.open_recording(recording.path)
+        _finish_load(widget)
+
+        widget._annotation_edit.setText("drifted badly")  # noqa: SLF001
+        widget.annotate_opened_recording()
+
+        assert widget._annotation_edit.text() == ""  # noqa: SLF001
+        assert "note added" in widget._load_status.text()  # noqa: SLF001
+        with h5py.File(recording.path, "r") as handle:
+            stored = handle["entry/notes/description"][()]
+        text = stored.decode("utf-8") if isinstance(stored, bytes) else str(stored)
+        assert "recording: at acquisition" in text
+        assert "drifted badly" in text
+    finally:
+        widget.shutdown()
+        viewer.close()
+
+
+def test_annotating_with_nothing_open_says_so_and_keeps_the_text(tmp_path):
+    """A note typed with no recording open is not silently dropped."""
+    viewer = napari.Viewer(show=False)
+    widget = LiveInstrumentWidget(viewer, _FakeScanner(), camera=_FakeCamera())
+    try:
+        widget.set_session(Session(tmp_path / "shift"))
+        widget._annotation_edit.setText("worth keeping")  # noqa: SLF001
+
+        widget.annotate_opened_recording()
+
+        assert "open a recording" in widget._load_status.text()  # noqa: SLF001
+        assert widget._annotation_edit.text() == "worth keeping"  # noqa: SLF001
+    finally:
+        widget.shutdown()
+        viewer.close()
+
+
+def test_listing_every_session_spans_directories_and_disambiguates_names(tmp_path):
+    """The all-sessions checkbox reaches other sessions, qualified by directory."""
+    viewer = napari.Viewer(show=False)
+    widget = LiveInstrumentWidget(viewer, _FakeScanner(), camera=_FakeCamera())
+    try:
+        base = tmp_path / "data"
+        Session(base / "monday").record([_a_frame()], label="scan")
+        tuesday = Session(base / "tuesday")
+        tuesday.record([_a_frame()], label="scan")
+        widget.set_session(tuesday)
+
+        # This session only: one entry, and per-session numbering means the
+        # name alone would not distinguish it from Monday's.
+        assert widget._recording_combo.count() == 1  # noqa: SLF001
+
+        widget._all_sessions_check.setChecked(True)  # noqa: SLF001
+
+        combo = widget._recording_combo  # noqa: SLF001
+        both = 2
+        assert combo.count() == both
+        shown = [combo.itemText(index) for index in range(combo.count())]
+        assert any(text.startswith("monday/") for text in shown)
+        assert any(text.startswith("tuesday/") for text in shown)
+    finally:
+        widget.shutdown()
+        viewer.close()
+
+
+def test_disk_label_reports_free_space_and_warns_when_a_plan_will_not_fit(
+    tmp_path, monkeypatch
+):
+    """
+    Free space is reported, and an oversized plan is flagged before it runs.
+
+    Free space is stubbed rather than measured: whether the warning fires
+    is the behaviour under test, and against a real filesystem that would
+    depend on how much spare disk the machine running the tests happens to
+    have — which is how a CI runner and a laptop end up disagreeing.
+    """
+    viewer = napari.Viewer(show=False)
+    widget = LiveInstrumentWidget(viewer, _FakeScanner(), camera=_FakeCamera())
+    try:
+        roomy = 10**15
+        monkeypatch.setattr(
+            "miainwoodpecker.viewer.live.free_space", lambda _path: roomy
+        )
+        widget.set_session(Session(tmp_path / "shift"))
+
+        assert "free" in widget._space_label.text()  # noqa: SLF001
+        assert "warning" not in widget._space_label.text()  # noqa: SLF001
+
+        cramped = 1000
+        monkeypatch.setattr(
+            "miainwoodpecker.viewer.live.free_space", lambda _path: cramped
+        )
+        widget._refresh_session_labels()  # noqa: SLF001
+
+        assert "warning" in widget._space_label.text()  # noqa: SLF001
+        assert "scan frames need up to" in widget._space_label.text()  # noqa: SLF001
     finally:
         widget.shutdown()
         viewer.close()

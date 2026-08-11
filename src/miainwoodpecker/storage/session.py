@@ -83,6 +83,7 @@ import dataclasses
 import datetime
 import json
 import re
+import shutil
 import threading
 import typing
 from pathlib import Path
@@ -97,6 +98,8 @@ if typing.TYPE_CHECKING:
     import os
     from collections.abc import Callable, Iterable, Iterator
 
+    import numpy.typing as npt
+
     from miainwoodpecker.devices.interface import Frame
 
 _SIDECAR_NAME = "session.json"
@@ -107,6 +110,9 @@ _INDEX_DIGITS = 4
 _CONTEXT_PREFIX = "session_"
 _CONTEXT_FIELDS = ("operator", "sample", "notes")
 _JOIN_TIMEOUT_S = 30.0
+# 1000, not 1024: operators compare this against what the OS file manager
+# and `df -h` report, and those use decimal units.
+_BYTES_PER_UNIT = 1000.0
 # How much frame data one "open this recording" reads into memory. A pilot
 # day's 2048x2048 float32 Ronchigram frames are 16.8MB each, so an
 # unbounded read of a long series would exhaust memory rather than display
@@ -928,6 +934,205 @@ def default_root(base: os.PathLike[str] | str | None = None) -> Path:
     """
     parent = Path(base) if base is not None else Path.home() / "miainwoodpecker-data"
     return parent / _now().strftime("%Y-%m-%d")
+
+
+def annotate(path: os.PathLike[str] | str, note: str) -> str:
+    """
+    Add a note to a recording that is already on disk.
+
+    The gap this closes: notes could only be attached at acquisition time,
+    from the session's standing notes and the per-recording field. But the
+    thing worth writing down is often only known afterwards — that a scan
+    drifted, that a sample charged, that this is the one to keep — and an
+    operator who cannot record that goes back to a paper notebook, which is
+    the habit this project exists to replace.
+
+    Appended, never overwritten, and labelled with its own scope and the
+    time it was added, for the same reason :func:`_compose_notes` labels
+    the other two: a reader has to be able to tell an observation made
+    during the shift from one added a week later. The original acquisition
+    note is therefore always still there.
+
+    Writes into the file's real ``NXnote`` at ``/entry/notes``, the same
+    place :class:`~miainwoodpecker.storage.nexus.NexusWriter` puts the
+    acquisition note, so nothing needs to know whether a note was written
+    at acquisition time or added afterwards.
+
+    Parameters
+    ----------
+    path : os.PathLike[str] | str
+        The recording to annotate.
+    note : str
+        The text to add. Blank text is refused rather than writing an
+        empty paragraph.
+
+    Returns
+    -------
+    str
+        The recording's full note text after the addition.
+
+    Raises
+    ------
+    RecordingReadError
+        If the note is blank, or the file cannot be opened for writing -
+        which for a hard-killed recording is the expected answer, since
+        that file has no readable container at all.
+    """
+    text = note.strip()
+    if not text:
+        msg = "an empty note adds nothing; type something to record it"
+        raise RecordingReadError(msg)
+    stamp = _now().strftime("%Y-%m-%dT%H:%M:%SZ")
+    addition = f"added {stamp}: {text}"
+    try:
+        with h5py.File(path, "r+") as handle:
+            entry = handle.require_group("entry")
+            entry.attrs.setdefault("NX_class", "NXentry")
+            notes = entry.require_group("notes")
+            notes.attrs.setdefault("NX_class", "NXnote")
+            existing = notes.get("description")
+            previous = _as_text(existing[()]) if existing is not None else ""
+            combined = f"{previous}\n\n{addition}" if previous else addition
+            # Recreated rather than resized: h5py's variable-length string
+            # datasets are fixed-shape scalars, so there is nothing to grow.
+            if existing is not None:
+                del notes["description"]
+            notes["description"] = combined
+    except OSError as exc:
+        msg = f"cannot annotate {Path(path).name}: {exc}"
+        raise RecordingReadError(msg) from exc
+    return combined
+
+
+def find_recordings(base: os.PathLike[str] | str) -> list[Recording]:
+    """
+    List recordings across every session directory under a base directory.
+
+    :meth:`Session.recordings` answers "what is in *this* session"; this
+    answers "where is that scan from last Tuesday", which previously meant
+    leaving the application for a file browser.
+
+    Deliberately a directory walk rather than an index or a database. The
+    filesystem is already the index (see this module's docstring), and a
+    catalogue would be a second source of truth to keep in sync with the
+    thing it describes - for a directory of files an operator also moves,
+    renames, and deletes by hand, that trade is not worth making. One
+    level deep, matching how sessions are laid out by
+    :func:`default_root`: a base holding one directory per session, plus
+    any loose recordings in the base itself.
+
+    Parameters
+    ----------
+    base : os.PathLike[str] | str
+        The directory holding session directories.
+
+    Returns
+    -------
+    list[Recording]
+        Every recording found, newest first, so the answer to "what did I
+        just take" is at the top. Empty if the base does not exist, rather
+        than raising: an operator who has not recorded anything yet has an
+        empty list, not an error.
+    """
+    root = Path(base)
+    if not root.is_dir():
+        return []
+    directories = [root, *(child for child in root.iterdir() if child.is_dir())]
+    found = [
+        described
+        for directory in directories
+        for candidate in sorted(directory.glob(f"*{_SUFFIX}"))
+        if (described := _describe(candidate)) is not None
+    ]
+    return sorted(found, key=lambda recording: recording.started_at, reverse=True)
+
+
+def free_space(path: os.PathLike[str] | str) -> int:
+    """
+    Return the bytes free on the filesystem holding a path.
+
+    Parameters
+    ----------
+    path : os.PathLike[str] | str
+        Any path on the filesystem of interest. The nearest existing
+        ancestor is used, so this answers for a session directory that has
+        not been created yet.
+
+    Returns
+    -------
+    int
+        Free bytes, or ``0`` if the filesystem cannot be interrogated -
+        reported to the operator as "unknown" rather than mistaken for
+        "full".
+    """
+    candidate = Path(path).resolve()
+    for target in (candidate, *candidate.parents):
+        if target.exists():
+            try:
+                return shutil.disk_usage(target).free
+            except OSError:  # pragma: no cover - platform dependent
+                return 0
+    return 0  # pragma: no cover - a resolved path always has an existing parent
+
+
+def estimate_size(
+    frame_shape: tuple[int, ...],
+    frame_count: int,
+    *,
+    dtype: npt.DTypeLike = np.float32,
+) -> int:
+    """
+    Estimate what a recording of this shape will occupy, before running it.
+
+    An upper bound, deliberately: it is the uncompressed size, while the
+    writer's default gzip+shuffle measured roughly a 10% saving on scan
+    data (§5 Phase 3). Erring high is the useful direction for a
+    free-space check - a warning that does not fire is worse than one that
+    fires slightly early - and compression ratio depends on the data,
+    which is not known until it has been acquired.
+
+    Parameters
+    ----------
+    frame_shape : tuple[int, ...]
+        Shape of one frame.
+    frame_count : int
+        Number of frames to be recorded.
+    dtype : npt.DTypeLike
+        Element type the frames will be stored as.
+
+    Returns
+    -------
+    int
+        Estimated bytes.
+    """
+    return int(np.prod(frame_shape)) * frame_count * np.dtype(dtype).itemsize
+
+
+def format_bytes(count: int) -> str:
+    """
+    Render a byte count the way an operator reads it.
+
+    Parameters
+    ----------
+    count : int
+        Bytes.
+
+    Returns
+    -------
+    str
+        A short human-readable size, e.g. ``"29.1 MB"``.
+    """
+    size = float(count)
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < _BYTES_PER_UNIT or unit == "GB":
+            return f"{size:.1f} {unit}" if unit != "B" else f"{size:.0f} B"
+        size /= _BYTES_PER_UNIT
+    return f"{size:.1f} TB"  # pragma: no cover - unreachable, GB returns first
+
+
+def _as_text(raw: object) -> str:
+    """Decode an HDF5 string value, which may come back as bytes."""
+    return raw.decode("utf-8") if isinstance(raw, bytes) else str(raw)
 
 
 def _now() -> datetime.datetime:

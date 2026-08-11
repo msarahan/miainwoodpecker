@@ -65,11 +65,17 @@ from miainwoodpecker.storage.session import (
     RecordingJob,
     RecordingReadError,
     Session,
+    annotate,
     describe,
+    estimate_size,
+    find_recordings,
+    format_bytes,
+    free_space,
 )
+from miainwoodpecker.viewer.jobs import AnalysisJob
 
 if typing.TYPE_CHECKING:
-    from collections.abc import Iterable, Iterator, Sequence
+    from collections.abc import Callable, Iterable, Iterator, Sequence
 
     import napari
 
@@ -112,6 +118,26 @@ class _AnalysisInput:
     path: Path
     frame_count: int
     origin: str
+
+
+@dataclasses.dataclass(frozen=True)
+class _AnalysisOutcome:
+    """
+    What an analysis produced, carried back to the GUI thread for display.
+
+    Attributes
+    ----------
+    payload : object
+        Whatever the analysis computed. Opaque here on purpose: each button
+        supplies its own display callable, because a mean projection, a sum
+        projection, and a fitted disk do not render the same way.
+    source : _AnalysisInput
+        The file it was computed from, so the status line can say how many
+        frames and where they came from.
+    """
+
+    payload: object
+    source: _AnalysisInput
 
 
 def _condition(recording: Recording) -> str:
@@ -217,6 +243,15 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         self._session: Session | None = None
         self._recording_job: RecordingJob | None = None
         self._load_job: LoadJob | None = None
+        self._analysis_job: AnalysisJob | None = None
+        # Set together with the job, and only read by _poll_analysis, so the
+        # result of whichever button started it lands in that button's own
+        # status label and layers. One job at a time is enforced in
+        # _start_analysis; all three buttons share the device.
+        self._analysis_status: QtWidgets.QLabel | None = None
+        self._analysis_display: (
+            Callable[[object, _AnalysisInput], str] | None
+        ) = None
         self._opened_file: Path | None = None
         self._scan_request: tuple[ScanParameters, int, str] = (
             ScanParameters(
@@ -264,6 +299,10 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         self._recording_combo = QtWidgets.QComboBox(group)
         self._recording_combo.setPlaceholderText("no recordings in this session")
         form.addRow("File", self._recording_combo)
+        self._all_sessions_check = QtWidgets.QCheckBox(
+            "List every session in the parent directory", group
+        )
+        form.addRow(self._all_sessions_check)
         self._open_recording_button = QtWidgets.QPushButton("Open selected", group)
         form.addRow(self._open_recording_button)
         self._open_file_button = QtWidgets.QPushButton("Open from disk...", group)
@@ -275,9 +314,17 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         self._load_status = QtWidgets.QLabel("nothing opened yet", group)
         self._load_status.setWordWrap(True)
         form.addRow("Opened", self._load_status)
+        self._annotation_edit = QtWidgets.QLineEdit(group)
+        self._annotation_edit.setPlaceholderText("note to add to the opened recording")
+        form.addRow("Add note", self._annotation_edit)
+        self._annotate_button = QtWidgets.QPushButton("Annotate opened", group)
+        form.addRow(self._annotate_button)
 
         self._open_recording_button.clicked.connect(self.open_selected_recording)
         self._open_file_button.clicked.connect(self.choose_and_open_recording)
+        self._all_sessions_check.toggled.connect(self._refresh_session_labels)
+        self._annotate_button.clicked.connect(self.annotate_opened_recording)
+        self._annotation_edit.returnPressed.connect(self.annotate_opened_recording)
         return group
 
     def _build_session_group(self) -> QtWidgets.QGroupBox:
@@ -292,6 +339,9 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         )
         session_form.addRow(self._change_session_button)
         self._build_session_context_rows(session_group, session_form)
+        self._space_label = QtWidgets.QLabel("", session_group)
+        self._space_label.setWordWrap(True)
+        session_form.addRow("Disk", self._space_label)
         self._recorded_label = QtWidgets.QLabel("nothing recorded yet", session_group)
         self._recorded_label.setWordWrap(True)
         session_form.addRow("Recorded", self._recorded_label)
@@ -644,7 +694,18 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
             return
         self._session_path_label.setText(str(self._session.root))
         recordings = self._session.recordings()
-        self._refresh_recording_choices(recordings)
+        # The combo can show either scope; the labels below always describe
+        # this session, because that is where the next recording goes.
+        if self._all_sessions_check.isChecked():
+            # find_recordings answers newest-first; the combo wants
+            # acquisition order, because it preselects the last entry.
+            self._refresh_recording_choices(
+                list(reversed(find_recordings(self._session.root.parent))),
+                qualified=True,
+            )
+        else:
+            self._refresh_recording_choices(recordings)
+        self._refresh_space_label()
         if not recordings:
             self._recorded_label.setText("nothing recorded yet")
             return
@@ -654,7 +715,9 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
             f"({latest.frame_count} frames)"
         )
 
-    def _refresh_recording_choices(self, recordings: Sequence[Recording]) -> None:
+    def _refresh_recording_choices(
+        self, recordings: Sequence[Recording], *, qualified: bool = False
+    ) -> None:
         """
         Repopulate the Recordings combo, keeping the operator's choice if it survives.
 
@@ -672,19 +735,73 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         Parameters
         ----------
         recordings : Sequence[Recording]
-            The session's recordings, in acquisition order.
+            The recordings to offer, in acquisition order.
+        qualified : bool
+            Whether to prefix each entry with its session directory. True
+            when listing across sessions, where the filename alone is
+            ambiguous: per-session numbering restarts at ``0001``, so two
+            sessions each hold a ``0001-scan-haadf-...`` and only the
+            directory tells them apart.
         """
         previous = self._recording_combo.currentData()
         self._recording_combo.clear()
         for recording in recordings:
+            name = (
+                f"{recording.path.parent.name}/{recording.path.name}"
+                if qualified
+                else recording.path.name
+            )
             self._recording_combo.addItem(
-                f"{recording.path.name} - {_condition(recording)}",
+                f"{name} - {_condition(recording)}",
                 str(recording.path),
             )
         restored = -1 if previous is None else self._recording_combo.findData(previous)
         if restored < 0:
             restored = self._recording_combo.count() - 1
         self._recording_combo.setCurrentIndex(restored)
+
+    def annotate_opened_recording(self) -> None:
+        """
+        Add a note to the recording currently open (the button handler).
+
+        Deliberately acts on the *opened* recording rather than the combo
+        selection: an operator annotates what they are looking at, and
+        making the target the thing on screen removes the way to annotate
+        the wrong file by leaving the combo on something else.
+
+        The field is cleared only on success, so a note refused for being
+        blank, or lost to an unwritable file, is still on screen to retry
+        or copy out.
+        """
+        if self._opened_file is None:
+            self._load_status.setText("open a recording before annotating it")
+            return
+        try:
+            annotate(self._opened_file, self._annotation_edit.text())
+        except RecordingReadError as exc:
+            self._load_status.setText(str(exc))
+            return
+        self._annotation_edit.clear()
+        self._load_status.setText(f"note added to {self._opened_file.name}")
+
+    def _refresh_space_label(self) -> None:
+        """Report free space where recordings are being written."""
+        if self._session is None:
+            self._space_label.setText("")
+            return
+        free = free_space(self._session.root)
+        frames = self._scan_count_spin.value()
+        planned = estimate_size(self._scan_request[0].shape, frames)
+        text = f"{format_bytes(free)} free"
+        if free and planned > free:
+            # An upper bound compared against the real number: erring high
+            # here means warning slightly early, which is the right way to
+            # be wrong about running out of disk mid-acquisition.
+            text += (
+                f" - warning: {frames} scan frames need up to "
+                f"{format_bytes(planned)}"
+            )
+        self._space_label.setText(text)
 
     def save_scan_frame(self) -> None:
         """Save the scan frame currently on screen into the session."""
@@ -912,13 +1029,15 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         return self._opened_file
 
     @contextlib.contextmanager
-    def _analysis_input(
+    def _analysis_input(  # noqa: PLR0913 - keyword-only inputs, not a call signature
         self,
         *,
         frame_count: int,
         label: str,
         title: str,
         filename: str,
+        existing: Path | None,
+        note: str | None,
     ) -> Iterator[_AnalysisInput]:
         """
         Yield the NeXus file an analysis button should run against.
@@ -953,6 +1072,16 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
             ``/entry/title`` for a written file.
         filename : str
             Temporary filename used for a fresh burst with no session.
+        existing : Path | None
+            The already-open recording to analyze, or None to acquire.
+            Passed in rather than read from the checkbox here because this
+            runs on a worker thread (see
+            :class:`~miainwoodpecker.viewer.jobs.AnalysisJob`), and reading
+            a widget off the GUI thread is exactly what that split exists to
+            prevent. :meth:`_start_analysis` resolves it beforehand.
+        note : str | None
+            Per-recording note for a fresh burst into a session, resolved on
+            the GUI thread for the same reason.
 
         Yields
         ------
@@ -965,7 +1094,6 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
             If the operator pointed the analysis at a file that cannot be
             analyzed, with the reason.
         """
-        existing = self._analysis_file()
         if existing is not None:
             described = describe(existing)
             refusal = _analysis_refusal(described)
@@ -987,17 +1115,115 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         )
         if self._session is not None:
             recording = self._session.record(
-                frames, label=label, title=title, note=self._note_for_next_recording()
+                frames, label=label, title=title, note=note
             )
-            try:
-                yield dataclasses.replace(acquired, path=recording.path)
-            finally:
-                self._refresh_session_labels()
+            # The session labels this recording changed are refreshed by
+            # _poll_analysis on the GUI thread, not here: this runs on a
+            # worker thread.
+            yield dataclasses.replace(acquired, path=recording.path)
         else:
             with tempfile.TemporaryDirectory() as tmp_dir:
                 path = Path(tmp_dir) / filename
                 write_frames(path, frames, title=title)
                 yield dataclasses.replace(acquired, path=path)
+
+    def _start_analysis(  # noqa: PLR0913 - keyword-only, and each one differs per button
+        self,
+        *,
+        status: QtWidgets.QLabel,
+        compute: Callable[[_AnalysisInput], object],
+        display: Callable[[object, _AnalysisInput], str],
+        frame_count: int,
+        label: str,
+        title: str,
+        filename: str,
+    ) -> None:
+        """
+        Run one analysis on a worker thread and return immediately.
+
+        The three analysis buttons differ in what they compute and how they
+        draw it, and are identical in everything else: stop the live camera
+        so the button and the loop never drive the same device at once,
+        acquire or open a file, do the work, draw the result, say what
+        happened. That shared part lives here, and the two callables are the
+        difference.
+
+        The GUI/worker split is the point. Everything that touches a widget
+        happens on this side of the call — resolving the operator's
+        Recordings checkbox and note field *before* the thread starts, and
+        deferring every layer and label update to :meth:`_poll_analysis`.
+        Only ``compute`` crosses over, and it is handed plain data.
+
+        One analysis at a time: a second click while one is running is
+        refused rather than queued, because all three share the camera and
+        the status labels, and two bursts interleaved on one device is not a
+        thing an operator ever wants.
+
+        Parameters
+        ----------
+        status : QtWidgets.QLabel
+            The clicked button's own status label.
+        compute : Callable[[_AnalysisInput], object]
+            The analysis, run on the worker thread. Must not touch Qt.
+        display : Callable[[object, _AnalysisInput], str]
+            Draws the result on the GUI thread and returns the status text.
+        frame_count : int
+            Frames to acquire, when acquiring.
+        label : str
+            Session label for a fresh burst.
+        title : str
+            ``/entry/title`` for a written file.
+        filename : str
+            Temporary filename for a fresh burst with no session.
+        """
+        if self._analysis_job is not None and self._analysis_job.is_running:
+            status.setText("another analysis is running")
+            return
+        if self._camera_loop is not None and self._camera_loop.is_running:
+            self.stop_camera()
+
+        existing = self._analysis_file()
+        note = self._note_for_next_recording()
+
+        def work() -> _AnalysisOutcome:
+            with self._analysis_input(
+                frame_count=frame_count,
+                label=label,
+                title=title,
+                filename=filename,
+                existing=existing,
+                note=note,
+            ) as source:
+                return _AnalysisOutcome(payload=compute(source), source=source)
+
+        self._analysis_status = status
+        self._analysis_display = display
+        self._analysis_job = AnalysisJob(work)
+        self._analysis_job.start()
+        status.setText("working...")
+        self._timer.start()
+
+    def _poll_analysis(self) -> None:
+        """Draw a finished analysis and report it, on the GUI thread."""
+        job = self._analysis_job
+        if job is None or job.is_running:
+            return
+        self._analysis_job = None
+        status = self._analysis_status
+        display = self._analysis_display
+        self._analysis_status = None
+        self._analysis_display = None
+        if status is None or display is None:  # pragma: no cover - set together
+            return
+        if job.error is not None:
+            status.setText(f"error: {job.error}")
+        else:
+            outcome = typing.cast("_AnalysisOutcome", job.result)
+            status.setText(display(outcome.payload, outcome.source))
+        # A fresh burst into a session wrote a file; the worker thread could
+        # not say so, so the labels catch up here.
+        self._refresh_session_labels()
+        self._maybe_stop_timer()
 
     def _analyze_camera_in_hyperspy(self) -> None:
         """
@@ -1026,30 +1252,26 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
             self._analyze_status.setText("install the 'analysis' extra")
             return
 
-        if self._camera_loop is not None and self._camera_loop.is_running:
-            self.stop_camera()
+        def compute(source: _AnalysisInput) -> object:
+            signal = load_as_hyperspy_signal(source.path)
+            return signal.mean(axis=signal.axes_manager.navigation_axes[0]).data
 
-        self._analyze_status.setText("working...")
-        try:
-            with self._analysis_input(
-                frame_count=_ANALYSIS_BURST_FRAME_COUNT,
-                label="hyperspy-burst",
-                title="hyperspy analysis burst",
-                filename="hyperspy_analysis_burst.nxs",
-            ) as source:
-                signal = load_as_hyperspy_signal(source.path)
-                projection = signal.mean(axis=signal.axes_manager.navigation_axes[0])
-        except Exception as exc:  # noqa: BLE001 - surfaced in the status label
-            self._analyze_status.setText(f"error: {exc}")
-            return
+        def display(payload: object, source: _AnalysisInput) -> str:
+            self._viewer.add_image(
+                payload,
+                name="HyperSpy mean projection (Camera)",
+                colormap="viridis",
+            )
+            return f"done - mean of {source.frame_count} frames from {source.origin}"
 
-        self._viewer.add_image(
-            projection.data,
-            name="HyperSpy mean projection (Camera)",
-            colormap="viridis",
-        )
-        self._analyze_status.setText(
-            f"done - mean of {source.frame_count} frames from {source.origin}"
+        self._start_analysis(
+            status=self._analyze_status,
+            compute=compute,
+            display=display,
+            frame_count=_ANALYSIS_BURST_FRAME_COUNT,
+            label="hyperspy-burst",
+            title="hyperspy analysis burst",
+            filename="hyperspy_analysis_burst.nxs",
         )
 
     def _analyze_camera_in_libertem(self) -> None:
@@ -1081,39 +1303,33 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
             self._libertem_status.setText("install the 'libertem' extra")
             return
 
-        if self._camera_loop is not None and self._camera_loop.is_running:
-            self.stop_camera()
-
-        self._libertem_status.setText("working...")
-        try:
+        def compute(source: _AnalysisInput) -> object:
             # Inline executor: this is a single UDF run over one small,
             # already-in-memory burst, not the large-dataset workload
             # LiberTEM's default dask executor is built for - spinning
             # up a local cluster per button click would be pure
             # overhead here.
-            with (
-                self._analysis_input(
-                    frame_count=_ANALYSIS_BURST_FRAME_COUNT,
-                    label="libertem-burst",
-                    title="libertem analysis burst",
-                    filename="libertem_analysis_burst.nxs",
-                ) as source,
-                Context.make_with("inline") as ctx,
-            ):
+            with Context.make_with("inline") as ctx:
                 dataset = load_as_libertem_dataset(ctx, source.path)
                 result = ctx.run_udf(dataset=dataset, udf=SumUDF())
-                sum_projection = result["intensity"].data
-        except Exception as exc:  # noqa: BLE001 - surfaced in the status label
-            self._libertem_status.setText(f"error: {exc}")
-            return
+                return result["intensity"].data
 
-        self._viewer.add_image(
-            sum_projection,
-            name="LiberTEM sum projection (Camera)",
-            colormap="viridis",
-        )
-        self._libertem_status.setText(
-            f"done - sum of {source.frame_count} frames from {source.origin}"
+        def display(payload: object, source: _AnalysisInput) -> str:
+            self._viewer.add_image(
+                payload,
+                name="LiberTEM sum projection (Camera)",
+                colormap="viridis",
+            )
+            return f"done - sum of {source.frame_count} frames from {source.origin}"
+
+        self._start_analysis(
+            status=self._libertem_status,
+            compute=compute,
+            display=display,
+            frame_count=_ANALYSIS_BURST_FRAME_COUNT,
+            label="libertem-burst",
+            title="libertem analysis burst",
+            filename="libertem_analysis_burst.nxs",
         )
 
     def _fit_central_disk_in_py4dstem(self) -> None:
@@ -1153,44 +1369,46 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
             self._py4dstem_status.setText("install the 'py4dstem' extra")
             return
 
-        if self._camera_loop is not None and self._camera_loop.is_running:
-            self.stop_camera()
+        def compute(source: _AnalysisInput) -> object:
+            diffraction_slice = load_as_diffraction_slice(source.path)
+            stack = diffraction_slice.data
+            pattern = stack if stack.ndim == _SINGLE_PATTERN_NDIM else stack[0]
+            return (pattern, *get_probe_size(pattern))
 
-        self._py4dstem_status.setText("working...")
-        try:
-            with self._analysis_input(
-                frame_count=1,
-                label="py4dstem-frame",
-                title="py4DSTEM analysis frame",
-                filename="py4dstem_analysis_frame.nxs",
-            ) as source:
-                diffraction_slice = load_as_diffraction_slice(source.path)
-                stack = diffraction_slice.data
-                pattern = stack if stack.ndim == _SINGLE_PATTERN_NDIM else stack[0]
-                radius, x0, y0 = get_probe_size(pattern)
-        except Exception as exc:  # noqa: BLE001 - surfaced in the status label
-            self._py4dstem_status.setText(f"error: {exc}")
-            return
+        def display(payload: object, source: _AnalysisInput) -> str:
+            pattern, radius, x0, y0 = typing.cast(
+                "tuple[typing.Any, float, float, float]", payload
+            )
+            self._viewer.add_image(
+                pattern,
+                name="py4DSTEM disk fit (Camera)",
+                colormap="gray",
+            )
+            self._viewer.add_shapes(
+                [
+                    [y0 - radius, x0 - radius],
+                    [y0 - radius, x0 + radius],
+                    [y0 + radius, x0 + radius],
+                    [y0 + radius, x0 - radius],
+                ],
+                shape_type="ellipse",
+                name="py4DSTEM disk fit",
+                edge_color="red",
+                face_color="transparent",
+            )
+            return (
+                f"done - r={radius:.1f}px center=({x0:.1f}, {y0:.1f}) "
+                f"from {source.origin}"
+            )
 
-        self._viewer.add_image(
-            pattern,
-            name="py4DSTEM disk fit (Camera)",
-            colormap="gray",
-        )
-        self._viewer.add_shapes(
-            [
-                [y0 - radius, x0 - radius],
-                [y0 - radius, x0 + radius],
-                [y0 + radius, x0 + radius],
-                [y0 + radius, x0 - radius],
-            ],
-            shape_type="ellipse",
-            name="py4DSTEM disk fit",
-            edge_color="red",
-            face_color="transparent",
-        )
-        self._py4dstem_status.setText(
-            f"done - r={radius:.1f}px center=({x0:.1f}, {y0:.1f})"
+        self._start_analysis(
+            status=self._py4dstem_status,
+            compute=compute,
+            display=display,
+            frame_count=1,
+            label="py4dstem-frame",
+            title="py4DSTEM analysis frame",
+            filename="py4dstem_analysis_frame.nxs",
         )
 
     def _maybe_stop_timer(self) -> None:
@@ -1200,13 +1418,21 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         )
         recording = self._recording_job is not None and self._recording_job.is_running
         loading = self._load_job is not None and self._load_job.is_running
-        if not scan_running and not camera_running and not recording and not loading:
+        analyzing = self._analysis_job is not None
+        if (
+            not scan_running
+            and not camera_running
+            and not recording
+            and not loading
+            and not analyzing
+        ):
             self._timer.stop()
 
     def refresh_display(self) -> None:
         """Push the newest frames into napari layers; called by the display timer."""
         self._poll_recording()
         self._poll_load()
+        self._poll_analysis()
         if self._scan_loop is not None:
             self._refresh_source(
                 self._scan_loop,
