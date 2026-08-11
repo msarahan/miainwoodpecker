@@ -93,7 +93,8 @@ from __future__ import annotations
 
 import typing
 
-import h5py
+from miainwoodpecker.storage import layout
+from miainwoodpecker.storage.nexus import require_frames
 
 if typing.TYPE_CHECKING:
     import os
@@ -101,7 +102,7 @@ if typing.TYPE_CHECKING:
     from libertem.api import Context
     from libertem.io.dataset.base import DataSet
 
-_DATASET_PATH = "/entry/data/data"
+_DATASET_PATH = layout.ABSOLUTE_NXDATA_DATA
 
 
 def load_as_libertem_dataset(
@@ -132,15 +133,12 @@ def load_as_libertem_dataset(
         The frame stack as a LiberTEM ``DataSet``, ready for
         :meth:`Context.run_udf`.
 
-    Raises
-    ------
-    ValueError
-        If the file was written by an acquisition that produced no
-        frames (so it has no ``/entry/data`` group to read).
+    Notes
+    -----
+    Raises :class:`~miainwoodpecker.storage.layout.NoFramesError` (via
+    :func:`~miainwoodpecker.storage.nexus.require_frames`) when the file
+    recorded no frames. Checked here rather than left to LiberTEM, whose
+    own "unable to infer dataset" message does not say what is wrong.
     """
-    with h5py.File(path, "r") as handle:
-        if "data" not in handle["entry"]:
-            msg = f"{path} has no /entry/data group; it recorded no frames"
-            raise ValueError(msg)
-
+    require_frames(path)
     return ctx.load("hdf5", path=str(path), ds_path=_DATASET_PATH)

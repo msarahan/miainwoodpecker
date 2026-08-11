@@ -18,6 +18,8 @@ import sys
 import textwrap
 import threading
 from collections.abc import Iterator
+from pathlib import Path
+from unittest import mock
 
 import h5py
 import numpy as np
@@ -30,6 +32,7 @@ from miainwoodpecker.storage.session import (
     RecordingJob,
     RecordingReadError,
     Session,
+    _is_locked,
     annotate,
     default_root,
     describe,
@@ -799,3 +802,197 @@ def test_format_bytes_uses_the_units_operators_compare_against():
     assert format_bytes(512) == "512 B"
     assert format_bytes(29_100_000) == "29.1 MB"
     assert format_bytes(2_500_000_000) == "2.5 GB"
+
+
+def test_session_context_reads_back_from_the_nexus_groups(tmp_path):
+    """
+    NXsample and NXuser are read, not merely written.
+
+    They are where standard tooling looks, and this project wrote them
+    for three phases while reading only its own JSON blob - so the groups
+    whose whole justification is interoperability were write-only for the
+    code that produced them.
+    """
+    session = Session(tmp_path / "s", operator="M. Sarahan", sample="Au on C")
+    recording = session.record([make_frame()], label="scan-haadf")
+
+    # Remove the blob entirely: whatever comes back now came from the groups.
+    with h5py.File(recording.path, "r+") as handle:
+        del handle["entry/metadata/vendor_metadata_json"]
+
+    context = read_session_context(recording.path)
+    assert context["operator"] == "M. Sarahan"
+    assert context["sample"] == "Au on C"
+
+
+def test_notes_are_not_recovered_from_the_composed_nxnote(tmp_path):
+    """
+    NXnote/description renders two scopes, so it is not a source for either.
+
+    ``_compose_notes`` prefixes the session's standing notes and the
+    recording's own with their scope precisely so a reader can tell them
+    apart. Reading ``notes`` back from it would hand the caller
+    "session: grid 3" where the session holds "grid 3" - which is why the
+    group reader deliberately covers sample and operator only.
+    """
+    session = Session(tmp_path / "s", notes="grid 3, hole 2")
+    recording = session.record([make_frame()], label="scan", note="after tilting")
+
+    assert read_session_context(recording.path)["notes"] == "grid 3, hole 2"
+    with h5py.File(recording.path, "r") as handle:
+        rendered = handle["entry/notes/description"][()]
+    text = rendered.decode("utf-8") if isinstance(rendered, bytes) else str(rendered)
+    assert "session: grid 3, hole 2" in text
+    assert "recording: after tilting" in text
+
+
+def test_the_sidecar_survives_a_failed_write(tmp_path):
+    """
+    An interrupted context save must not blank a shift's session.
+
+    The sidecar was truncate-then-write, so a crash or a full disk left a
+    truncated session.json - and _load_sidecar swallows the resulting
+    ValueError and silently reverts to blank context. Simulated by making
+    the temporary write fail, which is the step that used to be the
+    destructive one.
+    """
+    root = tmp_path / "s"
+    session = Session(root, operator="M. Sarahan")
+    original = (root / "session.json").read_text(encoding="utf-8")
+
+    def explode(*_args: object, **_kwargs: object) -> None:
+        msg = "disk full"
+        raise OSError(msg)
+
+    with (
+        mock.patch.object(Path, "write_text", explode),
+        pytest.raises(OSError, match="disk full"),
+    ):
+        session.update_context(operator="Someone Else")
+
+    # The old sidecar is intact, not a truncated fragment.
+    assert (root / "session.json").read_text(encoding="utf-8") == original
+    assert Session(root).operator == "M. Sarahan"
+    assert not list(root.glob("*.tmp"))
+
+
+def test_a_locked_recording_is_not_reported_as_damaged(tmp_path):
+    """
+    A file being written right now is in progress, not broken.
+
+    Session.recordings() opens every file in the directory, including one
+    a RecordingJob is actively writing. HDF5 refuses that read with an
+    OSError naming a lock, which used to be reported as "damaged - does
+    not open" - telling an operator their running acquisition had failed.
+
+    The lock is injected rather than provoked, and that is deliberate:
+    HDF5's file locking depends on the platform, the mount, and
+    HDF5_USE_FILE_LOCKING, and it does *not* engage in this project's own
+    test environment - a second open of a file held for writing simply
+    succeeds here. A test that opened the file twice and asserted the
+    happy answer would therefore pass without ever reaching the branch it
+    claims to cover. Injecting the error the library raises elsewhere
+    tests the classification, which is the part this project owns.
+    """
+    session = Session(tmp_path / "s")
+    recording = session.record([make_frame()], label="scan")
+
+    locked = OSError(
+        f"Unable to synchronously open file (unable to lock file, errno = 11, "
+        f"error message = 'Resource temporarily unavailable'): {recording.path}"
+    )
+    with mock.patch.object(h5py, "File", side_effect=locked):
+        described = describe(recording.path)
+
+    assert described.readable, "a locked file must not be reported as damaged"
+    assert not described.finalized
+    assert described.frame_count == 0
+
+
+def test_a_genuinely_broken_file_is_still_reported_as_damaged(tmp_path):
+    """The other side of the same branch: a lost container is not 'in use'."""
+    session = Session(tmp_path / "s")
+    recording = session.record([make_frame()], label="scan")
+    recording.path.write_bytes(b"not hdf5 at all")
+
+    described = describe(recording.path)
+    assert not described.readable
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "unable to lock file, errno = 11",
+        "Resource temporarily unavailable",
+        "file is already open for write",
+    ],
+)
+def test_lock_messages_are_recognized(message):
+    """The strings HDF5 actually produces for a file in use."""
+    assert _is_locked(OSError(message))
+
+
+@pytest.mark.parametrize(
+    "message",
+    ["bad object header version number", "file signature not found", ""],
+)
+def test_corruption_messages_are_not_mistaken_for_locks(message):
+    """A hard-killed writer's file must not be mistaken for a live one."""
+    assert not _is_locked(OSError(message))
+
+
+def test_join_reports_whether_the_worker_actually_finished(tmp_path):
+    """
+    A timed-out join must not look like a completed one.
+
+    join() returned None either way, so a caller polling result/error
+    afterwards saw (None, None) - the same state as "still running" -
+    with no way to tell which had happened.
+    """
+    release = threading.Event()
+
+    def blocking_frames() -> Iterator[Frame]:
+        release.wait(10.0)
+        yield make_frame()
+
+    session = Session(tmp_path / "s")
+    job = RecordingJob(session, blocking_frames(), label="scan")
+    job.start()
+    try:
+        assert job.join(timeout=0.05) is False
+        assert job.result is None
+    finally:
+        release.set()
+    assert job.join(timeout=10.0) is True
+    assert job.result is not None
+
+
+def test_a_cancelled_job_can_be_started_again(tmp_path):
+    """
+    start() clears cancellation, so a restarted job is not born cancelled.
+
+    _cancelled was never reset, so a cancelled-then-restarted job
+    returned on its first frame and wrote an empty file while reporting
+    success.
+    """
+    session = Session(tmp_path / "s")
+    job = RecordingJob(session, iter([make_frame()]), label="scan")
+    job.cancel()
+    job.start()
+    assert job.join(timeout=10.0)
+    assert job.is_cancelled is False
+
+    # And a genuine run after the restart records its frame.
+    job = RecordingJob(session, iter([make_frame(), make_frame()]), label="scan")
+    job.cancel()
+    job._frames = iter([make_frame(), make_frame()])  # noqa: SLF001 - fresh generator
+    job.start()
+    assert job.join(timeout=10.0)
+    assert job.result is not None
+    assert job.result.frame_count == 2  # noqa: PLR2004
+
+
+def test_joining_a_job_that_never_started_succeeds(tmp_path):
+    """Nothing to wait for is a finished job, not a failure."""
+    session = Session(tmp_path / "s")
+    assert RecordingJob(session, iter([]), label="scan").join(timeout=0.01) is True

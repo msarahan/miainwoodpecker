@@ -53,6 +53,20 @@ class _FakeScanner:
         """Release nothing; the fake owns no resources."""
 
 
+class _GradientScanner(_FakeScanner):
+    """Fake scanner whose frames vary, so autocontrast actually computes."""
+
+    def scan_frame(self, parameters: ScanParameters, channel: int = 0) -> Frame:
+        """Return a frame ramping 0..1 across the fast axis."""
+        height, width = parameters.shape
+        row = np.linspace(0.0, 1.0, width, dtype=np.float32)
+        return Frame(
+            data=np.tile(row, (height, 1)),
+            timestamp=datetime.datetime.now(tz=datetime.UTC),
+            metadata={"channel_index": channel},
+        )
+
+
 class _FakeCamera:
     """Fake camera returning constant 8x8 frames."""
 
@@ -951,6 +965,128 @@ def test_disk_label_reports_free_space_and_warns_when_a_plan_will_not_fit(
 
         assert "warning" in widget._space_label.text()  # noqa: SLF001
         assert "scan frames need up to" in widget._space_label.text()  # noqa: SLF001
+    finally:
+        widget.shutdown()
+        viewer.close()
+
+
+def test_an_unchanged_frame_is_not_redrawn():
+    """
+    A display tick that finds no new frame must not re-push the old one.
+
+    The timer runs at a fixed 33 ms while acquisition runs at whatever the
+    device manages, so most ticks see the frame they already drew.
+    Reassigning ``layer.data`` schedules a GPU re-upload and the
+    autocontrast pass walks the whole array twice - at Ronchigram size
+    that was on the order of a gigabyte a second of pointless work on the
+    GUI thread.
+
+    Observed through the autocontrast, which is the visible half: with the
+    loop stopped the frame cannot change, so a contrast limit set by hand
+    survives a refresh only if the refresh genuinely skipped its work.
+    """
+    viewer = napari.Viewer(show=False)
+    # A gradient, not the zero-filled default: autocontrast only sets a
+    # limit when max > min, so a constant frame would make this test pass
+    # whether or not the redundant work was skipped.
+    widget = LiveInstrumentWidget(viewer, _GradientScanner())
+    try:
+        widget.start_scan()
+        assert _wait_until(
+            lambda: widget._scan_loop.latest() is not None  # noqa: SLF001
+        )
+        assert widget.stop_scan()
+        widget.refresh_display()
+        layer = viewer.layers["Scan (HAADF)"]
+        assert tuple(layer.contrast_limits) != (-123.0, 456.0)
+
+        sentinel = (-123.0, 456.0)
+        layer.contrast_limits = sentinel
+        widget.refresh_display()
+        assert tuple(layer.contrast_limits) == sentinel
+    finally:
+        widget.shutdown()
+        viewer.close()
+
+
+def test_a_new_frame_is_still_drawn_after_a_skipped_tick():
+    """The skip must not latch: the next genuinely new frame still lands."""
+    viewer = napari.Viewer(show=False)
+    widget = LiveInstrumentWidget(viewer, _FakeScanner())
+    try:
+        widget._size_combo.setCurrentIndex(0)  # noqa: SLF001 - simulating user input
+        widget.start_scan()
+        assert _wait_until(
+            lambda: widget._scan_loop.latest() is not None  # noqa: SLF001
+        )
+        widget.refresh_display()
+        widget.refresh_display()  # a skipped tick
+        small_shape = (128, 128)
+        assert viewer.layers["Scan (HAADF)"].data.shape == small_shape
+
+        # Change the scan size; the next frames differ, so they must draw.
+        widget._size_combo.setCurrentIndex(1)  # noqa: SLF001 - simulating user input
+        larger = (256, 256)
+        assert _wait_until(
+            lambda: widget._scan_loop.latest().data.shape == larger  # noqa: SLF001
+        )
+        widget.refresh_display()
+        assert viewer.layers["Scan (HAADF)"].data.shape == larger
+    finally:
+        widget.shutdown()
+        viewer.close()
+
+
+def test_a_deleted_layer_comes_back_on_the_next_refresh():
+    """
+    Skipping must key on the layer still existing, not only on the frame.
+
+    An operator who deletes the layer while the source is idle would
+    otherwise never get it back, because the frame has not changed.
+    """
+    viewer = napari.Viewer(show=False)
+    widget = LiveInstrumentWidget(viewer, _FakeScanner())
+    try:
+        widget.start_scan()
+        assert _wait_until(
+            lambda: widget._scan_loop.latest() is not None  # noqa: SLF001
+        )
+        assert widget.stop_scan()
+        widget.refresh_display()
+        del viewer.layers["Scan (HAADF)"]
+
+        widget.refresh_display()
+        assert "Scan (HAADF)" in viewer.layers
+    finally:
+        widget.shutdown()
+        viewer.close()
+
+
+def test_a_grab_error_stops_the_display_timer():
+    """
+    A dead source must not leave the timer spinning on the error path.
+
+    Without this the 33 ms timer ran forever after a detector fell over,
+    reformatting the same exception thirty times a second for the rest of
+    the session.
+    """
+
+    class _BrokenScanner(_FakeScanner):
+        def scan_frame(self, parameters: ScanParameters, channel: int = 0) -> Frame:  # noqa: ARG002 - signature fixed by the Scanner protocol
+            """Fail the way an unplugged detector does."""
+            msg = "detector went away"
+            raise RuntimeError(msg)
+
+    viewer = napari.Viewer(show=False)
+    widget = LiveInstrumentWidget(viewer, _BrokenScanner())
+    try:
+        widget.start_scan()
+        assert _wait_until(
+            lambda: widget._scan_loop.error is not None  # noqa: SLF001
+        )
+        widget.refresh_display()
+        assert not widget._timer.isActive()  # noqa: SLF001
+        assert "detector went away" in widget._scan_status.text()  # noqa: SLF001
     finally:
         widget.shutdown()
         viewer.close()

@@ -154,6 +154,7 @@ import typing
 
 import h5py
 
+from miainwoodpecker.storage import layout
 from miainwoodpecker.storage.calibration import (
     AXIS_NAMES,
     AxisCalibration,
@@ -178,6 +179,15 @@ _DEFAULT_COMPRESSION_LEVEL = 4
 # built-in compressors. Blosc2/bitshuffle shuffle internally, so stacking
 # this filter ahead of them costs a pass over the data and buys nothing.
 _SHUFFLE_BENEFITING_FILTERS = frozenset({"gzip", "lzf"})
+# The NXdata layout this writer builds names exactly two frame axes, so a
+# frame is 2D. Enforced at append() rather than discovered at close().
+_FRAME_RANK = 2
+# Flush after every frame by default. Measured across the whole codec sweep
+# as within run-to-run noise, and it is what converts a SIGKILL mid-recording
+# from "the file does not open at all" into "short but readable" - so the
+# worst case an operator can hit is losing the frame in flight rather than
+# the whole session. See NexusWriter.flush.
+_DEFAULT_FLUSH_EVERY = 1
 
 CompressionSpec = typing.Union[str, "Mapping[str, typing.Any]", None]
 """
@@ -295,6 +305,7 @@ class NexusWriter:
         self._file: h5py.File | None = None
         self._data: h5py.Dataset | None = None
         self._times: h5py.Dataset | None = None
+        self._frame_metadata: h5py.Dataset | None = None
         self._count = 0
         self._first_metadata: typing.Mapping[str, typing.Any] | None = None
         self._resolved_calibration: FrameCalibration | None = None
@@ -382,6 +393,28 @@ class NexusWriter:
         if self._file is not None:
             self._file.flush()
 
+    def _metadata_group(self) -> h5py.Group:
+        """
+        Return ``/entry/metadata``, creating the NXcollection if needed.
+
+        Shared by the per-frame column (created at the first append) and
+        the first frame's blob (written at close), so whichever runs
+        first makes the group and the other joins it.
+
+        Returns
+        -------
+        h5py.Group
+            The ``NXcollection`` holding everything NeXus does not
+            otherwise describe.
+        """
+        assert self._file is not None  # noqa: S101 - guarded by both callers
+        entry = self._file["entry"]
+        collection = entry.get("metadata")
+        if collection is None:
+            collection = entry.create_group("metadata")
+            collection.attrs["NX_class"] = "NXcollection"
+        return collection
+
     def _filter_kwargs(self) -> dict[str, typing.Any]:
         """
         Build the ``create_dataset`` filter-pipeline keyword arguments.
@@ -424,27 +457,42 @@ class NexusWriter:
         RuntimeError
             If the writer is not open.
         ValueError
-            If the frame's shape or dtype differs from the first frame's,
-            or if the first frame's ``metadata["calibration"]`` is
-            malformed (an outright wrong type there surfaces as a
-            ``TypeError`` instead). That check happens here, on the *first*
-            append, rather than in :meth:`close`, so a mis-specified
-            calibration fails before an acquisition runs instead of after
-            it.
+            If the frame is not 2D, if its shape or dtype differs from the
+            first frame's, or if the first frame's
+            ``metadata["calibration"]`` is malformed (an outright wrong
+            type there surfaces as a ``TypeError`` instead). These checks
+            happen here, on append, rather than in :meth:`close`, so a
+            mis-specified acquisition fails before it runs instead of
+            after it.
         """
         if self._file is None:
             msg = "NexusWriter is not open; use it as a context manager."
             raise RuntimeError(msg)
 
-        detector = self._file["entry/instrument/detector"]
+        if frame.data.ndim != _FRAME_RANK:
+            # Checked here rather than left to fail in close(): the NXdata
+            # layout this writer builds is 2D-per-frame throughout (two
+            # named axes, a rank-3 signal). A 1D frame used to reach
+            # _write_nxdata and raise IndexError *after* the whole
+            # acquisition had been appended, and a 3D one silently produced
+            # a rank-4 signal described by two axes - a malformed file
+            # rather than an error. Frame.data's docstring still allows 1D
+            # for binned spectra; storing those needs a layout decision,
+            # not a shape guess (docs/architecture-review.md, §1.6).
+            msg = (
+                f"NexusWriter stores 2D frames; got a {frame.data.ndim}D frame "
+                f"of shape {frame.data.shape}"
+            )
+            raise ValueError(msg)
+
         if self._data is None:
-            self._first_metadata = frame.metadata
             self._resolved_calibration = resolve_frame_calibration(
                 typing.cast("tuple[int, int]", frame.data.shape),
                 calibration=self._calibration,
                 metadata=frame.metadata,
             )
             self._frame_zero = frame.timestamp
+            detector = self._file["entry/instrument/detector"]
             self._data = detector.create_dataset(
                 "data",
                 shape=(0, *frame.data.shape),
@@ -461,12 +509,44 @@ class NexusWriter:
                 dtype="float64",
             )
             self._times.attrs["units"] = "s"
-        elif frame.data.shape != self._data.shape[1:]:
-            msg = (
-                f"frame shape {frame.data.shape} does not match the first "
-                f"frame's shape {tuple(self._data.shape[1:])}"
+            # In the NXcollection, not in NXdetector alongside the frames.
+            # NXcollection is NeXus's own container for data that no base
+            # class or application definition describes, which is exactly
+            # what a JSON blob of vendor keys is; putting it in NXdetector
+            # instead made files claiming NXem fail validation, since a
+            # detector's contents *are* specified. Created here rather
+            # than at close() because it has to grow per frame.
+            collection = self._metadata_group()
+            self._frame_metadata = collection.create_dataset(
+                "frame_metadata_json",
+                shape=(0,),
+                maxshape=(None,),
+                dtype=h5py.string_dtype(encoding="utf-8"),
             )
-            raise ValueError(msg)
+            # A copy, not the caller's mapping: this is held until close(),
+            # and a caller reusing one dict across a series would otherwise
+            # have its later edits appear in what was written for frame 0.
+            self._first_metadata = dict(frame.metadata)
+        else:
+            if frame.data.shape != self._data.shape[1:]:
+                msg = (
+                    f"frame shape {frame.data.shape} does not match the first "
+                    f"frame's shape {tuple(self._data.shape[1:])}"
+                )
+                raise ValueError(msg)
+            if self._dtype is None and frame.data.dtype != self._data.dtype:
+                # Only when this writer adopted the first frame's dtype. An
+                # explicit dtype= means the caller asked for a cast, so a
+                # differing input dtype is the point rather than an error.
+                # Documented as raising since this method was written; h5py
+                # would otherwise cast silently, which is exactly the kind of
+                # quiet narrowing the dtype= parameter exists to keep opt-in.
+                msg = (
+                    f"frame dtype {frame.data.dtype} does not match the first "
+                    f"frame's dtype {self._data.dtype}; pass dtype= to store "
+                    f"a series as one dtype deliberately"
+                )
+                raise ValueError(msg)
 
         index = self._count
         self._data.resize(index + 1, axis=0)
@@ -475,30 +555,66 @@ class NexusWriter:
         self._times.resize(index + 1, axis=0)
         elapsed = frame.timestamp - typing.cast("datetime.datetime", self._frame_zero)
         self._times[index] = elapsed.total_seconds()
+        # Per frame, not once: acquisition.sequence.focal_series varies
+        # defocus_nm and requested_defocus_nm frame by frame precisely so a
+        # recording says what the instrument did rather than what it was
+        # asked to do. Keeping only the first frame's metadata threw that
+        # away silently (docs/architecture-review.md, §1.4).
+        assert self._frame_metadata is not None  # noqa: S101 - created alongside _data
+        self._frame_metadata.resize(index + 1, axis=0)
+        self._frame_metadata[index] = json.dumps(
+            dict(frame.metadata),
+            default=_json_default,
+            sort_keys=True,
+        )
         self._count += 1
 
     def close(self) -> None:
-        """Write plotting hints, axis calibration, and metadata; close the file."""
+        """
+        Write plotting hints, axis calibration, and metadata; close the file.
+
+        Finalization runs under ``try``/``finally`` so the file handle is
+        released even when a step fails. Without it, a raise partway
+        through (a full disk writing ``end_time``, metadata that will not
+        serialize) left ``self._file`` open *and* non-``None``, so the
+        handle leaked, the file stayed locked, and ``__exit__`` propagated
+        with the writer stuck half-finalized. The frames already on disk
+        are worth more than the finalization that failed, and an
+        unfinalized file is a state this project already handles
+        (``Recording.finalized``).
+        """
         if self._file is None:
             return
-        entry = self._file["entry"]
-        end_time = datetime.datetime.now(tz=datetime.UTC)
-        entry["end_time"] = _iso(end_time)
+        try:
+            entry = self._file["entry"]
+            end_time = datetime.datetime.now(tz=datetime.UTC)
+            entry["end_time"] = _iso(end_time)
 
-        if self._data is not None:
-            self._write_nxdata(entry)
-        if self._first_metadata:
-            collection = entry.create_group("metadata")
-            collection.attrs["NX_class"] = "NXcollection"
-            collection["vendor_metadata_json"] = json.dumps(
-                dict(self._first_metadata),
-                default=_json_default,
-                sort_keys=True,
-            )
-        self._file.close()
-        self._file = None
-        self._data = None
-        self._times = None
+            if self._data is not None:
+                self._write_nxdata(entry)
+            if self._first_metadata:
+                # Kept alongside the per-frame column, and kept at all
+                # because read_session_context() reads it: the first
+                # frame's metadata is where a session's own context lands.
+                self._metadata_group()["vendor_metadata_json"] = json.dumps(
+                    dict(self._first_metadata),
+                    default=_json_default,
+                    sort_keys=True,
+                )
+        finally:
+            self._file.close()
+            # Reset every piece of per-acquisition state, not just the
+            # handles. Leaving _count behind made a reused writer resize to
+            # count+1 and write at count, so frames 0..count-1 were HDF5
+            # fill values indistinguishable from real data.
+            self._file = None
+            self._data = None
+            self._times = None
+            self._frame_metadata = None
+            self._count = 0
+            self._first_metadata = None
+            self._resolved_calibration = None
+            self._frame_zero = None
 
     def _write_nxdata(self, entry: h5py.Group) -> None:
         """Create the NXdata group describing how to plot the frame stack."""
@@ -546,6 +662,8 @@ def _version() -> str:
 def write_frames(
     path: os.PathLike[str] | str,
     frames: Iterable[Frame],
+    *,
+    flush_every: int = _DEFAULT_FLUSH_EVERY,
     **kwargs: object,
 ) -> int:
     """
@@ -557,6 +675,14 @@ def write_frames(
         Destination HDF5 file.
     frames : Iterable[Frame]
         Frames to persist, in acquisition order.
+    flush_every : int
+        Call :meth:`NexusWriter.flush` after this many frames; ``0`` (or
+        less) never flushes. The default of 1 bounds worst-case loss from
+        a hard kill to the frame in flight, at a cost measured as within
+        run-to-run noise — the writer's flush docstring explains why this
+        is the difference between a file that opens and one that does not.
+        Raise it for a detector fast enough that the flush shows up in a
+        profile, which no measurement here has yet found.
     **kwargs : object
         Passed through to :class:`NexusWriter`.
 
@@ -568,6 +694,8 @@ def write_frames(
     with NexusWriter(path, **kwargs) as writer:
         for frame in frames:
             writer.append(frame)
+            if flush_every > 0 and writer.frame_count % flush_every == 0:
+                writer.flush()
         return writer.frame_count
 
 
@@ -598,6 +726,86 @@ def _axis_calibration_from_values(
     return AxisCalibration(kind, scale, offset, units)
 
 
+def read_frames(
+    path: os.PathLike[str] | str,
+) -> tuple[np.ndarray, np.ndarray, FrameCalibration]:
+    """
+    Read a whole recording — stack, times, and calibration — in one open.
+
+    The reader the Phase 4 analysis adapters share. Each of them used to
+    open the file itself for the arrays and then call
+    :func:`read_calibration`, which opens it a *second* time; each also
+    carried its own copy of the "this recording has no frames" check and
+    its message. So the layout was known in four places, the message in
+    four, and every analysis paid two opens of a file that can be tens of
+    megabytes.
+
+    Reads through :data:`~miainwoodpecker.storage.layout.NXDATA_GROUP`
+    rather than the detector group, deliberately: that is the group
+    ``close()`` creates, so a recording whose writer was abandoned is
+    refused here rather than analyzed as if it were complete. The viewer
+    already tells that story in words before it gets this far, and
+    :func:`read_series` is the reader that *does* recover such a file.
+
+    Parameters
+    ----------
+    path : os.PathLike[str] | str
+        An HDF5 file written by :class:`NexusWriter`.
+
+    Returns
+    -------
+    tuple[np.ndarray, np.ndarray, FrameCalibration]
+        The ``(frames, height, width)`` stack, the per-frame elapsed
+        times in seconds, and the ``y``/``x`` calibration.
+
+    Raises
+    ------
+    layout.NoFramesError
+        If the acquisition produced no frames, so there is no ``NXdata``
+        group to read.
+    """
+    with h5py.File(path, "r") as handle:
+        if layout.NXDATA_GROUP not in handle:
+            raise layout.NoFramesError(path)
+        data_group = handle[layout.NXDATA_GROUP]
+        data = data_group["data"][()]
+        frame_time = data_group["frame_time"][()]
+        calibration = FrameCalibration(
+            **{
+                name: _axis_calibration_from_values(
+                    data_group[name][()],
+                    _decoded(data_group[name].attrs["units"]),
+                )
+                for name in AXIS_NAMES
+            },
+        )
+    return data, frame_time, calibration
+
+
+def require_frames(path: os.PathLike[str] | str) -> None:
+    """
+    Raise unless a file holds an analyzable frame stack.
+
+    For an adapter that hands the path straight to a library rather than
+    reading the arrays itself — LiberTEM's ``Context.load`` opens the file
+    with its own reader — so it can still refuse an unfinalized recording
+    with this project's message instead of the library's much vaguer one.
+
+    Parameters
+    ----------
+    path : os.PathLike[str] | str
+        An HDF5 file written by :class:`NexusWriter`.
+
+    Raises
+    ------
+    layout.NoFramesError
+        If the acquisition produced no frames.
+    """
+    with h5py.File(path, "r") as handle:
+        if layout.NXDATA_GROUP not in handle:
+            raise layout.NoFramesError(path)
+
+
 def read_calibration(path: os.PathLike[str] | str) -> FrameCalibration:
     """
     Read back the per-axis calibration a written file carries.
@@ -622,16 +830,14 @@ def read_calibration(path: os.PathLike[str] | str) -> FrameCalibration:
 
     Raises
     ------
-    ValueError
-        If the file has no ``/entry/data`` group (it recorded no frames),
-        or if an axis's units are outside this project's vocabulary, so its
-        kind cannot be recovered rather than guessed.
+    layout.NoFramesError
+        If the file has no ``NXdata`` group, i.e. it recorded no frames.
+        A ``ValueError`` subclass, so existing callers catch it unchanged.
     """
     with h5py.File(path, "r") as handle:
-        if "data" not in handle["entry"]:
-            msg = f"{path} has no /entry/data group; it recorded no frames"
-            raise ValueError(msg)
-        data_group = handle["entry/data"]
+        if layout.NXDATA_GROUP not in handle:
+            raise layout.NoFramesError(path)
+        data_group = handle[layout.NXDATA_GROUP]
         axes = {
             name: _axis_calibration_from_values(
                 data_group[name][()],
@@ -679,10 +885,9 @@ def read_series(path: os.PathLike[str] | str) -> Iterator[tuple[np.ndarray, floa
         for a file written by an acquisition that produced no frames.
     """
     with h5py.File(path, "r") as handle:
-        detector = handle["entry/instrument/detector"]
-        if "data" not in detector:
+        if layout.DETECTOR_DATA not in handle:
             return
-        data = detector["data"]
-        times = detector["frame_time"]
+        data = handle[layout.DETECTOR_DATA]
+        times = handle[layout.DETECTOR_FRAME_TIME]
         for index in range(data.shape[0]):
             yield data[index], float(times[index])

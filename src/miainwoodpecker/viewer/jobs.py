@@ -35,16 +35,15 @@ choices *before* starting a job and defers every layer and label update to
 
 from __future__ import annotations
 
-import threading
 import typing
+
+from miainwoodpecker.jobs import BackgroundJob
 
 if typing.TYPE_CHECKING:
     from collections.abc import Callable
 
-_JOIN_TIMEOUT_S = 30.0
 
-
-class AnalysisJob:
+class AnalysisJob(BackgroundJob):
     """
     Run one analysis callable on a worker thread.
 
@@ -57,57 +56,22 @@ class AnalysisJob:
     """
 
     def __init__(self, work: Callable[[], object]) -> None:
-        self._work = work
-        self._lock = threading.Lock()
-        self._thread: threading.Thread | None = None
-        self._result: object | None = None
-        self._error: Exception | None = None
-
-    def start(self) -> None:
-        """Start the worker thread; a no-op if it is already running."""
-        if self.is_running:
-            return
-        self._thread = threading.Thread(target=self._run, name="analysis", daemon=True)
-        self._thread.start()
-
-    def join(self, timeout: float = _JOIN_TIMEOUT_S) -> None:
-        """
-        Wait for the worker thread to finish.
-
-        Parameters
-        ----------
-        timeout : float
-            Seconds to wait before giving up.
-        """
-        thread = self._thread
-        if thread is not None:
-            thread.join(timeout)
-
-    @property
-    def is_running(self) -> bool:
-        """Return whether the worker thread is still going."""
-        thread = self._thread
-        return thread is not None and thread.is_alive()
+        super().__init__("analysis")
+        self._callable = work
 
     @property
     def result(self) -> object | None:
         """Return what the callable returned, or None if it raised or is unfinished."""
         with self._lock:
-            return self._result
+            return self._raw_result
 
-    @property
-    def error(self) -> Exception | None:
-        """Return the exception the callable raised, if it raised one."""
-        with self._lock:
-            return self._error
+    def _work(self) -> object:
+        """
+        Run the caller's analysis on the worker thread.
 
-    def _run(self) -> None:
-        """Run the callable, capturing its result or its exception."""
-        try:
-            value = self._work()
-        except Exception as exc:  # noqa: BLE001 - surfaced via .error on the GUI thread
-            with self._lock:
-                self._error = exc
-        else:
-            with self._lock:
-                self._result = value
+        Returns
+        -------
+        object
+            Whatever the analysis produced, for the GUI thread to draw.
+        """
+        return self._callable()

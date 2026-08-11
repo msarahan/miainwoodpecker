@@ -91,6 +91,11 @@ _ANALYSIS_BURST_FRAME_COUNT = 5
 _DEFAULT_RECORD_FRAME_COUNT = 10
 _MAX_RECORD_FRAME_COUNT = 100000
 _NO_SESSION_MESSAGE = "no session - data is not being kept"
+# Shown when a live loop would not release the device in time. Refusing is
+# deliberate: driving a device from two threads corrupts frames silently
+# rather than raising (docs/architecture-review.md, §1.2).
+_SCANNER_BUSY_MESSAGE = "scanner still busy - live scan did not stop, try again"
+_CAMERA_BUSY_MESSAGE = "camera still busy - live loop did not stop, try again"
 _NOTES_HEIGHT_PX = 64
 # Long enough that typing a sentence writes the sidecar once, short enough
 # that an operator who types and immediately clicks Record has their note.
@@ -240,6 +245,11 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         self._camera = camera
         self._scan_loop: LiveAcquisition | None = None
         self._camera_loop: LiveAcquisition | None = None
+        # Newest frame already pushed into each napari layer, so a display
+        # tick that finds nothing new can skip the upload entirely. Holds
+        # a reference for identity comparison only; the array itself is
+        # the layer's, not a second copy.
+        self._displayed: dict[str, Frame] = {}
         self._session: Session | None = None
         self._recording_job: RecordingJob | None = None
         self._load_job: LoadJob | None = None
@@ -560,13 +570,27 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         self._scan_status.setText("running")
         self._timer.start()
 
-    def stop_scan(self) -> None:
-        """Stop the live scan loop."""
+    def stop_scan(self) -> bool:
+        """
+        Stop the live scan loop.
+
+        Returns
+        -------
+        bool
+            True if the worker actually finished. False means a grab is
+            still in flight and the scanner is still in use — callers
+            about to drive the scanner themselves must not proceed.
+        """
+        stopped = True
         if self._scan_loop is not None:
-            self._scan_loop.stop()
-        self._scan_button.setText("Start scan")
-        self._scan_status.setText("stopped")
-        self._maybe_stop_timer()
+            stopped = self._scan_loop.stop()
+        if stopped:
+            self._scan_button.setText("Start scan")
+            self._scan_status.setText("stopped")
+            self._maybe_stop_timer()
+        else:
+            self._scan_status.setText("still finishing a scan - try again")
+        return stopped
 
     def start_camera(self) -> None:
         """Start the camera and its live loop and the display timer."""
@@ -581,16 +605,29 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         self._camera_status.setText("running")
         self._timer.start()
 
-    def stop_camera(self) -> None:
-        """Stop the camera's live loop and pause the camera."""
+    def stop_camera(self) -> bool:
+        """
+        Stop the camera's live loop and pause the camera.
+
+        Returns
+        -------
+        bool
+            True if the worker actually finished. False means an exposure
+            is still in flight and the camera is still in use; the camera
+            is left running rather than stopped underneath it.
+        """
+        stopped = True
         if self._camera_loop is not None:
-            self._camera_loop.stop()
+            stopped = self._camera_loop.stop()
+        if not stopped:
+            self._camera_status.setText("still finishing an exposure - try again")
+            return False
         if self._camera is not None:
             self._camera.stop()
-        if self._camera is not None:
             self._camera_button.setText("Start camera")
             self._camera_status.setText("stopped")
         self._maybe_stop_timer()
+        return True
 
     def set_session(self, session: Session | None) -> None:
         """
@@ -836,8 +873,13 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         # One driver per device: the live loop and the recording would
         # otherwise call scan_frame from two threads at once, and the
         # device RPC protocol is strictly synchronous request/response
-        # over a single connection (migration plan, §6).
-        self.stop_scan()
+        # over a single connection (migration plan, §6). Refusing when the
+        # loop did not actually stop is the point of checking: starting
+        # anyway is what tears a frame in half across the reused
+        # shared-memory segment.
+        if not self.stop_scan():
+            self._recording_status.setText(_SCANNER_BUSY_MESSAGE)
+            return
         parameters, channel_index, channel_name = self._scan_request
         self._start_recording(
             scan_series(
@@ -858,7 +900,9 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
             return
         # Same one-driver-per-device rule as record_scan_frames; camera_series
         # starts and stops the camera around the series itself.
-        self.stop_camera()
+        if not self.stop_camera():
+            self._recording_status.setText(_CAMERA_BUSY_MESSAGE)
+            return
         self._start_recording(
             camera_series(self._camera, self._camera_count_spin.value()), "camera"
         )
@@ -1179,8 +1223,19 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         if self._analysis_job is not None and self._analysis_job.is_running:
             status.setText("another analysis is running")
             return
-        if self._camera_loop is not None and self._camera_loop.is_running:
-            self.stop_camera()
+        if (
+            self._camera_loop is not None
+            and self._camera_loop.is_running
+            and not self.stop_camera()
+        ):
+            # Refusing is the point rather than pessimism: an exposure
+            # still in flight means the live loop has not released the
+            # camera, and starting the burst anyway would drive one device
+            # from two threads - which tears a frame across the reused
+            # shared-memory segment instead of raising
+            # (docs/architecture-review.md, §1.2).
+            status.setText(_CAMERA_BUSY_MESSAGE)
+            return
 
         existing = self._analysis_file()
         note = self._note_for_next_recording()
@@ -1458,9 +1513,25 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
     ) -> None:
         if loop.error is not None:
             status_label.setText(f"error: {loop.error}")
+            # A failed grab stops the worker but sets no stop event, so
+            # without this the timer would run forever, reformatting the
+            # same exception 30 times a second at full display cost.
+            self._maybe_stop_timer()
             return
         frame = loop.latest()
         if frame is None:
+            return
+        if frame is self._displayed.get(layer_name) and layer_name in (
+            self._viewer.layers
+        ):
+            # Nothing new since the last tick. The display timer is fixed
+            # at 33 ms while acquisition runs at whatever the device
+            # manages, so most ticks see the frame they already drew:
+            # assigning layer.data schedules a GPU re-upload and the
+            # autocontrast pass walks the whole array twice, both for
+            # pixels that did not change. Identity is the right test -
+            # the loop hands out the same object until it grabs another.
+            self._refresh_rate_label(loop, status_label)
             return
         if layer_name in self._viewer.layers:
             layer = self._viewer.layers[layer_name]
@@ -1472,8 +1543,26 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
                     layer.contrast_limits = (low, high)
         else:
             self._viewer.add_image(frame.data, name=layer_name, colormap="gray")
-        if loop.is_running:
-            status_label.setText(f"running - {loop.stats.fps:.1f} fps")
+        self._displayed[layer_name] = frame
+        self._refresh_rate_label(loop, status_label)
+
+    def _refresh_rate_label(
+        self,
+        loop: LiveAcquisition,
+        status_label: QtWidgets.QLabel,
+    ) -> None:
+        """
+        Show the acquisition rate, rewriting the label only when it changes.
+
+        ``setText`` with identical text still costs a Qt repaint, and this
+        runs for every source on every tick; the rate only moves in the
+        first decimal a few times a second.
+        """
+        if not loop.is_running:
+            return
+        text = f"running - {loop.stats.fps:.1f} fps"
+        if status_label.text() != text:
+            status_label.setText(text)
 
     def shutdown(self) -> None:
         """Stop all loops, the camera, the display timer, and any recording."""

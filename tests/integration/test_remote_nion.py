@@ -23,6 +23,7 @@ import signal
 import subprocess
 import threading
 import time
+from multiprocessing.connection import Client
 
 import pytest
 
@@ -39,7 +40,10 @@ from miainwoodpecker.devices import (
     Scanner,
     remote,
 )
-from miainwoodpecker.devices.nion_server import _SHARED_MEMORY_THRESHOLD_BYTES
+from miainwoodpecker.devices.nion_server import (
+    PARK_TIMEOUT_EXIT_STATUS,
+    _SHARED_MEMORY_THRESHOLD_BYTES,
+)
 from miainwoodpecker.devices.remote import (
     HARDWARE_BACKEND,
     SERVER_EXITED,
@@ -53,6 +57,7 @@ from miainwoodpecker.devices.remote import (
     remote_simulated_instrument,
 )
 from miainwoodpecker.devices.rpc import (
+    Call,
     RemoteCallTimeoutError,
     RemoteConnectionLostError,
 )
@@ -525,6 +530,7 @@ def test_shutdown_times_out_against_a_wedged_server(monkeypatch):
     handler (``MIAINWOODPECKER_WEDGE_SHUTDOWN``), so this exercises the
     real socket-timeout path rather than a mocked-out client.
     """
+    monkeypatch.setenv("MIAINWOODPECKER_ENABLE_TEST_HOOKS", "1")
     monkeypatch.setenv("MIAINWOODPECKER_WEDGE_SHUTDOWN", "1")
     monkeypatch.setattr(remote, "_SHUTDOWN_TIMEOUT_S", 1.0)
     with remote_instrument() as instrument, pytest.raises(
@@ -539,13 +545,28 @@ def test_sigterm_fallback_fires_when_the_server_is_wedged(
     spawned_servers,
 ):
     """
-    A wedged server is killed, and its shared-memory segments are still freed.
+    A wedged server dies to the fallback, and its segments are still freed.
 
-    Asserts the fallback actually fired rather than inferring it: the
-    server process must have died of SIGTERM, and the three segments the
-    session used must be gone anyway — the per-device ``close()`` fallback
-    is what unlinks them when the handshake cannot.
+    Asserts the fallback actually fired rather than inferring it, and the
+    three segments the session used must be gone anyway — the per-device
+    ``close()`` fallback is what unlinks them when the handshake cannot.
+
+    **How the server dies changed when it grew signal handlers, and the
+    change is the point.** It used to die *of* SIGTERM (``-15``), the
+    default disposition. Now SIGTERM is caught and the server tries to
+    park first — but in this test the park is exactly what is wedged (the
+    hook blocks ``park_and_release`` itself), so the bounded attempt
+    expires and the server exits with ``PARK_TIMEOUT_EXIT_STATUS``. That
+    is the correct outcome and the reason the attempt is bounded at all:
+    an unbounded park here would have made a wedged server survive
+    SIGTERM entirely, forcing the client to escalate to ``SIGKILL`` —
+    which is what this test caught when the handler was first written.
+
+    Either way the process is gone promptly and the segments are
+    reclaimed; ``-SIGKILL`` is the one outcome that would mean the
+    handler had made things worse.
     """
+    monkeypatch.setenv("MIAINWOODPECKER_ENABLE_TEST_HOOKS", "1")
     monkeypatch.setenv("MIAINWOODPECKER_WEDGE_SHUTDOWN", "1")
     monkeypatch.setattr(remote, "_SHUTDOWN_TIMEOUT_S", 1.0)
     with remote_instrument() as instrument:
@@ -553,7 +574,7 @@ def test_sigterm_fallback_fires_when_the_server_is_wedged(
     expected_segment_count = 3  # scanner + both cameras
     assert len(used_names) == expected_segment_count
     assert len(spawned_servers) == 1
-    assert spawned_servers[0].returncode == -signal.SIGTERM
+    assert spawned_servers[0].returncode == PARK_TIMEOUT_EXIT_STATUS
     assert used_names.isdisjoint(_shm_names())
 
 
@@ -677,6 +698,7 @@ def test_health_check_detects_a_wedged_server(monkeypatch, spawned_servers):
     from what it already knows instead of sending a second request, since
     the first reply could still arrive and would be misread as the second's.
     """
+    monkeypatch.setenv("MIAINWOODPECKER_ENABLE_TEST_HOOKS", "1")
     monkeypatch.setenv("MIAINWOODPECKER_WEDGE_HEALTH", "1")
     with remote_instrument() as instrument:
         started = time.monotonic()
@@ -760,6 +782,7 @@ def test_killing_the_server_mid_acquisition_fails_the_call_in_flight(
     guessing at anything.
     """
     delay_s = 10.0
+    monkeypatch.setenv("MIAINWOODPECKER_ENABLE_TEST_HOOKS", "1")
     monkeypatch.setenv("MIAINWOODPECKER_DELAY_SCAN_S", str(delay_s))
     with remote_instrument() as instrument:
         server = spawned_servers[0]
@@ -924,4 +947,200 @@ def test_the_client_reclaims_segments_when_the_tracker_dies_too(spawned_servers)
             f"resource tracker; only {sorted(leaked)} of {sorted(used_names)} did"
         )
     # Stage two: teardown noticed the abnormal exit and unlinked them.
+    assert used_names.isdisjoint(_shm_names())
+
+
+@pytest.fixture
+def spawn_details(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, object]]:
+    """
+    Capture the ports and authkey each spawned server was given.
+
+    The client API deliberately exposes devices rather than transport
+    details, so a test that needs to open its *own* connection to a target
+    - to prove the server refuses a second one - has to learn them from
+    the spawn call.
+
+    Parameters
+    ----------
+    monkeypatch : pytest.MonkeyPatch
+        Used to restore the real spawn helper afterwards.
+
+    Returns
+    -------
+    list[dict[str, object]]
+        One entry per spawn, in order, with ``ports`` and ``authkey``.
+    """
+    captured: list[dict[str, object]] = []
+    spawn_server = remote._spawn_server  # noqa: SLF001
+
+    def capturing_spawn(
+        ports: dict[str, int],
+        authkey: bytes,
+        *args: object,
+        **kwargs: object,
+    ) -> subprocess.Popen[bytes]:
+        captured.append({"ports": dict(ports), "authkey": authkey})
+        return spawn_server(ports, authkey, *args, **kwargs)
+
+    monkeypatch.setattr(remote, "_spawn_server", capturing_spawn)
+    return captured
+
+
+def test_a_second_connection_to_a_frame_target_is_refused(spawn_details):
+    """
+    A frame-producing target admits one client at a time, and says so.
+
+    ``SharedFrameWriter`` reuses one segment per source, which is safe
+    only while a single request/response is in flight: a second client's
+    publish would overwrite the segment while the first is still copying
+    out of it, splicing two frames together with nothing raised anywhere.
+    That invariant used to rest on client convention alone - one
+    ``_RemoteDevice`` per target - which nothing server-side could check
+    and a second viewer pointed at these ports would quietly break.
+
+    The rejection is *served* rather than dropped, so the intruder learns
+    why on its first call instead of getting a bare EOF.
+    """
+    with remote_instrument() as instrument:
+        details = spawn_details[0]
+        port = details["ports"]["scanner"]
+        intruder = Client(("localhost", port), authkey=details["authkey"])
+        try:
+            intruder.send(Call("scanner", "scanner_id"))
+            result = intruder.recv()
+            assert result.error is not None
+            assert "already driven by another connection" in result.error
+        finally:
+            intruder.close()
+
+        # The legitimate client is untouched by the refusal.
+        assert isinstance(instrument.scanner.scanner_id, str)
+
+
+def test_a_refused_connection_releases_the_target_when_it_closes(spawn_details):
+    """A rejected client must not permanently hold the exclusivity slot."""
+    with remote_instrument() as instrument:
+        details = spawn_details[0]
+        port = details["ports"]["scanner"]
+        for _ in range(3):
+            intruder = Client(("localhost", port), authkey=details["authkey"])
+            intruder.send(Call("scanner", "scanner_id"))
+            assert intruder.recv().error is not None
+            intruder.close()
+        assert isinstance(instrument.scanner.scanner_id, str)
+
+
+def test_the_instrument_target_still_accepts_two_connections(spawn_details):
+    """
+    Exclusivity applies to frame targets only, not to ``instrument``.
+
+    The client itself opens two connections to that port on every
+    session - one for controls, one for health - precisely so a status
+    poll cannot queue behind a slow stage move. It publishes no frames,
+    so it has no segment to corrupt.
+    """
+    with remote_instrument():
+        details = spawn_details[0]
+        port = details["ports"]["instrument"]
+        extra = Client(("localhost", port), authkey=details["authkey"])
+        try:
+            extra.send(Call("instrument", "health"))
+            result = extra.recv()
+            assert result.error is None
+            assert result.value["ok"] is True
+        finally:
+            extra.close()
+
+
+def test_sigterm_parks_the_beam_before_the_server_exits(spawned_servers):
+    """
+    The client's fallback is terminate(), and it must not leave the beam on.
+
+    A signal-less server answered SIGTERM by dying with the column live -
+    and SIGTERM is precisely the wedged-server path that fallback exists
+    for, so it is the case where parking matters most. The assertion is
+    on observable outcomes rather than on a log line: the process leaves
+    through ``serve()``'s own return (status 0, not death by signal), and
+    parking released the devices, which is what retires their segments.
+    """
+    with remote_instrument() as instrument:
+        controls = instrument.instrument.available_controls()
+        assert BEAM_BLANKER_CONTROL in controls, "usim models a blanker"
+        instrument.instrument.set_beam_blanked(blanked=False)
+        assert not instrument.instrument.is_beam_blanked()
+        used_names = _exercise_shared_memory(instrument)
+
+        server = spawned_servers[0]
+        server.send_signal(signal.SIGTERM)
+        server.wait(timeout=_FAIL_FAST_BUDGET_S)
+        assert server.returncode == 0
+    assert used_names.isdisjoint(_shm_names())
+
+
+def test_the_wedge_hook_does_nothing_without_the_flag(monkeypatch, spawned_servers):
+    """
+    The environment variable alone must not wedge a server.
+
+    This is the safety property the flag exists for. The environment is
+    inherited wholesale by the subprocess, so an operator with
+    MIAINWOODPECKER_WEDGE_SHUTDOWN left set in a shell profile used to
+    get a real instrument whose shutdown blocked forever with nothing
+    saying why. With the hook set but the flag absent, shutdown is
+    ordinary: the handshake succeeds and the server exits 0, rather than
+    timing out and being terminated.
+    """
+    monkeypatch.setenv("MIAINWOODPECKER_WEDGE_SHUTDOWN", "1")
+    monkeypatch.delenv("MIAINWOODPECKER_ENABLE_TEST_HOOKS", raising=False)
+    monkeypatch.setattr(remote, "_SHUTDOWN_TIMEOUT_S", 10.0)
+
+    with remote_instrument() as instrument:
+        used_names = _exercise_shared_memory(instrument)
+
+    assert len(spawned_servers) == 1
+    assert spawned_servers[0].returncode == 0, (
+        "an unarmed wedge hook must leave the graceful shutdown intact"
+    )
+    assert used_names.isdisjoint(_shm_names())
+
+
+def test_an_orphaned_server_parks_itself_and_exits(monkeypatch, spawned_servers):
+    """
+    A server whose client vanished must not hold the instrument forever.
+
+    Without this, ``serve()`` blocks on its stop event indefinitely: the
+    vendor devices stay open, the camera threads keep running, the ports
+    stay bound, and the beam stays unblanked, with nothing to reclaim any
+    of it. On real hardware that is a column nobody can use and nobody is
+    watching.
+
+    Simulated by closing every connection without the shutdown
+    handshake, which is what a crashed client looks like from the
+    server's side. "All connections gone" is a sound signal here
+    specifically because reconnect is deliberately unsupported (migration
+    plan, §6), so a live client holds its connections for its whole life
+    - an *idle* client is still a connected one, and cannot trip this.
+    """
+    monkeypatch.setenv("MIAINWOODPECKER_ENABLE_TEST_HOOKS", "1")
+    monkeypatch.setenv("MIAINWOODPECKER_ORPHAN_GRACE_S", "1.0")
+
+    with remote_instrument() as instrument:
+        used_names = _exercise_shared_memory(instrument)
+        server = spawned_servers[0]
+        devices = [
+            instrument.ronchigram_camera,
+            instrument.eels_camera,
+            instrument.scanner,
+        ]
+        for device in devices:
+            if device is not None:
+                device._connection.close()  # noqa: SLF001 - simulating a crash
+        instrument.instrument._connection.close()  # noqa: SLF001
+        instrument.instrument._health_connection.close()  # noqa: SLF001
+
+        # The watchdog should notice and take the server down on its own.
+        server.wait(timeout=_FAIL_FAST_BUDGET_S)
+        assert server.returncode == 0, (
+            "an orphaned server should park and exit through its normal path"
+        )
+
     assert used_names.isdisjoint(_shm_names())

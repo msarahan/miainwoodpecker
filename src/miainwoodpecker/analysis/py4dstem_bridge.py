@@ -120,11 +120,10 @@ from __future__ import annotations
 
 import typing
 
-import h5py
 from py4DSTEM.data import Calibration, DiffractionSlice
 
 from miainwoodpecker.storage.calibration import PIXEL_UNITS, AxisKind
-from miainwoodpecker.storage.nexus import read_calibration
+from miainwoodpecker.storage.nexus import read_frames
 
 if typing.TYPE_CHECKING:
     import os
@@ -183,13 +182,7 @@ def load_as_diffraction_slice(path: os.PathLike[str] | str) -> DiffractionSlice:
         both refused rather than mislabelled as a diffraction-plane
         quantity.
     """
-    with h5py.File(path, "r") as handle:
-        entry = handle["entry"]
-        if "data" not in entry:
-            msg = f"{path} has no /entry/data group; it recorded no frames"
-            raise ValueError(msg)
-        data = entry["data/data"][()]
-    frame_calibration = read_calibration(path)
+    data, _frame_time, frame_calibration = read_frames(path)
     y_axis, x_axis = frame_calibration.y, frame_calibration.x
 
     if y_axis.kind is not x_axis.kind or y_axis.kind not in _Q_PIXEL_UNITS:

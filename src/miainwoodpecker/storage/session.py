@@ -82,6 +82,7 @@ import contextlib
 import dataclasses
 import datetime
 import json
+import os
 import re
 import shutil
 import threading
@@ -92,10 +93,11 @@ import h5py
 import numpy as np
 
 from miainwoodpecker.acquisition.sequence import record as record_frames
+from miainwoodpecker.jobs import BackgroundJob
+from miainwoodpecker.storage import layout
 from miainwoodpecker.storage.nexus import read_series
 
 if typing.TYPE_CHECKING:
-    import os
     from collections.abc import Callable, Iterable, Iterator
 
     import numpy.typing as npt
@@ -109,7 +111,6 @@ _STAMP_FORMAT = "%Y%m%dT%H%M%SZ"
 _INDEX_DIGITS = 4
 _CONTEXT_PREFIX = "session_"
 _CONTEXT_FIELDS = ("operator", "sample", "notes")
-_JOIN_TIMEOUT_S = 30.0
 # 1000, not 1024: operators compare this against what the OS file manager
 # and `df -h` report, and those use decimal units.
 _BYTES_PER_UNIT = 1000.0
@@ -241,6 +242,8 @@ class Session:
             raise NotADirectoryError(msg)
         self._root.mkdir(parents=True, exist_ok=True)
         self._context: dict[str, str] = dict.fromkeys(_CONTEXT_FIELDS, "")
+        # path -> ((mtime, size), description); see recordings().
+        self._recording_cache: dict[Path, tuple[tuple[float, int], Recording]] = {}
         self._created = _now()
         self._load_sidecar()
         self.update_context(operator=operator, sample=sample, notes=notes)
@@ -412,16 +415,42 @@ class Session:
         is the index, so there is nothing to keep in sync. Files whose
         names this session did not mint are ignored.
 
+        Descriptions are cached per file and invalidated by ``(mtime,
+        size)``, because describing one means *opening* it as HDF5, and
+        the viewer calls this on the GUI thread after every recording and
+        every analysis run. Without the cache a shift's worth of
+        recordings costs that many HDF5 opens per refresh — a freeze that
+        grows through the day, and worst on the network-mounted session
+        directory a real instrument is likeliest to use. The cache is
+        keyed on the stat rather than merely on the path so an
+        in-progress recording, whose file grows between refreshes, is
+        still re-read.
+
         Returns
         -------
         list[Recording]
             One entry per recording, sorted by sequence number.
         """
-        found = [
-            described
-            for candidate in self._root.glob(f"*{_SUFFIX}")
-            if (described := _describe(candidate)) is not None
-        ]
+        found = []
+        fresh: dict[Path, tuple[tuple[float, int], Recording]] = {}
+        for candidate in self._root.glob(f"*{_SUFFIX}"):
+            if _NAME_PATTERN.match(candidate.name) is None:
+                continue
+            try:
+                status = candidate.stat()
+                stamp = (status.st_mtime, status.st_size)
+            except OSError:
+                # Vanished between the glob and the stat; nothing to list.
+                continue
+            cached = self._recording_cache.get(candidate)
+            if cached is not None and cached[0] == stamp:
+                described = cached[1]
+            else:
+                described = _describe_path(candidate)
+            fresh[candidate] = (stamp, described)
+            found.append(described)
+        # Rebuilt rather than updated, so deleted files do not accumulate.
+        self._recording_cache = fresh
         return sorted(found, key=lambda recording: recording.index)
 
     def _next_index(self) -> int:
@@ -512,19 +541,41 @@ class Session:
                 self._created = datetime.datetime.fromisoformat(created)
 
     def _save_sidecar(self) -> None:
-        """Write the session context sidecar."""
+        """
+        Write the session context sidecar atomically.
+
+        Write-temp-then-``os.replace`` rather than truncate-then-write,
+        for the same reason :meth:`reserve_path` claims a name with
+        ``O_EXCL``: a crash or a full disk part-way through used to leave
+        a truncated ``session.json``, and :meth:`_load_sidecar` swallows
+        the resulting ``ValueError`` and silently reverts the session to
+        blank context. Losing a shift's operator and sample that way is
+        worse than the write failing outright. This runs on every context
+        edit — including a debounced one while the operator is still
+        typing — so it is not a rare path.
+
+        ``os.replace`` is atomic within a filesystem, and the temporary
+        file is created in the session directory itself so the rename
+        never crosses one.
+        """
         payload = {
             "schema": _SIDECAR_SCHEMA,
             "created": self._created.isoformat(),
             **self._context,
         }
-        self._sidecar_path.write_text(
-            json.dumps(payload, indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
+        text = json.dumps(payload, indent=2, sort_keys=True) + "\n"
+        temporary = self._sidecar_path.with_name(
+            f"{self._sidecar_path.name}.{os.getpid()}.tmp",
         )
+        try:
+            temporary.write_text(text, encoding="utf-8")
+            temporary.replace(self._sidecar_path)
+        except OSError:
+            temporary.unlink(missing_ok=True)
+            raise
 
 
-class RecordingJob:
+class RecordingJob(BackgroundJob):
     """
     Run one :meth:`Session.record` on a worker thread, cancellably.
 
@@ -564,47 +615,24 @@ class RecordingJob:
         title: str | None = None,
         note: str | None = None,
     ) -> None:
+        super().__init__("recording")
         self._session = session
         self._frames = frames
         self._label = label
         self._title = title
         self._note = note
-        self._lock = threading.Lock()
         self._cancelled = threading.Event()
-        self._thread: threading.Thread | None = None
-        self._result: Recording | None = None
-        self._error: Exception | None = None
         self._frames_seen = 0
 
-    def start(self) -> None:
-        """Start the worker thread; a no-op if it is already running."""
-        if self.is_running:
-            return
-        self._thread = threading.Thread(target=self._run, name="recording", daemon=True)
-        self._thread.start()
+    def _reset(self) -> None:
+        """Clear cancellation and the frame count before a fresh run."""
+        self._cancelled.clear()
+        with self._lock:
+            self._frames_seen = 0
 
     def cancel(self) -> None:
         """Ask the worker to stop after the current frame, keeping the file."""
         self._cancelled.set()
-
-    def join(self, timeout: float = _JOIN_TIMEOUT_S) -> None:
-        """
-        Wait for the worker thread to finish.
-
-        Parameters
-        ----------
-        timeout : float
-            Seconds to wait before giving up.
-        """
-        thread = self._thread
-        if thread is not None:
-            thread.join(timeout)
-
-    @property
-    def is_running(self) -> bool:
-        """Return whether the worker thread is currently alive."""
-        thread = self._thread
-        return thread is not None and thread.is_alive()
 
     @property
     def is_cancelled(self) -> bool:
@@ -621,13 +649,7 @@ class RecordingJob:
     def result(self) -> Recording | None:
         """Return the finished recording, or None until the job completes."""
         with self._lock:
-            return self._result
-
-    @property
-    def error(self) -> Exception | None:
-        """Return the exception that ended the job, if any."""
-        with self._lock:
-            return self._error
+            return typing.cast("Recording | None", self._raw_result)
 
     def _counted(self) -> Iterator[Frame]:
         """Yield frames until cancelled, counting them as they pass."""
@@ -638,24 +660,24 @@ class RecordingJob:
                 self._frames_seen += 1
             yield frame
 
-    def _run(self) -> None:
-        """Record on the worker thread, capturing any failure."""
-        try:
-            recording = self._session.record(
-                self._counted(),
-                label=self._label,
-                title=self._title,
-                note=self._note,
-            )
-        except Exception as exc:  # noqa: BLE001 - surfaced to callers via .error
-            with self._lock:
-                self._error = exc
-            return
-        with self._lock:
-            self._result = recording
+    def _work(self) -> object:
+        """
+        Record on the worker thread.
+
+        Returns
+        -------
+        object
+            The finished :class:`Recording`.
+        """
+        return self._session.record(
+            self._counted(),
+            label=self._label,
+            title=self._title,
+            note=self._note,
+        )
 
 
-class LoadJob:
+class LoadJob(BackgroundJob):
     """
     Read one recording off disk on a worker thread.
 
@@ -688,44 +710,20 @@ class LoadJob:
         *,
         budget_bytes: int = _DEFAULT_LOAD_BUDGET_BYTES,
     ) -> None:
+        super().__init__("loading")
         self._path = Path(path)
         self._budget_bytes = budget_bytes
-        self._lock = threading.Lock()
-        self._thread: threading.Thread | None = None
-        self._result: LoadedRecording | None = None
-        self._error: Exception | None = None
         self._frames_seen = 0
 
-    def start(self) -> None:
-        """Start the worker thread; a no-op if it is already running."""
-        if self.is_running:
-            return
-        self._thread = threading.Thread(target=self._run, name="loading", daemon=True)
-        self._thread.start()
-
-    def join(self, timeout: float = _JOIN_TIMEOUT_S) -> None:
-        """
-        Wait for the worker thread to finish.
-
-        Parameters
-        ----------
-        timeout : float
-            Seconds to wait before giving up.
-        """
-        thread = self._thread
-        if thread is not None:
-            thread.join(timeout)
+    def _reset(self) -> None:
+        """Clear the frame count before a fresh run."""
+        with self._lock:
+            self._frames_seen = 0
 
     @property
     def path(self) -> Path:
         """Return the file being read."""
         return self._path
-
-    @property
-    def is_running(self) -> bool:
-        """Return whether the worker thread is currently alive."""
-        thread = self._thread
-        return thread is not None and thread.is_alive()
 
     @property
     def frames_loaded(self) -> int:
@@ -737,33 +735,27 @@ class LoadJob:
     def result(self) -> LoadedRecording | None:
         """Return the loaded recording, or None until the job completes."""
         with self._lock:
-            return self._result
-
-    @property
-    def error(self) -> Exception | None:
-        """Return the exception that ended the job, if any."""
-        with self._lock:
-            return self._error
+            return typing.cast("LoadedRecording | None", self._raw_result)
 
     def _count(self, loaded: int) -> None:
         """Record progress from the worker thread."""
         with self._lock:
             self._frames_seen = loaded
 
-    def _run(self) -> None:
-        """Read on the worker thread, capturing any failure."""
-        try:
-            loaded = load_recording(
-                self._path,
-                budget_bytes=self._budget_bytes,
-                progress=self._count,
-            )
-        except Exception as exc:  # noqa: BLE001 - surfaced to callers via .error
-            with self._lock:
-                self._error = exc
-            return
-        with self._lock:
-            self._result = loaded
+    def _work(self) -> object:
+        """
+        Read on the worker thread.
+
+        Returns
+        -------
+        object
+            The loaded recording.
+        """
+        return load_recording(
+            self._path,
+            budget_bytes=self._budget_bytes,
+            progress=self._count,
+        )
 
 
 def describe(path: os.PathLike[str] | str) -> Recording:
@@ -880,9 +872,21 @@ def read_session_context(path: os.PathLike[str] | str) -> dict[str, str]:
     """
     Read back the session context a recording was made in.
 
-    Reads the ``session_``-prefixed keys out of
-    ``/entry/metadata/vendor_metadata_json`` — one of the three places
-    described in this module's docstring — and strips the prefix.
+    Reads the real NeXus groups first — ``NXsample``, ``NXuser``,
+    ``NXnote`` — and falls back to the ``session_``-prefixed keys in the
+    vendor-metadata JSON blob.
+
+    That order is the correction. This module writes its context to both,
+    and it used to read back *only* the blob — so the groups whose whole
+    justification is "this is where standard tooling looks" were
+    write-only for the project that wrote them. Worse, the blob is the
+    copy that disappears exactly when the file is damaged: it holds the
+    first frame's metadata, written in ``close()``, so a recording with no
+    frames or an unfinalized writer returned ``{}`` while the ``NXuser``
+    group sitting in the same file had the answer. The blob is still read
+    because it carries fields NeXus has no home for (``label``, ``root``,
+    and the per-recording ``note``), and because files written before the
+    writer grew ``sample=``/``user=``/``notes=`` have only that.
 
     Parameters
     ----------
@@ -894,23 +898,86 @@ def read_session_context(path: os.PathLike[str] | str) -> dict[str, str]:
     dict[str, str]
         The context keys (``operator``, ``sample``, ``notes``, ``label``,
         ``root``, and ``note`` if the recording had one of its own). Empty
-        for a file written without a session, one whose acquisition produced
-        no frames (the writer persists the first frame's metadata, so no
-        frames means no metadata), and one whose writer never finalized it
-        (the metadata group is written in ``close()``).
+        only for a file written without a session at all.
     """
     with h5py.File(path, "r") as handle:
-        dataset = handle.get("entry/metadata/vendor_metadata_json")
-        if dataset is None:
-            return {}
-        raw = dataset[()]
-    text = raw.decode("utf-8") if isinstance(raw, bytes) else str(raw)
-    stored = json.loads(text)
-    return {
-        key.removeprefix(_CONTEXT_PREFIX): value
-        for key, value in stored.items()
-        if key.startswith(_CONTEXT_PREFIX) and isinstance(value, str)
-    }
+        context = _context_from_nexus_groups(handle)
+        dataset = handle.get(layout.VENDOR_METADATA)
+        raw = None if dataset is None else dataset[()]
+    if raw is not None:
+        text = raw.decode("utf-8") if isinstance(raw, bytes) else str(raw)
+        stored = json.loads(text)
+        for key, value in stored.items():
+            if key.startswith(_CONTEXT_PREFIX) and isinstance(value, str):
+                # The groups win where both have it: they are what the
+                # file actually declares to a NeXus reader.
+                context.setdefault(key.removeprefix(_CONTEXT_PREFIX), value)
+    return context
+
+
+def _read_text(group: object, field: str) -> str | None:
+    """
+    Return a NeXus text field as ``str``, or None if it is absent.
+
+    Parameters
+    ----------
+    group : object
+        An open ``h5py.File`` to read the field from.
+    field : str
+        Path to the field, relative to the file root.
+
+    Returns
+    -------
+    str | None
+        The decoded text, or None when the field is not there.
+    """
+    dataset = group.get(field)
+    if dataset is None:
+        return None
+    raw = dataset[()]
+    return raw.decode("utf-8") if isinstance(raw, bytes) else str(raw)
+
+
+def _context_from_nexus_groups(handle: object) -> dict[str, str]:
+    """
+    Read session context from the NXsample and NXuser groups.
+
+    **Not ``NXnote``, and that turned out to be the interesting part.**
+    ``sample`` and ``operator`` reach their groups verbatim
+    (``/entry/sample/name``, ``/entry/user/name``), so reading them back
+    is a genuine round trip. The note field is different by design:
+    :func:`_compose_notes` merges the session's standing notes with this
+    recording's own and prefixes each with its scope, precisely so a
+    reader can tell them apart. That makes ``NXnote/description`` a
+    *rendering* of two fields rather than either one of them, and
+    recovering ``notes`` from it would hand back ``"session: grid 3"``
+    where the session holds ``"grid 3"``.
+
+    So the raw notes still come from the JSON blob, which stores the two
+    scopes separately. Worth stating rather than leaving as a silent
+    omission: it is the reason this function does not simply read every
+    group the writer emits, and a future reader who "fixes" the apparent
+    gap would reintroduce the bug.
+
+    Parameters
+    ----------
+    handle : object
+        An open ``h5py.File``.
+
+    Returns
+    -------
+    dict[str, str]
+        Whichever of ``sample`` and ``operator`` the file declares.
+    """
+    found: dict[str, str] = {}
+    for key, field in (
+        ("sample", f"{layout.SAMPLE_GROUP}/name"),
+        ("operator", f"{layout.USER_GROUP}/name"),
+    ):
+        value = _read_text(handle, field)
+        if value:
+            found[key] = value
+    return found
 
 
 def default_root(base: os.PathLike[str] | str | None = None) -> Path:
@@ -1246,6 +1313,36 @@ def _modified_at(path: Path) -> datetime.datetime:
     return datetime.datetime.fromtimestamp(stamp, tz=datetime.UTC)
 
 
+def _is_locked(error: OSError) -> bool:
+    """
+    Return whether an open failed because the file is in use, not broken.
+
+    HDF5 reports a file locked by a concurrent writer as a plain
+    ``OSError`` with the reason in its message rather than as a distinct
+    exception type or ``errno``, so this matches on the text the library
+    actually produces. Matching text is unlovely; the alternative is
+    calling a live acquisition damaged, which is worse. A false negative
+    just restores the old behaviour, so the failure mode is the one that
+    was already there.
+
+    Parameters
+    ----------
+    error : OSError
+        The exception ``h5py.File`` raised.
+
+    Returns
+    -------
+    bool
+        True when the message names a locking or concurrent-access
+        problem.
+    """
+    text = str(error).lower()
+    return any(
+        marker in text
+        for marker in ("unable to lock", "file is already open", "resource temporarily")
+    )
+
+
 def _inspect(path: Path) -> tuple[int, bool, bool]:
     """
     Return a file's frame count, whether it opens, and whether it was finalized.
@@ -1270,11 +1367,24 @@ def _inspect(path: Path) -> tuple[int, bool, bool]:
     """
     try:
         with h5py.File(path, "r") as handle:
-            dataset = handle.get("entry/instrument/detector/data")
+            dataset = handle.get(layout.DETECTOR_DATA)
             count = 0 if dataset is None else int(dataset.shape[0])
-            return count, True, "entry/data" in handle
-    except (OSError, KeyError):
+            return count, True, layout.NXDATA_GROUP in handle
+    except FileNotFoundError:
+        # Vanished between the listing and the open.
+        return 0, False, False
+    except OSError as error:
+        if _is_locked(error):
+            # Being written right now, by a RecordingJob in this process or
+            # another one pointed at the same directory. HDF5 refuses the
+            # read rather than the file being broken, and reporting that as
+            # "damaged - does not open" would tell an operator their
+            # in-progress acquisition had failed. Treated as an
+            # unfinalized-but-live recording, which is what it is.
+            return 0, True, False
         # A reserved-but-unwritten placeholder, or a write killed hard
         # enough to lose the HDF5 container. Both are real states an
         # operator can produce, so report them instead of raising.
+        return 0, False, False
+    except KeyError:
         return 0, False, False

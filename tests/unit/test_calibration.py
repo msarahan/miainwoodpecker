@@ -263,13 +263,64 @@ def test_a_length_or_energy_cannot_be_a_diffraction_axis():
         FrameCalibration.diffraction(0.5, units="eV")
 
 
-def test_field_of_view_gives_a_per_axis_scale_for_a_non_square_frame():
-    """The pre-existing scan path, expressed in the new model, unchanged."""
+def test_field_of_view_gives_square_pixels_on_a_non_square_frame():
+    """
+    fov_nm spans the longer axis and pixels are square, per ScanParameters.
+
+    This test previously asserted the opposite - fov_nm divided by each
+    dimension independently, giving 5.0 nm/px on the slow axis against
+    2.0 on the fast one. That describes a frame with rectangular pixels
+    that the instrument never acquired: Nion's own
+    ``get_scan_calibrations`` computes ``fov_nm / max(scan_shape)`` and
+    applies it to both axes. Square scans agree either way, which is why
+    nothing failed for three phases.
+    """
     calibration = FrameCalibration.from_field_of_view(20.0, (4, 10))
     assert calibration.y.units == "nm"
-    assert calibration.y.scale == pytest.approx(5.0)
+    pixel_nm = 20.0 / 10
+    assert calibration.y.scale == pytest.approx(pixel_nm)
+    assert calibration.x.scale == pytest.approx(pixel_nm)
+    # The short axis therefore covers 8 nm of the 20 nm field, not all of it.
+    assert np.allclose(calibration.y.values(4), [0.0, 2.0, 4.0, 6.0])
+
+
+def test_field_size_calibrates_each_axis_from_the_reported_extent():
+    """A device reporting its extent per axis is divided, not re-derived."""
+    calibration = FrameCalibration.from_field_size((8.0, 20.0), (4, 10))
+    assert calibration.y.scale == pytest.approx(2.0)
     assert calibration.x.scale == pytest.approx(2.0)
-    assert np.allclose(calibration.y.values(4), [0.0, 5.0, 10.0, 15.0])
+    assert calibration.y.units == "nm"
+    assert calibration.x.units == "nm"
+
+
+def test_field_size_is_preferred_over_the_scalar_field_of_view():
+    """
+    A scanner sends both; the per-axis one wins.
+
+    Both agree here, which is the point: the per-axis key is preferred so
+    storage never has to re-derive which axis a scalar spanned.
+    """
+    resolved = resolve_frame_calibration(
+        (4, 10),
+        metadata={"fov_nm": 20.0, "fov_size_nm": (8.0, 20.0)},
+    )
+    assert resolved.y.scale == pytest.approx(2.0)
+    assert resolved.x.scale == pytest.approx(2.0)
+
+
+def test_a_malformed_field_size_falls_back_to_the_scalar():
+    """A wrong-shaped extent is not a calibration; fov_nm still resolves."""
+    resolved = resolve_frame_calibration(
+        (4, 10),
+        metadata={"fov_nm": 20.0, "fov_size_nm": (8.0,)},
+    )
+    assert resolved.y.scale == pytest.approx(2.0)
+
+
+def test_a_non_positive_field_size_is_not_a_calibration():
+    """Zero or negative extents cannot describe a frame."""
+    with pytest.raises(ValueError, match="positive extent and shape"):
+        FrameCalibration.from_field_size((0.0, 10.0), (4, 10))
 
 
 def test_a_non_positive_field_of_view_is_not_a_calibration():

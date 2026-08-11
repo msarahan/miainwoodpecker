@@ -21,6 +21,7 @@ one result shape, dispatch by looking up ``target`` then ``getattr`` for
 
 from __future__ import annotations
 
+import contextlib
 import socket
 import typing
 from dataclasses import dataclass, field
@@ -28,6 +29,48 @@ from dataclasses import dataclass, field
 if typing.TYPE_CHECKING:
     import threading
     from multiprocessing.connection import Connection
+
+TARGET_NAMES = ("ronchigram_camera", "eels_camera", "scanner", "instrument")
+"""
+Every named target a device server can serve, in **argv order**.
+
+The order is part of the protocol, not a presentation choice: the client
+passes one port per target positionally on the server's command line, and
+the server zips them back against this same tuple. Both halves used to
+declare their own copy, so reordering one silently bound the scanner's
+port to the EELS camera — a mismatch ``strict=True`` cannot catch,
+because the *count* still agrees. One definition, on the side of the
+boundary that has no vendor dependency, removes the possibility.
+"""
+
+DEVICE_TARGET_NAMES = ("ronchigram_camera", "eels_camera", "scanner")
+"""The targets that are devices, i.e. everything but ``instrument``."""
+
+SIMULATED_BACKEND = "simulated"
+"""Backend name selecting the software simulator."""
+
+HARDWARE_BACKEND = "hardware"
+"""Backend name selecting real instrument hardware via vendor plug-ins."""
+
+BACKENDS = (SIMULATED_BACKEND, HARDWARE_BACKEND)
+"""Every backend name the server accepts on its command line."""
+
+# Below this, a Frame result travels as plain pickle over the socket
+# instead of through shared memory. This is a *protocol* decision - it
+# determines whether the client receives a Frame or a SharedFrameRef - so
+# it belongs here with the rest of the wire vocabulary rather than in the
+# GPL server module, where it lived until the MIT test suite had to
+# import that module simply to learn a number.
+#
+# Measured with scripts/ipc_overhead_benchmark.py against the
+# reused-segment writer (shared_frame.py) with Nagle disabled: pickle and
+# shared memory are within noise of each other from ~30KB to ~500KB (both
+# +0.3-0.5ms over a direct in-process call), and shared memory pulls
+# ahead smoothly above that - +1.5ms at ~1MB, +2.8ms at 2.1MB, +9.5ms at
+# 8.4MB, +25ms at 33.6MB, against naive pickle's +168ms at that largest
+# size. 64KB sits inside the band measured as "doesn't matter much either
+# way", so it is kept rather than tuned further.
+SHARED_MEMORY_THRESHOLD_BYTES = 64 * 1024
 
 
 def disable_nagle(connection: Connection) -> None:
@@ -51,6 +94,31 @@ def disable_nagle(connection: Connection) -> None:
     connection this project opens, not just the sizes that happened to
     reproduce it in one benchmark run.
 
+    The socket is put back into blocking mode before it is detached, and
+    that is load-bearing rather than defensive. ``socket.socket(fileno=)``
+    applies the process-wide :func:`socket.setdefaulttimeout` at
+    construction, and setting a timeout puts the *underlying fd* into
+    non-blocking mode — which ``detach()`` does not undo, because detach
+    only releases Python's ownership of the fd, not the flags already set
+    on it. So without the restore, any library anywhere in the process
+    calling ``setdefaulttimeout`` (plausible in a napari/Qt application
+    with HTTP-capable plugins) would silently switch every connection this
+    project opens to non-blocking. ``Connection.recv()`` would then raise
+    ``BlockingIOError`` — an ``OSError``, so :func:`send_call` wraps it as
+    ``RemoteConnectionLostError`` and the operator is told the device
+    server died when it is perfectly healthy. Verified directly rather
+    than reasoned about: with a default timeout set, wrapping a blocking
+    fd and detaching left it non-blocking and the next ``recv`` raising
+    ``EAGAIN``.
+
+    ``setblocking(True)`` rather than saving and restoring
+    ``os.get_blocking``: those two are Unix-only, so reading the old state
+    raised ``AttributeError`` on Windows — outside this function's
+    ``except`` clause, which would have made *every* connection setup
+    fail there. Restoring unconditionally is also correct rather than
+    merely portable, because a ``multiprocessing.connection`` endpoint is
+    always blocking to begin with.
+
     Parameters
     ----------
     connection : Connection
@@ -68,6 +136,8 @@ def disable_nagle(connection: Connection) -> None:
     except OSError:
         pass
     finally:
+        with contextlib.suppress(OSError):
+            raw.setblocking(True)  # noqa: FBT003 - stdlib signature is positional
         raw.detach()  # we don't own this fd; multiprocessing.connection does
 
 
@@ -111,14 +181,46 @@ class Result:
     error : str | None
         ``f"{type(exc).__name__}: {exc}"`` from the server side, when the
         call raised.
+    error_type : str | None
+        The exception's class *name* on the server side, so a caller can
+        distinguish a vendor ``TimeoutError`` from a ``ValueError``
+        without parsing the message. Deliberately the name rather than
+        the class: shipping a live exception object would mean
+        unpickling server-defined types in the client, which is exactly
+        the kind of coupling this protocol exists to avoid — and would
+        make the boundary depend on the GPL side having its classes
+        importable here. A name is plain data.
+
+        Added with a default so it is wire-compatible in both directions:
+        an older peer's ``Result`` unpickles with ``error_type=None``, and
+        a newer one's extra field is simply ignored by code that does not
+        read it.
     """
 
     value: object = None
     error: str | None = None
+    error_type: str | None = None
 
 
 class RemoteCallError(RuntimeError):
-    """Raised client-side when a :class:`Call` failed on the server."""
+    """
+    Raised client-side when a :class:`Call` failed on the server.
+
+    Carries :attr:`error_type`, the name of the exception class that
+    actually raised on the server, because everything used to arrive here
+    as one indistinguishable ``RemoteCallError`` — a vendor timeout, a
+    bad argument, and a full ``/dev/shm`` were separable only by matching
+    on the message text. A caller that wants to retry a timeout but not a
+    programming error now has something to branch on.
+
+    ``error_type`` holds the server-side exception class name, or
+    ``None`` when the failure happened client-side (a timeout, a lost
+    connection) and so has no server exception behind it.
+    """
+
+    def __init__(self, message: str, *, error_type: str | None = None) -> None:
+        super().__init__(message)
+        self.error_type = error_type
 
 
 class RemoteCallTimeoutError(RemoteCallError):
@@ -225,5 +327,5 @@ def send_call(
             raise RemoteConnectionLostError(msg) from error
     if result.error is not None:
         msg = f"remote call {call.target}.{call.method}() failed: {result.error}"
-        raise RemoteCallError(msg)
+        raise RemoteCallError(msg, error_type=result.error_type)
     return result.value
