@@ -5,8 +5,10 @@ message: >-
   metadata from this file.
 type: software
 authors:
-  - name: SuperSTEM
-repository-code: 'https://github.com/SuperSTEM/miainwoodpecker'
+  - family-names: Sarahan
+    given-names: Michael
+    alias: msarahan
+repository-code: 'https://github.com/msarahan/miainwoodpecker'
 abstract: >-
   Instrument control and data analysis for scanning transmission electron
   microscopes, built as a thin glue layer over existing open source

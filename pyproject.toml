@@ -16,7 +16,7 @@ name = "miainwoodpecker"
 dynamic = ["version"]
 description = "Instrument control and data analysis for STEM, built as glue over existing open source projects."
 authors = [
-    { name = "SuperSTEM" },
+    { name = "Michael Sarahan" },
 ]
 license = "MIT"
 requires-python = ">= 3.11" # Adjust based on the minimum version of Python that you support
@@ -43,9 +43,9 @@ dependencies = [
 miainwoodpecker-viewer = "miainwoodpecker.viewer.app:main"
 
 [project.urls]
-Homepage = "https://github.com/SuperSTEM/miainwoodpecker"
-"Source Code" = "https://github.com/SuperSTEM/miainwoodpecker"
-"Bug Tracker" = "https://github.com/SuperSTEM/miainwoodpecker/issues"
+Homepage = "https://github.com/msarahan/miainwoodpecker"
+"Source Code" = "https://github.com/msarahan/miainwoodpecker"
+"Bug Tracker" = "https://github.com/msarahan/miainwoodpecker/issues"
 Documentation = "https://miainwoodpecker.readthedocs.io"
 Download = "https://pypi.org/project/miainwoodpecker/#files"
 

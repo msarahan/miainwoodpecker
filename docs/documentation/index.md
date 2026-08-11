@@ -45,7 +45,7 @@ Either, you use a directory "_build" within the root path, or you separate
 
 The project name will occur in several places in the built documentation.
 > Project name: miainwoodpecker
-> Author name(s): SuperSTEM
+> Author name(s): Michael Sarahan
 > Project release []: 0.1
 
 If the documents are to be written in a language other than English,
