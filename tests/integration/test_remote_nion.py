@@ -43,10 +43,7 @@ from miainwoodpecker.devices import (
     Scanner,
     remote,
 )
-from miainwoodpecker.devices.nion_server import (
-    PARK_TIMEOUT_EXIT_STATUS,
-    _SHARED_MEMORY_THRESHOLD_BYTES,
-)
+from miainwoodpecker.devices.nion_server import PARK_TIMEOUT_EXIT_STATUS
 from miainwoodpecker.devices.remote import (
     HARDWARE_BACKEND,
     SERVER_EXITED,
@@ -58,6 +55,9 @@ from miainwoodpecker.devices.remote import (
     RemoteInstrumentDevices,
     remote_instrument,
     remote_simulated_instrument,
+)
+from miainwoodpecker.devices.rpc import (
+    SHARED_MEMORY_THRESHOLD_BYTES as _SHARED_MEMORY_THRESHOLD_BYTES,
 )
 from miainwoodpecker.devices.rpc import (
     Call,

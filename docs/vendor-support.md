@@ -170,7 +170,35 @@ teaching, documentation, and plenty of light microscopy — and the same
 `Camera` protocol fits, with three caveats that matter for treating one
 as a *measuring* device rather than a picture-taking one.
 
-**One adapter buys hundreds of cameras.**
+**A working one ships in this project.**
+`miainwoodpecker.devices.camera_server` is an MIT, in-tree device server
+for exactly this class of hardware — no vendor SDK, no licence question,
+so there is no reason for it to be out-of-tree:
+
+```python
+from miainwoodpecker.devices.remote import remote_instrument
+
+with remote_instrument(
+    server_module="miainwoodpecker.devices.camera_server",
+    backend="hardware",
+    plugin_names=["0"],          # camera index, /dev/video0, or a video file
+) as scope:
+    frame = scope.camera.acquire_frame()
+```
+
+Two backends, for the reason `nion_server` has two: `simulated`
+synthesises moving frames and needs **nothing installed**, so the whole
+path runs in CI and on a laptop with nothing plugged in; `hardware` opens
+a real capture device through OpenCV's `VideoCapture`, which speaks V4L2,
+AVFoundation and DirectShow/MSMF — every USB microscope, because they are
+all UVC devices pretending to be webcams. Install the `camera` extra for
+the second.
+
+A **video file is a first-class device**, which is more useful than it
+sounds: it is how a capture becomes a regression fixture, and it is how
+the hardware backend is tested here with no camera in the room.
+
+**One adapter buys hundreds more cameras.**
 [`pymmcore`](https://pypi.org/project/pymmcore/) is pip-installable
 Python bindings to Micro-Manager's MMCore, with no Java and no GUI, and
 Micro-Manager's adapter library includes `OpenCVgrabber` and
@@ -223,9 +251,11 @@ can demosaic for display; a recording should not.
 
 | Target | Size | Notes |
 |---|---|---|
-| **pymmcore-backed server** | 4–6 d | Every UVC microscope plus much of the scientific camera market, in one adapter |
+| ~~UVC microscopes and webcams~~ | **done** | `devices/camera_server.py`, both backends |
+| **pymmcore-backed server** | 4–6 d | Much of the *scientific* camera market in one adapter; UVC is already covered |
 | **gphoto DSLR/mirrorless** | 3–4 d | Check first whether Micro-Manager's DSLR adapter already covers the body |
-| **Raw decode + CFA metadata** | 1–2 d | Shared by both, and the piece that makes the data measurable |
+| **Raw decode + CFA metadata** | 1–2 d | The piece that makes a camera body's data measurable |
+| **ROI / gain on `CameraParameters`** | 2–3 d | ISO is gain; shared with the direct detectors |
 
 ## Transport: why every adapter is a subprocess
 

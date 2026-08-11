@@ -110,26 +110,20 @@ from miainwoodpecker.devices.rpc import (
     BACKENDS,
     HARDWARE_BACKEND,
     SIMULATED_BACKEND,
-    Call,
-    Result,
-    disable_nagle,
 )
 from miainwoodpecker.devices.rpc import (
     DEVICE_TARGET_NAMES as _DEVICE_TARGET_NAMES,
 )
 from miainwoodpecker.devices.rpc import (
-    SHARED_MEMORY_THRESHOLD_BYTES as _SHARED_MEMORY_THRESHOLD_BYTES,
-)
-from miainwoodpecker.devices.rpc import (
     TARGET_NAMES as _TARGET_NAMES,
 )
+from miainwoodpecker.devices.serving import accept_loop as _accept_loop
 from miainwoodpecker.devices.shared_frame import SharedFrameWriter
 from miainwoodpecker.storage import calibration as _calibration
 
 if typing.TYPE_CHECKING:
     import types
     from collections.abc import Iterator, Sequence
-    from multiprocessing.connection import Listener
 
     from nion.device_kit.CameraDevice import Camera as _DeviceKitCamera
     from nion.device_kit.ScanDevice import Device as _DeviceKitScanDevice
@@ -1641,215 +1635,6 @@ class _ServerSession:
         return released
 
 
-def _invoke(
-    target: object,
-    call: Call,
-    writer: SharedFrameWriter | None,
-    name: str,
-) -> Result:
-    """
-    Run one call against a target and package the outcome as a Result.
-
-    Split out of :func:`_serve_connection` so the socket loop reads as a
-    socket loop; the dispatch rules (properties are read rather than
-    invoked, large frames go around the pickle channel, a device's close
-    retires its segment) all live here.
-
-    Parameters
-    ----------
-    target : object
-        The device or ``NionInstrument`` the call dispatches to.
-    call : Call
-        The client's request.
-    writer : SharedFrameWriter | None
-        This target's reused shared-memory writer, or ``None`` for a
-        target that never returns a ``Frame``.
-    name : str
-        Server-side target name, for log attribution.
-
-    Returns
-    -------
-    Result
-        The value, or a stringified error - never a raised exception, so
-        one failing call cannot take down the connection or the server.
-    """
-    if not hasattr(target, call.method):
-        _LOGGER.warning("target %s: unknown method %r requested", name, call.method)
-        return Result(error=f"unknown method {call.method!r} on {call.target!r}")
-    try:
-        # getattr already evaluates properties (camera_id, scanner_id,
-        # channel_names): call the result only when it's a bound
-        # method, or a property's value gets invoked as a function.
-        attribute = getattr(target, call.method)
-        value = (
-            attribute(*call.args, **call.kwargs) if callable(attribute) else attribute
-        )
-        # Only frames worth the round trip are routed around the
-        # pickle-over-socket channel; everything else returned here
-        # is small (a string, a list of names, None).
-        if (
-            writer is not None
-            and isinstance(value, Frame)
-            and value.data.nbytes >= _SHARED_MEMORY_THRESHOLD_BYTES
-        ):
-            value = writer.publish(value)
-        # The device's own close() just stopped its acquisition
-        # thread; retire its shared-memory segment too, or it leaks
-        # in /dev/shm - named segments aren't reclaimed when a
-        # process dies, unlike its threads or anonymous memory.
-        if call.method == "close" and writer is not None:
-            writer.close()
-    except Exception as exc:
-        # The client gets the message; the log gets the traceback,
-        # which is the only place it survives - Result carries a
-        # string, so a stringified error is all that crosses the
-        # boundary. This is the per-call diagnostic the whole
-        # logging setup exists for.
-        _LOGGER.exception("target %s: call %s() raised", name, call.method)
-        return Result(
-            error=f"{type(exc).__name__}: {exc}",
-            error_type=type(exc).__name__,
-        )
-    return Result(value=value)
-
-
-def _serve_connection(  # noqa: PLR0913 - one dispatch loop, not a call signature
-    connection: object,
-    name: str,
-    target: object,
-    writer: SharedFrameWriter | None,
-    stop_event: threading.Event,
-    *,
-    rejected: str | None = None,
-    release: threading.Lock | None = None,
-    on_close: typing.Callable[[], None] | None = None,
-) -> None:
-    """
-    Handle Calls on one accepted connection until the client disconnects.
-
-    Logging here is deliberately failure-only. A successful call is not
-    logged at all, at any level: the frame path runs through this loop, so
-    even a disabled ``debug()`` call would sit between the client's request
-    and its frame, and §6's shared-memory benchmarks are the standard this
-    must not move.
-
-    Parameters
-    ----------
-    connection : object
-        The accepted connection, typed loosely to avoid importing
-        ``multiprocessing.connection`` for a type-only reference.
-    name : str
-        This connection's server-side target name, used to attribute log
-        records. Taken from the server's own binding rather than from
-        ``call.target``, which is whatever the client claimed.
-    target : object
-        The device (or ``NionInstrument``) this connection's calls dispatch to.
-    writer : SharedFrameWriter | None
-        This target's reused shared-memory writer, or ``None`` for a
-        target (``instrument``) that never returns a ``Frame``.
-    stop_event : threading.Event
-        Set after a ``shutdown`` call's reply has been sent, to let
-        :func:`serve` return. Setting it only *after* the send is what
-        keeps the acknowledgement from racing the listener teardown.
-    rejected : str | None
-        When set, this connection lost the race for an exclusive target:
-        every call is answered with this message instead of reaching the
-        device. Answering rather than hanging up means the client raises
-        ``RemoteCallError`` naming the real reason on its first call.
-    release : threading.Lock | None
-        The exclusivity lock this connection holds, released when it ends
-        so the next client can take the target over.
-    on_close : typing.Callable[[], None] | None
-        Called when this connection ends, so the session can notice
-        when the last one has gone.
-    """
-    try:
-        while True:
-            try:
-                call: Call = connection.recv()
-            except (EOFError, ConnectionError):
-                # ConnectionError (reset/broken pipe) is an abortive close
-                # rather than a clean one; both mean "the client is gone",
-                # and letting it escape would kill this thread with a
-                # traceback on the stderr the parent shares.
-                _LOGGER.debug("target %s: client disconnected", name)
-                return
-            result = (
-                Result(error=rejected)
-                if rejected is not None
-                else _invoke(target, call, writer, name)
-            )
-            connection.send(result)
-            if result.error is None and call.method == "shutdown":
-                stop_event.set()
-                return
-    except OSError:
-        # A client that vanished mid-reply breaks send() the same way.
-        # Same reasoning as the recv() guard above: this is the client's
-        # departure, not a server fault worth a thread-death traceback.
-        _LOGGER.debug("target %s: connection broke while replying", name)
-    finally:
-        with contextlib.suppress(OSError):
-            connection.close()
-        if release is not None:
-            release.release()
-        if on_close is not None:
-            on_close()
-
-
-def _accept_loop(
-    listener: Listener,
-    name: str,
-    target: object,
-    writer: SharedFrameWriter | None,
-    session: _ServerSession,
-) -> None:
-    """
-    Accept connections for one target, one handler thread per connection.
-
-    A frame-producing target (one with a ``writer``) admits **one**
-    connection at a time. Its ``SharedFrameWriter`` reuses a single
-    segment per shape, which is safe only while exactly one
-    request/response is in flight: two clients interleaving calls would
-    have the second's publish overwrite the segment while the first is
-    still copying out of it, silently splicing two frames together. That
-    invariant used to rest on client convention alone — one
-    ``_RemoteDevice`` per target — which nothing server-side could check
-    and a second viewer pointed at these ports would break. A rejected
-    connection is served, not dropped, so the client gets a diagnosis on
-    its first call rather than a bare EOF.
-    """
-    in_use = threading.Lock() if writer is not None else None
-    while True:
-        try:
-            connection = listener.accept()
-        except OSError:
-            _LOGGER.debug("target %s: listener closed, no longer accepting", name)
-            return  # listener.close() from elsewhere unblocks accept() this way.
-        rejected: str | None = None
-        if in_use is not None and not in_use.acquire(blocking=False):
-            rejected = (
-                f"target {name!r} is already driven by another connection; "
-                f"a frame-producing device admits one client at a time"
-            )
-            _LOGGER.warning("target %s: refused a second connection", name)
-        else:
-            _LOGGER.info("target %s: accepted a connection", name)
-        disable_nagle(connection)
-        session.connection_opened()
-        thread = threading.Thread(
-            target=_serve_connection,
-            args=(connection, name, target, writer, session.stop_event),
-            kwargs={
-                "rejected": rejected,
-                "release": None if rejected is not None else in_use,
-                "on_close": session.connection_closed,
-            },
-            daemon=True,
-        )
-        thread.start()
-
-
 def _orphan_watchdog(session: _ServerSession, grace_s: float) -> None:
     """
     Park and stop the server once its client is gone for good.
@@ -2091,8 +1876,12 @@ def serve(
                         name,
                         session.targets[name],
                         session.writers[name],
-                        session,
+                        session.stop_event,
                     ),
+                    kwargs={
+                        "on_open": session.connection_opened,
+                        "on_close": session.connection_closed,
+                    },
                     daemon=True,
                 )
                 thread.start()

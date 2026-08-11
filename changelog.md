@@ -126,6 +126,23 @@
   and why that redesign should land with the second column adapter rather
   than before it.
 
+- **A device server for commodity cameras**
+  (`miainwoodpecker.devices.camera_server`): USB microscopes, webcams, and
+  recorded video files, over OpenCV's `VideoCapture` — no vendor SDK, MIT,
+  in-tree. Two backends like the Nion server: `simulated` synthesises
+  moving frames and needs nothing installed, `hardware` opens a real
+  device (the `camera` extra). Frames carry `photometrically_linear:
+  False` and name their `colour_conversion`, because a UVC camera's pixels
+  have already been through demosaicing, gamma and white balance and are
+  an image rather than a measurement. Binning other than 1 is refused,
+  since consumer sensors crop. The camera arrives on a new neutral
+  `camera` target rather than being called a Ronchigram camera.
+
+- `devices/serving.py`: the vendor-free half of the server protocol —
+  dispatch, the connection loop, and the accept loop — extracted from
+  `nion_server` and shared with the camera server. Lifecycle deliberately
+  stays with each adapter: a webcam has no beam to park.
+
 ### Changed
 
 - CI's `integration` job runs its tests in parallel (`pytest -n auto`),

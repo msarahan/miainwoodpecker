@@ -112,6 +112,9 @@ from miainwoodpecker.devices.rpc import (
     send_call,
 )
 from miainwoodpecker.devices.rpc import (
+    CAMERA_TARGET_NAMES as _CAMERA_TARGET_NAMES,
+)
+from miainwoodpecker.devices.rpc import (
     TARGET_NAMES as _TARGET_NAMES,
 )
 from miainwoodpecker.devices.shared_frame import SharedFrameReader, SharedFrameRef
@@ -1059,6 +1062,10 @@ class RemoteInstrumentDevices:
         The Ronchigram camera, if this instrument has one.
     eels_camera : RemoteCamera | None
         The EELS camera, if this instrument has one.
+    camera : RemoteCamera | None
+        A camera that is neither of the above — a direct detector, a
+        commodity USB microscope, a camera body. ``None`` unless the
+        server serves the neutral ``camera`` target.
     scanner : RemoteScanner | None
         The scan device (HAADF/MAADF channels on the simulator), if this
         instrument has one. ``None`` for a detector-only server — a
@@ -1075,6 +1082,7 @@ class RemoteInstrumentDevices:
 
     ronchigram_camera: RemoteCamera | None
     eels_camera: RemoteCamera | None
+    camera: RemoteCamera | None
     scanner: RemoteScanner | None
     instrument: RemoteInstrument
     stage_size_nm: float
@@ -1095,9 +1103,10 @@ class RemoteInstrumentDevices:
         """
         return {
             name: camera
-            for name, camera in (
-                ("ronchigram_camera", self.ronchigram_camera),
-                ("eels_camera", self.eels_camera),
+            for name, camera in zip(
+                _CAMERA_TARGET_NAMES,
+                (self.ronchigram_camera, self.eels_camera, self.camera),
+                strict=True,
             )
             if camera is not None
         }
@@ -1433,7 +1442,7 @@ def remote_instrument(
 
         cameras = {
             name: RemoteCamera(connections[name], name, process)
-            for name in ("ronchigram_camera", "eels_camera")
+            for name in _CAMERA_TARGET_NAMES
             if name in connections
         }
         # Optional for the same reason the cameras are. A detector-only
@@ -1453,6 +1462,7 @@ def remote_instrument(
             yield RemoteInstrumentDevices(
                 ronchigram_camera=cameras.get("ronchigram_camera"),
                 eels_camera=cameras.get("eels_camera"),
+                camera=cameras.get("camera"),
                 scanner=scanner,
                 instrument=instrument,
                 stage_size_nm=float(
