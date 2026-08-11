@@ -104,6 +104,13 @@ supports Merlin, DECTRIS EIGER2, and ASI TPX3, with Gatan K2 IS and
 others in progress — and this project already depends on LiberTEM for
 analysis.
 
+The split is also where the *viewer's* limit lands, measured rather than
+assumed: napari's per-update cost is a fixed ~11 ms on an M2 Pro,
+independent of frame size (see [Phase 2](migration-plan.md)), so ~85 fps
+is a ceiling no frame size changes. Survey-rate sources are nowhere near
+it; a high-rate detector is past it before anything else becomes
+interesting.
+
 So the recommended split, and the reason it is not a cop-out:
 
 - **Control, configuration, and survey-rate acquisition** → a device

@@ -291,13 +291,39 @@ problem — read their source and docs before designing our own adapters:
   which is the regime where `ndv` would earn its place — and, separately,
   the regime this project already routes to LiberTEM-live.
 
-  **The open question is now much narrower.** 11 ms to upload and draw
-  one 512² texture on an M2 Pro is high for a GPU, which suggests most of
-  it is napari's CPU-side per-update overhead rather than the draw — the
-  cost `ndv` exists to remove. That is decidable with one cheap
-  experiment: re-run across `--size`. Roughly constant means fixed
-  overhead and `ndv` would help; scaling with pixels means upload and
-  draw, and changing viewer would not. **Not yet run.**
+  **The `ndv` question is now settled, by a size sweep on the same M2
+  Pro.** Display cost against scan size, 1 µs dwell throughout:
+
+  | scan | pixels | acquire | display |
+  |---|---|---|---|
+  | 512² | 0.26 M | 5.4 ms | **12.2 ms** |
+  | 1024² | 1.05 M | 17.4 ms | **11.2 ms** |
+  | 2048² | 4.19 M | 65.7 ms | **11.4 ms** |
+
+  **Sixteen times the pixels costs nothing.** The 1 ms spread across
+  sizes is smaller than the spread *within* any single run (p95 − median
+  ≈ 3.3 ms), so display time is flat to the precision available. At 2048²
+  a `float64` frame is 33.5 MB and it still repaints in the time 2 MB
+  does, which rules out upload and draw as well: this is napari's
+  CPU-side per-update overhead, exactly the cost `ndv` exists to remove.
+
+  **So the diagnosis is right and the conclusion inverts.** A fixed cost
+  is amortised precisely where it would otherwise hurt: every real
+  workload's frame time scales with data while this does not. Acquire
+  overtakes display between 512² and 1024², and against *beam* time it is
+  not close at any size — 4.7% of a 512² frame at 1 µs dwell, 0.27% of a
+  2048² one. There is no scanned-imaging regime in which changing viewer
+  would be measurable.
+
+  **Where it would still bite, and only there:** a source producing
+  *small* frames *fast*, since 11 ms is a hard ~85 fps ceiling
+  independent of size. A 256² detector at 200 fps would be viewer-bound.
+  That is the one case for `ndv` — and it is already the case this
+  project routes to LiberTEM-live rather than through `Camera`
+  (docs/vendor-support.md), so it is covered by a decision already taken.
+
+  **Verdict: keep napari. Revisit only if a live view needs sustained
+  high-rate small frames.** Phase 2's open question is closed.
 
   Earlier figures on this container (llvmpipe software rasterization)
   were acquire ~14.5 ms, display 33.6–47.7 ms across four runs. Real GPU

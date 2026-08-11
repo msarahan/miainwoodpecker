@@ -145,6 +145,17 @@
 
 ### Fixed
 
+- **Phase 2's napari-versus-`ndv` question is closed: keep napari.**
+  Measured on an M2 Pro across a 16× range of frame sizes, display cost
+  is flat — 12.2 / 11.2 / 11.4 ms at 512² / 1024² / 2048² — so it is
+  napari's fixed per-update overhead rather than upload or draw. That
+  diagnosis is the one `ndv` addresses, and it inverts the conclusion: a
+  fixed cost is amortised exactly where it would hurt, since every real
+  workload's frame time scales with data and this does not. Display is
+  4.7% of a 512² scan frame's beam time and 0.27% of a 2048² one. The
+  one regime where 11 ms would bite — small frames at high rate — is
+  already routed to LiberTEM-live.
+
 - `scripts/phase2_live_benchmark.py` compared display cost against the
   *simulator's* acquire time, which is not what gates a live view. On the
   first hardware-accelerated run that denominator produced "display
