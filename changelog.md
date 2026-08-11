@@ -117,11 +117,14 @@
 
 - `docs/vendor-support.md`: what Thermo Fisher, JEOL, Zeiss, Hitachi and
   Bruker actually expose, what the direct detector vendors expose
-  (Direct Electron, DECTRIS, Hamamatsu, Merlin, ASI, Gatan), and costed
-  tasks for each. Records the one place the framework is still
+  (Direct Electron, DECTRIS, Hamamatsu, Merlin, ASI, Gatan), what
+  commodity cameras need (pymmcore reaches every UVC microscope in one
+  adapter; a DSLR body is its own small gphoto one), and costed tasks for
+  each. Also records why every adapter is a subprocess even where no
+  licence requires it, and the one place the framework is still
   Nion-shaped — the device target names are a fixed positional tuple —
-  and why that redesign should land with the second column adapter
-  rather than before it.
+  and why that redesign should land with the second column adapter rather
+  than before it.
 
 ### Changed
 

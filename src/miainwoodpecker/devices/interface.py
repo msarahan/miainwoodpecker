@@ -123,6 +123,13 @@ class Frame:
     ----------
     data : npt.NDArray[typing.Any]
         The acquired array. 2D for images; may be 1D for binned spectra.
+
+        **Deliberately not 3D**, which a colour sensor would need. A
+        camera with a colour filter array should deliver its raw Bayer
+        plane here — which is 2D — and name the CFA pattern in
+        ``metadata``. Demosaicing invents two thirds of every pixel, so a
+        recording made from it measures the interpolation; a viewer is
+        free to demosaic for display. See docs/vendor-support.md.
     timestamp : datetime.datetime
         Acquisition time. Always timezone-aware (UTC).
     metadata : typing.Mapping[str, typing.Any]

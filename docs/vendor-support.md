@@ -13,11 +13,14 @@ that instrument. This is the map, not the itinerary.
 
 ## The landscape
 
-Two separate markets, and conflating them is the first mistake to avoid.
+Three markets, and conflating the first two is the mistake to avoid.
 **Column vendors** sell the microscope and control the optics, stage, and
-scan. **Detector vendors** sell what hangs off it. This project's
-`Scanner` and `InstrumentController` face the first; `Camera` faces the
-second, and often a different company.
+scan. **Detector vendors** sell what hangs off it — usually a different
+company, and often reachable without the column vendor's help at all.
+**Commodity cameras** are the third: UVC microscopes and camera bodies,
+which are real instruments for some purposes and want the same `Camera`
+protocol. This project's `Scanner` and `InstrumentController` face the
+first; `Camera` faces the other two.
 
 ### Column and instrument SDKs
 
@@ -158,6 +161,138 @@ What such an adapter would still have to work around, honestly:
 | **Gatan** | 5–8 d | Different topology: a bridge inside DM connecting out, plus a design decision about who owns the detector |
 | **ROI / gain / trigger on `CameraParameters`** | 2–3 d | Shared prerequisite for the three direct vendors |
 | **LiberTEM-live streaming handoff + ownership interlock** | 3–5 d | The design question above, settled once for all detectors |
+
+### Commodity and consumer cameras
+
+Not every sensor is a research detector. A consumer USB microscope, or a
+mirrorless body on a photo port, is a real instrument for alignment,
+teaching, documentation, and plenty of light microscopy — and the same
+`Camera` protocol fits, with three caveats that matter for treating one
+as a *measuring* device rather than a picture-taking one.
+
+**One adapter buys hundreds of cameras.**
+[`pymmcore`](https://pypi.org/project/pymmcore/) is pip-installable
+Python bindings to Micro-Manager's MMCore, with no Java and no GUI, and
+Micro-Manager's adapter library includes `OpenCVgrabber` and
+`Video4Linux` — which between them are every UVC microscope — alongside
+Andor, Basler, PVCAM, Spinnaker, IDS, Allied Vision, Aravis and dozens
+more. So the answer to "support commodity USB microscopes" is not one
+adapter per device: it is **one device server backed by pymmcore**, which
+also picks up a large slice of the scientific camera market for free.
+
+This is also the option that best fits what this project says it is for.
+[§4](migration-plan.md) already names pymmcore-plus as prior art worth
+studying; wrapping it is adopting that work rather than admiring it.
+
+**A DSLR or mirrorless body is its own small adapter.**
+[libgphoto2](https://github.com/gphoto/libgphoto2), through
+[`python-gphoto2`](https://github.com/jim-easterbrook/python-gphoto2),
+does tethered capture over PTP for a very wide range of bodies, Sony
+included, and can retrieve raw files. Two things to know before relying
+on it: **live view on Sony bodies is documented-flaky** (several open
+gphoto issues about preview freezing or rebooting the camera; the vendor
+SDK is the more reliable route for preview but is C++), and tethered raw
+capture runs at roughly 1–3 frames per second. That is a stills
+instrument, not a live one.
+
+**Three things make a consumer camera different from a detector**, and
+all three are the difference between an image and a measurement:
+
+- **Shoot raw or the data is fiction.** A JPEG has gamma, white balance,
+  sharpening and lens corrections baked in, so it has no photometric
+  linearity and nothing computed from it means anything. `rawpy`/libraw
+  reads Sony ARW and most other raw formats.
+- **ISO is gain**, which is the same field the direct detectors want on
+  `CameraParameters` and which does not exist yet. A pleasing
+  convergence: an a7 III and an ORCA are asking for the same addition.
+- **Binning is `[1]`.** Consumer bodies crop, they do not bin. Reporting
+  a single supported factor is the honest answer, and the interface
+  already accommodates it.
+
+**One genuine interface decision, worth making deliberately.**
+`Frame.data` is documented as 2D — an RGB frame is `(height, width, 3)`
+and does not fit. The resolution this page recommends is *not* to widen
+the type: a colour sensor should deliver its **raw Bayer plane as 2D**,
+with the CFA pattern in the frame metadata. That fits the existing
+interface, and more importantly it is the honest thing to store, because
+demosaicing invents two thirds of every pixel and anything measured from
+the result is measuring the interpolation. A viewer or an analysis step
+can demosaic for display; a recording should not.
+
+#### Estimates
+
+| Target | Size | Notes |
+|---|---|---|
+| **pymmcore-backed server** | 4–6 d | Every UVC microscope plus much of the scientific camera market, in one adapter |
+| **gphoto DSLR/mirrorless** | 3–4 d | Check first whether Micro-Manager's DSLR adapter already covers the body |
+| **Raw decode + CFA metadata** | 1–2 d | Shared by both, and the piece that makes the data measurable |
+
+## Transport: why every adapter is a subprocess
+
+The subprocess boundary was built for one reason — keeping GPL-3.0 code
+out of an MIT process — and that reason does not apply to most of the
+vendors on this page. Several of these SDKs are pure Python, permissively
+licensed, and would be simpler to call directly. So the question is fair:
+why not let those adapters run in-process, and skip the IPC?
+
+**The recommendation is one production path, and it is the subprocess.**
+Not out of consistency for its own sake, but because the boundary turned
+out to be earning its keep for four reasons that have nothing to do with
+copyright:
+
+- **With the beam on, "the application crashed" must not mean "nobody
+  parked the column".** The shutdown handshake, the orphan watchdog and
+  the bounded SIGTERM park all exist *because* the device process
+  outlives the application's crash. In-process, a repaint bug in the
+  viewer leaves a live column unattended. This is the argument that
+  decides it.
+- **Crash isolation.** A C SDK, a COM object, or a vendor DLL that
+  segfaults takes down a process that owns nothing but itself — not the
+  session, not the recording in progress, not the UI.
+- **Threading.** COM apartment rules, vendor callback threads, and Qt
+  owning the application's main thread compose badly. A separate process
+  has no shared main thread to fight over.
+- **Interpreter version.** AutoScript is pinned to Python 3.11; PyJEM is
+  whatever the instrument PC has; Nion pins its own stack. A subprocess
+  can run a *different interpreter*. In-process, the vendor chooses your
+  Python version — and if two vendors disagree, nobody wins.
+- **Remote operation.** The server can run on the instrument's control
+  computer with the application on an operator's laptop. Zeiss's API has
+  an explicit remote mode; an XP-only control PC may leave no other
+  option.
+
+And the cost is small, measured rather than assumed: pickle and shared
+memory are within noise of each other from ~30 KB to ~500 KB, with Nagle
+disabled and one reused segment
+(`scripts/ipc_overhead_benchmark.py`). A call is a socket round trip plus
+a memcpy — invisible at 10–100 frames per second. At 120 kHz it is the
+wrong architecture, but so is any request/response protocol; that case
+belongs to LiberTEM-live, not to an in-process variant of this one.
+
+**This is not the bifurcation it might look like.** The in-process path
+already exists and costs nothing: `NionCamera`, `NionScanner` and
+`NionInstrument` satisfy the protocols directly, and the test suite
+drives the same objects both ways — in-process in
+`tests/integration/test_nion_server.py`, over IPC in
+`test_remote_nion.py`. An adapter author writes protocol-satisfying
+objects and never thinks about transport. What would be a real
+bifurcation is *two supported production paths*, with two lifecycle
+stories, two error models, two teardown paths, and a "which one are you
+on?" question in every bug report. This project has been caught twice by
+behaviour that only appeared on one path — the startup hang, and whether
+frame metadata survives the shared-memory transport — which is the
+argument against having two.
+
+**Where the calculus genuinely differs.** A benchtop camera has no beam
+and no column, so the parking argument evaporates entirely, and for a
+pure-Python SDK the rest is thinner too. If an in-process production path
+is ever wanted, the right shape is not a second architecture: it is a
+`local_instrument()` context manager that imports the adapter and yields
+the same `InstrumentDevices`, sharing every test through the same
+conformance suite. One function, no new concepts. Worth building when
+something actually needs it — and worth *not* making the default even
+then, because the failure it protects against is one nobody notices until
+it matters.
 
 ## What the framework got right
 
@@ -325,11 +460,18 @@ a different job from a column adapter and is likely to come first.
 
 ## The short version
 
-**Start with a detector, not a column.** DECTRIS is the smallest real
-adapter in this document — a documented REST API, no vendor library, no
-OS constraint — and a detector-only server now works end to end, so it
-would prove the whole out-of-tree path at a fraction of the cost of any
-column vendor. Direct Electron is a close second and pip-installable.
+**Start with a detector or a camera, not a column.** DECTRIS is the
+smallest real adapter in this document — a documented REST API, no vendor
+library, no OS constraint — and a detector-only server now works end to
+end, so it would prove the whole out-of-tree path at a fraction of the
+cost of any column vendor. Direct Electron is a close second and
+pip-installable.
+
+**The best coverage per day of work is pymmcore.** One device server
+backed by Micro-Manager's core reaches every UVC microscope plus much of
+the scientific camera market, and it is the option that most matches what
+this project claims to be: §4 already names pymmcore-plus as prior art,
+and wrapping it is adopting that work rather than admiring it.
 
 Among column vendors, Thermo Fisher first — permissive wrapper, offline
 dummy, best class-map fit. JEOL second. Zeiss only if a site already has
@@ -338,6 +480,12 @@ question wearing a device-adapter costume.
 
 Two pieces of shared groundwork belong before, or with, the first
 adapter: **ROI, gain mode, and trigger on `CameraParameters`** if it is a
-detector, and the **target-name redesign** if it is a column — the one
-piece a second column adapter cannot work around, and the only place
-where the framework's shape is still Nion's rather than neutral.
+camera of any kind — a consumer body's ISO and an ORCA's gain are the
+same missing field — and the **target-name redesign** if it is a column,
+the one piece a second column adapter cannot work around and the only
+place where the framework's shape is still Nion's rather than neutral.
+
+Whichever comes first, it is a subprocess. The
+[transport section](#transport-why-every-adapter-is-a-subprocess)
+explains why that holds even where no licence requires it, and why it is
+not the architectural bifurcation it can look like.
