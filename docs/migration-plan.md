@@ -270,12 +270,40 @@ problem — read their source and docs before designing our own adapters:
   workers never touch Qt.
 - [x] Benchmark live frame latency —
   [`scripts/phase2_live_benchmark.py`](../scripts/phase2_live_benchmark.py).
-  **Result on this container (llvmpipe software rasterization), 512×512
-  scan:** acquire ~14.5 ms median; display 33.6–47.7 ms median across four
-  runs — display costs roughly **2.3–3.3× acquire**.
-  *This is not yet a verdict against napari.* Under software rendering the
-  rasterizer competes with acquisition for the same CPU, so the figure is
-  a pessimistic floor; the script detects the GL renderer and says so.
+  **Measured on real GPU hardware (Apple M2 Pro), 512×512 scan:** acquire
+  **5.4 ms** median (p95 6.1); display **11.1 ms** median (p95 15.3, max
+  15.6). Tight spread, unlike software rendering's 42%.
+
+  **Verdict: napari is comfortably fast enough for scanned imaging, and
+  the ratio that says otherwise is measuring the wrong thing.** Display
+  is 2.05× the *simulator's* acquire time — but the simulator produces a
+  512×512 frame in 5.4 ms while a real scan at 1 µs dwell takes
+  512² × 1 µs = **262 ms**. Against the beam time that actually gates a
+  live view, display costs **4.2% of a frame**; at 10 µs dwell, 0.4%.
+  This project's own script printed "display dominates … the empirical
+  argument for ndv" off that 2.05×, which was a denominator error rather
+  than a finding — the script now divides by the scan's physical duration
+  and reports the sustainable rate separately.
+
+  **Where the cost is real: cameras.** 11.1 ms per repaint is a hard
+  ceiling of ~90 fps regardless of source. Fine for the commodity camera
+  server (30–60 fps) and for survey-rate detectors; not fine above that,
+  which is the regime where `ndv` would earn its place — and, separately,
+  the regime this project already routes to LiberTEM-live.
+
+  **The open question is now much narrower.** 11 ms to upload and draw
+  one 512² texture on an M2 Pro is high for a GPU, which suggests most of
+  it is napari's CPU-side per-update overhead rather than the draw — the
+  cost `ndv` exists to remove. That is decidable with one cheap
+  experiment: re-run across `--size`. Roughly constant means fixed
+  overhead and `ndv` would help; scaling with pixels means upload and
+  draw, and changing viewer would not. **Not yet run.**
+
+  Earlier figures on this container (llvmpipe software rasterization)
+  were acquire ~14.5 ms, display 33.6–47.7 ms across four runs. Real GPU
+  hardware is 2.7× faster on acquire and 3–4× on display, so the software
+  numbers were the pessimistic floor the script claimed rather than a
+  verdict.
   Two measurement traps found while building it, either of which makes
   napari look ~2× faster than it is, and both of which the script now
   avoids: (1) with `show=False` the canvas is hidden, Qt issues no paint

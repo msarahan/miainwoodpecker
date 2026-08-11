@@ -143,6 +143,19 @@
   `nion_server` and shared with the camera server. Lifecycle deliberately
   stays with each adapter: a webcam has no beam to park.
 
+### Fixed
+
+- `scripts/phase2_live_benchmark.py` compared display cost against the
+  *simulator's* acquire time, which is not what gates a live view. On the
+  first hardware-accelerated run that denominator produced "display
+  dominates … the empirical argument for ndv" from a 2.05× ratio that
+  meant nothing of the sort: the simulator makes a 512² frame in 5.4 ms
+  where a real 1 µs-dwell scan takes 262 ms, against which display is
+  4.2% of a frame. The verdict now divides by the scan's physical
+  duration, reports the sustainable frame rate separately as the ceiling
+  a camera-rate source actually faces, and says what experiment would
+  decide the remaining question.
+
 ### Changed
 
 - CI's `integration` job runs its tests in parallel (`pytest -n auto`),

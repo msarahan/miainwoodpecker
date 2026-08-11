@@ -81,6 +81,10 @@ if typing.TYPE_CHECKING:
     from miainwoodpecker.devices.interface import Scanner
 
 _SOFTWARE_RENDERERS = ("llvmpipe", "softpipe", "swrast", "software")
+# Below this share of a frame's acquisition time, the display cost cannot
+# be what limits a live view - a tenth leaves an order of magnitude of
+# headroom, which is past arguing about.
+_NEGLIGIBLE_FRACTION = 0.1
 
 
 def _gl_renderer(viewer: napari.Viewer) -> str:
@@ -220,20 +224,80 @@ def main() -> None:
         return
     acquire_median = statistics.median(acquire_ms)
     display_median = statistics.median(display_ms)
-    print(f"\ndisplay is {display_median / acquire_median:.2f}x the acquire cost")
-    if display_median < acquire_median:
-        print("verdict: napari keeps up with this source.")
-    elif is_software:
+    scan_ms = args.size * args.size * args.dwell_us / 1000.0
+    _verdict(display_median, acquire_median, scan_ms, is_software=is_software)
+
+
+def _verdict(
+    display_median: float,
+    acquire_median: float,
+    scan_ms: float,
+    *,
+    is_software: bool,
+) -> None:
+    """
+    Say what the display cost means, against the comparison that matters.
+
+    **Not against ``acquire``, which is what this printed at first and
+    which is the wrong denominator.** ``acquire`` is the simulator going
+    as fast as it can with no beam involved; on hardware the same frame
+    takes ``size^2 x dwell``, which for the 512x512 default at 1us is
+    262ms rather than the simulator's 5ms. Dividing by the simulator made
+    napari look like the bottleneck in a pipeline where it accounts for a
+    few percent, and the first hardware-accelerated run duly printed
+    "display dominates ... the empirical argument for ndv" off a 2.05x
+    ratio that meant nothing of the sort.
+
+    What a live viewer has to beat is the rate frames actually *arrive*
+    at. So both are reported: the scan's own physical duration for a
+    scanned source, and the sustainable frame rate for a camera, which is
+    the case where this cost is a real ceiling.
+
+    Parameters
+    ----------
+    display_median : float
+        Median refresh-and-repaint time, in milliseconds.
+    acquire_median : float
+        Median device-layer frame time with no display, in milliseconds.
+    scan_ms : float
+        How long the requested scan physically takes on an instrument.
+    is_software : bool
+        Whether the renderer was a software rasterizer.
+    """
+    print(
+        f"\ndisplay is {display_median / acquire_median:.2f}x this source's "
+        f"acquire cost, which is the *simulator* going flat out - not the "
+        f"comparison that decides anything",
+    )
+    print(
+        f"against the scan it was asked for ({scan_ms:.0f}ms of real beam "
+        f"time): display is {100 * display_median / scan_ms:.1f}% of a frame",
+    )
+    print(
+        f"as a ceiling for a camera-rate source: "
+        f"{1000 / display_median:.0f} fps sustained",
+    )
+    if is_software:
         print(
-            "verdict: display dominates under software rendering. Re-run on a "
-            "GPU workstation before concluding anything about napari; only a "
-            "hardware-accelerated result justifies moving to ndv."
+            "verdict: software rasterization - this is a floor, not a "
+            "measurement. Re-run where there is a GPU.",
         )
-    else:
+        return
+    if display_median < scan_ms * _NEGLIGIBLE_FRACTION:
         print(
-            "verdict: display dominates on real GPU hardware - this is the "
-            "empirical argument for ndv or a custom VisPy canvas."
+            "verdict: negligible for scanned imaging. Whether it is also "
+            "fine for a fast camera depends on that camera's rate against "
+            "the sustained figure above.",
         )
+        return
+    print(
+        "verdict: display is a real share of the frame time for this "
+        "source. Before concluding anything about napari, re-run with "
+        "--size varied: a cost that barely moves is napari's fixed "
+        "per-update overhead (the thing ndv exists to remove), while one "
+        "that scales with pixels is upload and draw, which changing "
+        "viewer will not fix.",
+    )
 
 
 if __name__ == "__main__":
