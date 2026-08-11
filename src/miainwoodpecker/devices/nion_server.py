@@ -521,37 +521,6 @@ class NionInstrument:
             "stage_size_nm": self.stage_size_nm(),
         }
 
-    def connection_opened(self) -> None:
-        """Record that a client connection was accepted."""
-        with self._connection_lock:
-            self._connections += 1
-            self._ever_connected = True
-        self._connection_change.set()
-
-    def connection_closed(self) -> None:
-        """Record that a client connection ended."""
-        with self._connection_lock:
-            self._connections = max(0, self._connections - 1)
-        self._connection_change.set()
-
-    @property
-    def is_orphaned(self) -> bool:
-        """Return whether every client connection has gone after having some."""
-        with self._connection_lock:
-            return self._ever_connected and self._connections == 0
-
-    def wait_for_connection_change(self, timeout: float | None = None) -> None:
-        """
-        Block until a connection opens or closes, or the timeout elapses.
-
-        Parameters
-        ----------
-        timeout : float | None
-            Seconds to wait, or None to wait indefinitely.
-        """
-        self._connection_change.wait(timeout)
-        self._connection_change.clear()
-
     def health(self) -> dict[str, object]:
         """
         Answer "is this server alive and working?" without touching any device.
@@ -1058,6 +1027,37 @@ class _ServerSession:
         self.targets["instrument"] = devices.instrument
         self.writers["instrument"] = None
         devices.instrument.bind_session(self)
+
+    def connection_opened(self) -> None:
+        """Record that a client connection was accepted."""
+        with self._connection_lock:
+            self._connections += 1
+            self._ever_connected = True
+        self._connection_change.set()
+
+    def connection_closed(self) -> None:
+        """Record that a client connection ended."""
+        with self._connection_lock:
+            self._connections = max(0, self._connections - 1)
+        self._connection_change.set()
+
+    @property
+    def is_orphaned(self) -> bool:
+        """Return whether every client connection has gone after having some."""
+        with self._connection_lock:
+            return self._ever_connected and self._connections == 0
+
+    def wait_for_connection_change(self, timeout: float | None = None) -> None:
+        """
+        Block until a connection opens or closes, or the timeout elapses.
+
+        Parameters
+        ----------
+        timeout : float | None
+            Seconds to wait, or None to wait indefinitely.
+        """
+        self._connection_change.wait(timeout)
+        self._connection_change.clear()
 
     def health(self) -> dict[str, object]:
         """

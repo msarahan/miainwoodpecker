@@ -346,14 +346,14 @@ def _connect_with_retry(
     Raises
     ------
     DeviceServerStartupError
-        If the server exited before accepting connections.
+        If the server exited before accepting connections, or if the
+        deadline passed with a connection attempt still blocked inside
+        the authentication handshake — the wedged-at-startup case below.
     ConnectionRefusedError
         If ``deadline`` passed with the server still alive but not listening.
     OSError
         For any other socket-level failure past the deadline.
     """
-    from multiprocessing.connection import Client  # noqa: PLC0415
-
     while True:
         if process.poll() is not None:
             msg = (
@@ -366,7 +366,7 @@ def _connect_with_retry(
             )
             raise DeviceServerStartupError(msg)
         try:
-            connection = Client(("localhost", port), authkey=authkey)
+            connection = _connect_once(port, authkey, deadline)
         except (ConnectionRefusedError, OSError):
             if time.monotonic() > deadline:
                 raise
@@ -374,6 +374,90 @@ def _connect_with_retry(
         else:
             disable_nagle(connection)
             return connection
+
+
+def _connect_once(port: int, authkey: bytes, deadline: float) -> Connection:
+    """
+    Make one connection attempt, bounded by the caller's deadline.
+
+    ``multiprocessing.connection.Client`` blocks with **no timeout**
+    through both the TCP connect and the authentication handshake, so
+    the retry loop's deadline could never fire while an attempt was in
+    flight. Against a server that accepts the TCP connection but never
+    completes the handshake, the client hung forever inside its first
+    attempt — not a hypothetical: a server whose instrument accept
+    thread crashed at startup produced exactly this, hanging every test
+    run that touched it until something external killed it.
+
+    The attempt therefore runs on a scrap daemon thread and is abandoned
+    if the deadline passes. Abandoning is safe precisely because the
+    result is discarded: the thread holds only its own socket, which dies
+    with it or the process, and nothing else ever learns the connection
+    existed. A thread rather than a socket timeout, deliberately —
+    bounding it with ``socket.setdefaulttimeout`` would be process-global
+    state, and this project has already been bitten once by fd-mode side
+    effects on this exact path (see ``rpc.disable_nagle``).
+
+    Parameters
+    ----------
+    port : int
+        Port to connect to on localhost.
+    authkey : bytes
+        Shared secret for the connection handshake.
+    deadline : float
+        ``time.monotonic()`` value after which to abandon the attempt.
+
+    Returns
+    -------
+    Connection
+        The connected, authenticated client end.
+
+    Raises
+    ------
+    DeviceServerStartupError
+        If the deadline passed with the attempt still blocked — a server
+        that is alive but not completing handshakes, which retrying will
+        not fix.
+    ConnectionRefusedError
+        If nothing is listening on the port yet (the ordinary
+        during-startup case the retry loop exists for).
+    OSError
+        For other socket-level failures.
+    """
+    from multiprocessing.connection import Client  # noqa: PLC0415
+
+    outcome: list[object] = []
+    done = threading.Event()
+
+    def _attempt() -> None:
+        try:
+            outcome.append(Client(("localhost", port), authkey=authkey))
+        except BaseException as error:  # noqa: BLE001 - re-raised on the caller's thread
+            outcome.append(error)
+        done.set()
+
+    thread = threading.Thread(target=_attempt, name="device-connect", daemon=True)
+    thread.start()
+    if not done.wait(timeout=max(0.05, deadline - time.monotonic())):
+        msg = (
+            f"a connection attempt to the device server (port {port}) was "
+            f"still blocked in the handshake when the connect deadline "
+            f"passed - the server process is alive but not completing "
+            f"connections, which retrying will not fix"
+        )
+        raise DeviceServerStartupError(msg)
+    # Failures cross the thread boundary as objects and are re-raised here
+    # as fresh instances of the concrete classes the retry loop dispatches
+    # on, with the original chained as __cause__ so no diagnostic is lost.
+    result = outcome[0]
+    if isinstance(result, ConnectionRefusedError):
+        raise ConnectionRefusedError(*result.args) from result
+    if isinstance(result, OSError):
+        raise OSError(*result.args) from result
+    if isinstance(result, BaseException):
+        msg = f"the connection attempt failed unexpectedly: {result!r}"
+        raise DeviceServerStartupError(msg) from result
+    return typing.cast("Connection", result)
 
 
 class _RemoteDevice:
