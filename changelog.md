@@ -38,6 +38,13 @@
 - `docs/hardware-validation-checklist.md`: the ordered procedure for what
   cannot be verified against the simulator.
 
+- Two user-facing guides, cross-linked as the documentation's front door:
+  [Using the viewer](docs/using-the-viewer.md) for operating from the
+  screen (with a translation table for Nion Swift and DigitalMicrograph
+  habits) and [Scripting and automation](docs/scripting-and-automation.md)
+  for driving the same capabilities from Python, including what it takes
+  to put an AI agent at the controls.
+
 ### Changed
 
 - Default HDF5 compression is now gzip + byte shuffle, which measured smaller,
@@ -51,6 +58,16 @@
 
 ### Fixed
 
+- The device server crashed at startup: the connection-accounting methods
+  added for orphan detection landed on `NionInstrument` rather than
+  `_ServerSession`, so its accept thread and watchdog died with
+  `AttributeError`. Nothing caught it before CI, because no test runnable
+  without the `device` extra executes `serve()`.
+- A client connecting to a half-dead server hung forever rather than
+  failing: the crashed accept thread left the port open, so TCP connected
+  but the authentication handshake never completed, and
+  `multiprocessing.connection.Client` has no timeout. Connection attempts
+  are now bounded by the existing connect deadline even mid-handshake.
 - `NexusWriter` no longer declares `definition = "NXem"` by default. Validation
   showed the files did not conform (a required `NXsample` group was missing), so
   they now claim no application definition unless real specimen metadata is
