@@ -30,9 +30,28 @@ lifecycle bugs and hot-path waste. They are listed in priority order:
 first what can corrupt the scientific record, then coherence debt, then
 performance, then robustness for hardware day.
 
+## Status
+
+Everything in §1 (data corruption and loss), the §4 items that matter on
+hardware day, and the cheap half of §3 have since been **fixed**; each
+finding below is marked. What deliberately remains is listed in
+[§7](#7-what-was-not-done-and-why) with the reasoning, so an unfixed item
+is a decision on record rather than an oversight.
+
+Two of the fixes are worth calling out because writing them changed what
+they claimed. The `fov_nm` convention was settled by reading Nion's own
+`get_scan_calibrations` in the pinned release rather than by picking the
+reading that looked tidier — it computes `fov_nm / max(scan_shape)` and
+applies it to both axes, so two of this project's own tests were
+asserting the bug. And the first three display-optimization tests
+**passed with the optimization removed**: the fake scanner returns
+zero-filled frames, so the autocontrast they observed through never
+fired. They were rewritten against a gradient frame, and each is now
+verified to fail with its own clause disabled.
+
 ## 1. Findings that can corrupt or lose recorded data
 
-### 1.1 `fov_nm` means different things to Nion and to our calibration — non-square scans get wrong axes
+### 1.1 ✅ Fixed — `fov_nm` means different things to Nion and to our calibration — non-square scans get wrong axes
 
 **Verified against Nion's own source** (nionswift-instrumentation 23.6.2,
 the exact pin in `pyproject.toml`), `nion/instrumentation/scan_base.py`:
@@ -69,7 +88,7 @@ non-square-scan calibration round-trip test. Sanity-check against usim
 data on the next `device`-extra run (the convention above is from Nion's
 calibration code; the data path should be confirmed once, on principle).
 
-### 1.2 `LiveAcquisition.stop()` reports success on a timed-out join → two threads on one device → torn frames
+### 1.2 ✅ Fixed — `LiveAcquisition.stop()` reports success on a timed-out join → two threads on one device → torn frames
 
 `acquisition/live.py:86-92`: `thread.join(timeout)` discards its result
 and `self._thread = None` runs unconditionally, so after a 5 s timeout
@@ -104,7 +123,7 @@ and the device driven, unreachable and unstoppable). Fix 1 removes the
 trigger; reusing one loop instance (its restart path is implemented and
 tested but dead in production) would remove the pattern.
 
-### 1.3 The single-writer shared-memory invariant is unenforced server-side
+### 1.3 ✅ Fixed — the single-writer shared-memory invariant was unenforced server-side
 
 The server accepts **any number** of connections per target, each with a
 handler thread (`nion_server.py:1209-1222`), and all of them share one
@@ -115,7 +134,7 @@ session) reproduces the 1.2 tear without any bug in this codebase.
 **Fix**: accept one connection per frame-producing target (refuse or
 queue subsequent ones), or make writers per-connection.
 
-### 1.4 Per-frame metadata is discarded — a recorded focal series keeps only frame 0's defocus
+### 1.4 ✅ Fixed — per-frame metadata is discarded — a recorded focal series keeps only frame 0's defocus
 
 `nexus.py:441` stores `frame.metadata` only for the **first** frame;
 `close()` writes only that. But `focal_series`
@@ -128,7 +147,7 @@ holds a *reference* (not a copy) until `close()`.
 is enough to stop the loss; a typed dataset for numeric keys like
 `defocus_nm` is the better end state), and copy what's held.
 
-### 1.5 `flush()` is the designed answer to the worst crash mode — and no production path calls it
+### 1.5 ✅ Fixed — `flush()` is the designed answer to the worst crash mode — and no production path calls it
 
 The migration plan measured that a per-append `flush()` converts
 "file does not open at all" into "short but readable", at a cost within
@@ -141,7 +160,7 @@ the unbounded worst case the measurement was done to eliminate.
 `flush_every=1` as a parameter). One line restores the designed
 guarantee.
 
-### 1.6 `NexusWriter.close()` has no `try/finally`
+### 1.6 ✅ Fixed — `NexusWriter.close()` has no `try/finally`
 
 `nexus.py:480-501`: any failure while finalizing (writing `end_time`, the
 NXdata group, the metadata JSON) leaves `self._file` open and non-`None`
@@ -160,7 +179,7 @@ today. And `close()` doesn't reset `_count`/`_first_metadata`/`_frame_zero`,
 so a reused writer instance writes phantom zero-filled frames — guard or
 support reuse, not the middle state.
 
-### 1.7 `rpc.disable_nagle` can silently flip the connection to non-blocking
+### 1.7 ✅ Fixed — `rpc.disable_nagle` can silently flip the connection to non-blocking
 
 `rpc.py:62-71` wraps the connection's fd in `socket.socket(fileno=...)`.
 That constructor applies the process-wide `socket.setdefaulttimeout()`,
@@ -246,7 +265,7 @@ redesign, TCP_NODELAY, and streaming HDF5 writes are all real wins, and
 the live path has no gratuitous array copies. The waste is concentrated
 in the display/UI layer and a few hot-path details:
 
-- **The viewer re-uploads and re-normalizes the same frame every 33 ms.**
+- ✅ **Fixed — the viewer re-uploaded and re-normalized the same frame every 33 ms.**
   `_refresh_source` (`viewer/live.py:1236-1245`) has no "is this frame
   new?" check: at 10 fps acquisition and a 30 Hz timer, every frame is
   assigned to `layer.data` three times and `min()`/`max()` recomputed
@@ -256,14 +275,14 @@ in the display/UI layer and a few hot-path details:
   Similarly, status labels are rewritten 30×/s with unchanged text, and
   each `loop.stats` call copies a 30-element list to use its two
   endpoints.
-- **The analysis buttons do acquire → compress → write → re-read on the
-  GUI thread** (`viewer/live.py:984-1041`), against the module's own
+- ⬜ **Deferred (§7) — the analysis buttons do acquire → compress → write →
+  re-read on the GUI thread** (`viewer/live.py:984-1041`), against the module's own
   stated reason for `LoadJob` existing; the burst is also materialized
   via `list(camera_series(...))`, the exact pattern the streaming design
   exists to avoid, and the "working..." label never paints. Give them
   the `RecordingJob` treatment (the plan already lists this as the
   obvious next candidate).
-- **`Session.recordings()` opens every HDF5 file in the directory** and
+- ✅ **Fixed — `Session.recordings()` opened every HDF5 file in the directory** and
   the viewer calls it on the GUI thread after every recording and in
   `_analysis_input`'s `finally` (`viewer/live.py:646,995` →
   `session.py:1067`). 200 recordings into a shift on a network mount is
@@ -271,7 +290,7 @@ in the display/UI layer and a few hot-path details:
   Also `Session.record` discards `record_frames`' return value and
   reopens the file it just wrote merely to recount frames
   (`session.py:393-399`).
-- **Shared-memory segment thrash on shrink or alternating shapes.**
+- ✅ **Fixed — shared-memory segment thrash on shrink or alternating shapes.**
   `shared_frame.py:158-165` replaces the segment on any shape/dtype
   change, even when the existing segment is big enough — alternating
   512²/1024² pays create/unlink per frame, the exact regime the redesign
@@ -296,8 +315,8 @@ in the display/UI layer and a few hot-path details:
 
 These matter little against usim and a lot against a real column:
 
-- **No signal handling in the server, so the SIGTERM fallback never
-  parks the beam.** `park_and_release` is reachable only via the
+- ✅ **Fixed — no signal handling in the server, so the SIGTERM fallback
+  never parked the beam.** `park_and_release` is reachable only via the
   `shutdown` RPC; the wedged-server path — the one the fallback exists
   for — kills an unparked instrument. The server also shares the
   terminal's process group (no `start_new_session=True` at
@@ -306,7 +325,8 @@ These matter little against usim and a lot against a real column:
   cleanup fails too. **Fix**: a SIGTERM/SIGINT handler that runs
   `park_and_release` with a short bound then `os._exit`, plus
   `start_new_session=True`.
-- **A dead client leaves the server holding the instrument forever**
+- ⬜ **Deferred (§7) — a dead client leaves the server holding the instrument
+  forever**
   (`serve()` blocks on `stop_event` with no orphan detection). An idle
   watchdog or `PR_SET_PDEATHSIG` is cheap.
 - **A failed shared-memory `publish` loses a successfully acquired
@@ -319,7 +339,7 @@ These matter little against usim and a lot against a real column:
   the failure surfaces as the misleading hardware-startup error. Bind in
   the parent and inherit fds, or have the server bind port 0 and report
   back.
-- **`rpc.py` and `shared_frame.py` have zero unit tests** and are only
+- ✅ **Fixed — `rpc.py` and `shared_frame.py` had zero unit tests** and are only
   covered via tests gated on the `device` extra — in the base
   environment the license-boundary module and the shared-memory module
   are entirely untested, despite being pure-Python and trivially
@@ -371,20 +391,72 @@ Worth stating so a cleanup pass doesn't flatten it:
 
 ## 6. Priority order
 
-| # | Finding | Severity | Size |
+| # | Finding | Severity | Status |
 |---|---|---|---|
-| 1 | 1.1 `fov_nm` convention → wrong non-square axes | data corruption | small |
-| 2 | 1.2 `stop()` timeout lie → torn frames (3-part fix) | data corruption | small |
-| 3 | 1.4 per-frame metadata discarded (focal series) | data loss | medium |
-| 4 | 1.5 `flush()` never called in production | data loss | trivial |
-| 5 | 1.6 `close()` no try/finally + rank/dtype validation | data loss | small |
-| 6 | 1.7 `disable_nagle` non-blocking flip | latent, hard to trace | trivial |
-| 7 | 1.3 enforce one connection per frame target | latent corruption | small |
-| 8 | 4 SIGTERM park + process group + orphan watchdog | hardware safety | small |
-| 9 | 3 viewer frame-identity check + analysis off GUI thread | perf/UX | small–medium |
-| 10 | 4 unit tests for `rpc.py`/`shared_frame.py` | coverage of the boundary | small |
-| 11 | 2 layout helper, session-context read path, `_Job` base, boundary constants | maintainability | medium |
-| 12 | 3 remaining hot-path items (segment shrink, identity caching, recordings cache) | perf | small each |
+| 1 | 1.1 `fov_nm` convention → wrong non-square axes | data corruption | ✅ fixed |
+| 2 | 1.2 `stop()` timeout lie → torn frames (3-part fix) | data corruption | ✅ fixed |
+| 3 | 1.4 per-frame metadata discarded (focal series) | data loss | ✅ fixed |
+| 4 | 1.5 `flush()` never called in production | data loss | ✅ fixed |
+| 5 | 1.6 `close()` no try/finally + rank/dtype validation | data loss | ✅ fixed |
+| 6 | 1.7 `disable_nagle` non-blocking flip | latent, hard to trace | ✅ fixed |
+| 7 | 1.3 enforce one connection per frame target | latent corruption | ✅ fixed |
+| 8 | 4 SIGTERM park + own process group | hardware safety | ✅ fixed |
+| 9 | 3 viewer frame-identity check, label churn, timer-on-error | perf/UX | ✅ fixed |
+| 10 | 4 unit tests for `rpc.py`/`shared_frame.py` | coverage of the boundary | ✅ fixed |
+| 11 | 3 segment shrink/alternate thrash, `recordings()` cache | perf | ✅ fixed |
+| 12 | 3 analysis buttons still block the GUI thread | UX | ⬜ §7 |
+| 13 | 4 orphan watchdog for a dead client | robustness | ⬜ §7 |
+| 14 | 2 layout helper, session-context read path, `_Job` base, boundary constants | maintainability | ⬜ §7 |
+| 15 | 4 error identity across RPC, test-hook gating, `iter_ndata_directory`, sidecar atomicity, `_inspect` lock/damage | robustness | ⬜ §7 |
 
-Items 1–8 are the ones worth doing before hardware day; they are also the
-ones a pilot cannot discover gently.
+Items 1–11 are done, verified by the suite below. Everything a pilot
+cannot discover gently is in that set.
+
+**Verification.** 190 tests pass (164 base + 26 viewer under
+`xvfb-run`), `ruff check` and `pydoclint` clean in a CI-equivalent
+environment. Three fixes were checked against the bug they claim to fix
+by reintroducing it: the two `disable_nagle` tests fail with the
+pre-fix body (`BlockingIOError`, as predicted), and each display test
+fails with its own clause disabled. The device-extra integration tests
+(`test_remote_nion.py`, including the four new ones for connection
+exclusivity and SIGTERM parking) could not run here — no Nion stack in
+this container — so they are written but unexecuted; CI's `integration`
+job runs them.
+
+## 7. What was not done, and why
+
+Not oversights — each is a decision, listed so it can be revisited
+deliberately.
+
+- **The analysis buttons still block the GUI thread** (§3). This is the
+  largest remaining item and the one the migration plan itself already
+  names as "the obvious next candidate for the `RecordingJob`
+  treatment". It was left because the fix is a genuine refactor of three
+  handlers *plus* their tests — `test_live_widget.py` drives them
+  synchronously and asserts on the result immediately — and doing that
+  at the same time as seven correctness fixes would have made both
+  harder to review. It is a PoC/demo path, not the operator's data path,
+  which is what puts it after everything above.
+- **No orphan watchdog** for a server whose client died (§4). Worth
+  doing, but it needs a policy decision that should be made with
+  hardware in view: how long an instrument may sit idle-but-held before
+  the server parks it and exits is a question about the instrument, not
+  about this code, and a wrong guess parks a column someone is still
+  using.
+- **`Session.record` still reopens the file it just wrote.** Flagged as
+  a redundant open, and it is — but it is one HDF5 open per *recording*
+  against a write measured in seconds, and what it buys is reading the
+  frame count and finalized flag back from disk rather than trusting
+  what the writer reported. That verification is worth more than the
+  open costs. The `recordings()` cache addressed the case that actually
+  scaled badly (one open per file per UI refresh).
+- **The coherence debt in §2** — a shared layout helper, the
+  session-context read path, a `_Job` base class, moving the protocol
+  constants to the MIT side — is real and none of it is urgent. It wants
+  doing as one deliberate pass rather than folded into a correctness
+  commit, precisely so the diff that changes behaviour stays legible.
+- **The smaller §4 robustness items** (error identity across the RPC
+  boundary, gating the test hooks behind a flag, `iter_ndata_directory`
+  aborting on one bad file, the non-atomic sidecar write, `_inspect`
+  conflating a locked file with a damaged one) are each small and each
+  independent. They are the natural next batch.
