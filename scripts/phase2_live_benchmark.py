@@ -40,11 +40,26 @@ that honesty is that "acquire" now includes the IPC round trip; at
 ``_SHARED_MEMORY_THRESHOLD_BYTES``, so it travels through shared memory
 and §6's measurements put that overhead at roughly +3ms.
 
-Needs a real GL canvas, so run under a virtual display:
+Needs a real GL canvas. On a machine with a display - which is the case
+worth measuring, since only hardware-accelerated numbers settle
+anything - run it directly:
+
+    uv run --extra device --extra viewer \
+        python scripts/phase2_live_benchmark.py
+
+On a headless Linux box or in CI, wrap it in a virtual display. That
+gives llvmpipe software rasterization, which the report detects and
+labels as a floor rather than a verdict:
 
     xvfb-run -a -s "-screen 0 1920x1080x24" \
         uv run --extra device --extra viewer \
         python scripts/phase2_live_benchmark.py
+
+macOS needs neither wrapper and reports its own renderer (Apple's Metal
+-backed GL). Its unified memory removes the host-to-device texture copy
+a discrete card pays per frame, so it is a genuinely interesting data
+point rather than merely an available one - but the number is what
+decides that, not the architecture.
 """
 
 from __future__ import annotations
