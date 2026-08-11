@@ -950,6 +950,21 @@ class RemoteInstrument:
         """
         self._call("set_defocus_nm", defocus_nm)
 
+    def energy_offset_ev(self) -> float:
+        """Return the spectrometer energy offset, in electronvolts."""
+        return typing.cast("float", self._call("energy_offset_ev"))
+
+    def set_energy_offset_ev(self, offset_ev: float) -> None:
+        """
+        Set the spectrometer energy offset, in electronvolts.
+
+        Parameters
+        ----------
+        offset_ev : float
+            Target offset, in electronvolts.
+        """
+        self._call("set_energy_offset_ev", offset_ev)
+
     def is_beam_blanked(self) -> bool:
         """Return whether the beam is currently blanked."""
         return bool(self._call("is_beam_blanked"))

@@ -80,6 +80,16 @@
   a camera reconfigured mid-acquisition cannot mislabel the frame already
   in flight.
 
+- `energy_offset_series`: step the spectrometer's energy offset across a
+  series of EELS frames, recording the read-back offset beside the request
+  and restoring the original afterwards — the acquisition half of Nion's
+  multiple-shift EELS acquire. The camera is stopped around each step,
+  because a running camera returns a frame generated before the control
+  changed, which would mislabel the whole series by one. Brings a fourth
+  control to `InstrumentController` (`energy_offset_ev`), which the
+  camera's own calibration already tracks, so the recorded energy axis
+  follows the sweep for free.
+
 ### Changed
 
 - CI's `integration` job runs its tests in parallel (`pytest -n auto`),

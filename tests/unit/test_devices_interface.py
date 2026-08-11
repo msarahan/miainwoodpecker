@@ -8,6 +8,7 @@ import numpy as np
 from miainwoodpecker.devices import (
     BEAM_BLANKER_CONTROL,
     DEFOCUS_CONTROL,
+    ENERGY_OFFSET_CONTROL,
     STAGE_POSITION_CONTROL,
     Camera,
     CameraParameters,
@@ -110,10 +111,16 @@ class _FakeInstrument:
         self._controls = (
             list(controls)
             if controls is not None
-            else [STAGE_POSITION_CONTROL, DEFOCUS_CONTROL, BEAM_BLANKER_CONTROL]
+            else [
+                STAGE_POSITION_CONTROL,
+                DEFOCUS_CONTROL,
+                BEAM_BLANKER_CONTROL,
+                ENERGY_OFFSET_CONTROL,
+            ]
         )
         self.position_nm = (0.0, 0.0)
         self.defocus = 500.0
+        self.energy_offset = -20.0
         self.blanked = False
         self.park_count = 0
 
@@ -140,6 +147,21 @@ class _FakeInstrument:
     def set_defocus_nm(self, defocus_nm: float) -> None:
         """Record a defocus change."""
         self.defocus = defocus_nm
+
+    def energy_offset_ev(self) -> float:
+        """Return the last energy offset written."""
+        return self.energy_offset
+
+    def set_energy_offset_ev(self, offset_ev: float) -> None:
+        """
+        Record an energy-offset change.
+
+        Parameters
+        ----------
+        offset_ev : float
+            Requested offset, in electronvolts.
+        """
+        self.energy_offset = offset_ev
 
     def is_beam_blanked(self) -> bool:
         """Return whether the fake beam is blanked."""

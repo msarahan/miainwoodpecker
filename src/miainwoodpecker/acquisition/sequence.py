@@ -16,7 +16,7 @@ from __future__ import annotations
 import dataclasses
 import typing
 
-from miainwoodpecker.devices.interface import DEFOCUS_CONTROL
+from miainwoodpecker.devices.interface import DEFOCUS_CONTROL, ENERGY_OFFSET_CONTROL
 from miainwoodpecker.storage.nexus import write_frames
 
 if typing.TYPE_CHECKING:
@@ -180,6 +180,92 @@ def focal_series(
             )
     finally:
         instrument.set_defocus_nm(original_defocus_nm)
+
+
+def energy_offset_series(
+    camera: Camera,
+    values_ev: Iterable[float],
+    *,
+    instrument: InstrumentController,
+) -> Iterator[Frame]:
+    """
+    Yield one camera frame per spectrometer energy offset.
+
+    The EELS counterpart to :func:`focal_series`, and the same shape: set
+    a control, acquire, record the *read-back* value beside the requested
+    one, and restore the original on the way out — including when the
+    consumer abandons the generator early.
+
+    This is the sweep behind Nion's ``MultipleShiftEELSAcquire``: step the
+    energy offset across a series of frames so a spectrum wider than the
+    detector can be assembled, or so a drifting zero-loss peak can be
+    corrected for afterwards. Summing and cross-correlating the result is
+    deliberately left to the analysis side, where HyperSpy already does
+    it — this produces the series and records what it was taken at.
+
+    Unlike ``focal_series``, the simulator can actually demonstrate this:
+    stepping the offset visibly moves the zero-loss peak across the
+    detector, and the energy axis the frames carry follows it, because
+    the same control feeds the camera's calibration.
+
+    **The camera is stopped around each step, and that is load-bearing.**
+    A running camera is producing frames continuously, so the first one
+    returned after a control changes was generated *before* it —
+    measured against the simulator: acquiring straight after setting the
+    offset yields the previous offset's spectrum, while its metadata and
+    energy axis describe the new one. A series built that way is
+    mislabelled by one step throughout, which is worse than a slow one.
+    Stopping, setting, and restarting makes the very next frame correct,
+    also measured. Nion's ``MultipleShiftEELSAcquire`` takes a settling
+    delay between shifts for the same underlying reason.
+
+    Parameters
+    ----------
+    camera : Camera
+        The spectrometer camera to acquire from.
+    values_ev : Iterable[float]
+        Energy offsets to step through, in electronvolts.
+    instrument : InstrumentController
+        Instrument carrying the energy-offset control. Required, since
+        there is no meaningful fallback sweep the camera alone could do.
+
+    Yields
+    ------
+    Frame
+        One frame per requested offset, with ``energy_offset_ev`` (read
+        back) and ``requested_energy_offset_ev`` in its metadata.
+
+    Raises
+    ------
+    ValueError
+        If ``instrument`` does not implement the energy-offset control.
+    """
+    if ENERGY_OFFSET_CONTROL not in instrument.available_controls():
+        msg = (
+            "instrument does not implement the "
+            f"{ENERGY_OFFSET_CONTROL!r} control, so the energy offset "
+            f"cannot be swept"
+        )
+        raise ValueError(msg)
+    original_offset_ev = instrument.energy_offset_ev()
+    try:
+        for offset_ev in values_ev:
+            instrument.set_energy_offset_ev(offset_ev)
+            camera.start()
+            try:
+                frame = camera.acquire_frame()
+            finally:
+                camera.stop()
+            yield dataclasses.replace(
+                frame,
+                metadata={
+                    **frame.metadata,
+                    "energy_offset_ev": instrument.energy_offset_ev(),
+                    "requested_energy_offset_ev": offset_ev,
+                },
+            )
+    finally:
+        instrument.set_energy_offset_ev(original_offset_ev)
 
 
 def record(

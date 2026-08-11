@@ -37,6 +37,7 @@ pytest.importorskip("nion.usim_device", reason="requires the 'device' extra")
 from miainwoodpecker.devices import (
     BEAM_BLANKER_CONTROL,
     DEFOCUS_CONTROL,
+    ENERGY_OFFSET_CONTROL,
     STAGE_POSITION_CONTROL,
     Camera,
     CameraParameters,
@@ -266,13 +267,14 @@ def test_open_instrument_dispatches_the_hardware_backend():
 
 
 def test_instrument_reports_the_controls_usim_actually_has():
-    """All three neutral controls resolve to real usim controls."""
+    """All four neutral controls resolve to real usim controls."""
     with simulated_instrument() as microscope:
         controls = set(microscope.instrument.available_controls())
         assert controls == {
             STAGE_POSITION_CONTROL,
             DEFOCUS_CONTROL,
             BEAM_BLANKER_CONTROL,
+            ENERGY_OFFSET_CONTROL,
         }
 
 

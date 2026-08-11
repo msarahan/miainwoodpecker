@@ -30,10 +30,11 @@ import pytest
 
 pytest.importorskip("nion.usim_device", reason="requires the 'device' extra")
 
-from miainwoodpecker.acquisition import focal_series
+from miainwoodpecker.acquisition import energy_offset_series, focal_series
 from miainwoodpecker.devices import (
     BEAM_BLANKER_CONTROL,
     DEFOCUS_CONTROL,
+    ENERGY_OFFSET_CONTROL,
     STAGE_POSITION_CONTROL,
     Camera,
     CameraParameters,
@@ -60,6 +61,7 @@ from miainwoodpecker.devices.remote import (
 )
 from miainwoodpecker.devices.rpc import (
     Call,
+    RemoteCallError,
     RemoteCallTimeoutError,
     RemoteConnectionLostError,
 )
@@ -393,6 +395,79 @@ def test_a_big_scan_does_not_prevent_the_next_one(microscope):
     assert float(np.std(frame.data)) > 0.0
 
 
+# ------------------------------------------ device errors and recovery
+#
+# Nion asserts that a device error stops acquisition, surfaces, and leaves
+# the device restartable (test_exception_during_view_halts_scan and
+# test_able_to_restart_scan_after_exception_scan). In-process, for Nion,
+# the first two are exception propagation. Across this boundary they are a
+# genuinely different question - the exception raises in another process,
+# and what reaches the caller is a Result carrying a string - and the
+# third is the one that matters: is the *server* still usable afterwards,
+# or does the client have to respawn it and lose every device setting and
+# instrument control with it?
+
+_BAD_CHANNEL = 99
+
+
+def test_a_device_error_surfaces_with_its_type_and_leaves_the_device_usable(
+    microscope,
+):
+    """
+    A vendor exception crosses as a typed error, and the device works after.
+
+    Scanning a channel that does not exist raises ``IndexError`` inside
+    Nion's own scan device — a plain operator mistake rather than a
+    contrived failure. What matters is both halves: the caller learns
+    *what* failed rather than getting one indistinguishable
+    ``RemoteCallError``, and the very next scan on the same device and
+    the same connection succeeds. Without the second half, every bad
+    argument would cost a session.
+    """
+    scanner = microscope.scanner
+    parameters = ScanParameters(
+        height=16,
+        width=16,
+        pixel_time_us=1.0,
+        fov_nm=microscope.stage_size_nm * 0.1,
+    )
+    with pytest.raises(RemoteCallError) as failure:
+        scanner.scan_frame(parameters, channel=_BAD_CHANNEL)
+    assert failure.value.error_type == "IndexError"
+
+    recovered = scanner.scan_frame(parameters, channel=0)
+    assert recovered.data.shape == parameters.shape
+
+
+def test_a_device_error_leaves_the_server_and_its_other_targets_alive(microscope):
+    """
+    One device's failure is not the server's, nor the other devices'.
+
+    Each target is served on its own connection and its own handler
+    thread, so this is the property that makes a bad call cheap: after
+    the scanner raises, the server still answers a health check and the
+    camera still acquires. A failure that took the process down would
+    also drop the instrument controls and leave the column unparked.
+    """
+    scanner = microscope.scanner
+    parameters = ScanParameters(
+        height=16,
+        width=16,
+        pixel_time_us=1.0,
+        fov_nm=microscope.stage_size_nm * 0.1,
+    )
+    with pytest.raises(RemoteCallError):
+        scanner.scan_frame(parameters, channel=_BAD_CHANNEL)
+
+    assert microscope.instrument.check_health().state == SERVER_RESPONSIVE
+    camera = microscope.eels_camera
+    camera.start()
+    try:
+        assert camera.acquire_frame().data.ndim == 2  # noqa: PLR2004 - a 2D detector
+    finally:
+        camera.stop()
+
+
 def test_outgrowing_the_segment_creates_a_new_one_and_frees_the_old(microscope):
     """
     A frame too big for the segment forces a new one, and the old one goes.
@@ -560,6 +635,7 @@ def test_describe_reports_the_backend_targets_and_controls(microscope):
         STAGE_POSITION_CONTROL,
         DEFOCUS_CONTROL,
         BEAM_BLANKER_CONTROL,
+        ENERGY_OFFSET_CONTROL,
     }
     assert description["stage_size_nm"] == microscope.stage_size_nm
 
@@ -631,6 +707,50 @@ def test_focal_series_sweeps_real_defocus_over_ipc(microscope):
     # A defocus sweep leaves the field of view alone.
     assert all(frame.metadata["fov_nm"] == parameters.fov_nm for frame in frames)
     assert instrument.defocus_nm() == pytest.approx(original)
+
+
+def test_energy_offset_series_moves_the_spectrum_it_labels(microscope):
+    """
+    An energy sweep changes the data, not just the metadata.
+
+    The claim ``focal_series`` explicitly cannot make against the
+    simulator, and the reason this sweep is the better documentation
+    example: stepping the spectrometer offset visibly moves the zero-loss
+    peak across the detector, so the frames a reader gets really do
+    differ. Both halves are asserted — the recorded energy axis follows
+    the offset, *and* the spectrum underneath it moved.
+
+    This is also the regression guard for the reason the generator stops
+    the camera between steps: acquired continuously, the frame returned
+    after a control change was generated before it, so the peak would
+    stay put while the axis moved.
+    """
+    instrument = microscope.instrument
+    assert ENERGY_OFFSET_CONTROL in instrument.available_controls()
+    original = instrument.energy_offset_ev()
+    values = [-20.0, 20.0]
+    frames = list(
+        energy_offset_series(microscope.eels_camera, values, instrument=instrument),
+    )
+
+    assert [frame.metadata["requested_energy_offset_ev"] for frame in frames] == values
+    assert [
+        frame.metadata["energy_offset_ev"] for frame in frames
+    ] == pytest.approx(values)
+    # The camera resolves its energy axis from the same instrument
+    # control, so the recorded calibration tracks the sweep for free.
+    axis_offsets = [
+        resolve_frame_calibration(
+            frame.data.shape,
+            metadata=frame.metadata,
+        ).x.offset
+        for frame in frames
+    ]
+    assert axis_offsets == pytest.approx(values)
+    # And the data moved: the zero-loss peak is in a different channel.
+    peaks = [int(np.argmax(frame.data.sum(axis=0))) for frame in frames]
+    assert peaks[0] != peaks[1]
+    assert instrument.energy_offset_ev() == pytest.approx(original)
 
 
 # ----------------------------------------------------- graceful shutdown

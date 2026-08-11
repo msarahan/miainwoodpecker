@@ -44,8 +44,8 @@ The API is small, and each layer only depends on the one below it:
 
 | Layer | What it gives you |
 |---|---|
-| `miainwoodpecker.devices` | The instrument: `Camera`, `Scanner`, and `InstrumentController` (stage, defocus, beam blanker). Vendor-neutral, in operator units — pixels, microseconds, nanometres. |
-| `miainwoodpecker.acquisition` | Series as generators: `scan_series`, `camera_series`, `focal_series`, plus `record()` to stream any of them to disk and `LiveAcquisition` for a latest-frame-wins live loop. |
+| `miainwoodpecker.devices` | The instrument: `Camera` (with exposure and binning), `Scanner`, and `InstrumentController` (stage, defocus, beam blanker, spectrometer energy offset). Vendor-neutral, in operator units — pixels, microseconds, nanometres, electronvolts. |
+| `miainwoodpecker.acquisition` | Series as generators: `scan_series`, `camera_series`, `focal_series`, `energy_offset_series`, plus `record()` to stream any of them to disk and `LiveAcquisition` for a latest-frame-wins live loop. |
 | `miainwoodpecker.storage` | Files and sessions: `Session`, `write_frames`/`read_frames`, per-axis calibration, and the legacy `.ndata` importer. |
 | `miainwoodpecker.analysis` | One-line loaders into HyperSpy, LiberTEM, and py4DSTEM. |
 
@@ -95,17 +95,69 @@ read back from the instrument, so the file says what the microscope
 *did*, not just what it was asked. The original defocus is restored
 afterwards, even if you abandon the series early.
 
-The instrument controls are directly available too — check
-`available_controls()` first, since not every microscope has every
-control:
+## A second experiment: stepping the spectrometer
+
+The EELS counterpart has the same shape, and unlike a focal series the
+bundled simulator can actually show you the effect — the zero-loss peak
+moves across the detector as the offset steps:
+
+```python
+from miainwoodpecker.acquisition import energy_offset_series, record
+from miainwoodpecker.devices.remote import remote_simulated_instrument
+
+with remote_simulated_instrument() as microscope:
+    record(
+        energy_offset_series(
+            microscope.eels_camera,
+            [-40.0, -20.0, 0.0, 20.0, 40.0],   # eV
+            instrument=microscope.instrument,
+        ),
+        "energy-series.nxs",
+    )
+```
+
+The recorded energy axis follows the sweep on its own, because the
+camera resolves its calibration from the same instrument control. This
+is the acquisition half of what Nion Swift calls a multiple-shift EELS
+acquire; summing and aligning the series afterwards is HyperSpy's job,
+and [the analysis section](#loading-recordings-into-analysis-tools) is how you
+hand it over.
+
+One thing worth knowing: the camera is stopped and restarted around each
+step. A running camera is always a frame ahead, so acquiring straight
+after changing a control gives you the *previous* step's data with the
+new step's label — a series wrong by one throughout. Restarting costs a
+little time and removes the possibility.
+
+## Instrument controls
+
+The controls are directly available too — check `available_controls()`
+first, since not every microscope has every control:
 
 ```python
 instrument = microscope.instrument
 instrument.set_defocus_nm(12.5)
 instrument.set_stage_position_nm(100.0, -50.0)   # (y, x)
 instrument.set_beam_blanked(blanked=True)
+instrument.set_energy_offset_ev(-20.0)
 instrument.park()   # safe unattended state: blanks the beam if one exists
 ```
+
+Cameras carry their own two settings, applied together because binning
+changes the axis calibration as well as the frame size:
+
+```python
+from miainwoodpecker.devices import CameraParameters
+
+camera = microscope.eels_camera
+print(camera.binning_values)                # what this detector supports
+took = camera.configure(CameraParameters(exposure_ms=40.0, binning=2))
+print(took)                                 # what it actually accepted
+```
+
+Configure a camera *before* starting it if you need the very first frame
+to be at the new settings — a running camera finishes the frame already
+in flight first.
 
 ## Sessions from scripts
 

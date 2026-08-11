@@ -97,7 +97,7 @@ learn:
   without a configuration change — with the current default kept only
   for devices that publish no controls.
 
-Built as `nion_server._camera_calibration_metadata`: the server resolves
+Built as `NionCamera.calibration_metadata`: the server resolves
 the controls with Nion's own `build_calibration` and puts per-axis
 `{kind, scale, offset, units}` into the frame metadata as plain data,
 where `resolve_frame_calibration` already looks. No `nion.*` crosses the
@@ -182,7 +182,7 @@ Two things the simulator taught, both now load-bearing:
   Configuring a stopped camera has the first frame already correct, which
   is the path to use when it matters.
 
-### 4. Two frame-identity contracts we do not test at all
+### 4. Two frame-identity contracts we do not test at all — **done**
 
 `test_frame_do_not_change_after_acquisition` holds four frames, checksums
 them, acquires more, and asserts the checksums still hold. Read that
@@ -194,11 +194,14 @@ removed. This is the cheapest high-value test on the list.
 
 `test_consecutive_frames_have_unique_data` is its complement — successive
 frames must actually differ, which catches a stale-buffer read that
-returns the same frame twice. Both are worth having, and their comment is
-worth stealing too: both seed the RNG, because the test is invalid if the
-detector is saturated.
+returns the same frame twice.
 
-### 5. Failure and recovery across the RPC boundary
+Both were verified by removing the copy: with `view.copy()` replaced by
+`view`, both fail. The second fails for its own reason, which is why it
+is worth having separately — aliased views make every frame identical,
+the frozen-image failure a checksum test cannot see.
+
+### 5. Failure and recovery across the RPC boundary — **done**
 
 `test_exception_during_view_halts_scan`, `test_exception_during_record_halts_scan`,
 and `test_able_to_restart_scan_after_exception_scan` say a device error
@@ -206,28 +209,44 @@ must stop acquisition, surface, and leave the device restartable.
 
 In-process for them, that is exception propagation. For us it crosses a
 socket, so it is a genuinely different question with a genuinely
-different answer, and the third test is the one that matters: after a
-device raises, is the *server* still usable, or does the client have to
-respawn it? `error_type` already crosses the boundary; nothing asserts
-what the device does afterwards.
+different answer, and the third test is the one that matters. Both halves
+are now asserted, using a scan of a channel that does not exist — a plain
+operator mistake, which raises `IndexError` inside Nion's own scan
+device: the caller learns *what* failed rather than getting one
+indistinguishable `RemoteCallError`, the very next scan on the same
+device and connection succeeds, and the server still answers a health
+check while the other devices keep acquiring. Without the recovery half,
+every bad argument would cost a session — and with it the instrument
+controls, leaving the column unparked.
 
-Related and nearly free: `test_big_scan_does_not_prevent_further_playing`.
-There is already a 4096² health-check scan in the suite; it checks that
-the big scan succeeds, not that the next small one does.
+`test_big_scan_does_not_prevent_further_playing` came with the frame
+identity tests above.
 
-### 6. An energy-offset series, as a worked example
+### 6. An energy-offset series, as a worked example — **done**
 
 `MultipleShiftEELSAcquire` is a real operator workflow with a real test:
 acquire N EELS frames while stepping the spectrometer energy offset,
 optionally take a dark reference, cross-correlate, and sum. usim exposes
 the control it needs — `ZLPoffset`, currently −20.0.
 
-`acquisition/sequence.py` already has `focal_series`, and this is the
-same shape with a different control. It is worth building specifically
-because, unlike focal series, **the simulator can actually demonstrate
-it**: shifting the zero-loss peak visibly moves the data, so it works as
-a documentation example that a reader can run and see. The hardware
-checklist notes focal series cannot do that.
+`energy_offset_series` is the same shape as `focal_series` with a
+different control, and it earns its place for the reason predicted: the
+simulator really does demonstrate it, so the docs example is one a reader
+can run and watch the zero-loss peak move.
+
+Building it turned up a bug that would have made the whole thing wrong,
+and it generalises past this one function. **A running camera is always a
+frame ahead.** Acquiring immediately after setting a control returns a
+frame generated *before* the change, while its metadata and energy axis
+describe the new one — so a series built the obvious way is mislabelled
+by one step throughout, which is worse than not having it. Stopping the
+camera around each step makes the next frame correct; both behaviours
+measured. Nion's `MultipleShiftEELSAcquire` takes a settling delay
+between shifts for the same underlying reason.
+
+The energy offset is the fourth control on `InstrumentController`, and it
+arrived the way that module says controls should: with the caller that
+needed it, not before.
 
 ### 7. Adopt Nion's session vocabulary
 

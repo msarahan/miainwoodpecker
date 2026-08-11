@@ -7,8 +7,20 @@ import typing
 import numpy as np
 import pytest
 
-from miainwoodpecker.acquisition import camera_series, focal_series, record, scan_series
-from miainwoodpecker.devices import DEFOCUS_CONTROL, Frame, ScanParameters
+from miainwoodpecker.acquisition import (
+    camera_series,
+    energy_offset_series,
+    focal_series,
+    record,
+    scan_series,
+)
+from miainwoodpecker.devices import (
+    DEFOCUS_CONTROL,
+    ENERGY_OFFSET_CONTROL,
+    CameraParameters,
+    Frame,
+    ScanParameters,
+)
 from miainwoodpecker.storage import read_series
 
 _PARAMETERS = ScanParameters(height=4, width=4, pixel_time_us=1.0, fov_nm=10.0)
@@ -50,11 +62,38 @@ class _CountingCamera:
         self.running = False
         self.start_count = 0
         self.stop_count = 0
+        self._parameters = CameraParameters(exposure_ms=10.0)
 
     @property
     def camera_id(self) -> str:
         """Return the fake camera's id."""
         return "counting_camera"
+
+    @property
+    def binning_values(self) -> tuple[int, ...]:
+        """Return the binning factors this fake supports."""
+        return (1,)
+
+    def parameters(self) -> CameraParameters:
+        """Return the settings the next frame would use."""
+        return self._parameters
+
+    def configure(self, parameters: CameraParameters) -> CameraParameters:
+        """
+        Record new settings and report them back.
+
+        Parameters
+        ----------
+        parameters : CameraParameters
+            The requested exposure and binning.
+
+        Returns
+        -------
+        CameraParameters
+            The same settings; this fake rounds nothing.
+        """
+        self._parameters = parameters
+        return self._parameters
 
     def start(self) -> None:
         """Mark acquisition as running."""
@@ -84,6 +123,8 @@ class _RecordingInstrument:
         self._controls = list(controls)
         self.defocus = 500.0
         self.requested: list[float] = []
+        self.energy_offset = -20.0
+        self.requested_offsets: list[float] = []
 
     def stage_size_nm(self) -> float:
         """Return a fake stage extent."""
@@ -119,6 +160,26 @@ class _RecordingInstrument:
         """
         self.requested.append(defocus_nm)
         self.defocus = defocus_nm + 0.5
+
+    def energy_offset_ev(self) -> float:
+        """Return the current energy offset."""
+        return self.energy_offset
+
+    def set_energy_offset_ev(self, offset_ev: float) -> None:
+        """
+        Record and apply an energy-offset change, landing 0.25eV off.
+
+        Off the setpoint for the same reason ``set_defocus_nm`` is:
+        ``energy_offset_series`` must record what it read back, not what
+        it asked for.
+
+        Parameters
+        ----------
+        offset_ev : float
+            Requested offset, in electronvolts.
+        """
+        self.requested_offsets.append(offset_ev)
+        self.energy_offset = offset_ev + 0.25
 
     def is_beam_blanked(self) -> bool:
         """Return a fixed unblanked state."""
@@ -271,3 +332,89 @@ def test_record_streams_a_series_to_disk(tmp_path):
     assert len(recovered) == expected
     # Frames arrive in acquisition order: pixel value equals sequence number.
     assert [int(data.flat[0]) for data, _ in recovered] == [1, 2, 3, 4]
+
+
+def test_energy_offset_series_steps_the_offset_and_records_the_read_back():
+    """
+    Each frame carries the offset the instrument reached, beside the request.
+
+    The same discipline ``focal_series`` applies to defocus: a recording
+    should say what the instrument did, not what it was asked to do. The
+    fake lands 0.25eV off its setpoint so the two cannot be confused.
+    """
+    camera = _CountingCamera()
+    instrument = _RecordingInstrument(controls=(ENERGY_OFFSET_CONTROL,))
+    frames = list(
+        energy_offset_series(camera, [-10.0, 0.0, 10.0], instrument=instrument),
+    )
+
+    expected_count = 3
+    assert len(frames) == expected_count
+    assert instrument.requested_offsets[:expected_count] == [-10.0, 0.0, 10.0]
+    assert [frame.metadata["requested_energy_offset_ev"] for frame in frames] == [
+        -10.0,
+        0.0,
+        10.0,
+    ]
+    assert [frame.metadata["energy_offset_ev"] for frame in frames] == [
+        -9.75,
+        0.25,
+        10.25,
+    ]
+
+
+def test_energy_offset_series_restarts_the_camera_around_every_step():
+    """
+    The camera is stopped and started per step, not once for the series.
+
+    Not incidental structure: a running camera returns a frame generated
+    *before* the control changed, so a series acquired without the
+    restart is mislabelled by one step throughout. Asserted on the
+    start/stop counts because that is the only externally visible trace
+    of it.
+    """
+    camera = _CountingCamera()
+    instrument = _RecordingInstrument(controls=(ENERGY_OFFSET_CONTROL,))
+    steps = 3
+    list(energy_offset_series(camera, [-10.0, 0.0, 10.0], instrument=instrument))
+
+    assert camera.start_count == steps
+    assert camera.stop_count == steps
+    assert not camera.running
+
+
+def test_energy_offset_series_restores_the_offset_when_abandoned_early():
+    """
+    Abandoning the generator still puts the spectrometer back.
+
+    The same guarantee ``focal_series`` gives for defocus, and it matters
+    more here: an operator who interrupts a sweep should not be left with
+    a spectrometer offset from wherever the sweep happened to stop.
+    """
+    camera = _CountingCamera()
+    instrument = _RecordingInstrument(controls=(ENERGY_OFFSET_CONTROL,))
+    original = instrument.energy_offset_ev()
+
+    series = energy_offset_series(camera, [-10.0, 0.0, 10.0], instrument=instrument)
+    next(series)
+    series.close()  # what `break` out of a for-loop does at GC time
+
+    assert instrument.requested_offsets[-1] == original
+    assert not camera.running
+
+
+def test_energy_offset_series_rejects_an_instrument_without_the_control():
+    """
+    An instrument with no spectrometer control says so rather than failing later.
+
+    ``available_controls`` is the documented way to ask, and this project
+    has already been bitten by a control that accepts a value and ignores
+    it — so the check is on what the instrument *claims*, before any
+    frame is acquired.
+    """
+    camera = _CountingCamera()
+    instrument = _RecordingInstrument(controls=(DEFOCUS_CONTROL,))
+
+    with pytest.raises(ValueError, match=ENERGY_OFFSET_CONTROL):
+        list(energy_offset_series(camera, [0.0], instrument=instrument))
+    assert camera.start_count == 0

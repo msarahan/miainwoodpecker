@@ -13,14 +13,17 @@ scanner produces one frame per request (live scanning is a repeated
 multi-signal acquisition are still deferred.
 
 :class:`InstrumentController` is the Phase 3 addition, and holds to the
-same rule. It exposes exactly three controls — stage position, defocus,
-beam blanker — because those are what a parameter sweep
-(``acquisition.sequence.focal_series``) and a safe teardown
+same rule. It exposes four controls — stage position, defocus, beam
+blanker, spectrometer energy offset — because those are what a parameter
+sweep (``acquisition.sequence.focal_series``,
+``acquisition.sequence.energy_offset_series``) and a safe teardown
 (:meth:`InstrumentController.park`) actually need, not because the
-underlying instruments expose only three. A real Nion STEM controller has
+underlying instruments expose only four. A real Nion STEM controller has
 hundreds of named controls (``C10``, ``C12``, ``CAperture``, ``EHT``, …);
 proxying all of them would be a vendor API in vendor-neutral clothing.
-Adding a control here should be driven by a caller that needs it.
+Adding a control here should be driven by a caller that needs it — which
+is how the energy offset arrived, with ``energy_offset_series`` and not
+before it.
 """
 
 from __future__ import annotations
@@ -332,6 +335,7 @@ class Scanner(typing.Protocol):
 STAGE_POSITION_CONTROL = "stage_position"
 DEFOCUS_CONTROL = "defocus"
 BEAM_BLANKER_CONTROL = "beam_blanker"
+ENERGY_OFFSET_CONTROL = "energy_offset"
 
 
 @typing.runtime_checkable
@@ -372,6 +376,14 @@ class InstrumentController(typing.Protocol):
 
     def set_defocus_nm(self, defocus_nm: float) -> None:
         """Set the defocus, in nanometres."""
+        ...
+
+    def energy_offset_ev(self) -> float:
+        """Return the spectrometer's energy offset, in electronvolts."""
+        ...
+
+    def set_energy_offset_ev(self, offset_ev: float) -> None:
+        """Set the spectrometer's energy offset, in electronvolts."""
         ...
 
     def is_beam_blanked(self) -> bool:

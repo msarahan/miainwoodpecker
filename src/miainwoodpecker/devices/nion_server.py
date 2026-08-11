@@ -100,6 +100,7 @@ from nion.utils import Registry as _Registry
 from miainwoodpecker.devices.interface import (
     BEAM_BLANKER_CONTROL,
     DEFOCUS_CONTROL,
+    ENERGY_OFFSET_CONTROL,
     STAGE_POSITION_CONTROL,
     CameraParameters,
     Frame,
@@ -230,6 +231,11 @@ _ORPHAN_GRACE_S = 30.0
 _DEFOCUS_CONTROL_NAME = "C10"
 _BLANKER_CONTROL_NAME = "C_Blank"
 _STAGE_POSITION_CONTROL_NAME = "stage_position_m"
+# The spectrometer's energy offset. Nion's name for it, and already in eV
+# rather than the metres/volts the other controls use - confirmed against
+# usim, whose eels_x_offset calibration control tracks it exactly, so the
+# recorded energy axis follows the offset with no conversion between them.
+_ENERGY_OFFSET_CONTROL_NAME = "ZLPoffset"
 
 _NM_PER_M = 1e9
 # Only a geometry hint for choosing a field of view. Nion's device_kit
@@ -845,6 +851,8 @@ class NionInstrument:
             available.append(DEFOCUS_CONTROL)
         if self._has_control(_BLANKER_CONTROL_NAME):
             available.append(BEAM_BLANKER_CONTROL)
+        if self._has_control(_ENERGY_OFFSET_CONTROL_NAME):
+            available.append(ENERGY_OFFSET_CONTROL)
         return available
 
     def stage_position_nm(self) -> tuple[float, float]:
@@ -883,6 +891,24 @@ class NionInstrument:
         self._controller.set_control_output(
             _DEFOCUS_CONTROL_NAME,
             defocus_nm / _NM_PER_M,
+        )
+
+    def energy_offset_ev(self) -> float:
+        """Return the spectrometer energy offset in eV (the vendor's ``ZLPoffset``)."""
+        return float(self._controller.get_control_output(_ENERGY_OFFSET_CONTROL_NAME))
+
+    def set_energy_offset_ev(self, offset_ev: float) -> None:
+        """
+        Set the spectrometer energy offset, in electronvolts.
+
+        Parameters
+        ----------
+        offset_ev : float
+            Target offset, in electronvolts.
+        """
+        self._controller.set_control_output(
+            _ENERGY_OFFSET_CONTROL_NAME,
+            offset_ev,
         )
 
     def is_beam_blanked(self) -> bool:

@@ -14,6 +14,7 @@ the main application.
 from miainwoodpecker.devices.interface import (
     BEAM_BLANKER_CONTROL,
     DEFOCUS_CONTROL,
+    ENERGY_OFFSET_CONTROL,
     STAGE_POSITION_CONTROL,
     Camera,
     CameraParameters,
@@ -26,6 +27,7 @@ from miainwoodpecker.devices.interface import (
 __all__ = [
     "BEAM_BLANKER_CONTROL",
     "DEFOCUS_CONTROL",
+    "ENERGY_OFFSET_CONTROL",
     "STAGE_POSITION_CONTROL",
     "Camera",
     "CameraParameters",
