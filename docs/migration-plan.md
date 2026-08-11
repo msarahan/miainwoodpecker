@@ -454,7 +454,17 @@ problem — read their source and docs before designing our own adapters:
   A per-append `flush()` was measured to convert that third case entirely
   into the second, so `NexusWriter.flush()` is now public — and its cost
   across the whole codec sweep is **within run-to-run noise**, so bounding
-  worst-case loss to a single frame is essentially free. SWMR would go
+  worst-case loss to a single frame is essentially free.
+  - **Correction, found by the architecture review (§ below): making it
+    public was not the same as using it.** For three phases *nothing in
+    `src/` ever called it* — not `write_frames`, not `sequence.record`,
+    not `Session.record`, not `RecordingJob` — so every real acquisition
+    still had the unbounded worst case this item was written to
+    eliminate, while the plan read as though it had been fixed. Only the
+    benchmark and the tests flushed. `write_frames` now flushes after
+    each frame by default (`flush_every=1`), which is what turns the
+    measurement above into the guarantee it was always described as.
+  SWMR would go
   further but is a genuine architectural conflict rather than an oversight:
   HDF5 forbids creating objects once SWMR is enabled, and `close()` creates
   the NXdata group *after* all appends because it needs the final frame
@@ -1354,6 +1364,30 @@ The invariant now holds mechanically: `nion.*` is imported in
 
 ## 7. Open questions
 
+- **A full-stack architecture review has been done, and what it found is
+  tracked in [`architecture-review.md`](architecture-review.md)** rather
+  than duplicated here. The verdict was that this plan's load-bearing
+  decisions hold mechanically — the license boundary, the layering, the
+  no-Qt-in-workers rule — and that the defects were at the *seams*, where
+  two individually-correct halves met with mismatched assumptions.
+  - **The pattern in §8 held for a third time.** That section already
+    records two of this plan's own claims turning out false when finally
+    checked (`definition = "NXem"` on files that did not validate;
+    §6's never-import-`nion.*` invariant already breached by
+    `storage/legacy.py`). The review added two more of exactly that
+    shape. `fov_nm` was documented as "field of view of the scanned
+    region" without saying *which axis*, and storage had picked the
+    reading Nion does not use — so every non-square scan was written with
+    a slow-axis scale wrong by the aspect ratio, with two of this
+    project's own tests asserting the bug. And the per-frame `flush()`
+    above was made public, described as the fix, and then never called by
+    any shipped code path. Neither would have surfaced from tests,
+    because the tests encoded the same assumption the code did.
+  - **What that suggests for this plan's method**: "measure, don't
+    assume" (§1) has been reliably applied to *new* questions and
+    reliably not applied to claims already written down. Both new
+    findings came from checking a stated claim against the thing it was a
+    claim about — Nion's own calibration source, and a grep for callers.
 - **Bluesky/ophyd**: the [Bluesky](https://blueskyproject.io/) experiment
   orchestration framework (device abstraction via `ophyd`/`ophyd-async`,
   scripted acquisition via a `RunEngine`) is a real, actively developed

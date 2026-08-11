@@ -7,6 +7,7 @@
 
 Home <self>
 Migration plan <migration-plan>
+Architecture review <architecture-review>
 Hardware validation checklist <hardware-validation-checklist>
 Documentation <documentation/index>
 :::
