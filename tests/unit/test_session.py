@@ -30,8 +30,13 @@ from miainwoodpecker.storage.session import (
     RecordingJob,
     RecordingReadError,
     Session,
+    annotate,
     default_root,
     describe,
+    estimate_size,
+    find_recordings,
+    format_bytes,
+    free_space,
     load_recording,
     read_session_context,
 )
@@ -681,3 +686,116 @@ def test_default_root_is_a_dated_directory(tmp_path):
     assert root.parent == tmp_path
     assert root.name == datetime.datetime.now(tz=datetime.UTC).strftime("%Y-%m-%d")
     assert not root.exists()
+
+
+def _note_of(path) -> str:
+    """Read a recording's NXnote description back off disk."""
+    with h5py.File(path, "r") as handle:
+        raw = handle["entry/notes/description"][()]
+    return raw.decode("utf-8") if isinstance(raw, bytes) else str(raw)
+
+
+def test_annotate_appends_without_losing_the_acquisition_note(tmp_path):
+    """A note added afterwards is added, not substituted for the original."""
+    session = Session(tmp_path / "shift", notes="session-wide observation")
+    recording = session.record([make_frame()], label="scan", note="at acquisition")
+
+    returned = annotate(recording.path, "  charged badly, discard  ")
+
+    stored = _note_of(recording.path)
+    assert stored == returned
+    # Both original scopes survive, and the addition is labelled as one.
+    assert "session: session-wide observation" in stored
+    assert "recording: at acquisition" in stored
+    assert "charged badly, discard" in stored
+    assert stored.index("recording: at acquisition") < stored.index("charged badly")
+    # Whitespace is trimmed, and the label carries when it was added.
+    assert "added " in stored
+    assert "  charged" not in stored
+
+
+def test_annotate_accumulates_across_several_additions(tmp_path):
+    """Annotating twice keeps both, in the order they were added."""
+    session = Session(tmp_path / "shift")
+    recording = session.record([make_frame()], label="scan")
+
+    annotate(recording.path, "first thought")
+    annotate(recording.path, "second thought")
+
+    stored = _note_of(recording.path)
+    assert stored.index("first thought") < stored.index("second thought")
+
+
+def test_annotate_works_on_a_recording_that_had_no_note(tmp_path):
+    """A recording written with no notes at all gains an NXnote group."""
+    session = Session(tmp_path / "shift")
+    recording = session.record([make_frame()], label="scan")
+    with h5py.File(recording.path, "r") as handle:
+        assert "entry/notes" not in handle
+
+    annotate(recording.path, "added later")
+
+    with h5py.File(recording.path, "r") as handle:
+        assert handle["entry/notes"].attrs["NX_class"] == "NXnote"
+    assert "added later" in _note_of(recording.path)
+
+
+def test_annotate_refuses_blank_text_and_unreadable_files(tmp_path):
+    """The two ways to fail both say why rather than writing something useless."""
+    session = Session(tmp_path / "shift")
+    recording = session.record([make_frame()], label="scan")
+
+    with pytest.raises(RecordingReadError, match="empty note"):
+        annotate(recording.path, "   ")
+
+    broken = tmp_path / "not-hdf5.nxs"
+    broken.write_bytes(b"not an HDF5 file at all")
+    with pytest.raises(RecordingReadError, match="cannot annotate"):
+        annotate(broken, "anything")
+
+
+def test_find_recordings_spans_sessions_newest_first(tmp_path):
+    """Cross-session enumeration answers "where is that scan from Tuesday"."""
+    base = tmp_path / "data"
+    monday = Session(base / "2026-08-10")
+    tuesday = Session(base / "2026-08-11")
+    monday.record([make_frame()], label="monday-scan")
+    tuesday.record([make_frame()], label="tuesday-scan")
+    # A loose recording directly in the base, not inside a session directory.
+    loose = Session(base)
+    loose.record([make_frame()], label="loose-scan")
+
+    found = find_recordings(base)
+
+    labels = [recording.label for recording in found]
+    assert sorted(labels) == ["loose-scan", "monday-scan", "tuesday-scan"]
+    # Newest first, so "what did I just take" is at the top.
+    stamps = [recording.started_at for recording in found]
+    assert stamps == sorted(stamps, reverse=True)
+
+
+def test_find_recordings_is_empty_rather_than_raising_for_a_missing_base(tmp_path):
+    """An operator who has recorded nothing yet gets a list, not an error."""
+    assert find_recordings(tmp_path / "never-created") == []
+
+
+def test_estimate_size_is_an_uncompressed_upper_bound():
+    """The estimate errs high, which is the useful direction for a warning."""
+    frames = 10
+    shape = (256, 256)
+    assert estimate_size(shape, frames) == 256 * 256 * frames * 4
+    assert estimate_size(shape, frames, dtype=np.float64) == 256 * 256 * frames * 8
+
+
+def test_free_space_answers_for_a_directory_not_yet_created(tmp_path):
+    """A session directory chosen but not created still reports its filesystem."""
+    assert free_space(tmp_path) > 0
+    assert free_space(tmp_path / "does" / "not" / "exist") > 0
+
+
+def test_format_bytes_uses_the_units_operators_compare_against():
+    """Decimal units, matching what df -h and the file manager report."""
+    assert format_bytes(0) == "0 B"
+    assert format_bytes(512) == "512 B"
+    assert format_bytes(29_100_000) == "29.1 MB"
+    assert format_bytes(2_500_000_000) == "2.5 GB"

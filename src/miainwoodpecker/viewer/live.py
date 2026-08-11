@@ -65,7 +65,12 @@ from miainwoodpecker.storage.session import (
     RecordingJob,
     RecordingReadError,
     Session,
+    annotate,
     describe,
+    estimate_size,
+    find_recordings,
+    format_bytes,
+    free_space,
 )
 from miainwoodpecker.viewer.jobs import AnalysisJob
 
@@ -294,6 +299,10 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         self._recording_combo = QtWidgets.QComboBox(group)
         self._recording_combo.setPlaceholderText("no recordings in this session")
         form.addRow("File", self._recording_combo)
+        self._all_sessions_check = QtWidgets.QCheckBox(
+            "List every session in the parent directory", group
+        )
+        form.addRow(self._all_sessions_check)
         self._open_recording_button = QtWidgets.QPushButton("Open selected", group)
         form.addRow(self._open_recording_button)
         self._open_file_button = QtWidgets.QPushButton("Open from disk...", group)
@@ -305,9 +314,17 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         self._load_status = QtWidgets.QLabel("nothing opened yet", group)
         self._load_status.setWordWrap(True)
         form.addRow("Opened", self._load_status)
+        self._annotation_edit = QtWidgets.QLineEdit(group)
+        self._annotation_edit.setPlaceholderText("note to add to the opened recording")
+        form.addRow("Add note", self._annotation_edit)
+        self._annotate_button = QtWidgets.QPushButton("Annotate opened", group)
+        form.addRow(self._annotate_button)
 
         self._open_recording_button.clicked.connect(self.open_selected_recording)
         self._open_file_button.clicked.connect(self.choose_and_open_recording)
+        self._all_sessions_check.toggled.connect(self._refresh_session_labels)
+        self._annotate_button.clicked.connect(self.annotate_opened_recording)
+        self._annotation_edit.returnPressed.connect(self.annotate_opened_recording)
         return group
 
     def _build_session_group(self) -> QtWidgets.QGroupBox:
@@ -322,6 +339,9 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         )
         session_form.addRow(self._change_session_button)
         self._build_session_context_rows(session_group, session_form)
+        self._space_label = QtWidgets.QLabel("", session_group)
+        self._space_label.setWordWrap(True)
+        session_form.addRow("Disk", self._space_label)
         self._recorded_label = QtWidgets.QLabel("nothing recorded yet", session_group)
         self._recorded_label.setWordWrap(True)
         session_form.addRow("Recorded", self._recorded_label)
@@ -674,7 +694,18 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
             return
         self._session_path_label.setText(str(self._session.root))
         recordings = self._session.recordings()
-        self._refresh_recording_choices(recordings)
+        # The combo can show either scope; the labels below always describe
+        # this session, because that is where the next recording goes.
+        if self._all_sessions_check.isChecked():
+            # find_recordings answers newest-first; the combo wants
+            # acquisition order, because it preselects the last entry.
+            self._refresh_recording_choices(
+                list(reversed(find_recordings(self._session.root.parent))),
+                qualified=True,
+            )
+        else:
+            self._refresh_recording_choices(recordings)
+        self._refresh_space_label()
         if not recordings:
             self._recorded_label.setText("nothing recorded yet")
             return
@@ -684,7 +715,9 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
             f"({latest.frame_count} frames)"
         )
 
-    def _refresh_recording_choices(self, recordings: Sequence[Recording]) -> None:
+    def _refresh_recording_choices(
+        self, recordings: Sequence[Recording], *, qualified: bool = False
+    ) -> None:
         """
         Repopulate the Recordings combo, keeping the operator's choice if it survives.
 
@@ -702,19 +735,73 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         Parameters
         ----------
         recordings : Sequence[Recording]
-            The session's recordings, in acquisition order.
+            The recordings to offer, in acquisition order.
+        qualified : bool
+            Whether to prefix each entry with its session directory. True
+            when listing across sessions, where the filename alone is
+            ambiguous: per-session numbering restarts at ``0001``, so two
+            sessions each hold a ``0001-scan-haadf-...`` and only the
+            directory tells them apart.
         """
         previous = self._recording_combo.currentData()
         self._recording_combo.clear()
         for recording in recordings:
+            name = (
+                f"{recording.path.parent.name}/{recording.path.name}"
+                if qualified
+                else recording.path.name
+            )
             self._recording_combo.addItem(
-                f"{recording.path.name} - {_condition(recording)}",
+                f"{name} - {_condition(recording)}",
                 str(recording.path),
             )
         restored = -1 if previous is None else self._recording_combo.findData(previous)
         if restored < 0:
             restored = self._recording_combo.count() - 1
         self._recording_combo.setCurrentIndex(restored)
+
+    def annotate_opened_recording(self) -> None:
+        """
+        Add a note to the recording currently open (the button handler).
+
+        Deliberately acts on the *opened* recording rather than the combo
+        selection: an operator annotates what they are looking at, and
+        making the target the thing on screen removes the way to annotate
+        the wrong file by leaving the combo on something else.
+
+        The field is cleared only on success, so a note refused for being
+        blank, or lost to an unwritable file, is still on screen to retry
+        or copy out.
+        """
+        if self._opened_file is None:
+            self._load_status.setText("open a recording before annotating it")
+            return
+        try:
+            annotate(self._opened_file, self._annotation_edit.text())
+        except RecordingReadError as exc:
+            self._load_status.setText(str(exc))
+            return
+        self._annotation_edit.clear()
+        self._load_status.setText(f"note added to {self._opened_file.name}")
+
+    def _refresh_space_label(self) -> None:
+        """Report free space where recordings are being written."""
+        if self._session is None:
+            self._space_label.setText("")
+            return
+        free = free_space(self._session.root)
+        frames = self._scan_count_spin.value()
+        planned = estimate_size(self._scan_request[0].shape, frames)
+        text = f"{format_bytes(free)} free"
+        if free and planned > free:
+            # An upper bound compared against the real number: erring high
+            # here means warning slightly early, which is the right way to
+            # be wrong about running out of disk mid-acquisition.
+            text += (
+                f" - warning: {frames} scan frames need up to "
+                f"{format_bytes(planned)}"
+            )
+        self._space_label.setText(text)
 
     def save_scan_frame(self) -> None:
         """Save the scan frame currently on screen into the session."""

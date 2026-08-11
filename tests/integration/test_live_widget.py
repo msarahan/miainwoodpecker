@@ -144,6 +144,15 @@ def _finish_analysis(widget: LiveInstrumentWidget) -> None:
     assert _wait_until(done)
 
 
+def _a_frame() -> Frame:
+    """Return one small constant frame, for tests that just need a recording."""
+    return Frame(
+        data=np.ones((8, 8), dtype=np.float32),
+        timestamp=datetime.datetime.now(tz=datetime.UTC),
+        metadata={},
+    )
+
+
 def _abandon_a_writer(path, frame_count: int = 3) -> None:
     """
     Leave the file an abandoned-but-cleanly-exited writer leaves.
@@ -835,6 +844,113 @@ def test_analysis_burst_is_kept_in_the_session_when_one_is_attached(tmp_path):
         assert recording.label == "hyperspy-burst"
         assert recording.frame_count == burst_frames
         assert read_session_context(recording.path)["operator"] == "M. Sarahan"
+    finally:
+        widget.shutdown()
+        viewer.close()
+
+
+def test_annotating_the_opened_recording_writes_into_its_note(tmp_path):
+    """The button annotates what is on screen, and clears the field on success."""
+    viewer = napari.Viewer(show=False)
+    widget = LiveInstrumentWidget(viewer, _FakeScanner(), camera=_FakeCamera())
+    try:
+        session = Session(tmp_path / "shift")
+        widget.set_session(session)
+        recording = session.record([_a_frame()], label="scan", note="at acquisition")
+        widget.open_recording(recording.path)
+        _finish_load(widget)
+
+        widget._annotation_edit.setText("drifted badly")  # noqa: SLF001
+        widget.annotate_opened_recording()
+
+        assert widget._annotation_edit.text() == ""  # noqa: SLF001
+        assert "note added" in widget._load_status.text()  # noqa: SLF001
+        with h5py.File(recording.path, "r") as handle:
+            stored = handle["entry/notes/description"][()]
+        text = stored.decode("utf-8") if isinstance(stored, bytes) else str(stored)
+        assert "recording: at acquisition" in text
+        assert "drifted badly" in text
+    finally:
+        widget.shutdown()
+        viewer.close()
+
+
+def test_annotating_with_nothing_open_says_so_and_keeps_the_text(tmp_path):
+    """A note typed with no recording open is not silently dropped."""
+    viewer = napari.Viewer(show=False)
+    widget = LiveInstrumentWidget(viewer, _FakeScanner(), camera=_FakeCamera())
+    try:
+        widget.set_session(Session(tmp_path / "shift"))
+        widget._annotation_edit.setText("worth keeping")  # noqa: SLF001
+
+        widget.annotate_opened_recording()
+
+        assert "open a recording" in widget._load_status.text()  # noqa: SLF001
+        assert widget._annotation_edit.text() == "worth keeping"  # noqa: SLF001
+    finally:
+        widget.shutdown()
+        viewer.close()
+
+
+def test_listing_every_session_spans_directories_and_disambiguates_names(tmp_path):
+    """The all-sessions checkbox reaches other sessions, qualified by directory."""
+    viewer = napari.Viewer(show=False)
+    widget = LiveInstrumentWidget(viewer, _FakeScanner(), camera=_FakeCamera())
+    try:
+        base = tmp_path / "data"
+        Session(base / "monday").record([_a_frame()], label="scan")
+        tuesday = Session(base / "tuesday")
+        tuesday.record([_a_frame()], label="scan")
+        widget.set_session(tuesday)
+
+        # This session only: one entry, and per-session numbering means the
+        # name alone would not distinguish it from Monday's.
+        assert widget._recording_combo.count() == 1  # noqa: SLF001
+
+        widget._all_sessions_check.setChecked(True)  # noqa: SLF001
+
+        combo = widget._recording_combo  # noqa: SLF001
+        both = 2
+        assert combo.count() == both
+        shown = [combo.itemText(index) for index in range(combo.count())]
+        assert any(text.startswith("monday/") for text in shown)
+        assert any(text.startswith("tuesday/") for text in shown)
+    finally:
+        widget.shutdown()
+        viewer.close()
+
+
+def test_disk_label_reports_free_space_and_warns_when_a_plan_will_not_fit(
+    tmp_path, monkeypatch
+):
+    """
+    Free space is reported, and an oversized plan is flagged before it runs.
+
+    Free space is stubbed rather than measured: whether the warning fires
+    is the behaviour under test, and against a real filesystem that would
+    depend on how much spare disk the machine running the tests happens to
+    have — which is how a CI runner and a laptop end up disagreeing.
+    """
+    viewer = napari.Viewer(show=False)
+    widget = LiveInstrumentWidget(viewer, _FakeScanner(), camera=_FakeCamera())
+    try:
+        roomy = 10**15
+        monkeypatch.setattr(
+            "miainwoodpecker.viewer.live.free_space", lambda _path: roomy
+        )
+        widget.set_session(Session(tmp_path / "shift"))
+
+        assert "free" in widget._space_label.text()  # noqa: SLF001
+        assert "warning" not in widget._space_label.text()  # noqa: SLF001
+
+        cramped = 1000
+        monkeypatch.setattr(
+            "miainwoodpecker.viewer.live.free_space", lambda _path: cramped
+        )
+        widget._refresh_session_labels()  # noqa: SLF001
+
+        assert "warning" in widget._space_label.text()  # noqa: SLF001
+        assert "scan frames need up to" in widget._space_label.text()  # noqa: SLF001
     finally:
         widget.shutdown()
         viewer.close()

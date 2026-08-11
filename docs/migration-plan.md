@@ -935,19 +935,44 @@ problem — read their source and docs before designing our own adapters:
     in flight blocks the switch rather than being silently redirected.
   - ~~**Nothing reads a session back**~~ — **done** (§5 Phase 3): recordings
     open from the session or an arbitrary path, and the analysis buttons run
-    against a file on disk. Two smaller gaps remain in its place: a recording
-    cannot be annotated *after* the fact, and there is no cross-session
-    enumeration, so "find that scan from last Tuesday" is still a file
-    browser's job.
-  - **Disk-space and long-run behaviour is unexamined.** A pilot day of
-    2048×2048 float32 frames is tens of GB; nothing warns, estimates, or
-    reports free space. Note the compression work (§5 Phase 3) improved the
-    per-file arithmetic — a 1024² scan recording is 29.1 MB rather than
-    32.1 MB, or 13.8 MB stored as float32 — but nothing *tracks* the total.
+    against a file on disk. Both gaps this left behind are now closed too:
+    - ~~*A recording cannot be annotated after the fact*~~ — `annotate()`
+      appends into the file's real `NXnote`, so an after-the-fact note lands
+      in the same place as one written at acquisition time and nothing
+      downstream needs to know the difference. Appended and labelled with
+      when it was added, never overwriting the acquisition note, for the
+      same reason the session and recording scopes are labelled: a reader
+      has to be able to tell an observation made during the shift from one
+      added a week later. The button acts on the *opened* recording rather
+      than the combo selection, which removes the way to annotate the wrong
+      file by leaving the combo elsewhere.
+    - ~~*No cross-session enumeration*~~ — `find_recordings()` walks the
+      session directories under a base and the Recordings combo can list
+      that scope instead of just this session, so "find that scan from last
+      Tuesday" no longer means leaving the app. Entries are then qualified
+      by directory, because per-session numbering restarts at `0001` and the
+      filename alone is ambiguous across sessions. Deliberately a directory
+      walk and not an index: the filesystem is already the index, and a
+      catalogue would be a second source of truth to keep in sync with a
+      directory an operator also moves and renames files in by hand.
+  - ~~**Disk-space and long-run behaviour is unexamined**~~ — **done** for
+    the reporting half. `free_space()` and `estimate_size()` back a Disk row
+    in the Session group that shows what is free and warns when the planned
+    frame count would not fit. The estimate is the *uncompressed* size on
+    purpose: erring high means warning slightly early, which is the right
+    direction to be wrong about running out of disk mid-acquisition, and the
+    real ratio depends on data that does not exist yet. What is still not
+    done is tracking cumulative usage across a shift, or doing anything
+    about it beyond saying so.
   - **A large file is read twice on the analyze-from-disk path** — once by
     the load job for display, once by the adapter — because the adapters take
     a path rather than an array. Harmless at pilot scale, wasteful at
-    2048×2048.
+    2048×2048. **Still open, and deliberately**: fixing it means changing
+    what `load_as_hyperspy_signal`, `load_as_libertem_dataset`, and
+    `load_as_diffraction_slice` accept, which is a Phase 4 adapter API
+    change rather than the Phase 5 wiring the rest of this list is. Each has
+    an in-memory constructor to target (`Signal2D`, `MemoryDataSet`,
+    `DiffractionSlice`), so the shape is known; it is scoped, not blocked.
   - ~~**The analysis buttons still block the GUI thread**~~ — **done**. All
     three now hand off to
     [`AnalysisJob`](../src/miainwoodpecker/viewer/jobs.py), which has
