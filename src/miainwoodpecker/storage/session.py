@@ -235,6 +235,8 @@ class Session:
             raise NotADirectoryError(msg)
         self._root.mkdir(parents=True, exist_ok=True)
         self._context: dict[str, str] = dict.fromkeys(_CONTEXT_FIELDS, "")
+        # path -> ((mtime, size), description); see recordings().
+        self._recording_cache: dict[Path, tuple[tuple[float, int], Recording]] = {}
         self._created = _now()
         self._load_sidecar()
         self.update_context(operator=operator, sample=sample, notes=notes)
@@ -406,16 +408,42 @@ class Session:
         is the index, so there is nothing to keep in sync. Files whose
         names this session did not mint are ignored.
 
+        Descriptions are cached per file and invalidated by ``(mtime,
+        size)``, because describing one means *opening* it as HDF5, and
+        the viewer calls this on the GUI thread after every recording and
+        every analysis run. Without the cache a shift's worth of
+        recordings costs that many HDF5 opens per refresh — a freeze that
+        grows through the day, and worst on the network-mounted session
+        directory a real instrument is likeliest to use. The cache is
+        keyed on the stat rather than merely on the path so an
+        in-progress recording, whose file grows between refreshes, is
+        still re-read.
+
         Returns
         -------
         list[Recording]
             One entry per recording, sorted by sequence number.
         """
-        found = [
-            described
-            for candidate in self._root.glob(f"*{_SUFFIX}")
-            if (described := _describe(candidate)) is not None
-        ]
+        found = []
+        fresh: dict[Path, tuple[tuple[float, int], Recording]] = {}
+        for candidate in self._root.glob(f"*{_SUFFIX}"):
+            if _NAME_PATTERN.match(candidate.name) is None:
+                continue
+            try:
+                status = candidate.stat()
+                stamp = (status.st_mtime, status.st_size)
+            except OSError:
+                # Vanished between the glob and the stat; nothing to list.
+                continue
+            cached = self._recording_cache.get(candidate)
+            if cached is not None and cached[0] == stamp:
+                described = cached[1]
+            else:
+                described = _describe_path(candidate)
+            fresh[candidate] = (stamp, described)
+            found.append(described)
+        # Rebuilt rather than updated, so deleted files do not accumulate.
+        self._recording_cache = fresh
         return sorted(found, key=lambda recording: recording.index)
 
     def _next_index(self) -> int:

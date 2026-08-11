@@ -219,6 +219,11 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         self._camera = camera
         self._scan_loop: LiveAcquisition | None = None
         self._camera_loop: LiveAcquisition | None = None
+        # Newest frame already pushed into each napari layer, so a display
+        # tick that finds nothing new can skip the upload entirely. Holds
+        # a reference for identity comparison only; the array itself is
+        # the layer's, not a second copy.
+        self._displayed: dict[str, Frame] = {}
         self._session: Session | None = None
         self._recording_job: RecordingJob | None = None
         self._load_job: LoadJob | None = None
@@ -1286,9 +1291,25 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
     ) -> None:
         if loop.error is not None:
             status_label.setText(f"error: {loop.error}")
+            # A failed grab stops the worker but sets no stop event, so
+            # without this the timer would run forever, reformatting the
+            # same exception 30 times a second at full display cost.
+            self._maybe_stop_timer()
             return
         frame = loop.latest()
         if frame is None:
+            return
+        if frame is self._displayed.get(layer_name) and layer_name in (
+            self._viewer.layers
+        ):
+            # Nothing new since the last tick. The display timer is fixed
+            # at 33 ms while acquisition runs at whatever the device
+            # manages, so most ticks see the frame they already drew:
+            # assigning layer.data schedules a GPU re-upload and the
+            # autocontrast pass walks the whole array twice, both for
+            # pixels that did not change. Identity is the right test -
+            # the loop hands out the same object until it grabs another.
+            self._refresh_rate_label(loop, status_label)
             return
         if layer_name in self._viewer.layers:
             layer = self._viewer.layers[layer_name]
@@ -1300,8 +1321,26 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
                     layer.contrast_limits = (low, high)
         else:
             self._viewer.add_image(frame.data, name=layer_name, colormap="gray")
-        if loop.is_running:
-            status_label.setText(f"running - {loop.stats.fps:.1f} fps")
+        self._displayed[layer_name] = frame
+        self._refresh_rate_label(loop, status_label)
+
+    def _refresh_rate_label(
+        self,
+        loop: LiveAcquisition,
+        status_label: QtWidgets.QLabel,
+    ) -> None:
+        """
+        Show the acquisition rate, rewriting the label only when it changes.
+
+        ``setText`` with identical text still costs a Qt repaint, and this
+        runs for every source on every tick; the rate only moves in the
+        first decimal a few times a second.
+        """
+        if not loop.is_running:
+            return
+        text = f"running - {loop.stats.fps:.1f} fps"
+        if status_label.text() != text:
+            status_label.setText(text)
 
     def shutdown(self) -> None:
         """Stop all loops, the camera, the display timer, and any recording."""
