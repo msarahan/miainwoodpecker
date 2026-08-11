@@ -367,6 +367,17 @@ class _RemoteDevice:
         self._connection = connection
         self._target = target
         self._lock = threading.Lock()
+        # Serializes a frame call *and* its shared-memory copy-out as one
+        # unit. self._lock alone is not enough: send_call releases it as
+        # soon as the reply is in hand, so a second thread could send the
+        # next scan_frame while this one is still copying out of the
+        # segment the server is about to overwrite. The reused-segment
+        # design is safe only while exactly one request/response is in
+        # flight per target (shared_frame.py's module docstring), and
+        # "the caller promises to use one thread" is not something this
+        # class can check. Always acquired *before* self._lock, never the
+        # reverse, so the two cannot deadlock.
+        self._frame_lock = threading.Lock()
         self._reader = SharedFrameReader()
         self._process = process
 
@@ -411,11 +422,18 @@ class _RemoteDevice:
             ) from error
 
     def _frame(self, method: str, *args: object) -> Frame:
-        """Make a call that returns a frame, following a shared-memory reference."""
-        result = self._call(method, *args)
-        if isinstance(result, SharedFrameRef):
-            return self._reader.read(result)
-        return typing.cast("Frame", result)
+        """
+        Make a call that returns a frame, following a shared-memory reference.
+
+        The call and the copy-out are one critical section: see
+        ``self._frame_lock``'s comment for why splitting them silently
+        corrupts frames when two threads drive one device.
+        """
+        with self._frame_lock:
+            result = self._call(method, *args)
+            if isinstance(result, SharedFrameRef):
+                return self._reader.read(result)
+            return typing.cast("Frame", result)
 
     def detach(self) -> None:
         """

@@ -246,12 +246,19 @@ def test_the_uncalibrated_fallback_still_reads_back_as_uncalibrated(tmp_path):
 
 
 def test_reading_a_scan_recordings_calibration_recovers_nanometres(tmp_path):
-    """The pre-existing fov_nm path reads back as a real-space calibration."""
+    """
+    The fov_nm path reads back as a real-space calibration with square pixels.
+
+    A non-square scan is the case that distinguishes the conventions:
+    fov_nm spans the longer axis, so both scales are 20/8, not 20/4 and
+    20/8. This test asserted the latter before the convention was pinned
+    against Nion's own scan calibration code.
+    """
     path = tmp_path / "scan.nxs"
     write_frames(path, [_frame(0, shape=(4, 8), fov_nm=20.0)])
     recovered = read_calibration(path)
     assert recovered.y.kind is AxisKind.REAL_SPACE
-    assert recovered.y.scale == pytest.approx(5.0)
+    assert recovered.y.scale == pytest.approx(2.5)
     assert recovered.x.scale == pytest.approx(2.5)
 
 

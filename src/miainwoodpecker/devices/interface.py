@@ -79,7 +79,18 @@ class ScanParameters:
     pixel_time_us : float
         Dwell time per pixel, in microseconds.
     fov_nm : float
-        Field of view of the scanned region, in nanometers.
+        Field of view of the scanned region, in nanometres, spanning the
+        **longer** axis. Pixels are square, so on a non-square scan the
+        shorter axis covers proportionally less than ``fov_nm``; use
+        :attr:`fov_size_nm` rather than assuming both axes span it.
+
+        This is not a free choice: it is the convention Nion's own scan
+        layer implements, and a vendor-neutral type that disagreed with
+        the only adapter behind it would be neutral in name only.
+        ``nion.instrumentation.scan_base.get_scan_calibrations`` computes
+        ``pixel_size_nm = fov_nm / max(scan_shape)`` and applies it to
+        both axes, and ``ScanFrameParameters.fov_size_nm`` derives the
+        second axis from the pixel aspect ratio.
     """
 
     height: int
@@ -91,6 +102,25 @@ class ScanParameters:
     def shape(self) -> tuple[int, int]:
         """Return the numpy-style (rows, columns) shape of a scanned frame."""
         return (self.height, self.width)
+
+    @property
+    def pixel_size_nm(self) -> float:
+        """Return the size of one square scan pixel, in nanometres."""
+        return self.fov_nm / max(self.height, self.width)
+
+    @property
+    def fov_size_nm(self) -> tuple[float, float]:
+        """
+        Return the scanned extent as ``(y_nm, x_nm)``, in nanometres.
+
+        The per-axis form of :attr:`fov_nm`, in the same ``(y, x)`` order
+        as :attr:`shape`. Storage and analysis want this rather than the
+        scalar: deriving per-axis extents by dividing ``fov_nm`` by each
+        dimension independently silently produces non-square pixels and
+        writes a wrong scale on the shorter axis of every non-square scan.
+        """
+        pixel_nm = self.pixel_size_nm
+        return (self.height * pixel_nm, self.width * pixel_nm)
 
 
 @typing.runtime_checkable

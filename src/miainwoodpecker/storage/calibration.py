@@ -128,6 +128,17 @@ is the same route for the kinds ``fov_nm`` cannot express. See
 :func:`resolve_frame_calibration` for the accepted shape.
 """
 
+FIELD_SIZE_KEY = "fov_size_nm"
+"""
+Frame-metadata key carrying a scan's extent as ``(y_nm, x_nm)``.
+
+Preferred over the scalar ``fov_nm`` because it states the extent of each
+axis rather than leaving storage to re-derive it from a convention. See
+:meth:`FrameCalibration.from_field_size`, and
+:attr:`~miainwoodpecker.devices.interface.ScanParameters.fov_size_nm`,
+which is what a scanner puts here.
+"""
+
 AXIS_NAMES = ("y", "x")
 """
 The frame's two axis names, slow first, matching the on-disk datasets.
@@ -597,21 +608,31 @@ class FrameCalibration:
         """
         Return the real-space calibration a scan's field of view implies.
 
-        The pre-existing scan path, expressed in the new model: a frame
-        spanning ``fov_nm`` across each axis, sampled at pixel edges, so a
-        non-square scan gets a different scale per axis.
+        ``fov_nm`` spans the **longer** axis and pixels are square, so the
+        scale is ``fov_nm / max(height, width)`` on *both* axes — the
+        convention :class:`~miainwoodpecker.devices.interface.ScanParameters`
+        documents and Nion's scan layer implements
+        (``get_scan_calibrations`` computes exactly this).
+
+        This used to divide ``fov_nm`` by each dimension independently,
+        which is right only for square scans and silently wrong for every
+        other: a 4x10 scan at 20 nm got a 5 nm/px slow axis against a
+        2 nm/px fast one, describing a frame the instrument never
+        acquired. Square scans are unaffected, which is why nothing
+        failed. Prefer :meth:`from_field_size` when the device reports its
+        extent per axis; this remains for the scalar ``fov_nm`` path.
 
         Parameters
         ----------
         fov_nm : float
-            Field of view in nanometres, spanning the whole frame.
+            Field of view in nanometres, spanning the frame's longer axis.
         shape : tuple[int, int]
             The frame's ``(height, width)``.
 
         Returns
         -------
         FrameCalibration
-            Both axes real space in nanometres, offset zero.
+            Both axes real space in nanometres, offset zero, same scale.
 
         Raises
         ------
@@ -625,9 +646,57 @@ class FrameCalibration:
                 f"got fov_nm={fov_nm!r} shape={shape!r}"
             )
             raise ValueError(msg)
+        pixel_nm = fov_nm / max(height, width)
         return cls(
-            y=AxisCalibration(AxisKind.REAL_SPACE, fov_nm / height, units="nm"),
-            x=AxisCalibration(AxisKind.REAL_SPACE, fov_nm / width, units="nm"),
+            y=AxisCalibration(AxisKind.REAL_SPACE, pixel_nm, units="nm"),
+            x=AxisCalibration(AxisKind.REAL_SPACE, pixel_nm, units="nm"),
+        )
+
+    @classmethod
+    def from_field_size(
+        cls,
+        fov_size_nm: tuple[float, float],
+        shape: tuple[int, int],
+    ) -> FrameCalibration:
+        """
+        Return the real-space calibration an explicit per-axis extent implies.
+
+        The preferred scan path: the device states what it actually
+        scanned, per axis, and storage divides rather than re-deriving a
+        convention from a scalar. That removes the class of bug
+        :meth:`from_field_of_view`'s docstring describes — storage cannot
+        disagree with the device about which axis a single number spanned
+        if the device sends both.
+
+        Parameters
+        ----------
+        fov_size_nm : tuple[float, float]
+            The scanned extent as ``(y_nm, x_nm)``, in nanometres, in the
+            same axis order as ``shape``.
+        shape : tuple[int, int]
+            The frame's ``(height, width)``.
+
+        Returns
+        -------
+        FrameCalibration
+            Both axes real space in nanometres, offset zero.
+
+        Raises
+        ------
+        ValueError
+            If either extent or either dimension is not positive.
+        """
+        y_nm, x_nm = fov_size_nm
+        height, width = shape
+        if y_nm <= 0 or x_nm <= 0 or height <= 0 or width <= 0:
+            msg = (
+                f"a field size calibration needs a positive extent and shape, "
+                f"got fov_size_nm={fov_size_nm!r} shape={shape!r}"
+            )
+            raise ValueError(msg)
+        return cls(
+            y=AxisCalibration(AxisKind.REAL_SPACE, y_nm / height, units="nm"),
+            x=AxisCalibration(AxisKind.REAL_SPACE, x_nm / width, units="nm"),
         )
 
     @classmethod
@@ -920,8 +989,18 @@ def resolve_frame_calibration(
         return FrameCalibration.uncalibrated()
     if METADATA_KEY in metadata:
         return _from_metadata_mapping(metadata[METADATA_KEY], shape)
-    fov_nm = metadata.get("fov_nm")
     height, width = shape
+    fov_size_nm = metadata.get(FIELD_SIZE_KEY)
+    if (
+        isinstance(fov_size_nm, (tuple, list))
+        and len(fov_size_nm) == len(AXIS_NAMES)
+        and all(isinstance(extent, (int, float)) and extent > 0 for extent in fov_size_nm)
+        and height
+        and width
+    ):
+        y_nm, x_nm = fov_size_nm
+        return FrameCalibration.from_field_size((float(y_nm), float(x_nm)), shape)
+    fov_nm = metadata.get("fov_nm")
     if isinstance(fov_nm, (int, float)) and fov_nm > 0 and height and width:
         return FrameCalibration.from_field_of_view(float(fov_nm), shape)
     return FrameCalibration.uncalibrated()

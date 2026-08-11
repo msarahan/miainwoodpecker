@@ -83,13 +83,48 @@ class LiveAcquisition:
         )
         self._thread.start()
 
-    def stop(self, timeout: float = 5.0) -> None:
-        """Signal the loop to stop and join the worker thread."""
+    def stop(self, timeout: float = 5.0) -> bool:
+        """
+        Signal the loop to stop and join the worker thread.
+
+        Returns whether the worker actually finished, and callers that are
+        about to touch the device themselves **must** check it. A grab
+        already in flight cannot be interrupted — it is blocked inside the
+        device call — so a long exposure or a slow scan can outlast
+        ``timeout``. Reporting success anyway (which this used to do, by
+        discarding ``join``'s outcome and clearing the thread handle
+        unconditionally) told callers the device was free while the worker
+        was still driving it. That is not mere contention: the client's
+        shared-memory copy-out and the server's next publish would then
+        overlap on one reused segment, producing a frame that is half scan
+        N and half scan N+1 with no exception raised anywhere
+        (docs/architecture-review.md, §1.2).
+
+        On failure the thread handle is deliberately kept, so
+        :attr:`is_running` keeps reporting the truth and a later
+        :meth:`stop` can join the same worker again.
+
+        Parameters
+        ----------
+        timeout : float
+            Seconds to wait for the worker to finish.
+
+        Returns
+        -------
+        bool
+            True if the worker thread finished (or was never started).
+            False if it is still running, in which case the device is
+            still in use.
+        """
         self._stop_event.set()
         thread = self._thread
-        if thread is not None:
-            thread.join(timeout)
+        if thread is None:
+            return True
+        thread.join(timeout)
+        if thread.is_alive():
+            return False
         self._thread = None
+        return True
 
     @property
     def is_running(self) -> bool:

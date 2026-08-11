@@ -311,6 +311,11 @@ class NionScanner:
                 "channel_index": channel,
                 "channel_name": self._device.get_channel_name(channel),
                 "fov_nm": parameters.fov_nm,
+                # The per-axis extent alongside the scalar, so storage
+                # divides what the scan actually covered rather than
+                # re-deriving it from a convention it could disagree with.
+                # Square pixels mean these differ on a non-square scan.
+                "fov_size_nm": parameters.fov_size_nm,
                 "pixel_time_us": parameters.pixel_time_us,
             },
         )

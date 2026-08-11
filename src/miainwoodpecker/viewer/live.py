@@ -85,6 +85,11 @@ _ANALYSIS_BURST_FRAME_COUNT = 5
 _DEFAULT_RECORD_FRAME_COUNT = 10
 _MAX_RECORD_FRAME_COUNT = 100000
 _NO_SESSION_MESSAGE = "no session - data is not being kept"
+# Shown when a live loop would not release the device in time. Refusing is
+# deliberate: driving a device from two threads corrupts frames silently
+# rather than raising (docs/architecture-review.md, §1.2).
+_SCANNER_BUSY_MESSAGE = "scanner still busy - live scan did not stop, try again"
+_CAMERA_BUSY_MESSAGE = "camera still busy - live loop did not stop, try again"
 _NOTES_HEIGHT_PX = 64
 # Long enough that typing a sentence writes the sidecar once, short enough
 # that an operator who types and immediately clicks Record has their note.
@@ -510,13 +515,27 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         self._scan_status.setText("running")
         self._timer.start()
 
-    def stop_scan(self) -> None:
-        """Stop the live scan loop."""
+    def stop_scan(self) -> bool:
+        """
+        Stop the live scan loop.
+
+        Returns
+        -------
+        bool
+            True if the worker actually finished. False means a grab is
+            still in flight and the scanner is still in use — callers
+            about to drive the scanner themselves must not proceed.
+        """
+        stopped = True
         if self._scan_loop is not None:
-            self._scan_loop.stop()
-        self._scan_button.setText("Start scan")
-        self._scan_status.setText("stopped")
-        self._maybe_stop_timer()
+            stopped = self._scan_loop.stop()
+        if stopped:
+            self._scan_button.setText("Start scan")
+            self._scan_status.setText("stopped")
+            self._maybe_stop_timer()
+        else:
+            self._scan_status.setText("still finishing a scan - try again")
+        return stopped
 
     def start_camera(self) -> None:
         """Start the camera and its live loop and the display timer."""
@@ -531,16 +550,29 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         self._camera_status.setText("running")
         self._timer.start()
 
-    def stop_camera(self) -> None:
-        """Stop the camera's live loop and pause the camera."""
+    def stop_camera(self) -> bool:
+        """
+        Stop the camera's live loop and pause the camera.
+
+        Returns
+        -------
+        bool
+            True if the worker actually finished. False means an exposure
+            is still in flight and the camera is still in use; the camera
+            is left running rather than stopped underneath it.
+        """
+        stopped = True
         if self._camera_loop is not None:
-            self._camera_loop.stop()
+            stopped = self._camera_loop.stop()
+        if not stopped:
+            self._camera_status.setText("still finishing an exposure - try again")
+            return False
         if self._camera is not None:
             self._camera.stop()
-        if self._camera is not None:
             self._camera_button.setText("Start camera")
             self._camera_status.setText("stopped")
         self._maybe_stop_timer()
+        return True
 
     def set_session(self, session: Session | None) -> None:
         """
@@ -719,8 +751,13 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         # One driver per device: the live loop and the recording would
         # otherwise call scan_frame from two threads at once, and the
         # device RPC protocol is strictly synchronous request/response
-        # over a single connection (migration plan, §6).
-        self.stop_scan()
+        # over a single connection (migration plan, §6). Refusing when the
+        # loop did not actually stop is the point of checking: starting
+        # anyway is what tears a frame in half across the reused
+        # shared-memory segment.
+        if not self.stop_scan():
+            self._recording_status.setText(_SCANNER_BUSY_MESSAGE)
+            return
         parameters, channel_index, channel_name = self._scan_request
         self._start_recording(
             scan_series(
@@ -741,7 +778,9 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
             return
         # Same one-driver-per-device rule as record_scan_frames; camera_series
         # starts and stops the camera around the series itself.
-        self.stop_camera()
+        if not self.stop_camera():
+            self._recording_status.setText(_CAMERA_BUSY_MESSAGE)
+            return
         self._start_recording(
             camera_series(self._camera, self._camera_count_spin.value()), "camera"
         )
@@ -1026,8 +1065,13 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
             self._analyze_status.setText("install the 'analysis' extra")
             return
 
-        if self._camera_loop is not None and self._camera_loop.is_running:
-            self.stop_camera()
+        if (
+            self._camera_loop is not None
+            and self._camera_loop.is_running
+            and not self.stop_camera()
+        ):
+            self._analyze_status.setText(_CAMERA_BUSY_MESSAGE)
+            return
 
         self._analyze_status.setText("working...")
         try:
@@ -1081,8 +1125,13 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
             self._libertem_status.setText("install the 'libertem' extra")
             return
 
-        if self._camera_loop is not None and self._camera_loop.is_running:
-            self.stop_camera()
+        if (
+            self._camera_loop is not None
+            and self._camera_loop.is_running
+            and not self.stop_camera()
+        ):
+            self._libertem_status.setText(_CAMERA_BUSY_MESSAGE)
+            return
 
         self._libertem_status.setText("working...")
         try:
@@ -1153,8 +1202,13 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
             self._py4dstem_status.setText("install the 'py4dstem' extra")
             return
 
-        if self._camera_loop is not None and self._camera_loop.is_running:
-            self.stop_camera()
+        if (
+            self._camera_loop is not None
+            and self._camera_loop.is_running
+            and not self.stop_camera()
+        ):
+            self._py4dstem_status.setText(_CAMERA_BUSY_MESSAGE)
+            return
 
         self._py4dstem_status.setText("working...")
         try:
