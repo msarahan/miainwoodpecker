@@ -354,8 +354,21 @@ run = "pytest {args:--cov=miainwoodpecker --cov-report=term-missing}"
 # receiving rather than pinning away.
 [tool.hatch.envs.validate]
 description = """Validate written NeXus files against the NXem NXDL schema."""
+# Python is pinned rather than left to hatch's own default. CI's job sets up
+# 3.11, but hatch resolves each env's interpreter independently of the job's
+# setup-python step, and picked 3.12 on the runner - which is how this env
+# passed locally and failed in CI.
+python = "3.11"
+# Deliberately plain "pynxtools", not "pynxtools[em]". The NXDL definitions
+# (including NXem) ship inside the base wheel, which is what makes offline
+# validation possible at all; the [em] extra adds the vendor-format reader
+# stack - pynxtools-em -> kikuchipy -> numba 0.53.1 -> llvmlite 0.36.0 - which
+# is both the ~70-package dependency the Phase 3 notes explicitly avoided and
+# unbuildable on Python 3.12 (llvmlite 0.36 supports <3.10 only). Nothing here
+# converts vendor formats; this env only checks a file we wrote against a
+# schema.
 extra-dependencies = [
-    "pynxtools[em]>=0.15",
+    "pynxtools>=0.15",
 ]
 
 [tool.hatch.envs.validate.scripts]

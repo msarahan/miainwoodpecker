@@ -12,6 +12,7 @@ disk is the thing under test.
 
 import datetime
 import json
+import signal
 import subprocess
 import sys
 import textwrap
@@ -466,6 +467,10 @@ def test_an_abandoned_recording_still_loads_every_frame(tmp_path):
     assert loaded.data[2][0, 0] == pytest.approx(2.0)
 
 
+@pytest.mark.skipif(
+    not hasattr(signal, "SIGKILL"),
+    reason="needs SIGKILL to leave a genuinely unflushed HDF5 file; Windows has none",
+)
 def test_a_hard_killed_recording_reports_a_reason_instead_of_an_h5py_error(tmp_path):
     """A SIGKILL-ed acquisition leaves a file that cannot be opened at all."""
     target = tmp_path / "0001-killed-20260810T120000Z.nxs"
