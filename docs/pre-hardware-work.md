@@ -10,9 +10,15 @@ already wrote it down, as tests. `nionswift-instrumentation-kit` ships
 about 8,900 lines of acquisition tests, and a minority of them — the ones
 that assert something about a *device*, rather than about Swift's
 document model — are statements about how a STEM acquisition layer must
-behave. Those are portable, and several
-of them describe behaviour this project currently does not have or does
-not check.
+behave. Those are portable, and several of them described behaviour this
+project did not have or did not check.
+
+**All seven items below are now done.** The page is kept as the record of
+what was built and why, and of the three §7 open questions the work
+closed — two of them by removal rather than by answering. Each item ends
+with what the simulator taught, since that turned out to be more than
+expected: usim publishes real calibration values, real instrument state,
+and a spectrometer control whose effect on the data is visible.
 
 ## Reading their tests without taking their code
 
@@ -53,7 +59,7 @@ metadata, calibration, and error recovery that are true of any STEM
 acquisition layer, ours included. Those are the source for everything
 below; each item names the specific ones.
 
-## The work, in priority order
+## The work, in the order it was done
 
 ### 1. Feed calibration from the instrument — **done**
 
@@ -182,15 +188,15 @@ Two things the simulator taught, both now load-bearing:
   Configuring a stopped camera has the first frame already correct, which
   is the path to use when it matters.
 
-### 4. Two frame-identity contracts we do not test at all — **done**
+### 4. Two frame-identity contracts nothing was testing — **done**
 
 `test_frame_do_not_change_after_acquisition` holds four frames, checksums
 them, acquires more, and asserts the checksums still hold. Read that
 against this project's transport: **frames arrive through a single
 reused shared-memory segment.** The `_frame_lock` and the copy-out are
 what stop a previously-returned frame being overwritten underneath the
-caller, and there is currently no test that would fail if either were
-removed. This is the cheapest high-value test on the list.
+caller, and nothing in the suite would have failed if the copy were
+removed. This was the cheapest high-value test on the list.
 
 `test_consecutive_frames_have_unique_data` is its complement — successive
 frames must actually differ, which catches a stale-buffer read that
@@ -288,7 +294,7 @@ equivalents here worth writing out: reading and writing calibrations,
 finding which recording a derived result came from, and copying session
 metadata from one recording to another.
 
-## What this does not include
+## What this does not include, and what is left
 
 Sub-scan support (`test_subscan_has_proper_calibrations` and its dozen
 siblings) is a real feature with real calibration consequences —
@@ -296,3 +302,25 @@ a sub-scan's calibration must carry the *offset* of the sub-region, not
 just a smaller field of view. It is left off this list because it is a
 feature decision rather than a gap, and it should follow a request from
 someone who wants it rather than the existence of a test for it.
+
+Two things the work above did *not* close, both from
+[§7](migration-plan.md), and both now the operator-facing half of what
+used to be a plumbing problem:
+
+- **No UI selects a microscope mode, or the camera settings.** Exposure,
+  binning, and the energy offset are all reachable from code and all
+  recorded per frame; nothing in the viewer exposes them, so an operator
+  still needs a script. That is a viewer change, not a device one.
+- **A mode the device does not describe still needs code.** The
+  calibration path reads what the camera publishes; a microscope mode
+  that changes what an axis *means* without changing the controls behind
+  it has nowhere to say so.
+
+And one recurring lesson worth carrying to hardware day, because it
+appeared twice from different directions: **a running camera is always a
+frame ahead.** Changing binning or an instrument control while a camera
+is live leaves the frame in flight at the old settings. Binning is
+recoverable from the frame's own shape, so frames stay honest about it;
+exposure and instrument state are not, which is why `energy_offset_series`
+stops the camera around each step and why anything that needs a frame
+taken at known settings should configure before starting.
