@@ -120,6 +120,37 @@ from miainwoodpecker.devices.shared_frame import SharedFrameReader, SharedFrameR
 # protocol: which exit status means "retry with different ports".
 PORT_UNAVAILABLE_EXIT_STATUS = 4
 
+DEFAULT_SERVER_MODULE = "miainwoodpecker.devices.nion_server"
+"""
+The device server module this client launches unless told otherwise.
+
+Named rather than hard-coded because of who the *other* vendors are.
+Nion's stack is GPL-3.0, and the subprocess boundary exists to keep its
+copyleft out of this process. The other vendors' SDKs are proprietary,
+which is a different constraint pointing the same way, and it is not
+uniform: Thermo Fisher's scripting interface is a COM server installed
+with the microscope (wrappable by the BSD-licensed ``temscript``,
+redistributable by us), JEOL's PyJEM lives on the TEM control PC and is
+not on PyPI, and Zeiss's SmartSEM ActiveX requires an agreement with
+Zeiss before anyone may develop against it. Only the last of those
+categorically cannot be in-tree — but all of them make an adapter a
+site-specific thing that a lab should be able to write, install, and run
+without forking this project. So the module is a parameter.
+
+The contract such a package implements is the whole of what
+``nion_server.py`` does on its command line: accept ``--backend``, accept
+one positional port per name in
+:data:`~miainwoodpecker.devices.rpc.TARGET_NAMES`, bind a
+``multiprocessing.connection.Listener`` on each with the authkey from
+``MIAINWOODPECKER_AUTHKEY``, and serve
+:class:`~miainwoodpecker.devices.rpc.Call` objects against targets that
+satisfy the protocols in :mod:`miainwoodpecker.devices.interface`. See
+docs/vendor-support.md for what that costs per vendor, and for the one
+part of it that does *not* yet fit an arbitrary instrument: the target
+names are a fixed tuple, so a vendor with a different set of detectors
+has to map onto them.
+"""
+
 if typing.TYPE_CHECKING:
     from collections.abc import Iterator, Sequence
     from multiprocessing.connection import Connection
@@ -135,6 +166,7 @@ if typing.TYPE_CHECKING:
 # rpc.py stays the one place both peers agree on it.
 __all__ = [
     "BACKENDS",
+    "DEFAULT_SERVER_MODULE",
     "HARDWARE_BACKEND",
     "SERVER_EXITED",
     "SERVER_RESPONSIVE",
@@ -332,6 +364,7 @@ def _connect_with_retry(
     authkey: bytes,
     deadline: float,
     process: subprocess.Popen[bytes],
+    server_module: str = DEFAULT_SERVER_MODULE,
 ) -> Connection:
     """
     Connect to a Listener that may not have started accepting yet.
@@ -353,6 +386,9 @@ def _connect_with_retry(
         ``time.monotonic()`` value after which to give up.
     process : subprocess.Popen[bytes]
         The server process, watched for early exit.
+    server_module : str
+        The module that was launched, named in the failure message so an
+        out-of-tree adapter's import error is diagnosable.
 
     Returns
     -------
@@ -373,12 +409,16 @@ def _connect_with_retry(
     while True:
         if process.poll() is not None:
             msg = (
-                f"the device server exited with status {process.returncode} "
-                f"before accepting connections. Its own diagnostic went to "
-                f"stderr (inherited from this process): a hardware backend "
-                f"with no instrument present reports which nion Registry "
-                f"components it looked for, which plug-ins it loaded or "
-                f"skipped, and how to name the right one."
+                f"the device server ({server_module}) exited with status "
+                f"{process.returncode} before accepting connections. Its "
+                f"own diagnostic went to stderr, inherited from this "
+                f"process. Status 1 with nothing else on stderr usually "
+                f"means the module could not be imported — an out-of-tree "
+                f"vendor adapter has to be installed in the same "
+                f"interpreter as this application. This project's own "
+                f"server instead reports, for a hardware backend with no "
+                f"instrument present, which nion Registry components it "
+                f"looked for and which plug-ins it loaded or skipped."
             )
             raise DeviceServerStartupError(msg)
         try:
@@ -1039,6 +1079,7 @@ RemoteSimulatedInstrument = RemoteInstrumentDevices
 def _start_server(
     backend: str,
     plugin_names: Sequence[str],
+    server_module: str = DEFAULT_SERVER_MODULE,
 ) -> tuple[dict[str, int], bytes, subprocess.Popen[bytes]]:
     """
     Spawn a device server, retrying if a chosen port was taken meanwhile.
@@ -1067,6 +1108,9 @@ def _start_server(
         ``"simulated"`` or ``"hardware"``.
     plugin_names : Sequence[str]
         ``nionswift_plugin`` modules for the hardware backend.
+    server_module : str
+        Module to run with ``python -m``; see
+        :data:`DEFAULT_SERVER_MODULE`.
 
     Returns
     -------
@@ -1081,7 +1125,9 @@ def _start_server(
     for _attempt in range(_PORT_RETRY_ATTEMPTS):
         ports = {name: _free_port() for name in _TARGET_NAMES}
         authkey = secrets.token_bytes(32)
-        process = _spawn_server(ports, authkey, backend, plugin_names)
+        process = _spawn_server(
+            ports, authkey, backend, plugin_names, server_module,
+        )
         # The server exits this way *before* serving anything, so a short
         # wait either catches the collision or finds it still starting up;
         # a still-running server is the normal case and falls straight
@@ -1108,6 +1154,7 @@ def _spawn_server(
     authkey: bytes,
     backend: str,
     plugin_names: Sequence[str],
+    server_module: str = DEFAULT_SERVER_MODULE,
 ) -> subprocess.Popen[bytes]:
     """
     Launch the device server subprocess.
@@ -1122,6 +1169,9 @@ def _spawn_server(
         ``"simulated"`` or ``"hardware"``.
     plugin_names : Sequence[str]
         ``nionswift_plugin`` modules for the hardware backend.
+    server_module : str
+        Module to run with ``python -m``; see
+        :data:`DEFAULT_SERVER_MODULE`.
 
     Returns
     -------
@@ -1148,7 +1198,7 @@ def _spawn_server(
         [
             sys.executable,
             "-m",
-            "miainwoodpecker.devices.nion_server",
+            server_module,
             "--backend",
             backend,
             *plugin_arguments,
@@ -1273,6 +1323,7 @@ def _shut_down_server(
 def remote_instrument(
     backend: str = SIMULATED_BACKEND,
     plugin_names: Sequence[str] = (),
+    server_module: str = DEFAULT_SERVER_MODULE,
 ) -> Iterator[RemoteInstrumentDevices]:
     """
     Spawn the device server subprocess for a backend and connect to it.
@@ -1299,6 +1350,12 @@ def remote_instrument(
     plugin_names : Sequence[str]
         ``nionswift_plugin`` modules providing hardware devices; ignored
         by the simulated backend.
+    server_module : str
+        The device server to launch with ``python -m``. Defaults to this
+        project's Nion server; name another to drive a different vendor's
+        instrument from an out-of-tree adapter, which is how a
+        proprietary SDK that cannot be redistributed here is reached. See
+        :data:`DEFAULT_SERVER_MODULE`.
 
     Yields
     ------
@@ -1316,12 +1373,12 @@ def remote_instrument(
             f"{', '.join(sorted(BACKENDS))}"
         )
         raise ValueError(msg)
-    ports, authkey, process = _start_server(backend, plugin_names)
+    ports, authkey, process = _start_server(backend, plugin_names, server_module)
     connections: dict[str, Connection] = {}
     try:
         deadline = time.monotonic() + _CONNECT_TIMEOUT_S
         connections["instrument"] = _connect_with_retry(
-            ports["instrument"], authkey, deadline, process,
+            ports["instrument"], authkey, deadline, process, server_module,
         )
         # A second connection to the same target, reserved for health
         # checks: see RemoteInstrument for why sharing the control
@@ -1329,7 +1386,7 @@ def remote_instrument(
         # server accepts any number of connections per target, one handler
         # thread each, so this costs one socket and one idle thread.
         connections["instrument:health"] = _connect_with_retry(
-            ports["instrument"], authkey, deadline, process,
+            ports["instrument"], authkey, deadline, process, server_module,
         )
         instrument = RemoteInstrument(
             connections["instrument"],
@@ -1340,7 +1397,7 @@ def remote_instrument(
         served = typing.cast("Sequence[str]", description["targets"])
         for name in served:
             connections[name] = _connect_with_retry(
-                ports[name], authkey, deadline, process,
+                ports[name], authkey, deadline, process, server_module,
             )
 
         cameras = {

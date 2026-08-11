@@ -99,6 +99,20 @@
   field means what they mean, and an approximate one would be a
   confidently wrong claim.
 
+- `remote_instrument(server_module=...)`: the client can launch a device
+  server it did not ship, so a vendor adapter can be an out-of-tree
+  package rather than a fork. `tests/unit/test_out_of_tree_server.py`
+  writes a complete vendor-free server and drives the whole client
+  against it with no `device` extra installed, which is both the
+  regression test and the specification an adapter writes against. The
+  startup diagnostic now names the module it failed to launch.
+
+- `docs/vendor-support.md`: what Thermo Fisher, JEOL, Zeiss, Hitachi and
+  Bruker actually expose, and costed tasks for a second adapter. Records
+  the one place the framework is still Nion-shaped — the device target
+  names are a fixed positional tuple — and why that redesign should land
+  with the second adapter rather than before it.
+
 ### Changed
 
 - CI's `integration` job runs its tests in parallel (`pytest -n auto`),

@@ -47,6 +47,9 @@ measurements included:
   piece was built or adopted, and the phased record of getting here.
 - [Architecture review](architecture-review.md) — a full-stack audit of
   the implementation, findings and fixes.
+- [Other vendors](vendor-support.md) — what Thermo Fisher, JEOL, Zeiss,
+  Hitachi and Bruker actually expose, and what a second device adapter
+  would cost.
 - [Development docs](documentation/index.md) — environments, linting,
   publishing.
 
@@ -60,5 +63,6 @@ Migration plan <migration-plan>
 Architecture review <architecture-review>
 Hardware validation checklist <hardware-validation-checklist>
 Work before hardware <pre-hardware-work>
+Other vendors <vendor-support>
 Development <documentation/index>
 :::
