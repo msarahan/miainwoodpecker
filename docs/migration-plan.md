@@ -167,7 +167,82 @@ problem — read their source and docs before designing our own adapters:
   (`inspect.signature`, rather than guessing again from error text)
   confirmed the original 2-argument call was correct all along — the
   bug was resolution nondeterminism, not the call site.
-- [ ] Validate against real hardware.
+- [x] Stage the device layer for hardware without having hardware, so that
+  access to an instrument is a validation day rather than a development
+  phase. `nion_server.serve()` no longer hard-constructs the simulator:
+  `open_instrument(backend, plugin_names)` dispatches to either
+  `simulated_instrument()` — byte-for-byte the same usim construction,
+  including the both-cameras-must-be-closed teardown the Phase 0 note
+  warns about — or a new `hardware_instrument()`, selected with
+  `--backend {simulated,hardware}` plus a repeatable `--plugin MODULE`
+  (each defaulting to `MIAINWOODPECKER_BACKEND` /
+  `MIAINWOODPECKER_HARDWARE_PLUGINS`, command line winning).
+  `remote_instrument(backend=...)` threads it through the MIT side;
+  `remote_simulated_instrument()` keeps its exact signature as a two-line
+  delegation, because the viewer, the session layer, and three benchmark
+  scripts are written against it.
+  - **The real path is Nion's own discovery mechanism, traced through the
+    installed stack rather than guessed at.**
+    `nion.swift.model.PlugInManager.load_plug_ins` iterates
+    `pkgutil.iter_modules(nionswift_plugin.__path__)`, imports each
+    submodule and calls its module-level `run()`; a device plug-in's
+    `run()` is what registers `stem_controller`, `scan_module`, and
+    `camera_module` with `nion.utils.Registry`. `hardware_instrument()`
+    reproduces exactly that step — no plug-in directories, no manifests,
+    no `Application` — then reads the registry back and takes the same
+    `nion.device_kit`-level objects `NionCamera`/`NionScanner` already
+    wrap, so Phase 0's finding about the `HardwareSource` layer still
+    holds.
+  - **More of that is testable now than expected, which is the useful
+    finding.** `nionswift_plugin.usim.run()` works headlessly, so tests
+    drive the whole discovery path — import → `run()` → registry read →
+    device wrapping → camera classification → teardown via `stop()` — by
+    pointing `--plugin` at the usim plug-in *as a stand-in vendor
+    plug-in*. What waits for hardware is only *which* plug-in package a
+    real instrument ships, plus the six assumptions below.
+  - **The failure path is tested, because it is the one that can be.**
+    With no vendor plug-in installed, `--backend=hardware` exits with
+    status 2 (distinct from 1, so a launcher can tell "no microscope" from
+    "crash") and one actionable line naming what it looked for, what it
+    skipped, and how to override. Autodiscovery deliberately skips `usim`:
+    letting `--backend=hardware` silently resolve to the simulator is the
+    single failure mode a backend selector exists to prevent. A client-side
+    fix fell out of testing that error over IPC — the server dies before
+    binding a listener, so `_connect_with_retry` used to spin for its full
+    15s deadline and then raise `ConnectionRefusedError`, discarding the
+    only diagnostic that mattered; it now watches `process.poll()` and
+    raises `DeviceServerStartupError` naming the exit status.
+  - **Six assumptions are unverified without hardware, and are recorded as
+    guesses rather than as working code** (each also flagged in a comment
+    at its site): that a vendor plug-in registers from a module-level
+    `run()`; that `camera_device.camera_type` labels a real camera
+    `"ronchigram"`/`"eels"` (an unlabelled camera falls back to the
+    Ronchigram slot, so a one-camera instrument still works); the three
+    vendor control names (see Phase 3); which `GetVal2D` axis-keyword
+    convention a vendor controller follows (the adapter tries the no-axis
+    form and falls back on `TypeError`, but only the first branch is
+    exercised); that a real controller publishes `stage_size_nm` (absence
+    falls back to 1 µm, so a real instrument silently gets a wrong
+    field-of-view *hint* until someone checks); and the autodiscovery skip
+    list itself. `InstrumentDevices` now holds `eels_camera: … | None` and
+    the client asks `instrument.describe()` before connecting to any device
+    target, so it only opens connections for targets that exist — usim
+    always has both cameras, a real instrument need not.
+  - **A precedence bug in `--plugin`, found by a sibling change and fixed at
+    the root.** The parser seeded argparse's `action="append"` *default* from
+    `MIAINWOODPECKER_HARDWARE_PLUGINS`, and `append` adds to its default
+    rather than replacing it — so `--plugin foo` with that variable set meant
+    "the environment's plug-ins *and* foo", contradicting the command-line-wins
+    precedence documented above. Now `default=None` with the environment read
+    after parsing, and five tests pin the precedence rather than leaving it
+    assumed. Worth recording because the first fix attempted was a workaround
+    in `viewer/app.py` (clearing the variable for the child process), which
+    would have left the documented behaviour still false at the layer that
+    defines it.
+- [ ] Validate against real hardware. Still open, but no longer
+  open-ended: what remains is the enumerated substitution above, and
+  `docs/hardware-validation-checklist.md` is the ordered procedure for it,
+  written so each step's failure is diagnosable before the next one runs.
 
 **Phase 2 — Live viewer MVP**
 - [x] Decouple acquisition from display —
@@ -188,8 +263,8 @@ problem — read their source and docs before designing our own adapters:
 - [x] Benchmark live frame latency —
   [`scripts/phase2_live_benchmark.py`](../scripts/phase2_live_benchmark.py).
   **Result on this container (llvmpipe software rasterization), 512×512
-  scan:** acquire 12.7 ms median (79 fps ceiling); display 42.4 ms median,
-  p95 57 ms (23.6 fps) — display costs **3.35× acquire**.
+  scan:** acquire ~14.5 ms median; display 33.6–47.7 ms median across four
+  runs — display costs roughly **2.3–3.3× acquire**.
   *This is not yet a verdict against napari.* Under software rendering the
   rasterizer competes with acquisition for the same CPU, so the figure is
   a pessimistic floor; the script detects the GL renderer and says so.
@@ -200,6 +275,36 @@ problem — read their source and docs before designing our own adapters:
   *schedules* a repaint, so the event loop must be flushed **inside** the
   timed region. An honest hidden-vs-shown comparison went 5.3 ms → 22.7 ms
   for the same operation.
+  - **The originally recorded figures were 12.7 ms acquire / 42.4 ms display
+    / "3.35× acquire", and two later corrections matter more than the small
+    numeric drift.** First, the +1.8 ms on acquire is explained rather than
+    mysterious: the old figure was an in-process call, and the script now
+    goes through `remote_simulated_instrument()` — the MIT client the shipped
+    viewer actually uses — so it crosses the IPC boundary. A 512×512 float64
+    frame is 2.1 MB, and §6 independently measured the shared-memory path's
+    overhead at that size as +2.8 ms, which accounts for the difference
+    within noise. (The script had also gone stale rather than wrong: it
+    imported `devices.nion_adapter`, the module §6 split into
+    `nion_server.py` + `remote.py`, so it simply did not run.)
+  - **Second, and the reason the ratio should never have been quoted to
+    three significant figures: display cost is load-dependent, not merely a
+    pessimistic floor.** Across four runs acquire held to a 3% spread
+    (14.2–14.7 ms) while display moved 42% (33.6–47.7 ms), falling
+    monotonically as other work on the machine finished. That is the
+    directly observed signature of what this item originally reasoned about a
+    priori. So "2.3–3.3×" is the honest form; a single number invites being
+    read as a property of napari rather than of a loaded software rasterizer.
+  - **Third, and it qualifies the "display dominates" framing more than a GPU
+    would: at 1024×1024 the ordering reverses on this same box** — acquire
+    48.5 ms, display 30.8 ms, i.e. display is 0.63× acquire and the script
+    prints that napari keeps up with the source. Display cost grows
+    sublinearly with pixel count while usim's scan generation grows about
+    linearly, so **512×512 is close to napari's worst case here rather than
+    representative of it**, and at the larger scans a real experiment is
+    likelier to use, the device is already the bottleneck. Anyone reading the
+    old 3.35× as "napari is 3× too slow" should note it was size-specific.
+    This strengthens rather than weakens the decision to withhold judgement
+    until the GPU re-run.
 - [ ] Re-run the benchmark on a GPU workstation at real scan rates. Only a
   hardware-accelerated result showing display still dominating justifies
   moving to `ndv` or a custom VisPy canvas.
@@ -211,9 +316,59 @@ problem — read their source and docs before designing our own adapters:
   `camera_series`, `focal_series`) plus `record()`, which streams them to
   disk as they arrive rather than buffering. `camera_series` stops the
   camera in a `finally`, so abandoning a series early still releases the
-  device. `focal_series` currently sweeps field of view: sweeping focus or
-  stage tilt needs instrument controls the Phase 1 interface deliberately
-  does not expose yet, but the generator shape carries over.
+  device. `focal_series` originally swept field of view because sweeping
+  focus needed instrument controls the Phase 1 interface deliberately did
+  not expose; those controls now exist (below), so
+  `focal_series(..., instrument=...)` sweeps **real defocus**, while
+  omitting `instrument` sweeps field of view exactly as before. It records
+  both the `requested_defocus_nm` and the *read-back* `defocus_nm` per
+  frame, so a recording says what the instrument did rather than what it
+  was asked to do, and restores the original defocus in a `finally` even
+  when the consumer abandons the generator early — the same discipline
+  `camera_series` already applies to leaving a camera running.
+- [x] Instrument controls, deliberately three and no more —
+  `InstrumentController` in
+  [`src/miainwoodpecker/devices/interface.py`](../src/miainwoodpecker/devices/interface.py):
+  stage position, defocus, beam blanker, plus `stage_size_nm()`,
+  `available_controls()` and `park()`. Holding to Phase 1's
+  smallest-useful-interface discipline mattered more than usual here: a
+  real Nion `STEMController` exposes *hundreds* of named controls (`C10`,
+  `C12`, `CAperture`, `EHT`, `ZLPoffset`, …), and proxying them would be a
+  vendor API wearing vendor-neutral clothing. Units are the operator's,
+  matching `ScanParameters` — nanometres, never the vendor's metres — and
+  positions are `(y, x)` in the same axis order the `(height, width)` scan
+  convention already pins. The adapter drives them through the
+  *named-control* API on `stem_controller.STEMController`'s own base class
+  (`does_control_exist`/`get_control_output`/`set_control_output`, and
+  `GetVal2D`/`SetVal2D` for the stage) rather than `device_kit`'s
+  `defocus_m`/`stage_position_m` convenience properties, because the
+  properties exist only on Nion's reference implementation while the
+  named-control API is what any vendor controller must implement — and is
+  how Nion's own higher layers drive controls (`AcquisitionPreferences`
+  declares `ControlDescription("blanker", …, "C_Blank", …)`). The control
+  *names* are therefore Nion's, taken from Nion's code, not invented here.
+  - **Measured for effect on data, not merely for a successful setter**,
+    with [`scripts/device_control_verification.py`](../scripts/device_control_verification.py)
+    over the real IPC boundary, reporting the shot-noise floor (two frames
+    at a *fixed* setting) against the change after moving the control.
+    §7's `probe_position` finding is exactly the trap: usim has controls
+    that accept a value, echo it back, and are then silently dropped.
+    Results (256×256 scans, median of 3): defocus `C10` moves Ronchigram
+    data **6.23× the noise floor**; stage position **5.78×** (and drives
+    the scanner's frame mean 0.5551 → 0.0003); the blanker **962×**, taking
+    the Ronchigram mean from 11840 counts to 0.004.
+  - **Three honest negatives, confirmed in the simulator's source and not
+    only by measurement**, so they are properties of usim rather than of
+    this adapter: defocus does not affect scan data
+    (`ScanDataGenerator.generate_scan_data` never reads `C10`), and
+    blanking affects neither EELS data (`EELSCameraSimulator` lists
+    `is_blanked` in `depends_on` but its `get_frame_data` never gates on
+    it) nor scan data. So a defocus focal series over the *scanner*
+    produces noise-identical frames in simulation: the control is genuinely
+    driven and recorded, and the data response is what waits for hardware.
+    `probe_position` is deliberately still **not** exposed — §7's finding
+    stands, and adding a setter that silently does nothing is precisely the
+    mistake this measurement exists to prevent.
 - [x] NeXus/HDF5 storage —
   [`src/miainwoodpecker/storage/nexus.py`](../src/miainwoodpecker/storage/nexus.py).
   **Deliberately written with `h5py` alone, not `pynxtools-em`.** NeXus is
@@ -223,7 +378,8 @@ problem — read their source and docs before designing our own adapters:
   scikit-learn, sympy, xraydb…) to supply, for our purposes, a schema
   convention. Following a documented format is not reinventing one — this
   is precisely what avoids a bespoke project format. `NexusWriter` streams
-  into a resizable per-frame-chunked, gzip dataset so long acquisitions
+  into a resizable per-frame-chunked, compressed dataset (gzip + byte
+  shuffle by default — see the compression item below) so long acquisitions
   persist incrementally, and scan frames reporting `fov_nm` get real
   spatial axes in nanometres (cameras correctly fall back to `pixel`).
   **Independently validated**: files load in `nexusformat` (the NeXpy
@@ -232,30 +388,267 @@ problem — read their source and docs before designing our own adapters:
   plot them without any of our code.
 - [x] Legacy `.ndata` importer —
   [`src/miainwoodpecker/storage/legacy.py`](../src/miainwoodpecker/storage/legacy.py).
-  Uses Nion's own `NDataHandler` rather than re-implementing its zip
-  container, converts to `Frame`, and recovers Swift's naive-UTC
-  timestamps as aware. Tests write fixtures with Nion's *writer*, so the
-  real container format is exercised, and cover the full migration path
-  (old library directory → single NeXus file).
-- [ ] Validate output against the official NXem NXDL schema with
-  `pynxtools`. Files declare `definition = "NXem"` to state intent, but
-  that claim is currently unverified — the NeXus/FAIRmat spec sites are
-  unreachable from this environment, so the required-field list could not
-  be checked. This belongs in a CI validation step, not the runtime.
-- [ ] Revisit compression. gzip level 4 on noisy `float64` scan data
-  measured a *1.08× ratio* — i.e. slightly larger than raw — while
-  `float32` camera frames compressed to 0.69×. Worth evaluating
-  bitshuffle/blosc, or storing scan data as `float32`. Still open for
-  *this* (HDF5 storage) context, but §6 now has a related, resolved data
-  point for the shared-memory IPC context: zstd on the same kind of
-  frames confirms scan data barely compresses (0.95–0.96×) and shows
-  camera frames compress better with zstd than gzip suggested
-  (0.61–0.73×) — consistent with, and a useful cross-check on, this
-  item's numbers, even though that investigation concluded compression
-  doesn't belong on the IPC path regardless of ratio, for reasons
-  (memcpy vs. CPU-bound compression time) specific to shared memory that
-  don't necessarily transfer to the storage question here.
-- [ ] Consider Zarr alongside HDF5 for parallel/cloud-friendly writes.
+  Converts to `Frame` and recovers Swift's naive-UTC timestamps as aware.
+  Tests write fixtures with Nion's *writer*, so the real container format is
+  exercised, and cover the full migration path (old library directory →
+  single NeXus file). Originally read via Nion's own `NDataHandler` rather
+  than re-implementing its zip container; that import turned out to breach
+  §6's license boundary and the reader is now standard-library only, which
+  also means this module needs no optional extra — see the end of §6.
+- [x] A session, so an operator can actually keep data —
+  [`src/miainwoodpecker/storage/session.py`](../src/miainwoodpecker/storage/session.py),
+  wired into the viewer and `app.py`. Phase 3 could already *write* NeXus
+  files and stream a series into one, but nothing in the running
+  application ever chose a filename: the viewer was live-display-only and
+  the Phase 4 analysis buttons wrote their bursts into a
+  `TemporaryDirectory` that was deleted on the way out. So a Phase 5 pilot
+  was blocked for an entirely mundane reason — an operator could press
+  nothing and keep their data.
+  - **Deliberately small**: a directory, a naming rule, and three pieces of
+    context (operator, sample, notes). No database, no catalogue, no
+    index — the filesystem is the index and NeXus files are the records.
+    `Session.record` is a thin wrapper over `sequence.record` rather than a
+    second write path, so the streaming property carries straight over.
+  - **Collisions are impossible rather than unlikely.** Names like
+    `0001-scan-haadf-20260810T182524Z.nxs` are claimed by *creating* the
+    file with `O_EXCL`, not by checking for absence and then writing, so
+    two acquisitions in the same second — from two threads, or two
+    processes pointed at one directory — cannot collide; the loser
+    increments and retries. Tested with concurrent threads, not argued from
+    the code.
+  - **An existing session directory is reused, never cleared**, because an
+    operator restarting mid-shift should land back in the same session
+    rather than clobber the morning's data: numbering resumes from the
+    highest index on disk, context loads from the previous run's
+    `session.json`, and omitting a context field keeps the stored value
+    instead of blanking it.
+  - **Recording runs off the GUI thread.** A `RecordingJob` mirrors
+    `LiveAcquisition`'s shape (daemon thread, state behind a lock, errors
+    captured rather than raised) and lives in `session.py` rather than the
+    viewer specifically so it *cannot* reach a Qt object. Phase 2's
+    thread-safety contract therefore holds in both directions. "Save
+    displayed frame" needs no device and leaves the live loop running;
+    "Record frames" stops it first, because the device RPC is strictly
+    synchronous over one connection per §6, so two threads calling
+    `scan_frame` would corrupt the stream rather than merely contend.
+  - **Verified through the real entry point**, the standard §6 set: driving
+    `app.main()` under `xvfb-run` against the actual device subprocess
+    recorded two real 2048×2048 float32 Ronchigram frames into a readable
+    23.3MB file, with the click handler returning in 2ms against 5.5s of
+    write time, and no `nion_server` process or `/dev/shm` segment
+    surviving teardown.
+- [x] **What an interrupted acquisition actually produces — measured, and
+  the answer changed the writer.** The `NexusWriter` note above says writes
+  persist incrementally; that is true of the *dataset* but does not mean an
+  abandoned write leaves a readable file. Three interruption modes, writing
+  three frames then stopping abnormally: an exception inside the `with`
+  block still runs `close()`, so the file is short but **complete and
+  valid** — and this is the common case, which is why "Stop recording" is
+  cooperative cancellation rather than killing the writer. An abandoned
+  writer that exits cleanly leaves all frames readable but **no `/entry/data`
+  group, no `end_time`, no metadata** — which matters precisely because the
+  Phase 4 adapters read `/entry/data`, so they fail on a file whose frames
+  are demonstrably present. And a `SIGKILL` mid-acquisition leaves a file
+  that **does not open at all** (`OSError: bad object header version
+  number`), not a short-but-valid one, because HDF5 buffers object headers.
+  A per-append `flush()` was measured to convert that third case entirely
+  into the second, so `NexusWriter.flush()` is now public — and its cost
+  across the whole codec sweep is **within run-to-run noise**, so bounding
+  worst-case loss to a single frame is essentially free. SWMR would go
+  further but is a genuine architectural conflict rather than an oversight:
+  HDF5 forbids creating objects once SWMR is enabled, and `close()` creates
+  the NXdata group *after* all appends because it needs the final frame
+  shape — supporting it means restructuring the writer to create NXdata up
+  front (§7).
+- [x] Revisit compression — resolved, and **the winner cost nothing**. The
+  default is now gzip level 4 *plus HDF5's byte-shuffle filter*; not
+  blosc2, not bitshuffle, not float32. Measured with
+  [`scripts/nexus_compression_benchmark.py`](../scripts/nexus_compression_benchmark.py)
+  on real acquired frames, timed through the actual `NexusWriter` append
+  loop.
+  - **First, the recorded 1.08× reconciles exactly, so it needn't be
+    re-litigated.** Dataset storage size gives a rock-steady **0.957×** at
+    every scan size; the 1.08× was a whole-*file* measurement on a small
+    recording, where ~36KB of fixed HDF5 structural overhead dominates (a
+    single-frame 64² recording measures 1.874× whole-file against 0.960×
+    dataset-only). Both numbers were right, and the original reading —
+    gzip was doing essentially nothing on this data — was right too.
+  - **Shuffle is a pure win on every axis and every dataset, so it is the
+    default rather than an option.** A generic compressor sees an IEEE
+    float array as an interleaved stream where every 4th or 8th byte is a
+    near-constant exponent and the rest is noisy mantissa, so no useful
+    match appears; shuffle transposes into byte planes, making the exponent
+    plane long compressible runs and quarantining the noisy mantissa where
+    it can only fail to compress rather than poison every match around it.
+    Ratios improve 0.957→0.866 on float64 scan, 0.336→0.233 on EELS,
+    0.694→0.532 on Ronchigram, **while Ronchigram write time roughly halves
+    (747→374 ms/frame) and read-back drops 327→192 ms**, because deflate
+    does less work on a stream that has structure. No trade-off to weigh.
+  - **blosc2+zstd is better still and is deliberately not the default.** It
+    edges the ratio (Ronchigram 0.527) and is dramatically faster (84
+    ms/frame write, 82 ms read), but it is a *plugin* codec: a file written
+    with it **cannot be opened at all** without `hdf5plugin` in the
+    reading environment — and the readers that matter here are other
+    people's (`nexusformat`, HyperSpy, LiberTEM, py4DSTEM, `pynxtools`).
+    Trading "any HDF5 tool can read this" for a few percent of ratio is the
+    wrong trade for a project whose entire storage argument is §3's. So it
+    is opt-in behind a new `compression` extra — an interoperability
+    argument, not a weight one. Note also that no plugin codec wins
+    everywhere: `bitshuffle+lz4` is the fastest tested but collapses on
+    EELS data (0.475 against gzip+shuffle's 0.233).
+  - **float32 is a bigger win than any codec, and still not the writer's
+    decision.** A 1024² scan recording goes 32.1MB → **13.8MB** as
+    float32+shuffle, a **2.33×** reduction of which the dtype does 2.0× —
+    downcasting matters ~10× more than codec choice. And the precision is
+    not physically real: usim's `generate_scan_data` is annotated
+    `-> NDArray[float32]` and builds float32 internally; the float64 arrives
+    purely from its last line, where `numpy.random.randn()` (float64) is
+    added to a float32 array and numpy promotes. A float32 round trip loses
+    at most **1.55e-07 of the frame's own noise standard deviation**. But
+    downcasting is lossy and irreversible, the writer is handed an array
+    rather than a statement about its precision, and no real-hardware dtype
+    is validated yet — a writer that quietly narrowed what it was given
+    would assert provenance it cannot know. So `dtype=` is an explicit
+    opt-in and the accidental promotion is a §7 follow-up to fix upstream.
+- [x] Validate output against the official NXem NXDL schema with
+  `pynxtools` — done, and **the answer was that our files did not
+  validate.** `pynxtools` ships the NXDL definitions inside the wheel, so
+  the schema is checkable entirely offline even though the NeXus/FAIRmat
+  spec sites remain blocked from this environment.
+  - **Exactly one required group was missing**: `/entry/sampleID`, needing
+    `is_simulation`, `preparation_date`, and `atom_types`. Everything else
+    the writer emits — every `NX_class`, the `signal`/`axes` hints, the
+    `units` attributes, `definition`, `start_time` — passed without
+    comment, and adding just that group flips the same file to valid.
+  - **All three missing fields are facts about the physical specimen, so
+    none is fabricable.** Inventing them to make a schema pass would be the
+    real failure here: a file that lies about its provenance is worse than
+    one that admits an incomplete declaration. **So `definition` now
+    defaults to `None`** — the file declares no application definition
+    rather than claiming `NXem` falsely. It remains a well-formed NeXus file
+    conforming to the base classes (still independently loadable and
+    plottable by `nexusformat`); it simply stops asserting conformance it
+    cannot demonstrate. Passing `sample=` together with `definition="NXem"`
+    produces a file that verifiably validates. Note there is no weaker
+    application definition to fall back to — `NXentry` is a base class — so
+    "claim something weaker but true" resolves to "claim nothing".
+  - **The obvious version of this CI job would have passed silently
+    forever**: `pynx validate` exits 0 even when it prints "is NOT valid".
+    [`scripts/validate_nexus_schema.py`](../scripts/validate_nexus_schema.py)
+    therefore uses the programmatic validation API, which returns a real
+    boolean, and exits non-zero itself. It runs three checks, the third
+    existing specifically so the job cannot pass vacuously: a default
+    recording claims no definition; a fully-described recording *is* valid
+    NXem; and a file claiming `NXem` *without* the sample group **is still
+    reported invalid** — so if an upgrade ever made the validator stop
+    finding problems, the first two would go quiet and this one fails
+    loudly. Verified by two deliberate sabotages, each producing exit 1.
+  - Session context now lands in real NeXus classes rather than inside a
+    vendor-metadata JSON blob: `sample=` → `NXsample`, `user=` → `NXuser`,
+    `notes=` → `NXnote`. Checking *which* of those the schema actually
+    demanded was the finding — `sampleID` is `minOccurs="1"` and was the
+    only failure, while `userID` and `noteID` are optional, so `user` and
+    `notes` are there for honesty about where session context belongs
+    rather than to satisfy the validator.
+- [x] Per-axis calibration for camera frames, configurable per acquisition —
+  [`src/miainwoodpecker/storage/calibration.py`](../src/miainwoodpecker/storage/calibration.py).
+  Closes the gap §7 recorded: camera frames used to fall back to `"pixel"`
+  units because nothing could say what their axes meant. The model is
+  `AxisKind` × `AxisCalibration(kind, scale, offset, units)` ×
+  `FrameCalibration(y, x)` — five kinds (real space `nm`, reciprocal space
+  `1/nm`, energy `eV`/`meV`, angle `mrad`, and uncalibrated `pixel`) with a
+  short frozen unit vocabulary and one exact factor per unit. No units
+  dependency: this is a data model, not a units framework.
+  - **Per *axis*, established by measurement rather than by assumption.**
+    usim's `EELSCameraSimulator.get_dimensional_calibrations` returns
+    `[Calibration(), Calibration(offset=…, scale=…, units="eV")]` — index 0
+    (the 256-row slow axis) carries *nothing*, index 1 (the 1024-column fast
+    axis) is dispersive at 0.5 eV/channel. That is why `dispersive_axis`
+    defaults to `"x"`, and why it stays a parameter; the cross axis defaults
+    to the pixel fallback instead of borrowing the energy unit, because it is
+    not an energy axis.
+  - **Per *acquisition*, not per detector**, because the axis kind is a
+    property of the microscope's mode: the same camera yields reciprocal-space
+    diffraction in one mode and something else in another. Supplied via
+    `NexusWriter(calibration=…)` or through `metadata["calibration"]` — the
+    route `fov_nm` already travels. Nothing new is required, and no existing
+    signature or on-disk layout changed.
+  - **NeXus has no axis-*kind* attribute, so none was invented.** `NXdata`'s
+    `AXISNAME` carries `units` and `long_name`, and the unit string is the
+    whole carrier. Measured through `pynxtools.units.NXUnitSet.matches`:
+    **`"1/nm"` matches `NX_WAVENUMBER`; `"nm-1"` does not, and neither does
+    `"A^-1"`** — so `1/nm` is canonical here and py4DSTEM's spelling is the
+    adapter's problem, not the file's. `"pixel"` matches no category at all,
+    which is exactly what makes it an honest admission rather than a claim.
+  - **Angle is its own kind rather than folded into reciprocal space**, because
+    `RonchigramCameraSimulator` reports `units="rad"` and converting angle to
+    reciprocal space needs the electron wavelength — which would mean
+    inventing a value. Cross-kind conversion is refused outright.
+  - **The uncalibrated state is first-class**: an axis labelled `"pixel"`
+    cannot carry a scale (enforced), a *missing* calibration falls back
+    silently, and a *malformed* one raises on the first `append` rather than at
+    `close()`, so the failure lands where the caller can still act on it.
+  - **Carried into the adapters, each with a different real constraint.**
+    HyperSpy fits natively and every kind round-trips, plus a new
+    `load_as_hyperspy_spectrum` → `Signal1D` that sums along the
+    non-dispersive direction and refuses when no single energy axis is named.
+    py4DSTEM's `Calibration.Q_pixel_units` accepts only `"pixels"`, `"A^-1"`,
+    or `"mrad"`, so **nm⁻¹ must be converted to Å⁻¹ (÷10)** — done explicitly
+    and asserted at the *values* level, not just the label, because that is
+    precisely the class of error that silently makes every downstream number
+    wrong by exactly 10×; real-space, energy, mixed-kind, and anisotropic axes
+    are refused with messages naming why. LiberTEM still has nowhere to put
+    it: re-verified against 0.16 that `DataSetMeta` has no per-axis
+    scale/offset/units and `H5DataSet` takes no metadata parameter, now
+    recorded as a canary test rather than as prose that could quietly go stale.
+- [x] Read a recording back, so the viewer is not write-only —
+  `session.load_recording` / `LoadJob`, wired into a Recordings group in the
+  widget. Files open from the session or an arbitrary path, multi-frame
+  recordings go in as `(frames, h, w)` so napari's own frame slider does the
+  navigation (no bespoke stack UI), and reads are bounded by a frame-data
+  budget that always admits at least one frame and reports truncation. The
+  three Phase 4 analysis buttons can now run against a file on disk instead of
+  a fresh burst, in a defined precedence (opened file → session burst →
+  temporary burst), leaving the original behaviour and its tests intact.
+  Loading runs off the GUI thread on `RecordingJob`'s established shape:
+  measured, the click handler returns in 1.7 ms against a 1.5 s read.
+  - **The degraded cases were measured against a real `SIGKILL`ed writer, and
+    one of them exposed a false error message.** An abandoned-writer file
+    opens and displays *every* frame, because `read_series` reads
+    `/entry/instrument/detector`, which survives — so the UI reports "frames,
+    unfinalized — viewable, not analyzable". Analysis is pre-empted rather
+    than passed through, because the adapters' own message ("has no
+    `/entry/data` group; it recorded no frames") is *false* for such a file:
+    the frames are demonstrably there. A hard-killed file cannot be opened at
+    all, and its `OSError: bad object header version number` is wrapped into
+    one sentence explaining HDF5's buffered object headers and that the frames
+    are unrecoverable — no traceback reaches the UI.
+  - Session notes are multi-line and per-recording notes exist, both reaching
+    `NexusWriter`'s real `sample=`/`user=`/`notes=` parameters, so
+    `NXsample`/`NXuser`/`NXnote` are genuine rather than the `session_`-prefixed
+    stand-in the session work flagged as dishonest. Changing session directory
+    is a button, refused while a recording is in flight — the job would in fact
+    finish correctly into the old directory, but the UI would then describe a
+    directory not receiving the file, and cancelling an acquisition to change a
+    setting is worse.
+- [x] Consider Zarr alongside HDF5 — **evaluated and declined**, on three
+  independent grounds, the first decisive on its own. (1) **NeXus is an
+  HDF5 convention, so Zarr would mean abandoning it**: `pynxtools` contains
+  zero references to zarr, so the validation job just built cannot run
+  against a Zarr store at all, and the alternatives are adopting HyperSpy's
+  bespoke `.zspy` container or defining our own group layout — which is the
+  bespoke project format this project exists to stop maintaining. (2) **The
+  analysis libraries already wired in cannot read it**, checked directly
+  rather than assumed: exactly one of RosettaSciIO's 38 plugins is
+  Zarr-based and it is HyperSpy's own container; LiberTEM's 16 dataset
+  types include none; `emdfile`/py4DSTEM none. A Zarr backend would mean a
+  second read path in all three adapters, tripling the surface §3 exists to
+  shrink. (3) **What Zarr buys addresses workloads this project doesn't
+  have** — acquisition here is strictly single-writer by construction, and
+  nobody has asked for object-store output. And there is no performance
+  argument either: a matched-codec comparison gives ratios within 0.02
+  everywhere with timings within noise. Nothing implemented, no dependency
+  added.
 
 **Phase 4 — Analysis integration**
 - [x] Wire one analysis library in as a menu action operating on the new
@@ -519,8 +912,41 @@ problem — read their source and docs before designing our own adapters:
 
 **Phase 5 — Parity and cutover**
 - Audit which Swift features the team actually uses day to day (not the
-  full feature surface) and build a parity checklist from that.
+  full feature surface) and build a parity checklist from that. Recording
+  data (Phase 3's session item) is a *precondition* for this audit, not a
+  substitute for it.
 - Pilot the new app in parallel with Swift on one instrument before cutover.
+- What a pilot still needs beyond the session work, in rough order of how
+  quickly each would be missed on a real instrument:
+  - **Real hardware validation of the whole path** — everything is measured
+    against usim, and how long a real detector's write actually takes is
+    what decides whether the per-frame `flush()` is a nicety or a
+    requirement.
+  - **Multi-line and per-recording notes.** A single-line per-session field
+    is enough to prove the wiring and not enough for a shift's worth of
+    observations.
+  - **No way to change session directory from the UI** — chosen at launch,
+    so an operator switching samples after lunch restarts the app.
+    `set_session()` is the single path such a button would use, so this is
+    small, just not done.
+  - ~~**Nothing reads a session back**~~ — **done** (§5 Phase 3): recordings
+    open from the session or an arbitrary path, and the analysis buttons run
+    against a file on disk. Two smaller gaps remain in its place: a recording
+    cannot be annotated *after* the fact, and there is no cross-session
+    enumeration, so "find that scan from last Tuesday" is still a file
+    browser's job.
+  - **Disk-space and long-run behaviour is unexamined.** A pilot day of
+    2048×2048 float32 frames is tens of GB; nothing warns, estimates, or
+    reports free space. Note the compression work (§5 Phase 3) improved the
+    per-file arithmetic — a 1024² scan recording is 29.1 MB rather than
+    32.1 MB, or 13.8 MB stored as float32 — but nothing *tracks* the total.
+  - **A large file is read twice on the analyze-from-disk path** — once by
+    the load job for display, once by the adapter — because the adapters take
+    a path rather than an array. Harmless at pilot scale, wasteful at
+    2048×2048.
+  - **The analysis buttons still block the GUI thread** for the length of
+    their burst — pre-existing, and the obvious next candidate for the
+    `RecordingJob` treatment the recording path already uses.
 
 ## 6. License — resolved: process-boundary isolation
 
@@ -556,13 +982,14 @@ main MIT-licensed application never imports `nion.*`.
 - [`src/miainwoodpecker/devices/remote.py`](../src/miainwoodpecker/devices/remote.py) —
   MIT, no `nion.*` import. `RemoteCamera`/`RemoteScanner` implement the
   same `Camera`/`Scanner` protocols by sending `Call`s over IPC.
-  `remote_simulated_instrument()` spawns the server subprocess, connects
-  with a generated authkey, and tears down with `Popen.terminate()`
-  (SIGTERM) rather than a graceful RPC shutdown — sufficient here because
-  the whole *process* being killed reclaims its threads and sockets
-  regardless of Python-level cleanup; a real-hardware backend would likely
-  need a gentler path to park the instrument safely, simulated hardware
-  does not.
+  `remote_simulated_instrument()` spawns the server subprocess and connects
+  with a generated authkey. It originally tore down with `Popen.terminate()`
+  (SIGTERM) rather than a graceful RPC shutdown — sufficient for a
+  simulator, because the whole *process* being killed reclaims its threads
+  and sockets regardless of Python-level cleanup — while noting that a
+  real-hardware backend would need a gentler path to park the instrument
+  safely. **That path is now built, and SIGTERM is demoted to a fallback**
+  (see "Graceful shutdown" below).
 - [`src/miainwoodpecker/viewer/app.py`](../src/miainwoodpecker/viewer/app.py)
   imports `remote`, not `nion_server` — the actual, shipped application
   never links GPL-3.0 code into its own process. Verified, not assumed:
@@ -741,6 +1168,190 @@ of how this was checked, the same way `ipc_overhead_benchmark.py` and the
 Phase 2 live-viewer benchmark are kept regardless of which way their
 results pointed.
 
+**Graceful shutdown, with SIGTERM demoted to a fallback.** The handshake is
+one RPC on the existing `instrument` target. On `shutdown()` the server
+stops every camera, calls `instrument.park()` — which blanks the beam if a
+blanker exists and does nothing if not, because parking the stage or
+dropping the high tension would be a guess about the hardware rather than a
+service to it — closes every device, closes each device's
+`SharedFrameWriter`, replies with a plain-data report, and only then lets
+`serve()` return so the process exits 0. Every step is individually guarded
+and its failure recorded in the report's `errors` list rather than raised,
+so a half-successful park still acknowledges *and* still unlinks its
+segments. The stop event is set only *after* the reply is sent, which keeps
+the acknowledgement from racing the listener teardown.
+
+The client waits a bounded 10s (`rpc.send_call` grew an opt-in `timeout_s`
+and `RemoteCallTimeoutError`; ordinary device calls still wait forever,
+because an acquisition genuinely takes as long as it takes and a wrong guess
+would abort a good exposure). On timeout, on error, *or on a report that
+lists errors*, it falls back to the pre-existing path — closing each device
+over its own connection, which unlinks the same segments — then
+`terminate()`, escalating to `kill()`.
+
+**The shared-memory guarantee is preserved, and that ordering is the whole
+point.** Both paths unlink: the graceful one because the server closes its
+own writers, the fallback because the client closes each device. Verified
+both ways against the same three named segments the leak test uses, and the
+wedged case is exercised against a genuinely unresponsive server rather
+than a mocked client — `MIAINWOODPECKER_WEDGE_SHUTDOWN` is a documented
+test-only hook that makes the shutdown handler block forever without
+replying, so the real socket-timeout path runs and the test asserts the
+process really died of `SIGTERM` rather than inferring it. Two smaller
+consequences: `NionCamera.close()`/`NionScanner.close()` are now idempotent
+(park closes devices, and the owning context manager closes them again on
+its way out), and an explicit `shutdown()` deliberately is not re-callable
+over the same connection, because acknowledging a shutdown ends the
+server's life — teardown checks `process.poll()` first and skips to
+detaching readers, so calling the handshake yourself yields exit status 0
+rather than a pointless second SIGTERM. That last one was found by a test
+that assumed idempotence at the wrong layer; the failure was the correct
+signal.
+
+**Telling a live server from a dead or wedged one.** `instrument`'s
+`check_health()` distinguishes three genuinely different conditions with
+three different correct responses: responsive (0.4 ms round trip), exited
+(via `Popen.poll()`, reporting the exit status and naming the signal), and
+alive-but-unresponsive (a bounded 5 s wait). It is meaningful *because* the
+server-side handler reads process state only — no device, no vendor object,
+no lock — so it neither perturbs an acquisition nor queues behind one. Once
+the process is gone, device and control calls raise
+`RemoteConnectionLostError` naming the signal, in under 10 ms both at idle
+and from inside an in-flight 4096×4096 scan. Ordinary device calls still
+wait forever, unchanged and deliberately: a dead server needs no timeout,
+because its socket closes.
+
+**Reconnect was considered and deliberately not built**, and the reason is
+data integrity rather than effort. A fresh server subprocess is a fresh
+instrument construction, so a started camera, the scan settings in use, and
+every instrument control revert to defaults — and a recording in progress
+would keep appending frames to the *same file* from a differently-configured
+instrument, which is a corrupted scientific record rather than an interrupted
+one. Compounding it, a server that died without parking leaves the column in
+a state nothing client-side knows, which warrants operator attention rather
+than silent recovery. An explicit `reconnect()` was rejected too:
+`remote_instrument()` already *is* how a session is obtained, so a second
+entry point could only duplicate it while implying a continuity it cannot
+deliver. Failing fast, with the context manager as the recovery path, is the
+whole design.
+
+**What a hard-killed server actually guarantees — where measuring changed
+the answer, so the correction is worth stating plainly.** This section
+previously assumed a `SIGKILL`-ed server *must* leak its segments, since
+named POSIX segments are tmpfs entries rather than process resources and a
+killed process runs no cleanup. Both premises are true and the conclusion
+still did not follow: `multiprocessing`'s `resource_tracker` is a **separate
+child process** of the server, it auto-registers every segment
+`SharedFrameWriter` creates (the same auto-registration recorded above as a
+warning-noise wart), and it unlinks everything it holds when the server's end
+of its pipe closes. Measured: `SIGKILL` the server alone and the segments are
+gone immediately and stay gone.
+
+That is a CPython implementation detail rather than a documented guarantee,
+and it has an identifiable failure mode — it needs the tracker to outlive the
+server. Kill both (a process-group kill, a cgroup OOM kill, a container stop,
+`kill -9` on a process tree) and the segments genuinely persist; verified by
+killing the tracker first and confirming all three of a session's segments
+survive. So `SharedFrameReader.unlink_orphan()` lets the client reclaim the
+names it attached to — a deliberate, narrow exception to this module's
+writer-owns-unlink rule, sound only because that rule's premise (a live
+writer that keeps recreating the segment) has failed along with the writer's
+process. Teardown sweeps with it once the process is gone, *whatever killed
+it*, rather than conditionally on exit status: the precondition that makes
+unlinking legitimate is a dead writer, not a particular exit code, and
+conditioning on status would strand exactly the segment that needed
+reclaiming when a server exits 0 having *recorded* a shared-memory error.
+
+| How the server ended | What unlinks its segments |
+|---|---|
+| Graceful `shutdown()` handshake | the server itself, before replying |
+| SIGTERM fallback (wedged server) | the client's per-device `close()`, over live connections, before the kill |
+| `SIGKILL` of the server alone | the server's `resource_tracker` child — measured, but a stdlib implementation detail |
+| `SIGKILL` of the server **and** its tracker | the client's `unlink_orphan()`, for every segment it read a frame from |
+
+**The non-guarantees are real and are not bugs the client can fix.** A
+segment whose name never reached the client (killed between `shm_open` and
+the reply carrying its `SharedFrameRef`) is unrecoverable from this side —
+nothing here ever learned its name; the window is one create-publish-send
+sequence per device per resize, narrow but not zero. And if the client dies
+at the same moment as the server and its tracker, nothing runs at all. Both
+residuals are bounded by the reuse design itself — one segment per device
+per shape, not one per frame — so the worst case is a handful of stale
+entries rather than unbounded growth. The tests state exactly this and no
+more, and the tracker-dies-too test asserts in two stages (first that the
+segments *do* survive, then that teardown reclaims them) so it cannot pass
+vacuously if the mitigation were deleted.
+
+**Server-side failures are now diagnosable.** The subprocess inherited the
+parent's stderr, so anything it said interleaved anonymously with the
+application's own output — including, on hardware day, the one diagnostic
+that matters when `--backend=hardware` finds no instrument. It now uses
+stdlib `logging` configured only in `main()`, so importing the module
+in-process (which its own tests do) leaves logging inert in the standard
+way. Covered: startup, per-plug-in load outcome, bound ports, connection
+accepts, per-call failures **with the traceback** (the wire protocol carries
+only a stringified error, so the log is the only place it survives), and the
+shutdown report. Deliberately *not* covered: anything on the frame path — a
+successful call is logged at no level, so the shared-memory publish/read
+path is untouched and this section's benchmarks stand (re-measured after the
+change: acquire median unchanged within run-to-run variance). Quiet by
+default via `MIAINWOODPECKER_DEVICE_LOG_LEVEL` (default `WARNING`), with
+`MIAINWOODPECKER_DEVICE_LOG_FILE` to take it out of a shared terminal; a bad
+level name or unopenable file warns and degrades rather than taking the
+server down over its own diagnostics. Every record carries the pid, and the
+logger is named explicitly rather than from `__name__`, which under `python
+-m` would be the useless `"__main__"`.
+
+**One pre-existing breach of this section's own invariant, found while
+auditing the boundary and since closed.**
+[`src/miainwoodpecker/storage/legacy.py`](../src/miainwoodpecker/storage/legacy.py)
+did `from nion.swift.model import NDataHandler` at module scope — an
+in-process import of GPL-3.0 code by an MIT module, exactly what this
+section's decision exists to prevent. It predated the subprocess isolation
+work and was arguably a *narrower* exposure than the device layer's (a
+one-shot file-format read, only reachable with the `device` extra
+installed), but "arguably narrower" is not "on the right side of the
+boundary", and the original reasoning — reuse a vendor reader rather than
+re-implement a container — was correct in general and the wrong trade here.
+
+**The obvious fix does not exist, which is worth recording so it isn't
+proposed again.** RosettaSciIO looked like the answer: §3 already names it
+as this project's file-I/O building block, so reusing it would have removed
+the problem without new code. It has **no `.ndata` reader** — checked
+directly, 38 IO plugins and none handles the extension. Reading a claim
+like that off a dependency's reputation rather than its plugin list is the
+same shortcut this plan keeps having to correct.
+
+**What shipped instead: a standard-library reader.** Re-implementing turned
+out to be cheap because the format is documented and trivial —
+`NDataHandler`'s own docstring says "ndata files are a zip file consisting
+of data.npy file and a metadata.json file. Both files must be
+uncompressed." Nion hand-rolls a zip parser because *writing* in place needs
+byte offsets into uncompressed members; reading needs none of that, so
+`zipfile` + `numpy.load` + `json.load` is the entire implementation.
+Verified against a genuine Nion-written file before committing to the
+approach: both members are `ZIP_STORED`, the extracted stream is seekable,
+and data and properties round-trip exactly. This is reading a documented
+format, not the bespoke-format invention §3 warns against — and it *removes*
+a dependency rather than adding one: `legacy.py` now needs no optional
+extra at all.
+
+The risk that replaces the old one is a reader validated against our own
+assumptions about the format rather than the format itself, so the existing
+integration tests keep building their fixtures with **Nion's own writer**
+(a test is not the distributed application, and nothing there is imported by
+shipped code), while `tests/unit/test_legacy_reader.py` covers the error and
+edge paths — a non-zip file, a container with no array, a file with no
+metadata member — with hand-built zips in the base environment, which is
+also the standing proof that the reader needs no vendor code. Two behaviours
+worth noting: a file whose `metadata.json` is missing still yields its array
+rather than being refused, because the array is the irreplaceable part; and
+a truncated or unrelated file raises a `ValueError` naming the path instead
+of a `zipfile` traceback.
+
+The invariant now holds mechanically: `nion.*` is imported in
+`nion_server.py` and nowhere else in `src/`.
+
 ## 7. Open questions
 
 - **Bluesky/ophyd**: the [Bluesky](https://blueskyproject.io/) experiment
@@ -756,10 +1367,56 @@ results pointed.
   server's serving loop, shared-memory transport, and threshold have only
   been exercised against `nionswift-usim`. Real hardware may have
   different frame-rate/size characteristics worth re-benchmarking against
-  once available.
-- **Shared-memory threshold precision**: see §6 — 8MB is conservative,
-  not precisely fitted; the actual crossover between plain-pickle and
-  shared-memory transport is noisier than a single benchmark run resolved.
+  once available. The gating item is no longer open-ended, though: it is
+  now the six enumerated assumptions under §5 Phase 1 plus a vendor
+  `nionswift_plugin` package, and
+  [`docs/hardware-validation-checklist.md`](hardware-validation-checklist.md)
+  is the ordered procedure. Highest-consequence item on it: sanity-check
+  the defocus *magnitude* before trusting it, because a metres/nanometres
+  mix-up is a factor of 1e9 sent to the column, not a rounding error.
+- **Calibration exists as a model but nothing feeds it from the
+  instrument.** §5 Phase 3's calibration work closed the "camera frames have
+  no physical axes" half of this: a per-axis, per-acquisition model now
+  exists and writes correct NeXus units. What remains is the *plumbing* —
+  nothing reads calibration off a device (`camera_base.CameraSettings` and
+  `camera_module.camera_settings` are still read-but-unused in the nion
+  stack), and no UI selects a microscope mode, so today an operator cannot
+  choose between real-space, reciprocal, and energy axes without writing
+  code. Exposure and binning control are also still absent, and want doing
+  *with* calibration rather than after it, since binning changes the pixel
+  scale. This spans `devices/interface.py`, the viewer, and the session
+  layer.
+- **The EELS dispersive-axis default is grounded in the simulator only.**
+  `dispersive_axis="x"` was chosen because usim reports its energy
+  calibration on axis 1 of a 256×1024 frame; a real spectrometer's
+  orientation needs confirming on hardware (it is on the checklist), and it
+  is a parameter precisely so a wrong default is a configuration change
+  rather than a code change.
+- **Scan data arrives as `float64` for no physical reason.** usim's
+  `generate_scan_data` is annotated `-> NDArray[float32]` and builds float32
+  internally; the promotion happens in its final line, where
+  `numpy.random.randn()` (float64) is added to a float32 array. Storing
+  float32 is a measured **2.33×** file-size win at a quantization error
+  1.6e-07 of the data's own noise standard deviation (§5 Phase 3), so the
+  fix belongs upstream of storage rather than as a silent downcast in the
+  writer. Real-hardware dtype is unvalidated, which is the other reason not
+  to change the default yet.
+- **SWMR-mode writing** conflicts with `NexusWriter` creating its `NXdata`
+  group at `close()` (it needs the final frame shape for the axes).
+  Supporting it means restructuring the writer to create NXdata up front —
+  a real design change, and the remaining step beyond the per-frame
+  `flush()` that already bounds worst-case loss to one frame.
+- ~~**`storage/legacy.py` imports GPL-3.0 code in-process**~~ —
+  **resolved**: re-implemented on the standard library, so `nion.*` is now
+  imported in `nion_server.py` and nowhere else in `src/`. See the end of
+  §6, including why RosettaSciIO (the obvious reuse candidate) could not do
+  it.
+- ~~**Shared-memory threshold precision**~~ — **resolved** by the
+  reused-segment redesign (§6), not by fitting a better number for the old
+  design. The threshold is now 64KB and sits inside a band the benchmark
+  measured as "doesn't matter much either way" (pickle and shared memory
+  within 0.3–0.5ms of each other from ~30KB to ~500KB). It does want
+  re-measuring at real frame rates, which is on the hardware checklist.
 - **A real 4D-STEM acquisition mode**: §5's Phase 4 py4DSTEM follow-up
   measured, rather than assumed, that even the simulated device stack
   cannot produce scan-position-varying diffraction frames without
@@ -776,13 +1433,25 @@ results pointed.
 ## 8. Summary
 
 Beyond the device layer, almost nothing here needs to be built from
-scratch: napari + PySide6 for the shell and rendering, HDF5/Zarr + NeXus/NXem
-+ RosettaSciIO for storage and I/O, and HyperSpy/py4DSTEM/LiberTEM for
-analysis. The actual new code this project needs to write is the device
-bridge (Phase 1), the live-viewer dock widget (Phase 2), the acquisition
-sequencer and legacy-data importer (Phase 3), and analysis wiring (Phase
-4: one adapter function and one menu action each into HyperSpy, LiberTEM,
-and, on single-diffraction-pattern terms, py4DSTEM) — glue, as intended.
+scratch: napari + PySide6 for the shell and rendering, HDF5 + NeXus/NXem
++ RosettaSciIO for storage and I/O (Zarr evaluated and declined — §5
+Phase 3), and HyperSpy/py4DSTEM/LiberTEM for analysis. The actual new code
+this project needs to write is the device bridge (Phase 1), the live-viewer
+dock widget (Phase 2), the acquisition sequencer, session layer, and
+legacy-data importer (Phase 3), and analysis wiring (Phase 4: one adapter
+function and one menu action each into HyperSpy, LiberTEM, and, on
+single-diffraction-pattern terms, py4DSTEM) — glue, as intended.
+
+Two of this plan's own claims turned out to be false when finally checked,
+which is worth recording as a pattern rather than as two isolated
+corrections. The files declared `definition = "NXem"` for three phases
+before anyone validated them, and they did not conform — one required
+`NXsample` group short. And §6's own central invariant, that the MIT
+application never imports `nion.*`, was already breached by
+`storage/legacy.py` while §6 was being written. Both were found by checking
+a stated claim rather than by anything failing, and neither would have
+surfaced from tests, which is the argument for §1's "measure, don't assume"
+extending to the documentation as well as the code.
 The LiberTEM adapter is also a useful lesson in the plan's own "measure,
 don't assume" principle (§1): an earlier version of this plan grouped
 LiberTEM with py4DSTEM as both needing 4D-STEM data this app doesn't

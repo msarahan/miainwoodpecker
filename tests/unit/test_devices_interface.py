@@ -5,7 +5,16 @@ import typing
 
 import numpy as np
 
-from miainwoodpecker.devices import Camera, Frame, ScanParameters, Scanner
+from miainwoodpecker.devices import (
+    BEAM_BLANKER_CONTROL,
+    DEFOCUS_CONTROL,
+    STAGE_POSITION_CONTROL,
+    Camera,
+    Frame,
+    InstrumentController,
+    ScanParameters,
+    Scanner,
+)
 
 
 class _FakeCamera:
@@ -66,6 +75,58 @@ class _FakeScanner:
         """Release nothing; the fake owns no resources."""
 
 
+class _FakeInstrument:
+    """Minimal in-memory implementation of the InstrumentController protocol."""
+
+    def __init__(self, *, controls: typing.Sequence[str] | None = None) -> None:
+        self._controls = (
+            list(controls)
+            if controls is not None
+            else [STAGE_POSITION_CONTROL, DEFOCUS_CONTROL, BEAM_BLANKER_CONTROL]
+        )
+        self.position_nm = (0.0, 0.0)
+        self.defocus = 500.0
+        self.blanked = False
+        self.park_count = 0
+
+    def stage_size_nm(self) -> float:
+        """Return a fake stage extent."""
+        return 1000.0
+
+    def available_controls(self) -> typing.Sequence[str]:
+        """Return the controls this fake claims to implement."""
+        return self._controls
+
+    def stage_position_nm(self) -> tuple[float, float]:
+        """Return the last position written."""
+        return self.position_nm
+
+    def set_stage_position_nm(self, y_nm: float, x_nm: float) -> None:
+        """Record an absolute stage move."""
+        self.position_nm = (y_nm, x_nm)
+
+    def defocus_nm(self) -> float:
+        """Return the last defocus written."""
+        return self.defocus
+
+    def set_defocus_nm(self, defocus_nm: float) -> None:
+        """Record a defocus change."""
+        self.defocus = defocus_nm
+
+    def is_beam_blanked(self) -> bool:
+        """Return whether the fake beam is blanked."""
+        return self.blanked
+
+    def set_beam_blanked(self, *, blanked: bool) -> None:
+        """Record a blanker change."""
+        self.blanked = blanked
+
+    def park(self) -> None:
+        """Blank the beam, as a real park does."""
+        self.park_count += 1
+        self.blanked = True
+
+
 def test_fake_camera_satisfies_camera_protocol():
     """A structural implementation is recognized by the runtime-checkable protocol."""
     assert isinstance(_FakeCamera(), Camera)
@@ -97,3 +158,31 @@ def test_scan_frame_uses_requested_shape():
     parameters = ScanParameters(height=8, width=16, pixel_time_us=1.0, fov_nm=50.0)
     frame = _FakeScanner().scan_frame(parameters)
     assert frame.data.shape == parameters.shape
+
+
+def test_fake_instrument_satisfies_instrument_controller_protocol():
+    """A structural implementation is recognized by the runtime-checkable protocol."""
+    assert isinstance(_FakeInstrument(), InstrumentController)
+
+
+def test_stage_position_is_y_then_x_like_scan_parameters_shape():
+    """Positions use the same (slow, fast) axis order as a frame's shape."""
+    instrument = _FakeInstrument()
+    instrument.set_stage_position_nm(3.0, 7.0)
+    expected = (3.0, 7.0)
+    assert instrument.stage_position_nm() == expected
+
+
+def test_park_blanks_the_beam():
+    """Parking leaves the beam blanked, which is the whole point of the hook."""
+    instrument = _FakeInstrument()
+    assert not instrument.is_beam_blanked()
+    instrument.park()
+    assert instrument.is_beam_blanked()
+
+
+def test_available_controls_can_report_a_partial_instrument():
+    """An instrument without a blanker says so rather than failing on use."""
+    instrument = _FakeInstrument(controls=[DEFOCUS_CONTROL])
+    assert BEAM_BLANKER_CONTROL not in instrument.available_controls()
+    assert isinstance(instrument, InstrumentController)

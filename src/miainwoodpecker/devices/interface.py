@@ -6,11 +6,21 @@ viewer, storage) depends only on the protocols in this module, never on a
 vendor SDK, so another vendor's hardware can be added later as a new
 adapter without touching those layers (see docs/migration-plan.md, §2).
 
-These are deliberately the *smallest* interfaces that support the Phase 2
-live-viewer MVP: a camera produces frames continuously once started, and a
+These are deliberately the *smallest* interfaces that support the phase
+that needs them: a camera produces frames continuously once started, and a
 scanner produces one frame per request (live scanning is a repeated
 ``scan_frame`` loop). Exposure/settings modeling and hardware-synchronized
-multi-signal acquisition are deferred until the phases that need them.
+multi-signal acquisition are still deferred.
+
+:class:`InstrumentController` is the Phase 3 addition, and holds to the
+same rule. It exposes exactly three controls — stage position, defocus,
+beam blanker — because those are what a parameter sweep
+(``acquisition.sequence.focal_series``) and a safe teardown
+(:meth:`InstrumentController.park`) actually need, not because the
+underlying instruments expose only three. A real Nion STEM controller has
+hundreds of named controls (``C10``, ``C12``, ``CAperture``, ``EHT``, …);
+proxying all of them would be a vendor API in vendor-neutral clothing.
+Adding a control here should be driven by a caller that needs it.
 """
 
 from __future__ import annotations
@@ -144,4 +154,72 @@ class Scanner(typing.Protocol):
 
     def close(self) -> None:
         """Release the device."""
+        ...
+
+
+# Neutral names for the controls an InstrumentController may report through
+# available_controls(). Strings rather than an enum so the value survives the
+# device-server IPC boundary as plain data (see devices/rpc.py).
+STAGE_POSITION_CONTROL = "stage_position"
+DEFOCUS_CONTROL = "defocus"
+BEAM_BLANKER_CONTROL = "beam_blanker"
+
+
+@typing.runtime_checkable
+class InstrumentController(typing.Protocol):
+    """
+    Instrument-level controls that are not owned by any single detector.
+
+    Units are the operator's, matching :class:`ScanParameters`: nanometres
+    for lengths, never the vendor's metres. Positions are ``(y, x)``
+    tuples, the same axis order as ``ScanParameters.shape``.
+
+    Not every instrument has every control (a microscope may have no beam
+    blanker; a simulator may model a control it then ignores), so callers
+    must consult :meth:`available_controls` before driving one rather than
+    assuming a successful setter means a working control — a distinction
+    this project has already been bitten by (docs/migration-plan.md, §7).
+    """
+
+    def stage_size_nm(self) -> float:
+        """Return the usable stage extent, for choosing a sensible field of view."""
+        ...
+
+    def available_controls(self) -> typing.Sequence[str]:
+        """Return the ``*_CONTROL`` names this instrument actually implements."""
+        ...
+
+    def stage_position_nm(self) -> tuple[float, float]:
+        """Return the current stage position as ``(y, x)``, in nanometres."""
+        ...
+
+    def set_stage_position_nm(self, y_nm: float, x_nm: float) -> None:
+        """Move the stage to an absolute ``(y, x)`` position, in nanometres."""
+        ...
+
+    def defocus_nm(self) -> float:
+        """Return the current defocus, in nanometres."""
+        ...
+
+    def set_defocus_nm(self, defocus_nm: float) -> None:
+        """Set the defocus, in nanometres."""
+        ...
+
+    def is_beam_blanked(self) -> bool:
+        """Return whether the beam is currently blanked."""
+        ...
+
+    def set_beam_blanked(self, *, blanked: bool) -> None:
+        """Blank or unblank the beam."""
+        ...
+
+    def park(self) -> None:
+        """
+        Put the instrument in a safe unattended state.
+
+        Blanks the beam if a blanker exists. Deliberately *not* a full
+        teardown: stopping detectors and releasing devices belongs to the
+        code that owns them (the device server's shutdown handshake), not
+        to a single-instrument control surface.
+        """
         ...

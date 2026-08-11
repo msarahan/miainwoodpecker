@@ -3,7 +3,23 @@ Integration tests: reading legacy Nion Swift ``.ndata`` files.
 
 Fixtures are written by Nion's own ``NDataHandler`` rather than by
 hand-assembling zip files, so these tests exercise the real container
-format. Skipped unless the ``device`` extra is installed.
+format. That is the entire point of this file, and it is why it still
+needs the ``device`` extra even though
+:mod:`miainwoodpecker.storage.legacy` no longer does: the reader was
+re-implemented on the standard library to keep GPL-3.0 code out of the MIT
+application's process (see that module's docstring and
+docs/migration-plan.md §6), so the risk that replaces the old one is a
+reader that works against our *assumptions* about the format rather than
+the format itself. Writing the fixtures with the vendor's own writer is
+what closes that gap.
+
+Using Nion's writer here is not the boundary violation the reader was: a
+test is not the distributed application, and nothing in this file is
+imported by shipped code.
+
+Reader behaviour that needs no vendor code to exercise — error paths,
+metadata-less files, hand-built containers — lives in
+``tests/unit/test_legacy_reader.py`` so it runs without the extra.
 """
 
 import datetime

@@ -17,18 +17,65 @@ Skipped automatically unless the ``device`` optional dependency group is
 installed.
 """
 
+import os
 import pathlib
+import signal
+import subprocess
+import threading
+import time
 
 import pytest
 
 pytest.importorskip("nion.usim_device", reason="requires the 'device' extra")
 
-from miainwoodpecker.devices import Camera, ScanParameters, Scanner
+from miainwoodpecker.acquisition import focal_series
+from miainwoodpecker.devices import (
+    BEAM_BLANKER_CONTROL,
+    DEFOCUS_CONTROL,
+    STAGE_POSITION_CONTROL,
+    Camera,
+    InstrumentController,
+    ScanParameters,
+    Scanner,
+    remote,
+)
 from miainwoodpecker.devices.nion_server import _SHARED_MEMORY_THRESHOLD_BYTES
-from miainwoodpecker.devices.remote import remote_simulated_instrument
+from miainwoodpecker.devices.remote import (
+    HARDWARE_BACKEND,
+    SERVER_EXITED,
+    SERVER_RESPONSIVE,
+    SERVER_UNRESPONSIVE,
+    SIMULATED_BACKEND,
+    _CONNECT_TIMEOUT_S,
+    DeviceServerStartupError,
+    RemoteInstrumentDevices,
+    remote_instrument,
+    remote_simulated_instrument,
+)
+from miainwoodpecker.devices.rpc import (
+    RemoteCallTimeoutError,
+    RemoteConnectionLostError,
+)
 
 _DEV_SHM = pathlib.Path("/dev/shm")  # noqa: S108 - inspected read-only, never written to
+_PROC = pathlib.Path("/proc")
 _LARGE_SIZE = 1536  # 1536x1536 float64 = ~18.9MB, comfortably above threshold
+# A scan slow enough that a kill can land while it is genuinely in flight:
+# 4096x4096 measured ~0.9s against usim on this container, versus ~0.15s for
+# _LARGE_SIZE. Sized for "reliably still running after a short sleep", not
+# for realism.
+_SLOW_SCAN_SIZE = 4096
+# A dead or wedged server must be reported in well under this. Deliberately
+# loose - the point is "does not hang", and the measured figures are two to
+# three orders of magnitude below it, so the assertion cannot go flaky on a
+# loaded CI machine while still failing an actual hang.
+_FAIL_FAST_BUDGET_S = 20.0
+# A health check must be cheap enough to poll from a UI timer. Measured
+# ~0.4ms against the simulator; asserted loosely for the same reason.
+_HEALTH_LATENCY_BUDGET_MS = 500.0
+# Enough polls to be a meaningful sample while a scan runs, capped so a fast
+# machine cannot spin here indefinitely.
+_MAX_HEALTH_POLLS = 20
 
 
 def _shm_names() -> set[str]:
@@ -43,6 +90,44 @@ def microscope():
     """Spawn one device server subprocess for every test in this module."""
     with remote_simulated_instrument() as instrument:
         yield instrument
+
+
+@pytest.fixture
+def spawned_servers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> list[subprocess.Popen[bytes]]:
+    """
+    Capture every device server subprocess a test spawns.
+
+    Several tests below need the ``Popen`` handle itself — to signal it, or
+    to assert how it died — and ``remote_instrument`` deliberately does not
+    hand it out (the client API is about devices, not about process
+    management). Wrapping the private spawn helper is the least invasive
+    way to get it.
+
+    Parameters
+    ----------
+    monkeypatch : pytest.MonkeyPatch
+        Used to restore the real spawn helper afterwards.
+
+    Returns
+    -------
+    list[subprocess.Popen[bytes]]
+        Filled in spawn order as the test runs.
+    """
+    spawned: list[subprocess.Popen[bytes]] = []
+    spawn_server = remote._spawn_server  # noqa: SLF001
+
+    def capturing_spawn(
+        *args: object,
+        **kwargs: object,
+    ) -> subprocess.Popen[bytes]:
+        process = spawn_server(*args, **kwargs)
+        spawned.append(process)
+        return process
+
+    monkeypatch.setattr(remote, "_spawn_server", capturing_spawn)
+    return spawned
 
 
 def test_remote_devices_satisfy_the_protocols(microscope):
@@ -166,8 +251,17 @@ def test_no_shared_memory_segments_leak_after_teardown():
 
     Uses a fresh instrument rather than the module fixture, since the
     check is only meaningful across a full spawn-to-teardown lifecycle.
+
+    Asserts against the specific segment names this session used rather
+    than comparing whole-directory ``/dev/shm`` snapshots before and
+    after. A snapshot diff was order-dependently flaky under
+    ``pytest-randomly``: ``/dev/shm`` is machine-global and also holds
+    POSIX semaphores and segments created by anything else running in the
+    same interpreter (napari/Qt thread pools, numpy, other test modules),
+    so unrelated churn between the two snapshots failed a test that was
+    only ever meant to check *our* segments. Naming them directly is both
+    immune to that and a stricter statement of the actual property.
     """
-    before = _shm_names()
     with remote_simulated_instrument() as instrument:
         parameters = ScanParameters(
             height=_LARGE_SIZE,
@@ -186,5 +280,648 @@ def test_no_shared_memory_segments_leak_after_teardown():
             instrument.eels_camera.acquire_frame()
         finally:
             instrument.eels_camera.stop()
-    after = _shm_names()
-    assert after == before
+        # Collected while the session is still alive: once it tears down,
+        # the readers have detached and no longer know the names.
+        used_names = {
+            reader._segment.name  # noqa: SLF001
+            for reader in (
+                instrument.scanner._reader,  # noqa: SLF001
+                instrument.ronchigram_camera._reader,  # noqa: SLF001
+                instrument.eels_camera._reader,  # noqa: SLF001
+            )
+            if reader._segment is not None  # noqa: SLF001
+        }
+
+    # Guards against this test passing vacuously if the shared-memory
+    # path was never actually taken (e.g. a threshold change).
+    expected_segment_count = 3  # scanner + both cameras
+    assert len(used_names) == expected_segment_count
+    assert used_names.isdisjoint(_shm_names())
+
+
+def _exercise_shared_memory(
+    instrument: RemoteInstrumentDevices,
+) -> set[str]:
+    """
+    Push a large frame through every device, then name the segments used.
+
+    Returns the segment names while the session is still alive, since the
+    readers detach on teardown and stop knowing them — the same technique
+    ``test_no_shared_memory_segments_leak_after_teardown`` uses, factored
+    out so the graceful-shutdown and wedged-server variants below assert
+    the same property against the same three segments.
+
+    Parameters
+    ----------
+    instrument : RemoteInstrumentDevices
+        A live session.
+
+    Returns
+    -------
+    set[str]
+        The ``/dev/shm`` names the session's three readers are attached to.
+    """
+    parameters = ScanParameters(
+        height=_LARGE_SIZE,
+        width=_LARGE_SIZE,
+        pixel_time_us=1.0,
+        fov_nm=instrument.stage_size_nm * 0.1,
+    )
+    instrument.scanner.scan_frame(parameters, channel=0)
+    for camera in (instrument.ronchigram_camera, instrument.eels_camera):
+        camera.start()
+        try:
+            camera.acquire_frame()
+        finally:
+            camera.stop()
+    return {
+        reader._segment.name  # noqa: SLF001
+        for reader in (
+            instrument.scanner._reader,  # noqa: SLF001
+            instrument.ronchigram_camera._reader,  # noqa: SLF001
+            instrument.eels_camera._reader,  # noqa: SLF001
+        )
+        if reader._segment is not None  # noqa: SLF001
+    }
+
+
+# --------------------------------------------------- instrument controls
+
+
+def test_remote_instrument_satisfies_the_controller_protocol(microscope):
+    """RemoteInstrument is recognized by the runtime-checkable protocol."""
+    assert isinstance(microscope.instrument, InstrumentController)
+
+
+def test_describe_reports_the_backend_targets_and_controls(microscope):
+    """
+    The client learns what the server has before connecting to it.
+
+    This is what lets a real instrument omit a camera the simulator
+    happens to have: the client connects only to the reported targets.
+    """
+    description = microscope.instrument.describe()
+    assert description["backend"] == SIMULATED_BACKEND
+    assert list(description["targets"]) == [
+        "ronchigram_camera",
+        "eels_camera",
+        "scanner",
+    ]
+    assert set(description["controls"]) == {
+        STAGE_POSITION_CONTROL,
+        DEFOCUS_CONTROL,
+        BEAM_BLANKER_CONTROL,
+    }
+    assert description["stage_size_nm"] == microscope.stage_size_nm
+
+
+def test_defocus_round_trips_over_ipc(microscope):
+    """Setting defocus over IPC changes what a later read returns."""
+    instrument = microscope.instrument
+    original = instrument.defocus_nm()
+    try:
+        instrument.set_defocus_nm(original + 750.0)
+        assert instrument.defocus_nm() == pytest.approx(original + 750.0)
+    finally:
+        instrument.set_defocus_nm(original)
+    assert instrument.defocus_nm() == pytest.approx(original)
+
+
+def test_stage_position_round_trips_over_ipc(microscope):
+    """A (y, x) stage move survives the round trip in the right axis order."""
+    instrument = microscope.instrument
+    original = instrument.stage_position_nm()
+    try:
+        instrument.set_stage_position_nm(original[0] + 12.0, original[1] + 34.0)
+        moved = instrument.stage_position_nm()
+        assert moved == pytest.approx((original[0] + 12.0, original[1] + 34.0))
+    finally:
+        instrument.set_stage_position_nm(*original)
+
+
+def test_beam_blanker_round_trips_over_ipc(microscope):
+    """The blanker's keyword-only setter crosses the RPC boundary as a kwarg."""
+    instrument = microscope.instrument
+    assert not instrument.is_beam_blanked()
+    try:
+        instrument.set_beam_blanked(blanked=True)
+        assert instrument.is_beam_blanked()
+    finally:
+        instrument.set_beam_blanked(blanked=False)
+    assert not instrument.is_beam_blanked()
+
+
+def test_focal_series_sweeps_real_defocus_over_ipc(microscope):
+    """
+    A defocus sweep over the real device server produces the expected frames.
+
+    Note what this does *not* claim: usim's scan generator does not model
+    defocus at all (measured with
+    ``scripts/device_control_verification.py`` - a 2500nm defocus change
+    moves scan data by 1.00x the shot-noise floor, versus 6.2x for the
+    Ronchigram camera), so the frames here differ only by noise. What is
+    verified is that the sweep drives the real control, records the
+    read-back value per frame, and restores the instrument afterwards.
+    """
+    instrument = microscope.instrument
+    parameters = ScanParameters(
+        height=32,
+        width=32,
+        pixel_time_us=1.0,
+        fov_nm=microscope.stage_size_nm * 0.1,
+    )
+    original = instrument.defocus_nm()
+    values = [original + 100.0, original + 200.0, original + 300.0]
+    frames = list(
+        focal_series(microscope.scanner, parameters, values, instrument=instrument),
+    )
+    assert len(frames) == len(values)
+    assert [frame.metadata["requested_defocus_nm"] for frame in frames] == values
+    assert [frame.metadata["defocus_nm"] for frame in frames] == pytest.approx(values)
+    assert all(frame.data.shape == parameters.shape for frame in frames)
+    # A defocus sweep leaves the field of view alone.
+    assert all(frame.metadata["fov_nm"] == parameters.fov_nm for frame in frames)
+    assert instrument.defocus_nm() == pytest.approx(original)
+
+
+# ----------------------------------------------------- graceful shutdown
+
+
+def test_graceful_shutdown_parks_and_releases_every_device():
+    """
+    A healthy server stops the cameras, blanks the beam, and releases devices.
+
+    Uses its own session: the handshake ends that server's life, so it
+    cannot share the module fixture.
+    """
+    with remote_instrument() as instrument:
+        report = instrument.instrument.shutdown()
+    assert report["backend"] == SIMULATED_BACKEND
+    assert set(report["cameras_stopped"]) == {"ronchigram_camera", "eels_camera"}
+    assert report["beam_blanked"] is True
+    assert set(report["devices_released"]) == {
+        "ronchigram_camera",
+        "eels_camera",
+        "scanner",
+    }
+    assert report["errors"] == []
+
+
+def test_an_explicit_shutdown_leaves_teardown_nothing_to_kill(spawned_servers):
+    """
+    Calling the handshake yourself makes teardown a no-op, not a second SIGTERM.
+
+    Acknowledging a shutdown ends the server's life — it closes that
+    connection and exits — so the handshake is deliberately *not*
+    re-callable over the same connection. What teardown must do instead is
+    notice the process has already gone. Asserted by exit status: a clean
+    ``0`` rather than the ``-SIGTERM`` a redundant kill would leave.
+    """
+    with remote_instrument() as instrument:
+        instrument.instrument.shutdown()
+    assert spawned_servers[0].returncode == 0
+
+
+def test_graceful_shutdown_leaves_no_shared_memory_segments():
+    """
+    The handshake retires the reused segments, which SIGTERM alone cannot.
+
+    Named POSIX segments outlive the process that created them, so this is
+    the property the whole shutdown ordering exists to preserve.
+    """
+    with remote_instrument() as instrument:
+        used_names = _exercise_shared_memory(instrument)
+        report = instrument.instrument.shutdown()
+    expected_segment_count = 3  # scanner + both cameras
+    assert len(used_names) == expected_segment_count
+    assert report["errors"] == []
+    assert used_names.isdisjoint(_shm_names())
+
+
+def test_hardware_backend_over_ipc_fails_fast_and_says_why():
+    """
+    Asking for hardware with none attached fails promptly, not after a timeout.
+
+    The server prints what it looked for and exits; the client notices the
+    exit instead of retrying until the 15s connect deadline, which would
+    otherwise turn the one useful diagnostic into a silent hang followed by
+    ``ConnectionRefusedError``. This is the hardware backend's *testable*
+    failure mode, and the one a misconfigured instrument computer hits.
+    """
+    started = time.monotonic()
+    with pytest.raises(
+        DeviceServerStartupError,
+        match="exited with status",
+    ), remote_instrument(HARDWARE_BACKEND):
+        pass  # pragma: no cover - must not get this far
+    assert time.monotonic() - started < _CONNECT_TIMEOUT_S
+
+
+def test_shutdown_times_out_against_a_wedged_server(monkeypatch):
+    """
+    A server that never answers raises rather than blocking forever.
+
+    The wedge is a documented test-only hook in the server's shutdown
+    handler (``MIAINWOODPECKER_WEDGE_SHUTDOWN``), so this exercises the
+    real socket-timeout path rather than a mocked-out client.
+    """
+    monkeypatch.setenv("MIAINWOODPECKER_WEDGE_SHUTDOWN", "1")
+    monkeypatch.setattr(remote, "_SHUTDOWN_TIMEOUT_S", 1.0)
+    with remote_instrument() as instrument, pytest.raises(
+        RemoteCallTimeoutError,
+        match="did not reply",
+    ):
+        instrument.instrument.shutdown()
+
+
+def test_sigterm_fallback_fires_when_the_server_is_wedged(
+    monkeypatch,
+    spawned_servers,
+):
+    """
+    A wedged server is killed, and its shared-memory segments are still freed.
+
+    Asserts the fallback actually fired rather than inferring it: the
+    server process must have died of SIGTERM, and the three segments the
+    session used must be gone anyway — the per-device ``close()`` fallback
+    is what unlinks them when the handshake cannot.
+    """
+    monkeypatch.setenv("MIAINWOODPECKER_WEDGE_SHUTDOWN", "1")
+    monkeypatch.setattr(remote, "_SHUTDOWN_TIMEOUT_S", 1.0)
+    with remote_instrument() as instrument:
+        used_names = _exercise_shared_memory(instrument)
+    expected_segment_count = 3  # scanner + both cameras
+    assert len(used_names) == expected_segment_count
+    assert len(spawned_servers) == 1
+    assert spawned_servers[0].returncode == -signal.SIGTERM
+    assert used_names.isdisjoint(_shm_names())
+
+
+# ------------------------------------------------------------ health check
+
+
+def test_health_check_reports_a_responsive_server(microscope):
+    """
+    A live server answers with its own process state, quickly.
+
+    The latency assertion is part of the contract rather than decoration:
+    the check exists to be polled routinely (a UI status timer), which it
+    can only be if it stays cheap. It is cheap because the server's handler
+    touches no device and takes no lock — see ``NionInstrument.health``.
+    """
+    health = microscope.instrument.check_health()
+    assert health.state == SERVER_RESPONSIVE
+    assert health.is_responsive
+    assert health.exit_status is None
+    assert health.latency_ms < _HEALTH_LATENCY_BUDGET_MS
+    report = health.report
+    assert report["ok"] is True
+    assert report["backend"] == SIMULATED_BACKEND
+    assert report["pid"] > 0
+    assert report["shutting_down"] is False
+    assert set(report["targets"]) == {
+        "ronchigram_camera",
+        "eels_camera",
+        "scanner",
+    }
+    # Nothing has been closed yet, so every served device is still open.
+    assert set(report["open_devices"]) == set(report["targets"])
+    assert "responsive" in health.detail
+
+
+def test_health_check_does_not_disturb_an_acquisition(microscope):
+    """
+    Polling health while a scan is in flight neither blocks nor corrupts it.
+
+    This is the property that makes the check usable at all, and it is not
+    self-evident: a health call sharing the instrument control connection
+    would serialize behind whatever is on it, and a health call that
+    touched a device would contend with the acquisition itself. So the scan
+    runs on a worker thread while the main thread polls, and both halves
+    are asserted — every poll answers promptly, *and* the frame comes back
+    intact.
+    """
+    parameters = ScanParameters(
+        height=_SLOW_SCAN_SIZE,
+        width=_SLOW_SCAN_SIZE,
+        pixel_time_us=1.0,
+        fov_nm=microscope.stage_size_nm * 0.1,
+    )
+    outcome: dict[str, object] = {}
+
+    def scan() -> None:
+        frame = microscope.scanner.scan_frame(parameters, channel=0)
+        outcome["shape"] = frame.data.shape
+
+    worker = threading.Thread(target=scan)
+    worker.start()
+    try:
+        polled = []
+        while worker.is_alive() and len(polled) < _MAX_HEALTH_POLLS:
+            polled.append(microscope.instrument.check_health())
+            time.sleep(0.01)
+    finally:
+        worker.join(timeout=_FAIL_FAST_BUDGET_S)
+    assert not worker.is_alive()
+    assert outcome["shape"] == parameters.shape
+    assert polled, "the scan finished before a single health check ran"
+    assert all(health.state == SERVER_RESPONSIVE for health in polled)
+    assert all(health.latency_ms < _HEALTH_LATENCY_BUDGET_MS for health in polled)
+    # Restore the segment size the rest of this module's tests expect.
+    microscope.scanner.scan_frame(
+        ScanParameters(
+            height=_LARGE_SIZE,
+            width=_LARGE_SIZE,
+            pixel_time_us=1.0,
+            fov_nm=microscope.stage_size_nm * 0.1,
+        ),
+        channel=0,
+    )
+
+
+def test_health_check_detects_a_killed_server(spawned_servers):
+    """
+    SIGKILL at idle is reported as "exited", naming the signal.
+
+    ``SIGKILL`` rather than ``SIGTERM`` on purpose: it is the one signal a
+    process cannot handle, so nothing on the server side gets to tidy up or
+    reply, which is exactly the condition the client must diagnose on its
+    own.
+    """
+    with remote_instrument() as instrument:
+        server = spawned_servers[0]
+        assert instrument.instrument.check_health().is_responsive
+        server.send_signal(signal.SIGKILL)
+        server.wait(timeout=_FAIL_FAST_BUDGET_S)
+        started = time.monotonic()
+        health = instrument.instrument.check_health()
+        assert time.monotonic() - started < _FAIL_FAST_BUDGET_S
+    assert health.state == SERVER_EXITED
+    assert health.exit_status == -signal.SIGKILL
+    assert "SIGKILL" in health.detail
+    assert "cannot be recovered" in health.detail
+
+
+def test_health_check_detects_a_wedged_server(monkeypatch, spawned_servers):
+    """
+    A server that is running but not answering is a third, distinct verdict.
+
+    Driven by a documented test-only server hook
+    (``MIAINWOODPECKER_WEDGE_HEALTH``) so the real bounded-wait path runs
+    against a genuinely unresponsive handler rather than a mocked client.
+
+    Two things are asserted beyond the verdict itself, both consequences of
+    giving the probe its own connection. The instrument's *control* calls
+    must still work — a wedged status probe must not cost the operator the
+    ability to blank the beam. And the retired probe must keep answering
+    from what it already knows instead of sending a second request, since
+    the first reply could still arrive and would be misread as the second's.
+    """
+    monkeypatch.setenv("MIAINWOODPECKER_WEDGE_HEALTH", "1")
+    with remote_instrument() as instrument:
+        started = time.monotonic()
+        health = instrument.instrument.check_health(timeout_s=1.0)
+        elapsed = time.monotonic() - started
+        assert health.state == SERVER_UNRESPONSIVE
+        assert health.exit_status is None
+        assert "did not answer" in health.detail
+        assert "wedged rather than busy" in health.detail
+        assert elapsed < _FAIL_FAST_BUDGET_S
+        # The control connection is untouched by the wedged probe.
+        assert instrument.instrument.defocus_nm() > 0
+        again = time.monotonic()
+        second = instrument.instrument.check_health(timeout_s=1.0)
+        assert time.monotonic() - again < 1.0
+        assert second.state == SERVER_UNRESPONSIVE
+        assert "retired this probe" in second.detail
+    assert spawned_servers[0].returncode is not None
+
+
+# --------------------------------------------------------- kill and recover
+
+
+def test_a_device_call_after_a_kill_fails_fast_and_names_the_cause(spawned_servers):
+    """
+    Both a device call and a control call fail immediately, saying why.
+
+    The behaviour being pinned is that a dead server does *not* need a
+    timeout to be detected: its socket closes, so the call fails at once.
+    What the client adds is the diagnosis — before this, the symptom was a
+    bare ``EOFError`` with no message, naming neither the target nor the
+    fact that the server had died.
+    """
+    with remote_instrument() as instrument:
+        server = spawned_servers[0]
+        parameters = ScanParameters(
+            height=32,
+            width=48,
+            pixel_time_us=1.0,
+            fov_nm=instrument.stage_size_nm * 0.1,
+        )
+        server.send_signal(signal.SIGKILL)
+        server.wait(timeout=_FAIL_FAST_BUDGET_S)
+
+        started = time.monotonic()
+        with pytest.raises(RemoteConnectionLostError) as failure:
+            instrument.scanner.scan_frame(parameters, channel=0)
+        assert time.monotonic() - started < _FAIL_FAST_BUDGET_S
+        message = str(failure.value)
+        assert "scanner.scan_frame()" in message
+        assert "SIGKILL" in message
+        assert "cannot be recovered" in message
+
+        started = time.monotonic()
+        with pytest.raises(RemoteConnectionLostError, match="SIGKILL"):
+            instrument.instrument.defocus_nm()
+        assert time.monotonic() - started < _FAIL_FAST_BUDGET_S
+
+
+def test_killing_the_server_mid_acquisition_fails_the_call_in_flight(
+    monkeypatch, spawned_servers,
+):
+    """
+    A kill during a scan raises in the blocked call rather than hanging it.
+
+    The mid-acquisition case is the one that matters operationally and the
+    one an idle-only test would miss: the client is parked in
+    ``connection.recv()`` with no timeout — correctly, because a real
+    exposure takes as long as it takes — so the only thing that can wake it
+    is the socket closing. That it does, and that the resulting error names
+    the cause, is what is asserted here.
+
+    "In flight" is arranged deterministically rather than raced for. This
+    originally sized a scan to be slow (4096x4096) and slept a fixed 0.3s
+    before killing, which is a bet on the machine: on a CI runner the scan
+    finished inside the window and the test failed on its own premise,
+    reporting nothing about the behaviour under test. The server's
+    ``MIAINWOODPECKER_DELAY_SCAN_S`` test hook now holds the scan open for a
+    known duration — the same approach the wedge hooks already take — and the
+    worker signals when it has actually issued the call, so no sleep is
+    guessing at anything.
+    """
+    delay_s = 10.0
+    monkeypatch.setenv("MIAINWOODPECKER_DELAY_SCAN_S", str(delay_s))
+    with remote_instrument() as instrument:
+        server = spawned_servers[0]
+        parameters = ScanParameters(
+            height=_LARGE_SIZE,
+            width=_LARGE_SIZE,
+            pixel_time_us=1.0,
+            fov_nm=instrument.stage_size_nm * 0.1,
+        )
+        outcome: dict[str, object] = {}
+        issued = threading.Event()
+
+        def scan() -> None:
+            started = time.monotonic()
+            issued.set()
+            try:
+                instrument.scanner.scan_frame(parameters, channel=0)
+            except BaseException as error:  # noqa: BLE001 - recorded for the assertions
+                outcome["error"] = error
+            outcome["elapsed_s"] = time.monotonic() - started
+
+        worker = threading.Thread(target=scan)
+        worker.start()
+        assert issued.wait(timeout=_FAIL_FAST_BUDGET_S), "the scan never started"
+        # The call is issued and the server is sleeping in the hook, so the
+        # client is parked in recv(); killing now is guaranteed mid-flight.
+        assert worker.is_alive()
+        server.send_signal(signal.SIGKILL)
+        worker.join(timeout=_FAIL_FAST_BUDGET_S)
+        assert not worker.is_alive()
+
+    assert isinstance(outcome["error"], RemoteConnectionLostError)
+    # Well inside the hook's delay, so the error came from the kill waking a
+    # blocked recv() rather than from the scan completing on its own.
+    assert outcome["elapsed_s"] < delay_s
+    assert "SIGKILL" in str(outcome["error"])
+
+
+def test_a_broken_connection_reports_more_than_a_bare_eof_error(spawned_servers):
+    """
+    A connection lost with the server still alive is also diagnosed, not raw.
+
+    The third failure mode, and the one that is *not* process death: the
+    socket goes away while the server is fine. Provoked by closing the
+    client's own end, which is the only way to produce it deterministically.
+    The point is the shape of the error — named call, stated cause — since
+    the underlying ``OSError``/``EOFError`` carries no message at all.
+    """
+    with remote_instrument() as instrument:
+        parameters = ScanParameters(
+            height=32,
+            width=48,
+            pixel_time_us=1.0,
+            fov_nm=instrument.stage_size_nm * 0.1,
+        )
+        instrument.scanner._connection.close()  # noqa: SLF001
+        with pytest.raises(RemoteConnectionLostError) as failure:
+            instrument.scanner.scan_frame(parameters, channel=0)
+        message = str(failure.value)
+        assert "scanner.scan_frame()" in message
+        assert "still running" in message
+        assert instrument.instrument.check_health().is_responsive
+    # The handshake still ran, so the server exited cleanly despite the
+    # broken device connection.
+    assert spawned_servers[0].returncode == 0
+
+
+def test_a_sigkilled_server_leaves_no_shared_memory_segments(spawned_servers):
+    """
+    The three segments a killed session used are gone once it tears down.
+
+    Same pattern as ``test_no_shared_memory_segments_leak_after_teardown``:
+    name the segments the session actually used and assert those are gone,
+    rather than diffing whole-directory ``/dev/shm`` snapshots, which is
+    flaky because ``/dev/shm`` is machine-global.
+
+    Two independent mechanisms can satisfy this, which is why the next test
+    exists to separate them: the server's own ``resource_tracker`` (a child
+    process that outlives a ``SIGKILL``-ed parent and cleans up after it)
+    and, failing that, the client's orphan unlink.
+    """
+    with remote_instrument() as instrument:
+        used_names = _exercise_shared_memory(instrument)
+        server = spawned_servers[0]
+        server.send_signal(signal.SIGKILL)
+        server.wait(timeout=_FAIL_FAST_BUDGET_S)
+    expected_segment_count = 3  # scanner + both cameras
+    assert len(used_names) == expected_segment_count
+    assert spawned_servers[0].returncode == -signal.SIGKILL
+    assert used_names.isdisjoint(_shm_names())
+
+
+def _resource_tracker_pids(pid: int) -> list[int]:
+    """
+    Return the ``multiprocessing.resource_tracker`` children of a process.
+
+    Parameters
+    ----------
+    pid : int
+        Parent process id to search under.
+
+    Returns
+    -------
+    list[int]
+        Pids of that process's resource-tracker children.
+    """
+    found = []
+    for entry in _PROC.iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            status = (entry / "status").read_text()
+            cmdline = (entry / "cmdline").read_bytes().decode(errors="replace")
+        except OSError:
+            continue  # the process exited while we were reading it
+        parent = [
+            line.split()[1] for line in status.splitlines() if line.startswith("PPid:")
+        ]
+        if parent and int(parent[0]) == pid and "resource_tracker" in cmdline:
+            found.append(int(entry.name))
+    return found
+
+
+@pytest.mark.skipif(
+    not _PROC.is_dir() or not _DEV_SHM.is_dir(),
+    reason="needs Linux /proc and /dev/shm to find the tracker and see segments",
+)
+def test_the_client_reclaims_segments_when_the_tracker_dies_too(spawned_servers):
+    """
+    Kill the server *and* its resource tracker: the client still cleans up.
+
+    This test earns its complexity by isolating a mechanism the simpler leak
+    test cannot see. Measuring rather than assuming what a ``SIGKILL``
+    leaves behind turned up something the design had not accounted for: the
+    server's ``multiprocessing.resource_tracker`` is a *separate child
+    process*, it registers every segment the writer creates, and it unlinks
+    them when the server's end of its pipe closes — so an ordinary
+    ``SIGKILL`` of the server alone leaks nothing, despite the server itself
+    running no cleanup at all.
+
+    That is a CPython implementation detail, not a guarantee, and it fails
+    exactly when the tracker dies alongside the server: a process-group
+    kill, a cgroup OOM kill, a container stop. So this test kills both, and
+    asserts in two stages — first that the segments really do survive (the
+    leak is real, and this test would be vacuous otherwise), then that the
+    client's own unlink reclaims them, which is the only thing left that
+    can.
+    """
+    with remote_instrument() as instrument:
+        used_names = _exercise_shared_memory(instrument)
+        server = spawned_servers[0]
+        trackers = _resource_tracker_pids(server.pid)
+        assert trackers, "expected the server to own a resource_tracker child"
+        for tracker_pid in trackers:
+            os.kill(tracker_pid, signal.SIGKILL)
+        server.send_signal(signal.SIGKILL)
+        server.wait(timeout=_FAIL_FAST_BUDGET_S)
+        # Stage one: with no tracker, the leak is real and observable.
+        leaked = used_names & _shm_names()
+        assert leaked == used_names, (
+            "expected every segment to survive a server killed alongside its "
+            f"resource tracker; only {sorted(leaked)} of {sorted(used_names)} did"
+        )
+    # Stage two: teardown noticed the abnormal exit and unlinked them.
+    assert used_names.isdisjoint(_shm_names())

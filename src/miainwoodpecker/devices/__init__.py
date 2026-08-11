@@ -11,11 +11,24 @@ docs/migration-plan.md §6, for why that module must never be imported by
 the main application.
 """
 
-from miainwoodpecker.devices.interface import Camera, Frame, ScanParameters, Scanner
+from miainwoodpecker.devices.interface import (
+    BEAM_BLANKER_CONTROL,
+    DEFOCUS_CONTROL,
+    STAGE_POSITION_CONTROL,
+    Camera,
+    Frame,
+    InstrumentController,
+    ScanParameters,
+    Scanner,
+)
 
 __all__ = [
+    "BEAM_BLANKER_CONTROL",
+    "DEFOCUS_CONTROL",
+    "STAGE_POSITION_CONTROL",
     "Camera",
     "Frame",
+    "InstrumentController",
     "ScanParameters",
     "Scanner",
 ]

@@ -16,13 +16,20 @@ from __future__ import annotations
 import dataclasses
 import typing
 
+from miainwoodpecker.devices.interface import DEFOCUS_CONTROL
 from miainwoodpecker.storage.nexus import write_frames
 
 if typing.TYPE_CHECKING:
     import os
     from collections.abc import Iterable, Iterator
 
-    from miainwoodpecker.devices.interface import Camera, Frame, ScanParameters, Scanner
+    from miainwoodpecker.devices.interface import (
+        Camera,
+        Frame,
+        InstrumentController,
+        ScanParameters,
+        Scanner,
+    )
 
 
 def scan_series(
@@ -101,38 +108,78 @@ def camera_series(camera: Camera, count: int) -> Iterator[Frame]:
 def focal_series(
     scanner: Scanner,
     parameters: ScanParameters,
-    fov_values_nm: Iterable[float],
+    values_nm: Iterable[float],
     *,
     channel: int = 0,
+    instrument: InstrumentController | None = None,
 ) -> Iterator[Frame]:
     """
-    Yield one scanned frame per field-of-view value.
+    Yield one scanned frame per swept value, sweeping defocus or field of view.
 
-    A stand-in for the parameter-sweep shape that real focal and tilt
-    series need. Sweeping focus or stage tilt requires instrument controls
-    that the Phase 1 device interface deliberately does not expose yet;
-    field of view is the one sweepable axis available today, and the
-    generator shape is what will carry over.
+    Without an ``instrument``, this sweeps ``parameters.fov_nm`` — the
+    only axis the Phase 1 device interface could reach, and what existing
+    callers get, unchanged. With one, it sweeps real defocus and leaves
+    the field of view alone: the instrument's defocus is set, a frame is
+    scanned, and the *read-back* defocus (not the requested value) is
+    recorded in the frame's metadata, so a recording says what the
+    instrument did rather than what it was asked to do.
+
+    The original defocus is restored on the way out, including when the
+    consumer abandons the generator early — the same discipline
+    ``camera_series`` applies to leaving a camera running.
 
     Parameters
     ----------
     scanner : Scanner
         The scan device to drive.
     parameters : ScanParameters
-        Base scan settings; its ``fov_nm`` is replaced per step.
-    fov_values_nm : Iterable[float]
-        Field-of-view values to step through, in nanometres.
+        Base scan settings. Its ``fov_nm`` is replaced per step when
+        sweeping field of view, and used unchanged when sweeping defocus.
+    values_nm : Iterable[float]
+        Values to step through, in nanometres: fields of view without an
+        ``instrument``, defocus values with one.
     channel : int
         Detector channel index.
+    instrument : InstrumentController | None
+        Instrument to sweep defocus on. ``None`` keeps the historical
+        field-of-view sweep.
 
     Yields
     ------
     Frame
-        One frame per requested field of view.
+        One frame per requested value.
+
+    Raises
+    ------
+    ValueError
+        If ``instrument`` is given but does not implement defocus.
     """
-    for fov_nm in fov_values_nm:
-        stepped = dataclasses.replace(parameters, fov_nm=fov_nm)
-        yield scanner.scan_frame(stepped, channel)
+    if instrument is None:
+        for fov_nm in values_nm:
+            stepped = dataclasses.replace(parameters, fov_nm=fov_nm)
+            yield scanner.scan_frame(stepped, channel)
+        return
+    if DEFOCUS_CONTROL not in instrument.available_controls():
+        msg = (
+            "instrument does not implement the "
+            f"{DEFOCUS_CONTROL!r} control, so defocus cannot be swept"
+        )
+        raise ValueError(msg)
+    original_defocus_nm = instrument.defocus_nm()
+    try:
+        for defocus_nm in values_nm:
+            instrument.set_defocus_nm(defocus_nm)
+            frame = scanner.scan_frame(parameters, channel)
+            yield dataclasses.replace(
+                frame,
+                metadata={
+                    **frame.metadata,
+                    "defocus_nm": instrument.defocus_nm(),
+                    "requested_defocus_nm": defocus_nm,
+                },
+            )
+    finally:
+        instrument.set_defocus_nm(original_defocus_nm)
 
 
 def record(

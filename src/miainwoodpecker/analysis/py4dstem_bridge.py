@@ -65,6 +65,51 @@ them) - carrying over the axis calibration NexusWriter already wrote, the
 same way the HyperSpy adapter hands its axis values to ``AxesManager``
 instead of re-deriving them.
 
+The unit impedance mismatch, and the factor of ten inside it
+------------------------------------------------------------
+``py4DSTEM.data.Calibration.Q_pixel_units`` accepts **only** the literal
+strings ``"pixels"``, ``"A^-1"``, and ``"mrad"`` - a hard ``assert`` in
+py4DSTEM's own ``set_Q_pixel_units``, not a convention. None of those is
+what this project writes: NeXus wants a unit string its ``NX_WAVENUMBER``
+category accepts, and measured against ``pynxtools``' own matcher,
+``"A^-1"`` is **not** one of them (nor is ``"nm-1"``; ``"1/nm"`` and
+``"1/angstrom"`` are). So a reciprocal axis recorded in ``1/nm`` cannot be
+handed to py4DSTEM in the unit it was written in at all.
+
+It therefore has to be converted, and the conversion is where this could go
+badly wrong: **1 A^-1 is 10 nm^-1**, so a scale in ``1/nm`` becomes a scale
+in ``1/angstrom`` by dividing by ten. Passing an unconverted nm^-1
+magnitude while labelling it ``"A^-1"`` would leave every downstream
+py4DSTEM number - probe radius, scattering vector, lattice spacing - wrong
+by exactly 10x, with nothing in the file or the object saying so. The
+conversion is done by
+:meth:`miainwoodpecker.storage.calibration.AxisCalibration.converted_to`,
+which is an exact within-kind factor table and is unit-tested
+independently of py4DSTEM being installed, and the numbers are asserted in
+``tests/integration/test_py4dstem_bridge.py`` specifically. This is the
+same class of error the hardware checklist flags as its
+highest-consequence check (a metres/nanometres mix-up, migration plan §7).
+
+An axis this container genuinely cannot carry is refused rather than
+approximated: a real-space (nanometre) recording, which is what a *scan*
+produces, and an energy axis, which is what a spectrum image produces.
+Both would have to be mislabelled as a diffraction-plane quantity to fit,
+and the point of the calibration model is that a wrong axis is worse than
+an admitted pixel index. A scattering *angle* in ``mrad`` needs no
+conversion - it is one of py4DSTEM's own three - which is a second reason
+:class:`~miainwoodpecker.storage.calibration.AxisKind` keeps angles
+distinct from reciprocal space instead of converting them through a
+wavelength nothing here knows.
+
+One thing py4DSTEM models differently and this adapter deliberately does
+not translate: the diffraction-plane **origin**. Our axes put it in each
+axis's ``offset`` (a Ronchigram axis centred on the optic axis, as the
+simulated camera itself reports); py4DSTEM keeps it in ``qx0``/``qy0``,
+per scan position within a full ``DataCube``, not as an axis offset. There
+is no single-pattern home for it, and ``get_probe_size`` measures the
+centre from the data anyway, so the offset stays in the file rather than
+being forced into a field that means something else.
+
 Requires the ``py4dstem`` optional dependency group
 (``pip install miainwoodpecker[py4dstem]``) - kept separate from the
 ``analysis`` extra HyperSpy uses; see pyproject.toml for the measured
@@ -78,37 +123,24 @@ import typing
 import h5py
 from py4DSTEM.data import Calibration, DiffractionSlice
 
+from miainwoodpecker.storage.calibration import PIXEL_UNITS, AxisKind
+from miainwoodpecker.storage.nexus import read_calibration
+
 if typing.TYPE_CHECKING:
     import os
 
-    import numpy as np
-
-# py4DSTEM.data.Calibration.Q_pixel_units only accepts these three literal
-# values (see the assert in py4DSTEM/data/calibration.py's set_Q_pixel_units)
-# - "pixels" is the only one NexusWriter's own vocabulary ("pixel", singular)
-# maps onto. A calibrated diffraction-plane unit (A^-1, mrad) would need
-# per-camera calibration data the device interface doesn't expose - the same
-# real caveat hyperspy_bridge.py records for the Ronchigram camera.
-_Q_PIXEL_UNITS = {"pixel": "pixels"}
-
-
-def _axis_scale(values: np.ndarray) -> float:
-    """
-    Return the per-step spacing of a NeXus axis dataset's sample values.
-
-    Parameters
-    ----------
-    values : np.ndarray
-        The axis dataset's values, in acquisition/sample order.
-
-    Returns
-    -------
-    float
-        The spacing between consecutive samples, in that dataset's units.
-        Falls back to a unit scale when fewer than two samples are
-        available to take a spacing from.
-    """
-    return float(values[1] - values[0]) if len(values) > 1 else 1.0
+# Which of our axis kinds py4DSTEM's diffraction-plane calibration can
+# express, as (the unit we must convert the axis to, py4DSTEM's own label
+# for it). The labels are the only three `Calibration.set_Q_pixel_units`
+# asserts on; the units are the NeXus-valid spellings of the same
+# quantities. `1/angstrom` -> `A^-1` is the factor-of-ten conversion the
+# module docstring is about; `mrad` needs none; `pixel` -> `pixels` is the
+# pre-existing singular/plural mismatch.
+_Q_PIXEL_UNITS: dict[AxisKind, tuple[str, str]] = {
+    AxisKind.UNCALIBRATED: (PIXEL_UNITS, "pixels"),
+    AxisKind.RECIPROCAL_SPACE: ("1/angstrom", "A^-1"),
+    AxisKind.ANGLE: ("mrad", "mrad"),
+}
 
 
 def load_as_diffraction_slice(path: os.PathLike[str] | str) -> DiffractionSlice:
@@ -120,9 +152,12 @@ def load_as_diffraction_slice(path: os.PathLike[str] | str) -> DiffractionSlice:
     ``DiffractionSlice`` when the file holds exactly one frame, or a
     labelled stack (string ``slicelabels``, one per frame index)
     otherwise - calibrated on py4DSTEM's diffraction-plane (``Q``) axis
-    from exactly the axis values :mod:`miainwoodpecker.storage.nexus`
-    already wrote. No axis math is reimplemented; py4DSTEM's own
-    ``Calibration`` object does the bookkeeping, same as
+    from the axis calibration :mod:`miainwoodpecker.storage.nexus` already
+    wrote, converted into one of the three unit strings py4DSTEM accepts.
+    That conversion is exact and is the only axis arithmetic here (see the
+    module docstring for why it is a factor of ten and why getting it wrong
+    would be silent); py4DSTEM's own ``Calibration`` object does the rest of
+    the bookkeeping, same as
     :func:`~miainwoodpecker.analysis.hyperspy_bridge.load_as_hyperspy_signal`
     delegates to HyperSpy's ``AxesManager``.
 
@@ -140,39 +175,50 @@ def load_as_diffraction_slice(path: os.PathLike[str] | str) -> DiffractionSlice:
     ------
     ValueError
         If the file was written by an acquisition that produced no
-        frames (so it has no ``/entry/data`` group to read), or if its
-        axes carry a unit ``Calibration.Q_pixel_units`` does not accept
-        (real-space nanometre calibration, from a scan recording rather
-        than a camera one - this adapter is for diffraction-plane data,
-        matching what py4DSTEM's single-pattern operations expect).
+        frames (so it has no ``/entry/data`` group to read); if its axes
+        are not both the same kind of quantity at the same scale, since
+        ``Q_pixel_size`` is a single isotropic number; or if that kind is
+        not one a diffraction plane can hold - real-space nanometres, from
+        a *scan* recording, and an energy axis, from a spectrum image, are
+        both refused rather than mislabelled as a diffraction-plane
+        quantity.
     """
     with h5py.File(path, "r") as handle:
         entry = handle["entry"]
         if "data" not in entry:
             msg = f"{path} has no /entry/data group; it recorded no frames"
             raise ValueError(msg)
-        data_group = entry["data"]
-        data = data_group["data"][()]
-        x_values = data_group["x"][()]
-        y_values = data_group["y"][()]
-        x_units = data_group["x"].attrs["units"]
-        y_units = data_group["y"].attrs["units"]
+        data = entry["data/data"][()]
+    frame_calibration = read_calibration(path)
+    y_axis, x_axis = frame_calibration.y, frame_calibration.x
 
-    x_scale = _axis_scale(x_values)
-    y_scale = _axis_scale(y_values)
-    if x_units != y_units or x_units not in _Q_PIXEL_UNITS or x_scale != y_scale:
+    if y_axis.kind is not x_axis.kind or y_axis.kind not in _Q_PIXEL_UNITS:
         msg = (
-            f"{path}'s axes are calibrated as x={x_scale!r} {x_units!r}, "
-            f"y={y_scale!r} {y_units!r}; py4DSTEM.data.Calibration.Q_pixel_size/"
-            "Q_pixel_units model a single isotropic diffraction-plane scale "
-            "in 'pixels', 'A^-1', or 'mrad' - this adapter is for camera "
-            "(diffraction-plane) recordings, not scan (real-space) ones."
+            f"{path}'s axes are calibrated as y={y_axis.scale!r} "
+            f"{y_axis.units!r}, x={x_axis.scale!r} {x_axis.units!r}; "
+            f"py4DSTEM.data.Calibration.Q_pixel_size/Q_pixel_units model a "
+            f"single isotropic diffraction-plane scale in 'pixels', 'A^-1', "
+            f"or 'mrad' - this adapter is for camera (diffraction-plane) "
+            f"recordings, not scan (real-space) or spectrum (energy) ones."
+        )
+        raise ValueError(msg)
+
+    nexus_units, py4dstem_units = _Q_PIXEL_UNITS[y_axis.kind]
+    y_converted = y_axis.converted_to(nexus_units)
+    x_converted = x_axis.converted_to(nexus_units)
+    if y_converted.scale != x_converted.scale:
+        msg = (
+            f"{path}'s diffraction axes are anisotropic "
+            f"({y_converted.scale!r} vs {x_converted.scale!r} "
+            f"{nexus_units}); py4DSTEM.data.Calibration models one "
+            f"Q_pixel_size for both, so this cannot be expressed without "
+            f"discarding one of them."
         )
         raise ValueError(msg)
 
     calibration = Calibration()
-    calibration.Q_pixel_size = x_scale
-    calibration.Q_pixel_units = _Q_PIXEL_UNITS[x_units]
+    calibration.Q_pixel_size = x_converted.scale
+    calibration.Q_pixel_units = py4dstem_units
 
     n_frames = data.shape[0]
     if n_frames == 1:

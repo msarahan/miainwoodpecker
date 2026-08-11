@@ -38,16 +38,34 @@ read (mirroring the HyperSpy adapter's own check, and giving a clearer
 error than LiberTEM's own "unable to infer dataset" message would) and
 naming the dataset path our writer actually uses.
 
-**A real, honest limitation, not carried over from HyperSpy**: LiberTEM's
-``DataSetMeta`` has no per-axis scale/offset/units fields — nothing like
-HyperSpy's ``AxesManager``. There is no native LiberTEM object to hand
-NexusWriter's ``x``/``y``/``frame_time`` calibration to, so unlike the
-HyperSpy adapter, this one does not attempt an axis-calibration round
-trip; a ``DataSet``'s frames are addressed by plain integer navigation/
-signal indices. Calibration is still readable directly from the file
-with ``h5py`` (see ``storage.nexus.read_series`` or the HyperSpy
-adapter) if a caller needs it alongside a LiberTEM result — it is simply
-not part of what a ``DataSet`` itself carries.
+**A real, honest limitation, and it did not change when the calibration
+model arrived.** The per-axis calibration work that gave camera frames real
+physical axes (:mod:`miainwoodpecker.storage.calibration`) reached the
+HyperSpy and py4DSTEM adapters; there is still nothing here to hand it to,
+re-checked against LiberTEM 0.16 rather than carried over as a claim.
+``DataSetMeta.__init__`` takes ``shape``, ``array_backends``,
+``image_count``, ``raw_dtype``, ``dtype``, ``metadata``, and
+``sync_offset`` — nothing like ``AxesManager``'s per-axis
+``scale``/``offset``/``units``, and ``shape`` is a
+``libertem.common.Shape`` of plain integer extents. The one candidate,
+that free-form ``metadata`` passthrough, is not reachable from here
+anyway: ``H5DataSet.__init__`` has no ``metadata`` parameter, so
+``Context.load("hdf5", ...)`` cannot set it — and an untyped blob nothing
+in LiberTEM reads would be a place to *put* calibration, not a model that
+*uses* it, which is the distinction this note is about. A ``DataSet``'s
+frames stay addressed by integer navigation/signal indices.
+
+So this adapter deliberately attempts no axis-calibration round trip. A
+caller who needs the calibration alongside a UDF result reads it from the
+same file with
+:func:`miainwoodpecker.storage.nexus.read_calibration`, which returns the
+same :class:`~miainwoodpecker.storage.calibration.FrameCalibration` the
+HyperSpy adapter transfers onto an ``AxesManager``. This is a genuine
+difference between the two libraries' object models, not a gap in this
+adapter — and
+``tests/integration/test_libertem_bridge.py`` asserts it as a canary, so if
+LiberTEM ever grows a per-axis calibration field the test fails and this
+adapter can start using it instead of this paragraph aging quietly.
 
 **Also investigated and found not to apply here**: a stronger
 demonstration would run LiberTEM against a real, published 4D-STEM

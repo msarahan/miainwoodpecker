@@ -1,9 +1,10 @@
 """
 MIT-licensed client for the GPL-3.0 device server.
 
-Implements :class:`~miainwoodpecker.devices.interface.Camera` and
-:class:`~miainwoodpecker.devices.interface.Scanner` by sending
-:class:`~miainwoodpecker.devices.rpc.Call` objects to a
+Implements :class:`~miainwoodpecker.devices.interface.Camera`,
+:class:`~miainwoodpecker.devices.interface.Scanner` and
+:class:`~miainwoodpecker.devices.interface.InstrumentController` by
+sending :class:`~miainwoodpecker.devices.rpc.Call` objects to a
 :mod:`miainwoodpecker.devices.nion_server` subprocess and waiting for
 :class:`~miainwoodpecker.devices.rpc.Result` objects back. This module
 imports nothing from ``nion.*`` — that is the entire point: everything
@@ -12,20 +13,77 @@ module, and by extension on Nion hardware, without the running
 application ever linking GPL-3.0 code into its own process (see
 docs/migration-plan.md, §6).
 
-Process lifecycle: ``remote_simulated_instrument()`` explicitly calls
-``.close()`` on each device before terminating the server subprocess.
-That call matters more than it looks: it is what triggers the server's
-``SharedFrameWriter`` to ``unlink()`` that device's reused shared-memory
-segment (see :mod:`miainwoodpecker.devices.shared_frame`). Unlike a
-thread or a socket, a named POSIX shared-memory segment is *not*
-reclaimed when the process that created it dies — ``Popen.terminate()``
-alone would leak one segment per device that ever crossed the
-shared-memory threshold, silently, in ``/dev/shm``, surviving even a
-restart of this application. The subprocess is still hard-terminated
-afterwards as a backstop (e.g. if a `.close()` call itself fails), which
-remains fine for everything *except* those segments - threads and
-sockets really are reclaimed by the OS killing the process; shared
-memory segments are the one resource that specifically is not.
+``remote_instrument(backend=...)`` chooses which devices the server
+builds; ``remote_simulated_instrument()`` is the unchanged
+nionswift-usim entry point, kept as a thin delegation because the viewer
+and the benchmark scripts are written against it.
+
+Process lifecycle — the interesting part, and load-bearing rather than
+polite. A named POSIX shared-memory segment is *not* reclaimed when the
+process that created it dies (unlike its threads, sockets, or anonymous
+memory): it is a persistent tmpfs entry until explicitly ``unlink()``-ed,
+so the server must be given the chance to retire the reused segments
+:mod:`miainwoodpecker.devices.shared_frame` hands out. Teardown therefore
+goes, in order:
+
+1. Ask the server to shut down (``instrument.shutdown()``). It stops the
+   cameras, parks the instrument (blanks the beam if a blanker exists),
+   closes every device — which unlinks that device's segment — and
+   acknowledges with a report of what it did. Only then does it exit.
+2. Wait a bounded time for the process to exit on its own.
+3. If either step times out or errors, fall back to closing each device
+   individually (the pre-handshake behaviour, which unlinks the same
+   segments over a different connection) and then ``Popen.terminate()``,
+   escalating to ``kill()``. A hung server must never hang the
+   application, and it must not be allowed to leak segments either.
+4. Once the process is gone, whatever killed it, unlink the segments this
+   client attached to — via ``SharedFrameReader.unlink_orphan``, which is
+   safe precisely because the writer's process is dead.
+
+Step 4 is belt and braces, and the measurement behind that is worth
+knowing rather than rediscovering. A ``SIGKILL``-ed server normally leaks
+nothing anyway, because ``multiprocessing``'s ``resource_tracker`` is a
+separate child process that registers every segment the writer creates and
+unlinks them when the server's end of its pipe closes. That is a CPython
+implementation detail, not a guarantee, and it fails exactly when the
+tracker dies alongside the server — a process-group kill, a cgroup OOM
+kill, a container stop. Step 4 covers that, for every segment a frame was
+actually read from; ``unlink_orphan`` documents the narrow window even it
+cannot reach.
+
+Liveness — three conditions, three answers. Before this, the application
+had no way to tell a working device server from a dead or wedged one, and
+no defined behaviour when one died mid-session; a call either blocked
+forever or surfaced a bare ``EOFError``.
+:meth:`RemoteInstrument.check_health` now separates them:
+
+- **Responsive.** ``instrument.health()`` answered. Cheap by construction
+  (the server reads process state only, no device, no vendor object) and
+  carried on its *own* connection to the instrument target, so it neither
+  queues behind an in-flight control call nor perturbs an acquisition.
+- **Exited.** ``Popen.poll()`` says so. Reported with the exit status, or
+  the signal that killed it.
+- **Unresponsive.** The bounded wait elapsed with the process still
+  alive. Because ``health`` takes no device lock, this genuinely means
+  wedged rather than busy — which is exactly why the bound belongs here
+  and not on ordinary device calls, where a real acquisition takes as long
+  as it takes and a wrong timeout would abort a good exposure (§6).
+
+**No reconnect, deliberately.** A device server is not a stateless web
+backend: a fresh subprocess is a fresh instrument construction, so a
+started camera, the scan settings in use, and every instrument control
+(defocus, stage, blanker) revert. Worse, the server most likely to need
+reconnecting is one that died without parking, leaving the *column* in a
+state nothing on this side knows. Silently re-establishing a connection
+would therefore hand the operator a plausible-looking session whose
+device state is quietly wrong, and any recording in progress would keep
+appending frames from a differently-configured instrument to the same
+file — a corrupted scientific record, which is worse than a stopped one.
+A dedicated ``reconnect()`` was rejected for the same reason plus a
+simpler one: :func:`remote_instrument` already *is* the way to get a
+session, so a second entry point could only duplicate it while implying a
+continuity it cannot provide. What this module does instead is fail fast
+and say what happened, and let the caller decide to start a new session.
 """
 
 from __future__ import annotations
@@ -33,6 +91,7 @@ from __future__ import annotations
 import contextlib
 import os
 import secrets
+import signal
 import socket
 import subprocess
 import sys
@@ -41,11 +100,18 @@ import time
 import typing
 from dataclasses import dataclass
 
-from miainwoodpecker.devices.rpc import Call, disable_nagle, send_call
+from miainwoodpecker.devices.rpc import (
+    Call,
+    RemoteCallError,
+    RemoteCallTimeoutError,
+    RemoteConnectionLostError,
+    disable_nagle,
+    send_call,
+)
 from miainwoodpecker.devices.shared_frame import SharedFrameReader, SharedFrameRef
 
 if typing.TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Iterator, Sequence
     from multiprocessing.connection import Connection
 
     from miainwoodpecker.devices.interface import Frame, ScanParameters
@@ -53,6 +119,161 @@ if typing.TYPE_CHECKING:
 _TARGET_NAMES = ("ronchigram_camera", "eels_camera", "scanner", "instrument")
 _CONNECT_TIMEOUT_S = 15.0
 _TERMINATE_TIMEOUT_S = 5.0
+# How long to wait for the graceful-shutdown acknowledgement. Generous
+# because the server is stopping detectors and blanking the beam, which on
+# real hardware is a physical operation, not a flag flip - but bounded,
+# because the whole point of the handshake is to not hang the application.
+_SHUTDOWN_TIMEOUT_S = 10.0
+# How long to wait for a health reply. Small on purpose, and safe to be
+# small for one reason: the server's health handler reads process state
+# only - no device, no vendor object, no lock - and runs on its own
+# connection's handler thread, so nothing an acquisition does can delay it.
+# A server that misses this really is wedged.
+_HEALTH_TIMEOUT_S = 5.0
+# Grace given to a process whose connection just broke, before concluding
+# it is alive-but-unresponsive rather than dead. A server dying mid-call
+# closes its socket a moment before the kernel finishes reaping it, so
+# polling immediately can misclassify the most common failure there is.
+# Only ever paid on the failure path.
+_EXIT_GRACE_S = 0.5
+
+SIMULATED_BACKEND = "simulated"
+HARDWARE_BACKEND = "hardware"
+
+# The three conditions a caller must be able to tell apart, because the
+# right response differs: retry/continue, start a new session, or
+# investigate a server that is running but not working.
+SERVER_RESPONSIVE = "responsive"
+SERVER_EXITED = "exited"
+SERVER_UNRESPONSIVE = "unresponsive"
+
+
+class DeviceServerStartupError(RuntimeError):
+    """Raised when the device server process died before it served anything."""
+
+
+@dataclass(frozen=True)
+class ServerHealth:
+    """
+    The outcome of one liveness check on a device server.
+
+    Returned rather than raised: this is the call an application polls
+    routinely, and control flow through exceptions for the ordinary
+    "everything is fine" answer would be the wrong shape. Ordinary device
+    calls against a dead server still raise — see
+    :class:`~miainwoodpecker.devices.rpc.RemoteConnectionLostError`.
+
+    Attributes
+    ----------
+    state : str
+        One of :data:`SERVER_RESPONSIVE`, :data:`SERVER_EXITED`,
+        :data:`SERVER_UNRESPONSIVE`.
+    detail : str
+        One human-readable line naming what was observed, suitable for a
+        status bar or a log. Always populated, including when healthy.
+    report : dict[str, object] | None
+        The server's own health report (pid, backend, uptime, served
+        targets, still-open devices, whether a shutdown has begun), or
+        ``None`` if it never answered.
+    exit_status : int | None
+        ``Popen.returncode`` when the process has exited: negative means
+        killed by that signal. ``None`` while it is still running.
+    latency_ms : float | None
+        Round-trip time of the health call, or ``None`` if it did not
+        complete. Worth watching over a session: a server on its way to
+        wedged usually gets slow first.
+    """
+
+    state: str
+    detail: str
+    report: dict[str, object] | None = None
+    exit_status: int | None = None
+    latency_ms: float | None = None
+
+    @property
+    def is_responsive(self) -> bool:
+        """Return whether the server answered its health check."""
+        return self.state == SERVER_RESPONSIVE
+
+
+def _exit_description(status: int | None) -> str:
+    """
+    Describe a ``Popen.returncode`` in the terms an operator needs.
+
+    Parameters
+    ----------
+    status : int | None
+        ``Popen.returncode``: ``None`` if still running, negative if the
+        process was killed by ``-status``.
+
+    Returns
+    -------
+    str
+        A clause naming what happened to the process.
+    """
+    if status is None:
+        return "the device server process is still running"
+    if status < 0:
+        try:
+            name = signal.Signals(-status).name
+        except ValueError:  # pragma: no cover - defensive, all real signals resolve
+            name = f"signal {-status}"
+        return f"the device server process was killed by {name}"
+    return f"the device server process exited with status {status}"
+
+
+_UNRECOVERABLE = (
+    "this session cannot be recovered - a new device server is a new "
+    "instrument construction, so acquisition and control state do not carry "
+    "over; start a fresh remote_instrument() session"
+)
+
+
+def _lost_server_message(
+    target: str,
+    method: str,
+    error: RemoteConnectionLostError,
+    process: subprocess.Popen[bytes] | None,
+) -> str:
+    """
+    Describe a connection-lost failure with the server's fate named.
+
+    :mod:`miainwoodpecker.devices.rpc` cannot say this itself: it knows the
+    socket broke, but only this module owns the ``Popen`` handle that says
+    whether the process exited, and with what.
+
+    Parameters
+    ----------
+    target : str
+        The RPC target the failed call was made on.
+    method : str
+        The method that was being called.
+    error : RemoteConnectionLostError
+        The error raised by :func:`~miainwoodpecker.devices.rpc.send_call`,
+        used verbatim when there is no process handle to consult.
+    process : subprocess.Popen[bytes] | None
+        The server process, or ``None`` if this handle does not own one.
+
+    Returns
+    -------
+    str
+        A message naming the call, the process's fate, and the fact that
+        the session is unrecoverable.
+    """
+    if process is None:
+        return str(error)
+    status = process.poll()
+    if status is None:
+        # Give the kernel a moment: a server dying mid-call closes its
+        # socket just before it finishes exiting, and "connection broke but
+        # the process is fine" is a much rarer and stranger claim to make.
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            process.wait(timeout=_EXIT_GRACE_S)
+        status = process.poll()
+    return (
+        f"remote call {target}.{method}() failed: {_exit_description(status)}. "
+        f"{_UNRECOVERABLE}"
+    )
 
 
 def _free_port() -> int:
@@ -62,11 +283,60 @@ def _free_port() -> int:
         return probe.getsockname()[1]
 
 
-def _connect_with_retry(port: int, authkey: bytes, deadline: float) -> Connection:
-    """Connect to a Listener that may not have started accepting yet."""
+def _connect_with_retry(
+    port: int,
+    authkey: bytes,
+    deadline: float,
+    process: subprocess.Popen[bytes],
+) -> Connection:
+    """
+    Connect to a Listener that may not have started accepting yet.
+
+    Checks the server process on every attempt rather than only the clock.
+    Without that, the most likely real-world failure — asking for the
+    hardware backend on a machine with no instrument attached, where the
+    server prints what it looked for and exits — would show up here as a
+    silent 15-second wait ending in ``ConnectionRefusedError``, throwing
+    away the one diagnostic that matters.
+
+    Parameters
+    ----------
+    port : int
+        Port the target's Listener was told to bind.
+    authkey : bytes
+        Shared secret for the connection.
+    deadline : float
+        ``time.monotonic()`` value after which to give up.
+    process : subprocess.Popen[bytes]
+        The server process, watched for early exit.
+
+    Returns
+    -------
+    Connection
+        The connected client end, with Nagle disabled.
+
+    Raises
+    ------
+    DeviceServerStartupError
+        If the server exited before accepting connections.
+    ConnectionRefusedError
+        If ``deadline`` passed with the server still alive but not listening.
+    OSError
+        For any other socket-level failure past the deadline.
+    """
     from multiprocessing.connection import Client  # noqa: PLC0415
 
     while True:
+        if process.poll() is not None:
+            msg = (
+                f"the device server exited with status {process.returncode} "
+                f"before accepting connections. Its own diagnostic went to "
+                f"stderr (inherited from this process): a hardware backend "
+                f"with no instrument present reports which nion Registry "
+                f"components it looked for, which plug-ins it loaded or "
+                f"skipped, and how to name the right one."
+            )
+            raise DeviceServerStartupError(msg)
         try:
             connection = Client(("localhost", port), authkey=authkey)
         except (ConnectionRefusedError, OSError):
@@ -78,21 +348,110 @@ def _connect_with_retry(port: int, authkey: bytes, deadline: float) -> Connectio
             return connection
 
 
-class RemoteCamera:
-    """A ``Camera`` implementation that delegates over IPC to a device server."""
+class _RemoteDevice:
+    """
+    Shared plumbing for a device driven over one RPC connection.
 
-    def __init__(self, connection: Connection, target: str) -> None:
+    Holds the connection, the lock serializing round trips on it, the
+    shared-memory reader that large frames arrive through, and a handle on
+    the server process — the last one only so a failed call can say
+    *whether the server died* rather than raising a bare ``EOFError``.
+    """
+
+    def __init__(
+        self,
+        connection: Connection,
+        target: str,
+        process: subprocess.Popen[bytes] | None = None,
+    ) -> None:
         self._connection = connection
         self._target = target
         self._lock = threading.Lock()
         self._reader = SharedFrameReader()
+        self._process = process
 
     def _call(self, method: str, *args: object, **kwargs: object) -> object:
-        return send_call(
-            self._connection,
-            self._lock,
-            Call(self._target, method, args, kwargs),
-        )
+        """
+        Send one call to this device's target and return its value.
+
+        No timeout, deliberately: an acquisition takes as long as it takes,
+        and a wrong guess would abort a good exposure (§6). A *dead* server
+        needs no timeout to be detected — the socket closes and the call
+        fails at once — so the only thing this adds is naming the cause.
+
+        Parameters
+        ----------
+        method : str
+            Method name on the remote target.
+        *args : object
+            Positional arguments.
+        **kwargs : object
+            Keyword arguments.
+
+        Returns
+        -------
+        object
+            The call's return value.
+
+        Raises
+        ------
+        RemoteConnectionLostError
+            If the server process died or the connection broke, with the
+            exit status or signal named.
+        """
+        try:
+            return send_call(
+                self._connection,
+                self._lock,
+                Call(self._target, method, args, kwargs),
+            )
+        except RemoteConnectionLostError as error:
+            raise RemoteConnectionLostError(
+                _lost_server_message(self._target, method, error, self._process),
+            ) from error
+
+    def _frame(self, method: str, *args: object) -> Frame:
+        """Make a call that returns a frame, following a shared-memory reference."""
+        result = self._call(method, *args)
+        if isinstance(result, SharedFrameRef):
+            return self._reader.read(result)
+        return typing.cast("Frame", result)
+
+    def detach(self) -> None:
+        """
+        Detach from the server's shared segment without unlinking it.
+
+        Used on the graceful-shutdown path, where the server has already
+        retired the segment itself and there is no device left to call
+        ``close`` on.
+        """
+        self._reader.close()
+
+    def unlink_orphaned_segment(self) -> str | None:
+        """
+        Detach and unlink this device's segment, the server having exited.
+
+        Only correct once the server process is known dead — see
+        :meth:`~miainwoodpecker.devices.shared_frame.SharedFrameReader.unlink_orphan`
+        for why the reader is allowed to break the writer's ownership in
+        that one case, and for what it still cannot reach.
+
+        Returns
+        -------
+        str | None
+            The segment name unlinked, or ``None`` if this device never
+            used shared memory (every frame stayed under the threshold).
+        """
+        return self._reader.unlink_orphan()
+
+    def close(self) -> None:
+        """Release the remote device and detach from its shared segment."""
+        self._call("close")
+        self._reader.close()
+
+
+class RemoteCamera(_RemoteDevice):
+    """A ``Camera`` implementation that delegates over IPC to a device server."""
 
     @property
     def camera_id(self) -> str:
@@ -109,32 +468,11 @@ class RemoteCamera:
 
     def acquire_frame(self) -> Frame:
         """Return the next available frame from the remote device."""
-        result = self._call("acquire_frame")
-        if isinstance(result, SharedFrameRef):
-            return self._reader.read(result)
-        return typing.cast("Frame", result)
-
-    def close(self) -> None:
-        """Release the remote device and detach from its shared segment."""
-        self._call("close")
-        self._reader.close()
+        return self._frame("acquire_frame")
 
 
-class RemoteScanner:
+class RemoteScanner(_RemoteDevice):
     """A ``Scanner`` implementation that delegates over IPC to a device server."""
-
-    def __init__(self, connection: Connection, target: str) -> None:
-        self._connection = connection
-        self._target = target
-        self._lock = threading.Lock()
-        self._reader = SharedFrameReader()
-
-    def _call(self, method: str, *args: object, **kwargs: object) -> object:
-        return send_call(
-            self._connection,
-            self._lock,
-            Call(self._target, method, args, kwargs),
-        )
 
     @property
     def scanner_id(self) -> str:
@@ -148,114 +486,603 @@ class RemoteScanner:
 
     def scan_frame(self, parameters: ScanParameters, channel: int = 0) -> Frame:
         """Scan and return a single frame from the remote device."""
-        result = self._call("scan_frame", parameters, channel)
-        if isinstance(result, SharedFrameRef):
-            return self._reader.read(result)
-        return typing.cast("Frame", result)
+        return self._frame("scan_frame", parameters, channel)
 
-    def close(self) -> None:
-        """Release the remote device and detach from its shared segment."""
-        self._call("close")
-        self._reader.close()
+
+class RemoteInstrument:
+    """
+    An ``InstrumentController`` that delegates over IPC to a device server.
+
+    Also carries the three calls that are about the *server* rather than
+    the instrument — :meth:`describe`, :meth:`check_health` and
+    :meth:`shutdown` — because the server serves all of them on the same
+    ``instrument`` target, and because the client needs one place to ask
+    what the instrument has, whether it is still there, and for a clean
+    exit.
+
+    The health check runs over a *second* connection to that same target,
+    for two reasons that both matter in practice. It must not queue behind
+    an in-flight control call on the shared lock — a real stage move takes
+    seconds, and a status poll that blocks for it is useless. And a health
+    call that times out leaves its connection poisoned (a late reply would
+    be mistaken for the next call's answer), which must not cost the
+    session its instrument controls.
+    """
+
+    def __init__(
+        self,
+        connection: Connection,
+        target: str = "instrument",
+        *,
+        health_connection: Connection | None = None,
+        process: subprocess.Popen[bytes] | None = None,
+    ) -> None:
+        self._connection = connection
+        self._target = target
+        self._lock = threading.Lock()
+        self._process = process
+        self._health_connection = health_connection
+        self._health_lock = threading.Lock()
+        self._health_poisoned = False
+
+    def _call(
+        self,
+        method: str,
+        *args: object,
+        timeout_s: float | None = None,
+        **kwargs: object,
+    ) -> object:
+        """
+        Send one call to the instrument target and return its value.
+
+        Parameters
+        ----------
+        method : str
+            Method name on the instrument target.
+        *args : object
+            Positional arguments.
+        timeout_s : float | None
+            Bounded wait, or ``None`` to wait indefinitely (the default,
+            for the same reason device calls do).
+        **kwargs : object
+            Keyword arguments.
+
+        Returns
+        -------
+        object
+            The call's return value.
+
+        Raises
+        ------
+        RemoteConnectionLostError
+            If the server process died or the connection broke, with the
+            exit status or signal named.
+        """
+        try:
+            return send_call(
+                self._connection,
+                self._lock,
+                Call(self._target, method, args, kwargs),
+                timeout_s=timeout_s,
+            )
+        except RemoteConnectionLostError as error:
+            raise RemoteConnectionLostError(
+                _lost_server_message(self._target, method, error, self._process),
+            ) from error
+
+    def check_health(self, *, timeout_s: float = _HEALTH_TIMEOUT_S) -> ServerHealth:
+        """
+        Classify the device server as responsive, exited, or unresponsive.
+
+        Never raises: this is meant to be called routinely, including from
+        a UI timer, and the answer "the server is gone" is information
+        rather than an error. Cheap on the server side (process state only,
+        no device touched) and carried on its own connection, so it neither
+        perturbs an acquisition nor waits on one.
+
+        A timed-out check retires the probe connection permanently, because
+        the request was already sent and a late reply would be mistaken for
+        a later check's answer. Subsequent calls then report
+        :data:`SERVER_UNRESPONSIVE` from that fact alone — which is sound,
+        since nothing about this design lets a wedged server recover.
+
+        Parameters
+        ----------
+        timeout_s : float
+            Bounded wait for the reply.
+
+        Returns
+        -------
+        ServerHealth
+            The verdict, with a one-line ``detail`` naming what was seen.
+        """
+        already_known = self._health_without_asking()
+        if already_known is not None:
+            return already_known
+        assert self._health_connection is not None  # noqa: S101 - _health_without_asking checked
+        started = time.monotonic()
+        try:
+            report = send_call(
+                self._health_connection,
+                self._health_lock,
+                Call(self._target, "health"),
+                timeout_s=timeout_s,
+            )
+        except RemoteCallTimeoutError:
+            self._health_poisoned = True
+            return ServerHealth(
+                state=SERVER_UNRESPONSIVE,
+                detail=(
+                    f"the device server did not answer a health check within "
+                    f"{timeout_s}s while still running (pid "
+                    f"{self._process.pid if self._process else '?'}). Because a "
+                    f"health check touches no device, this means wedged rather "
+                    f"than busy. {_UNRECOVERABLE}"
+                ),
+            )
+        except RemoteConnectionLostError as error:
+            return self._health_after_lost_connection(error)
+        except RemoteCallError as error:
+            # The server answered, and said the call failed: it is alive
+            # enough to talk, so this is a bug rather than a liveness
+            # problem, and saying "exited" would be wrong.
+            return ServerHealth(
+                state=SERVER_UNRESPONSIVE,
+                detail=f"the device server rejected its own health check: {error}",
+                latency_ms=(time.monotonic() - started) * 1000.0,
+            )
+        latency_ms = (time.monotonic() - started) * 1000.0
+        answer = typing.cast("dict[str, object]", report)
+        uptime_s = float(typing.cast("float", answer.get("uptime_s", 0.0)))
+        open_devices = typing.cast(
+            "Sequence[str]",
+            answer.get("open_devices") or (),
+        )
+        return ServerHealth(
+            state=SERVER_RESPONSIVE,
+            detail=(
+                f"device server pid {answer.get('pid')} responsive on the "
+                f"{answer.get('backend')} backend, up {uptime_s:.0f}s, "
+                f"devices open: {', '.join(open_devices) or 'none'}"
+            ),
+            report=answer,
+            latency_ms=latency_ms,
+        )
+
+    def _health_without_asking(self) -> ServerHealth | None:
+        """
+        Answer a health check from what is already known, if that is enough.
+
+        Three cases need no round trip: the process has exited (the
+        strongest possible evidence, and free), no probe connection was
+        opened, or an earlier probe timed out and was retired.
+
+        Returns
+        -------
+        ServerHealth | None
+            The verdict, or ``None`` if the server must actually be asked.
+        """
+        status = self._process.poll() if self._process is not None else None
+        if status is not None:
+            return ServerHealth(
+                state=SERVER_EXITED,
+                detail=f"{_exit_description(status)}. {_UNRECOVERABLE}",
+                exit_status=status,
+            )
+        if self._health_connection is None:
+            return ServerHealth(
+                state=SERVER_UNRESPONSIVE,
+                detail=(
+                    "no health connection was opened for this instrument, so "
+                    "its liveness cannot be checked"
+                ),
+            )
+        if self._health_poisoned:
+            return ServerHealth(
+                state=SERVER_UNRESPONSIVE,
+                detail=(
+                    "an earlier health check timed out and retired this probe; "
+                    f"the server has not answered since. {_UNRECOVERABLE}"
+                ),
+            )
+        return None
+
+    def _health_after_lost_connection(
+        self,
+        error: RemoteConnectionLostError,
+    ) -> ServerHealth:
+        """
+        Classify a health check whose connection broke rather than timing out.
+
+        Parameters
+        ----------
+        error : RemoteConnectionLostError
+            The failure raised by the probe.
+
+        Returns
+        -------
+        ServerHealth
+            :data:`SERVER_EXITED` if the process has (or shortly does) exit,
+            which is the overwhelmingly likely cause; otherwise
+            :data:`SERVER_UNRESPONSIVE`, since a live server whose socket
+            broke cannot answer either.
+        """
+        self._health_poisoned = True
+        if self._process is None:
+            return ServerHealth(state=SERVER_UNRESPONSIVE, detail=str(error))
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            self._process.wait(timeout=_EXIT_GRACE_S)
+        status = self._process.poll()
+        return ServerHealth(
+            state=SERVER_EXITED if status is not None else SERVER_UNRESPONSIVE,
+            detail=f"{_exit_description(status)}. {_UNRECOVERABLE}",
+            exit_status=status,
+        )
+
+    def describe(self) -> dict[str, object]:
+        """Return the server's report of its backend, targets, and controls."""
+        return typing.cast("dict[str, object]", self._call("describe"))
+
+    def stage_size_nm(self) -> float:
+        """Return the stage extent, in nanometres."""
+        return typing.cast("float", self._call("stage_size_nm"))
+
+    def available_controls(self) -> Sequence[str]:
+        """Return the neutral control names the remote instrument implements."""
+        return typing.cast("Sequence[str]", self._call("available_controls"))
+
+    def stage_position_nm(self) -> tuple[float, float]:
+        """Return the stage position as ``(y, x)``, in nanometres."""
+        position = typing.cast(
+            "tuple[float, float]",
+            self._call("stage_position_nm"),
+        )
+        return (float(position[0]), float(position[1]))
+
+    def set_stage_position_nm(self, y_nm: float, x_nm: float) -> None:
+        """
+        Move the stage to an absolute ``(y, x)`` position, in nanometres.
+
+        Parameters
+        ----------
+        y_nm : float
+            Target position along the slow scan axis, in nanometres.
+        x_nm : float
+            Target position along the fast scan axis, in nanometres.
+        """
+        self._call("set_stage_position_nm", y_nm, x_nm)
+
+    def defocus_nm(self) -> float:
+        """Return the defocus, in nanometres."""
+        return typing.cast("float", self._call("defocus_nm"))
+
+    def set_defocus_nm(self, defocus_nm: float) -> None:
+        """
+        Set the defocus, in nanometres.
+
+        Parameters
+        ----------
+        defocus_nm : float
+            Target defocus, in nanometres.
+        """
+        self._call("set_defocus_nm", defocus_nm)
+
+    def is_beam_blanked(self) -> bool:
+        """Return whether the beam is currently blanked."""
+        return bool(self._call("is_beam_blanked"))
+
+    def set_beam_blanked(self, *, blanked: bool) -> None:
+        """
+        Blank or unblank the beam.
+
+        Parameters
+        ----------
+        blanked : bool
+            ``True`` to blank the beam, ``False`` to unblank it.
+        """
+        self._call("set_beam_blanked", blanked=blanked)
+
+    def park(self) -> None:
+        """Put the instrument in a safe state (blank the beam, if it can)."""
+        self._call("park")
+
+    def shutdown(self) -> dict[str, object]:
+        """
+        Ask the server to park, release its devices, and exit; return its report.
+
+        Returns
+        -------
+        dict[str, object]
+            The server's park report: what was stopped, whether the beam
+            ended up blanked, which devices were released, and any errors
+            it hit while doing so.
+        """
+        return typing.cast(
+            "dict[str, object]",
+            self._call("shutdown", timeout_s=_SHUTDOWN_TIMEOUT_S),
+        )
 
 
 @dataclass(frozen=True)
-class RemoteSimulatedInstrument:
+class RemoteInstrumentDevices:
     """
-    Handles to the devices of a simulated microscope, running in a subprocess.
+    Handles to the devices of one microscope, running in a server subprocess.
 
-    Same shape as the in-process
-    ``nion_server.SimulatedInstrument`` (deliberately: code written
-    against one works against the other unchanged).
+    Same shape as the in-process ``nion_server.InstrumentDevices``
+    (deliberately: code written against one works against the other
+    unchanged).
 
     Attributes
     ----------
-    ronchigram_camera : RemoteCamera
-        The simulated Ronchigram camera.
-    eels_camera : RemoteCamera
-        The simulated EELS camera.
+    ronchigram_camera : RemoteCamera | None
+        The Ronchigram camera, if this instrument has one.
+    eels_camera : RemoteCamera | None
+        The EELS camera, if this instrument has one.
     scanner : RemoteScanner
-        The simulated scan device (HAADF/MAADF channels).
+        The scan device (HAADF/MAADF channels on the simulator).
+    instrument : RemoteInstrument
+        Stage/defocus/blanker controls.
     stage_size_nm : float
-        The simulated stage extent, useful for choosing a sensible
+        The stage extent, useful for choosing a sensible
         ``ScanParameters.fov_nm``.
     """
 
-    ronchigram_camera: RemoteCamera
-    eels_camera: RemoteCamera
+    ronchigram_camera: RemoteCamera | None
+    eels_camera: RemoteCamera | None
     scanner: RemoteScanner
+    instrument: RemoteInstrument
     stage_size_nm: float
 
 
-@contextlib.contextmanager
-def remote_simulated_instrument() -> Iterator[RemoteSimulatedInstrument]:
-    """
-    Spawn the device server subprocess and connect to it.
+# Historical name, kept because the migration plan and README refer to it.
+RemoteSimulatedInstrument = RemoteInstrumentDevices
 
-    Yields
-    ------
-    RemoteSimulatedInstrument
-        Handles talking to the simulated cameras and scanner over IPC.
+
+def _spawn_server(
+    ports: typing.Mapping[str, int],
+    authkey: bytes,
+    backend: str,
+    plugin_names: Sequence[str],
+) -> subprocess.Popen[bytes]:
     """
-    ports = {name: _free_port() for name in _TARGET_NAMES}
-    authkey = secrets.token_bytes(32)
+    Launch the device server subprocess.
+
+    Parameters
+    ----------
+    ports : typing.Mapping[str, int]
+        Port to bind for each target name.
+    authkey : bytes
+        Shared secret for every Listener.
+    backend : str
+        ``"simulated"`` or ``"hardware"``.
+    plugin_names : Sequence[str]
+        ``nionswift_plugin`` modules for the hardware backend.
+
+    Returns
+    -------
+    subprocess.Popen[bytes]
+        The running server process.
+    """
     # os.environ already carries PYTHONWARNINGS from shared_frame's
     # module-level setdefault (imported above), so the server subprocess
     # inherits the same resource_tracker warning suppression.
     env = {**os.environ, "MIAINWOODPECKER_AUTHKEY": authkey.hex()}
-    process = subprocess.Popen(  # noqa: S603 - fixed argv, no shell, no user input
+    plugin_arguments = [
+        argument for name in plugin_names for argument in ("--plugin", name)
+    ]
+    return subprocess.Popen(  # noqa: S603 - fixed argv shape, no shell
         [
             sys.executable,
             "-m",
             "miainwoodpecker.devices.nion_server",
+            "--backend",
+            backend,
+            *plugin_arguments,
             *(str(ports[name]) for name in _TARGET_NAMES),
         ],
         env=env,
     )
-    connections: dict[str, Connection] = {}
+
+
+def _release_segments_of_a_dead_server(
+    devices: Sequence[_RemoteDevice],
+) -> None:
+    """
+    Detach from an exited server's segments, unlinking any it left behind.
+
+    Unlinking unconditionally rather than only for an abnormal exit, which
+    is both simpler and strictly safer. The rule that only the writer may
+    unlink exists to protect a *live* writer that keeps recreating the
+    segment; this function's precondition is that the writer's process is
+    dead, so there is nothing left to protect, and an already-unlinked name
+    costs one failed ``shm_open``. Making it conditional on the exit status
+    would leave a real gap: a server can exit ``0`` having *recorded* a
+    shared-memory error in its shutdown report, and detaching would then
+    strand exactly the segment that needs reclaiming.
+
+    Belt and braces rather than the only line of defence, and worth being
+    precise about which: measurement showed the server's
+    ``resource_tracker`` child normally survives a ``SIGKILL`` of the
+    server and unlinks those segments itself. This covers the case where it
+    does not — the tracker killed alongside the server, as a process-group
+    or cgroup OOM kill does — and it is still not a complete guarantee, for
+    the reason
+    :meth:`~miainwoodpecker.devices.shared_frame.SharedFrameReader.unlink_orphan`
+    spells out.
+
+    Parameters
+    ----------
+    devices : Sequence[_RemoteDevice]
+        Every device handle of the finished session.
+    """
+    for device in devices:
+        with contextlib.suppress(Exception):
+            device.unlink_orphaned_segment()
+
+
+def _shut_down_server(
+    instrument: RemoteInstrument,
+    devices: Sequence[_RemoteDevice],
+    process: subprocess.Popen[bytes],
+) -> None:
+    """
+    Tear the server down gracefully if it answers, by force if it does not.
+
+    Parameters
+    ----------
+    instrument : RemoteInstrument
+        The instrument target carrying the shutdown handshake.
+    devices : Sequence[_RemoteDevice]
+        Every device handle, for the fallback path's per-device ``close()``
+        (which is what unlinks the shared-memory segments when the
+        handshake did not get that far).
+    process : subprocess.Popen[bytes]
+        The server process.
+    """
+    if process.poll() is not None:
+        # Already gone: either a caller ran the handshake explicitly (exit
+        # 0, nothing left to ask and nothing left to kill) or it died on
+        # its own, in which case its segments need reclaiming from here.
+        # Either way there is nobody to talk to, and the sweep is safe.
+        _release_segments_of_a_dead_server(devices)
+        return
+    graceful = False
     try:
-        deadline = time.monotonic() + _CONNECT_TIMEOUT_S
-        for name in _TARGET_NAMES:
-            connections[name] = _connect_with_retry(ports[name], authkey, deadline)
-
-        instrument_lock = threading.Lock()
-        stage_size_nm = typing.cast(
-            "float",
-            send_call(
-                connections["instrument"],
-                instrument_lock,
-                Call("instrument", "stage_size_nm"),
-            ),
-        )
-
-        ronchigram_camera = RemoteCamera(
-            connections["ronchigram_camera"], "ronchigram_camera",
-        )
-        eels_camera = RemoteCamera(connections["eels_camera"], "eels_camera")
-        scanner = RemoteScanner(connections["scanner"], "scanner")
-        try:
-            yield RemoteSimulatedInstrument(
-                ronchigram_camera=ronchigram_camera,
-                eels_camera=eels_camera,
-                scanner=scanner,
-                stage_size_nm=stage_size_nm,
-            )
-        finally:
-            # Load-bearing, not just polite: each close() tells the server to
-            # unlink() that device's reused shared-memory segment. Skipping
-            # this and only terminating the subprocess would leak one
-            # /dev/shm segment per device that ever crossed the
-            # shared-memory threshold - see this module's docstring.
-            for device in (ronchigram_camera, eels_camera, scanner):
-                with contextlib.suppress(Exception):
-                    device.close()
-    finally:
-        for connection in connections.values():
+        report = instrument.shutdown()
+    except Exception:  # noqa: BLE001, S110 - any failure means "fall back", not "raise"
+        pass
+    else:
+        # A report listing errors means the server got *part* way through
+        # releasing devices. Treat that as ungraceful so the per-device
+        # fallback below gets a second attempt at the shared-memory
+        # segments, which are the one resource killing the process cannot
+        # reclaim.
+        graceful = not report.get("errors")
+        for device in devices:
             with contextlib.suppress(Exception):
-                connection.close()
+                device.detach()
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            process.wait(timeout=_TERMINATE_TIMEOUT_S)
+    if not graceful or process.poll() is None:
+        if process.poll() is not None:
+            # It died while we were asking, so there is nobody to close the
+            # devices over IPC and its segments are orphaned.
+            _release_segments_of_a_dead_server(devices)
+            return
+        for device in devices:
+            with contextlib.suppress(Exception):
+                device.close()
         process.terminate()
         try:
             process.wait(timeout=_TERMINATE_TIMEOUT_S)
         except subprocess.TimeoutExpired:
             process.kill()
             process.wait(timeout=_TERMINATE_TIMEOUT_S)
+        # The per-device close() above is what normally unlinks the
+        # segments, and it did so over live connections. Sweeping again
+        # costs nothing when they are already gone, and catches the case
+        # where a close() failed against a server too wedged to serve it.
+        _release_segments_of_a_dead_server(devices)
+
+
+@contextlib.contextmanager
+def remote_instrument(
+    backend: str = SIMULATED_BACKEND,
+    plugin_names: Sequence[str] = (),
+) -> Iterator[RemoteInstrumentDevices]:
+    """
+    Spawn the device server subprocess for a backend and connect to it.
+
+    The ``instrument`` target is connected first and asked to
+    ``describe()`` itself, so the client only connects to the device
+    targets the instrument actually has. usim always has both cameras; a
+    real instrument need not.
+
+    Parameters
+    ----------
+    backend : str
+        ``"simulated"`` for nionswift-usim, ``"hardware"`` for real
+        devices. Anything else is rejected by the server, which reports
+        the error back before this function returns.
+    plugin_names : Sequence[str]
+        ``nionswift_plugin`` modules providing hardware devices; ignored
+        by the simulated backend.
+
+    Yields
+    ------
+    RemoteInstrumentDevices
+        Handles talking to the cameras, scanner, and instrument over IPC.
+    """
+    ports = {name: _free_port() for name in _TARGET_NAMES}
+    authkey = secrets.token_bytes(32)
+    process = _spawn_server(ports, authkey, backend, plugin_names)
+    connections: dict[str, Connection] = {}
+    try:
+        deadline = time.monotonic() + _CONNECT_TIMEOUT_S
+        connections["instrument"] = _connect_with_retry(
+            ports["instrument"], authkey, deadline, process,
+        )
+        # A second connection to the same target, reserved for health
+        # checks: see RemoteInstrument for why sharing the control
+        # connection would make the check both slower and riskier. The
+        # server accepts any number of connections per target, one handler
+        # thread each, so this costs one socket and one idle thread.
+        connections["instrument:health"] = _connect_with_retry(
+            ports["instrument"], authkey, deadline, process,
+        )
+        instrument = RemoteInstrument(
+            connections["instrument"],
+            health_connection=connections["instrument:health"],
+            process=process,
+        )
+        description = instrument.describe()
+        served = typing.cast("Sequence[str]", description["targets"])
+        for name in served:
+            connections[name] = _connect_with_retry(
+                ports[name], authkey, deadline, process,
+            )
+
+        cameras = {
+            name: RemoteCamera(connections[name], name, process)
+            for name in ("ronchigram_camera", "eels_camera")
+            if name in connections
+        }
+        scanner = RemoteScanner(connections["scanner"], "scanner", process)
+        devices: list[_RemoteDevice] = [*cameras.values(), scanner]
+        try:
+            yield RemoteInstrumentDevices(
+                ronchigram_camera=cameras.get("ronchigram_camera"),
+                eels_camera=cameras.get("eels_camera"),
+                scanner=scanner,
+                instrument=instrument,
+                stage_size_nm=float(
+                    typing.cast("float", description["stage_size_nm"]),
+                ),
+            )
+        finally:
+            _shut_down_server(instrument, devices, process)
+    finally:
+        for connection in connections.values():
+            with contextlib.suppress(Exception):
+                connection.close()
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=_TERMINATE_TIMEOUT_S)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=_TERMINATE_TIMEOUT_S)
+
+
+@contextlib.contextmanager
+def remote_simulated_instrument() -> Iterator[RemoteInstrumentDevices]:
+    """
+    Spawn the device server subprocess for nionswift-usim and connect to it.
+
+    Yields
+    ------
+    RemoteInstrumentDevices
+        Handles talking to the simulated cameras and scanner over IPC.
+    """
+    with remote_instrument(SIMULATED_BACKEND) as devices:
+        yield devices

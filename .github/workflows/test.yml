@@ -77,3 +77,29 @@ jobs:
       run: |
         xvfb-run -a -s "-screen 0 1920x1080x24" \
           hatch run integration:python scripts/phase0_viewer_smoke_test.py
+
+  # Validate the files this project writes against the official NXem NXDL
+  # schema, per docs/migration-plan.md Phase 3: that check belongs in CI, not
+  # the runtime, so pynxtools lives in its own hatch env and is never a
+  # dependency of the shipped package. Its own job rather than a step in the
+  # matrix above because it needs no extras, no display, and no OS/Python
+  # sweep - the file layout it checks does not vary across them.
+  # The script exits non-zero on failure and includes a check that a
+  # deliberately non-conforming file is still reported invalid, so this cannot
+  # go green on an unvalidated file. (`pynx validate` alone would: the CLI
+  # exits 0 even when it prints "is NOT valid".)
+  nexus-schema:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+    - name: Set up Python
+      uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v5
+      with:
+        python-version: "3.11"
+
+    - name: Install hatch
+      uses: pypa/hatch@install
+
+    - name: Validate written files against the NXem NXDL schema
+      run: hatch run validate:schema

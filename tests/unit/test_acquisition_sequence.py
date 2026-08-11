@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 
 from miainwoodpecker.acquisition import camera_series, focal_series, record, scan_series
-from miainwoodpecker.devices import Frame, ScanParameters
+from miainwoodpecker.devices import DEFOCUS_CONTROL, Frame, ScanParameters
 from miainwoodpecker.storage import read_series
 
 _PARAMETERS = ScanParameters(height=4, width=4, pixel_time_us=1.0, fov_nm=10.0)
@@ -77,6 +77,60 @@ class _CountingCamera:
         """Release nothing; the fake owns no resources."""
 
 
+class _RecordingInstrument:
+    """InstrumentController that records every defocus it was asked for."""
+
+    def __init__(self, *, controls: typing.Sequence[str] = (DEFOCUS_CONTROL,)) -> None:
+        self._controls = list(controls)
+        self.defocus = 500.0
+        self.requested: list[float] = []
+
+    def stage_size_nm(self) -> float:
+        """Return a fake stage extent."""
+        return 1000.0
+
+    def available_controls(self) -> typing.Sequence[str]:
+        """Return the controls this fake claims to implement."""
+        return self._controls
+
+    def stage_position_nm(self) -> tuple[float, float]:
+        """Return a fixed position; this fake only models defocus."""
+        return (0.0, 0.0)
+
+    def set_stage_position_nm(self, y_nm: float, x_nm: float) -> None:
+        """Ignore stage moves; this fake only models defocus."""
+
+    def defocus_nm(self) -> float:
+        """Return the current defocus."""
+        return self.defocus
+
+    def set_defocus_nm(self, defocus_nm: float) -> None:
+        """
+        Record and apply a defocus change, landing 0.5nm off the setpoint.
+
+        Deliberately *not* exactly what was requested: a real instrument
+        lands near a setpoint, not on it, and ``focal_series`` is supposed
+        to record what it read back rather than what it asked for.
+
+        Parameters
+        ----------
+        defocus_nm : float
+            Requested defocus, in nanometres.
+        """
+        self.requested.append(defocus_nm)
+        self.defocus = defocus_nm + 0.5
+
+    def is_beam_blanked(self) -> bool:
+        """Return a fixed unblanked state."""
+        return False
+
+    def set_beam_blanked(self, *, blanked: bool) -> None:
+        """Ignore blanker changes; this fake only models defocus."""
+
+    def park(self) -> None:
+        """Do nothing; this fake has no blanker."""
+
+
 def test_scan_series_yields_requested_count_on_the_chosen_channel():
     """Every frame uses the given parameters and channel."""
     scanner = _RecordingScanner()
@@ -132,6 +186,69 @@ def test_focal_series_sweeps_field_of_view():
         call.pixel_time_us == _PARAMETERS.pixel_time_us for call, _ in scanner.calls
     )
     assert all(call.height == _PARAMETERS.height for call, _ in scanner.calls)
+
+
+def test_focal_series_sweeps_real_defocus_when_given_an_instrument():
+    """With an instrument, the swept values are defocus, not field of view."""
+    scanner = _RecordingScanner()
+    instrument = _RecordingInstrument()
+    values = [100.0, 200.0, 300.0]
+    frames = list(focal_series(scanner, _PARAMETERS, values, instrument=instrument))
+    assert len(frames) == len(values)
+    # The sweep drove defocus...
+    assert instrument.requested[: len(values)] == values
+    # ...and left the field of view alone, unlike the fov-sweeping mode.
+    assert all(call.fov_nm == _PARAMETERS.fov_nm for call, _ in scanner.calls)
+
+
+def test_focal_series_records_read_back_defocus_not_the_request():
+    """Metadata says what the instrument did, and also what it was asked for."""
+    instrument = _RecordingInstrument()
+    frames = list(
+        focal_series(_RecordingScanner(), _PARAMETERS, [100.0], instrument=instrument),
+    )
+    expected_request = 100.0
+    expected_read_back = 100.5  # the fake's 0.5nm settling error
+    assert frames[0].metadata["requested_defocus_nm"] == expected_request
+    assert frames[0].metadata["defocus_nm"] == expected_read_back
+
+
+def test_focal_series_restores_defocus_even_when_abandoned_early():
+    """An interrupted sweep leaves the instrument where it found it."""
+    instrument = _RecordingInstrument()
+    original = instrument.defocus_nm()
+    series = focal_series(
+        _RecordingScanner(),
+        _PARAMETERS,
+        [100.0, 200.0, 300.0],
+        instrument=instrument,
+    )
+    taken = list(itertools.islice(series, 1))
+    assert len(taken) == 1
+    series.close()  # what `break` out of a for-loop does at GC time
+    assert instrument.requested[-1] == original
+
+
+def test_focal_series_without_an_instrument_still_sweeps_field_of_view():
+    """The historical mode is untouched: no instrument means no defocus metadata."""
+    scanner = _RecordingScanner()
+    frames = list(focal_series(scanner, _PARAMETERS, [5.0, 10.0]))
+    assert [call.fov_nm for call, _ in scanner.calls] == [5.0, 10.0]
+    assert all("defocus_nm" not in frame.metadata for frame in frames)
+
+
+def test_focal_series_rejects_an_instrument_without_defocus():
+    """Sweeping a control the instrument does not have is a programming error."""
+    instrument = _RecordingInstrument(controls=())
+    with pytest.raises(ValueError, match="defocus"):
+        list(
+            focal_series(
+                _RecordingScanner(),
+                _PARAMETERS,
+                [100.0],
+                instrument=instrument,
+            ),
+        )
 
 
 def test_negative_count_is_rejected():

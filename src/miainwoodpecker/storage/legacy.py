@@ -1,30 +1,59 @@
 """
 Read legacy Nion Swift ``.ndata`` files so existing data is not orphaned.
 
-An ``.ndata`` file is a zip containing ``data.npy`` and
-``metadata.json``. Rather than re-implement that container, this uses
-Nion's own ``NDataHandler`` (already present with the ``device`` extra) to
-read it, and converts the result into the vendor-neutral
-:class:`~miainwoodpecker.devices.interface.Frame` so it can be written
-straight into the new NeXus format by
-:mod:`miainwoodpecker.storage.nexus`.
+Read with the standard library, **deliberately not with Nion's own
+``NDataHandler``**, and that is a license decision rather than a
+preference. This module is part of the MIT application, and
+docs/migration-plan.md §6's whole architecture rests on the invariant that
+the MIT application never imports ``nion.*`` in-process — an in-process
+import of a GPL-3.0 library is the case that section exists to avoid. An
+earlier version of this module imported ``NDataHandler`` on the reasoning
+that reusing a vendor reader beats re-implementing a container; correct in
+general, and the wrong trade here, because it quietly breached the
+boundary the rest of the project is built around.
 
-Importing this module requires the ``device`` optional dependency group.
+Re-implementing is cheap because the format is documented and trivial.
+``NDataHandler``'s own docstring: "ndata files are a zip file consisting of
+data.npy file and a metadata.json file. Both files must be uncompressed."
+Nion hand-rolls a zip parser because *writing* in-place needs byte offsets
+for uncompressed members; reading needs none of that, so
+:mod:`zipfile` plus :func:`numpy.load` and :func:`json.load` is the whole
+implementation. Verified against genuine Nion-written files — the tests
+build their fixtures with Nion's *writer* precisely so this reader is
+exercised against the real container rather than against our own
+assumptions about it.
+
+Note this is not the "invent a bespoke format" that §3 warns against; it is
+reading a documented one. RosettaSciIO would have been the natural reuse
+candidate — §3 already names it for file I/O — but it has no ``.ndata``
+reader (checked: 38 IO plugins, none handles the extension).
+
+Frames come back as the vendor-neutral
+:class:`~miainwoodpecker.devices.interface.Frame`, so they can be written
+straight into the new NeXus format by :mod:`miainwoodpecker.storage.nexus`.
+
+Unlike the rest of the legacy path's history, importing this module needs
+**no** optional dependency group: it is now standard library plus numpy.
 """
 
 from __future__ import annotations
 
 import datetime
+import json
 import pathlib
 import typing
+import zipfile
 
-from nion.swift.model import NDataHandler
+import numpy as np
 
 from miainwoodpecker.devices.interface import Frame
 
 if typing.TYPE_CHECKING:
     import os
     from collections.abc import Iterator
+
+_DATA_MEMBER = "data.npy"
+_METADATA_MEMBER = "metadata.json"
 
 # Swift records acquisition time under a few different keys depending on
 # the version that wrote the file; try them in order of preference.
@@ -78,18 +107,29 @@ def read_ndata(path: os.PathLike[str] | str) -> Frame:
     Raises
     ------
     ValueError
-        If the file contains no data array.
+        If the file is not a zip container, or contains no data array.
     """
     file_path = pathlib.Path(path)
-    handler = NDataHandler.NDataHandler(file_path)
     try:
-        data = handler.read_data()
-        properties = dict(handler.read_properties())
-    finally:
-        handler.close()
-    if data is None:
-        msg = f"no data array found in {file_path}"
-        raise ValueError(msg)
+        with zipfile.ZipFile(file_path) as archive:
+            names = set(archive.namelist())
+            if _DATA_MEMBER not in names:
+                msg = f"no data array found in {file_path}"
+                raise ValueError(msg)
+            with archive.open(_DATA_MEMBER) as member:
+                # allow_pickle stays at its default False: these are plain
+                # numeric arrays, and a .ndata file is untrusted input as
+                # far as this reader is concerned.
+                data = np.load(member)
+            properties: dict[str, typing.Any] = {}
+            if _METADATA_MEMBER in names:
+                # Swift has written .ndata files with no metadata member;
+                # the array is still worth recovering.
+                with archive.open(_METADATA_MEMBER) as member:
+                    properties = dict(json.load(member))
+    except zipfile.BadZipFile as error:
+        msg = f"{file_path} is not a valid .ndata (zip) file"
+        raise ValueError(msg) from error
     properties["source_path"] = str(file_path)
     return Frame(
         data=data,

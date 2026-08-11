@@ -8,15 +8,142 @@ framework. That keeps the storage layer thin while producing files any
 NeXus-aware tool can open, which is the whole point of not inventing
 another bespoke project format (see docs/migration-plan.md, §3).
 
-Scope of the compliance claim: files are written to standard NeXus
-conventions and declare ``definition = "NXem"`` to state intent, but they
-have **not** been validated against the official NXem NXDL schema.
-Doing that needs ``pynxtools``, which is a heavy dependency (~70
-packages) and belongs in a validation/CI step, not in the runtime — see
-the Phase 3 notes in the migration plan.
-
 Writes stream frame-by-frame into a resizable, chunked dataset, so a long
 acquisition is persisted as it happens rather than buffered in memory.
+
+Scope of the compliance claim, now actually checked
+---------------------------------------------------
+Earlier versions of this module declared ``definition = "NXem"``
+unconditionally, to state intent, while noting the claim was unverified.
+It has now been verified with ``pynxtools`` (see
+``scripts/validate_nexus_schema.py``, wired into CI), and the answer was
+**no**: a plain recording is *not* valid NXem. The whole gap is one
+required group, ``NXem``'s ``sampleID`` — an ``NXsample`` group carrying
+``is_simulation``, ``preparation_date``, and ``atom_types``. Every other
+required concept (``definition``, ``start_time``) and every class,
+``signal``/``axes`` hint, and ``units`` attribute this writer produces
+already satisfies the schema; adding just that group flips the same file
+to valid.
+
+Those three fields are facts about the physical specimen — which elements
+it contains, when it was prepared, whether it is real. No device API can
+supply them, and this writer will not invent them: a file that lies about
+its provenance is worse than one that declines to claim a definition. So
+the default is now to **claim nothing** rather than claim NXem falsely.
+Pass ``sample=...`` together with ``definition="NXem"`` — the operator or
+ELN knows those values — and the file is genuinely, verifiably NXem.
+Without them the file is still a well-formed NeXus file conforming to the
+base classes (``NXroot``/``NXentry``/``NXinstrument``/``NXdetector``/
+``NXdata``), independently confirmed loadable and plottable by
+``nexusformat``; it simply makes no application-definition claim.
+
+``user`` and ``notes`` write the other two pieces of session context into
+their real NeXus homes — ``NXuser`` at ``/entry/user``, ``NXnote`` at
+``/entry/notes`` — instead of burying them in this module's
+vendor-metadata JSON blob, which is where
+:mod:`miainwoodpecker.storage.session` had to put them while the writer
+had no fields for them. Both are *optional* in NXem (``userID``/``noteID``
+are ``minOccurs="0"``, unlike ``sampleID``'s ``minOccurs="1"``), so
+neither was ever part of the required-field gap; they are here for
+honesty about where session context belongs, not to satisfy the schema.
+
+Deliberately written with ``h5py`` alone, not ``pynxtools-em``: NeXus is a
+*convention over HDF5*, and ``pynxtools-em`` is a vendor-format→NXem
+reader/converter that pulls ~70 packages to supply, for our purposes, a
+schema convention. ``pynxtools`` therefore appears only in the validation
+environment, never in the runtime — which is where the migration plan's
+Phase 3 note says this belongs.
+
+Compression defaults are measured, not guessed
+----------------------------------------------
+``scripts/nexus_compression_benchmark.py`` measures ratio, write time, and
+read-back time on real simulator frames across gzip, lzf, blosc2,
+bitshuffle, and zstd, with and without HDF5's byte-shuffle filter. The
+finding that sets the default here: **byte shuffle is what rescues float
+data from a generic compressor, and it costs nothing.** Shuffling
+transposes the array into byte planes, so the like-significance bytes of
+adjacent floats sit together - the low-entropy sign/exponent plane
+becomes compressible runs, and the noisy mantissa bytes are quarantined
+where they can only fail to compress instead of poisoning every match
+around them.
+
+Adding ``shuffle=True`` to the gzip level 4 that was already the default
+is **strictly better on all three axes, on every dataset measured** -
+smaller, faster to write, faster to read:
+
+===================  ==============  ===================
+dataset              gzip-4 (old)    gzip-4 + shuffle
+===================  ==============  ===================
+scan 1024x1024 f64   0.957x          0.866x
+EELS 256x1024 f32    0.336x          0.233x
+Ronchigram 2048 f32  0.694x          0.532x
+===================  ==============  ===================
+
+...with Ronchigram write time dropping 747 -> 374 ms/frame and read-back
+327 -> 192 ms, because deflate does less work on a stream that actually
+has structure. There is no trade-off to weigh, so it is simply the
+default; ``compression="gzip"`` keeps working and now means gzip+shuffle.
+
+Blosc2 with zstd is a further step - marginally better ratios and much
+faster (Ronchigram 84 ms/frame write, 82 ms read) - but it is a *plugin*
+codec: a file written with it cannot be opened at all without
+``hdf5plugin`` installed in the reading environment. That is a real
+interoperability cost for a project whose entire storage argument (§3) is
+"follow a documented format so other tools can read it," and the readers
+in question include ``nexusformat``, HyperSpy, LiberTEM, and py4DSTEM.
+So it stays opt-in - ``compression=hdf5plugin.Blosc2(cname="zstd")``,
+with ``hdf5plugin`` an optional extra - rather than becoming the default
+and quietly making every file plugin-dependent for a few percent.
+
+Axis calibration is supplied per acquisition, never invented
+------------------------------------------------------------
+Frames used to get real axes in exactly one case — a scan reporting
+``fov_nm`` — and an honest ``units = "pixel"`` otherwise, which meant every
+camera frame this project wrote carried no physical axis at all
+(docs/migration-plan.md, §7). :mod:`miainwoodpecker.storage.calibration`
+now models that properly, **per axis** (an EELS frame's dispersive
+direction is energy and the other direction is not) and **per
+acquisition** (the same camera is reciprocal space in one microscope mode
+and something else in another). Pass ``calibration=`` here, or attach it to
+a frame's ``metadata`` under ``"calibration"`` — the same route ``fov_nm``
+already travels. Both paths are optional and the ``fov_nm`` and
+``"pixel"`` behaviours are unchanged, so nothing that already writes files
+has to change.
+
+What goes into the file is only what NeXus defines: ``units`` and
+``long_name`` on each ``NXdata`` ``AXISNAME`` field. NeXus has no attribute
+for "what kind of axis is this", so none is invented — the unit string
+carries it (``nm`` -> ``NX_LENGTH``, ``1/nm`` -> ``NX_WAVENUMBER``, ``eV``
+-> ``NX_ENERGY``, ``mrad`` -> ``NX_ANGLE``), which is exactly how
+``NXimage`` and ``NXspectrum`` distinguish real-space, reciprocal-space,
+and energy axes. See the calibration module for the measurements behind the
+unit spellings, including the one that matters: ``pynxtools`` accepts
+``"1/nm"`` for ``NX_WAVENUMBER`` and rejects ``"nm-1"``.
+
+Why ``dtype`` exists, and why it is not the default
+---------------------------------------------------
+Storing ``float64`` scan frames as ``float32`` is a **2.3x** size win -
+much bigger than any codec choice - because it halves the logical bytes
+*and* compresses slightly better afterwards (0.822x vs 0.866x at
+1024x1024): 32.1MB stored today becomes 13.8MB. And the same benchmark
+shows the precision that buys it is not physically real. The simulator's
+scan pipeline builds its sample array as ``float32`` and annotates
+``generate_scan_data`` as returning ``NDArray[numpy.float32]``; the
+``float64`` this project receives comes purely from numpy promoting
+``float32 + numpy.random.randn(...)``, since ``randn`` returns
+``float64``. A ``float32`` round trip of a real frame loses at most
+1.19e-07 absolute, which is **1.55e-07 of the frame's own noise standard
+deviation** - seven orders of magnitude below the signal's own
+uncertainty.
+
+That still does not make it this module's decision. Downcasting is lossy
+and irreversible, the storage layer is handed an array rather than a
+statement about its precision, and no real-hardware dtype has been
+validated yet (§2's open item). A writer that quietly narrowed what it
+was given would be asserting something about provenance it cannot know.
+The correct fix is upstream - stop the accidental promotion where it
+happens - so ``dtype`` is offered explicitly, documented, and off by
+default.
 """
 
 from __future__ import annotations
@@ -26,17 +153,42 @@ import json
 import typing
 
 import h5py
-import numpy as np
+
+from miainwoodpecker.storage.calibration import (
+    AXIS_NAMES,
+    AxisCalibration,
+    FrameCalibration,
+    axis_kind_for_units,
+    resolve_frame_calibration,
+)
 
 if typing.TYPE_CHECKING:
     import os
-    from collections.abc import Iterable, Iterator
+    from collections.abc import Iterable, Iterator, Mapping
+
+    import numpy as np
+    import numpy.typing as npt
 
     from miainwoodpecker.devices.interface import Frame
 
 _PROGRAM_NAME = "miainwoodpecker"
 _DEFAULT_COMPRESSION = "gzip"
 _DEFAULT_COMPRESSION_LEVEL = 4
+# HDF5's own byte-shuffle filter only makes sense in front of HDF5's own
+# built-in compressors. Blosc2/bitshuffle shuffle internally, so stacking
+# this filter ahead of them costs a pass over the data and buys nothing.
+_SHUFFLE_BENEFITING_FILTERS = frozenset({"gzip", "lzf"})
+
+CompressionSpec = typing.Union[str, "Mapping[str, typing.Any]", None]
+"""
+What :class:`NexusWriter` accepts for ``compression``.
+
+Either an h5py built-in filter name (``"gzip"``, ``"lzf"``), ``None`` for
+no compression, or a mapping of ``create_dataset`` keyword arguments —
+which is exactly what ``hdf5plugin``'s filter objects
+(``hdf5plugin.Blosc2(...)``, ``hdf5plugin.Bitshuffle(...)``) are, so they
+can be passed straight through.
+"""
 
 
 def _iso(timestamp: datetime.datetime) -> str:
@@ -62,29 +214,90 @@ class NexusWriter:
         Destination HDF5 file. Overwritten if it exists.
     title : str
         Human-readable title stored at ``/entry/title``.
-    definition : str
-        NeXus application definition name declared by the file.
-    compression : str | None
-        h5py compression filter for the frame dataset, or None to disable.
+    definition : str | None
+        NeXus application definition the file claims to conform to.
+        ``None`` (the default) writes no ``/entry/definition`` field and so
+        claims nothing — the honest default, since the definition this
+        project targets, ``NXem``, additionally requires specimen metadata
+        only the operator can supply. Pass ``"NXem"`` *together with*
+        ``sample`` to make the claim truthfully; see the module docstring.
+    sample : Mapping[str, object] | None
+        Fields for an ``NXsample`` group at ``/entry/sample``, written
+        verbatim. ``NXem`` requires ``is_simulation`` (bool),
+        ``preparation_date`` (ISO 8601), and ``atom_types``
+        (comma-separated element symbols).
+    user : Mapping[str, object] | None
+        Fields for an ``NXuser`` group at ``/entry/user``, written
+        verbatim — ``name``, ``affiliation``, ``email``, ``orcid`` are the
+        base class's own fields. Optional in ``NXem``, unlike ``sample``.
+    notes : str | None
+        Free-text session notes, written as ``description`` inside an
+        ``NXnote`` group at ``/entry/notes``.
+    calibration : FrameCalibration | None
+        Per-axis calibration for the frames this writer will be given —
+        real space, reciprocal space, energy, or the honest pixel fallback,
+        independently per axis. ``None`` (the default) falls back to the
+        frames' own ``metadata``: a ``"calibration"`` entry if present, then
+        ``"fov_nm"`` as before, then bare pixel indices. See
+        :func:`miainwoodpecker.storage.calibration.resolve_frame_calibration`
+        for the precedence, and never expect this writer to guess one.
+    compression : CompressionSpec
+        h5py compression filter for the frame dataset: a built-in filter
+        name (``"gzip"``, ``"lzf"``), ``None`` to disable, or a mapping of
+        ``create_dataset`` keyword arguments — which is what
+        ``hdf5plugin``'s filter objects are, so
+        ``compression=hdf5plugin.Blosc2(cname="zstd")`` works. Note a
+        plugin codec makes the file unreadable without that plugin
+        installed; the default deliberately stays on HDF5 built-ins.
+    compression_opts : object | None
+        Filter options, e.g. the gzip level. ``None`` uses the gzip
+        default level and is the correct value for filters that take no
+        options.
+    shuffle : bool | None
+        Apply HDF5's byte-shuffle filter before compressing. ``None``
+        (the default) enables it for the built-in compressors that
+        benefit and skips it for codecs that shuffle internally. This is
+        the single biggest ratio lever on float frames — see the module
+        docstring.
+    dtype : npt.DTypeLike | None
+        Store frames as this dtype instead of the dtype they arrive in.
+        **Lossy if narrower than the incoming data**; opt-in only, and
+        never applied on the writer's own initiative. See the module
+        docstring for the measured case this exists for.
     """
 
-    def __init__(
+    def __init__(  # noqa: PLR0913 - keyword-only file-format options, not a call signature
         self,
         path: os.PathLike[str] | str,
         *,
         title: str = "miainwoodpecker acquisition",
-        definition: str = "NXem",
-        compression: str | None = _DEFAULT_COMPRESSION,
+        definition: str | None = None,
+        sample: Mapping[str, object] | None = None,
+        user: Mapping[str, object] | None = None,
+        notes: str | None = None,
+        calibration: FrameCalibration | None = None,
+        compression: CompressionSpec = _DEFAULT_COMPRESSION,
+        compression_opts: object | None = None,
+        shuffle: bool | None = None,
+        dtype: npt.DTypeLike | None = None,
     ) -> None:
         self._path = path
         self._title = title
         self._definition = definition
+        self._sample = sample
+        self._user = user
+        self._notes = notes
+        self._calibration = calibration
         self._compression = compression
+        self._compression_opts = compression_opts
+        self._shuffle = shuffle
+        self._dtype = dtype
         self._file: h5py.File | None = None
         self._data: h5py.Dataset | None = None
         self._times: h5py.Dataset | None = None
         self._count = 0
         self._first_metadata: typing.Mapping[str, typing.Any] | None = None
+        self._resolved_calibration: FrameCalibration | None = None
         self._start: datetime.datetime | None = None
         self._frame_zero: datetime.datetime | None = None
 
@@ -100,11 +313,33 @@ class NexusWriter:
         entry = root.create_group("entry")
         entry.attrs["NX_class"] = "NXentry"
         entry.attrs["default"] = "data"
-        entry["definition"] = self._definition
+        if self._definition is not None:
+            entry["definition"] = self._definition
         entry["title"] = self._title
         entry["start_time"] = _iso(self._start)
         program = entry.create_dataset("program_name", data=_PROGRAM_NAME)
         program.attrs["version"] = _version()
+
+        # All three are written verbatim: specimen facts, who ran the
+        # session, and what they wrote down are the operator's or an ELN's
+        # to state, and the writer has no business editing or completing
+        # them. NXem's own requirements are documented on the parameters
+        # and enforced in CI, not here.
+        for group_name, nx_class, fields in (
+            ("sample", "NXsample", self._sample),
+            ("user", "NXuser", self._user),
+            (
+                "notes",
+                "NXnote",
+                None if self._notes is None else {"description": self._notes},
+            ),
+        ):
+            if fields is None:
+                continue
+            group = entry.create_group(group_name)
+            group.attrs["NX_class"] = nx_class
+            for name, value in fields.items():
+                group[name] = value
 
         instrument = entry.create_group("instrument")
         instrument.attrs["NX_class"] = "NXinstrument"
@@ -121,6 +356,60 @@ class NexusWriter:
         """Return how many frames have been appended so far."""
         return self._count
 
+    def flush(self) -> None:
+        """
+        Push buffered HDF5 structures out so a killed process leaves a readable file.
+
+        A sibling investigation measured what an interrupted acquisition
+        actually leaves behind, and the two failure modes are not equally
+        bad. A clean-but-abandoned exit already leaves every appended frame
+        on disk, just without the ``NXdata`` group, ``end_time``, or
+        metadata that :meth:`close` writes — recoverable, if unfinalized. A
+        ``SIGKILL`` mid-acquisition is worse: the file will not open at all
+        (``OSError: bad object header version number``), because HDF5's own
+        superblock and chunk-index updates are still buffered. Calling this
+        after each :meth:`append` was measured to convert the second case
+        into the first.
+
+        Deliberately a caller-controlled method rather than automatic
+        per-frame behaviour: this writes whole chunks through the filter
+        pipeline, so its cost scales with frame size and codec (measured in
+        ``scripts/nexus_compression_benchmark.py``), and how much of that a
+        given acquisition should pay to bound its worst-case loss is the
+        caller's trade to make, not the writer's. No-ops when the writer is
+        not open, so it is safe to call unconditionally.
+        """
+        if self._file is not None:
+            self._file.flush()
+
+    def _filter_kwargs(self) -> dict[str, typing.Any]:
+        """
+        Build the ``create_dataset`` filter-pipeline keyword arguments.
+
+        Returns
+        -------
+        dict[str, typing.Any]
+            ``compression``/``compression_opts``/``shuffle`` as h5py wants
+            them, whether the configured spec is a built-in filter name,
+            ``None``, or an ``hdf5plugin`` filter mapping.
+        """
+        compression = self._compression
+        if compression is not None and not isinstance(compression, str):
+            # An hdf5plugin filter object: already a mapping of the
+            # create_dataset kwargs (compression id + compression_opts).
+            kwargs: dict[str, typing.Any] = dict(compression)
+        else:
+            options = self._compression_opts
+            if options is None and compression == _DEFAULT_COMPRESSION:
+                options = _DEFAULT_COMPRESSION_LEVEL
+            kwargs = {"compression": compression, "compression_opts": options}
+
+        shuffle = self._shuffle
+        if shuffle is None:
+            shuffle = kwargs.get("compression") in _SHUFFLE_BENEFITING_FILTERS
+        kwargs["shuffle"] = shuffle
+        return kwargs
+
     def append(self, frame: Frame) -> None:
         """
         Append one frame, creating the dataset from the first frame's shape.
@@ -135,7 +424,13 @@ class NexusWriter:
         RuntimeError
             If the writer is not open.
         ValueError
-            If the frame's shape or dtype differs from the first frame's.
+            If the frame's shape or dtype differs from the first frame's,
+            or if the first frame's ``metadata["calibration"]`` is
+            malformed (an outright wrong type there surfaces as a
+            ``TypeError`` instead). That check happens here, on the *first*
+            append, rather than in :meth:`close`, so a mis-specified
+            calibration fails before an acquisition runs instead of after
+            it.
         """
         if self._file is None:
             msg = "NexusWriter is not open; use it as a context manager."
@@ -144,19 +439,19 @@ class NexusWriter:
         detector = self._file["entry/instrument/detector"]
         if self._data is None:
             self._first_metadata = frame.metadata
+            self._resolved_calibration = resolve_frame_calibration(
+                typing.cast("tuple[int, int]", frame.data.shape),
+                calibration=self._calibration,
+                metadata=frame.metadata,
+            )
             self._frame_zero = frame.timestamp
             self._data = detector.create_dataset(
                 "data",
                 shape=(0, *frame.data.shape),
                 maxshape=(None, *frame.data.shape),
-                dtype=frame.data.dtype,
+                dtype=self._dtype if self._dtype is not None else frame.data.dtype,
                 chunks=(1, *frame.data.shape),
-                compression=self._compression,
-                compression_opts=(
-                    _DEFAULT_COMPRESSION_LEVEL
-                    if self._compression == _DEFAULT_COMPRESSION
-                    else None
-                ),
+                **self._filter_kwargs(),
             )
             self._data.attrs["units"] = "counts"
             self._times = detector.create_dataset(
@@ -209,7 +504,6 @@ class NexusWriter:
         """Create the NXdata group describing how to plot the frame stack."""
         assert self._data is not None  # noqa: S101 - guarded by caller
         height, width = self._data.shape[1], self._data.shape[2]
-        metadata = self._first_metadata or {}
 
         data_group = entry.create_group("data")
         data_group.attrs["NX_class"] = "NXdata"
@@ -217,20 +511,20 @@ class NexusWriter:
         data_group["data"] = self._data
         data_group["frame_time"] = self._file["entry/instrument/detector/frame_time"]  # type: ignore[index]
 
-        # Scan frames know their field of view, so the spatial axes can carry
-        # real calibration in nanometres instead of bare pixel indices.
-        fov_nm = metadata.get("fov_nm")
-        if isinstance(fov_nm, (int, float)) and fov_nm > 0 and width and height:
-            y_values = np.linspace(0.0, float(fov_nm), height, endpoint=False)
-            x_values = np.linspace(0.0, float(fov_nm), width, endpoint=False)
-            units = "nm"
-        else:
-            y_values = np.arange(height, dtype="float64")
-            x_values = np.arange(width, dtype="float64")
-            units = "pixel"
-        for name, values in (("y", y_values), ("x", x_values)):
-            axis = data_group.create_dataset(name, data=values)
-            axis.attrs["units"] = units
+        # Resolved on the first append (so a bad calibration fails early);
+        # falls back to the honest pixel model when nobody supplied one.
+        calibration = self._resolved_calibration or FrameCalibration.uncalibrated()
+        # `units` and `long_name` are the two attributes NXdata itself
+        # defines on an AXISNAME field. The axis *kind* is not written -
+        # NeXus has no attribute for it, and the unit string carries it.
+        for name, length in zip(AXIS_NAMES, (height, width), strict=True):
+            axis_calibration = calibration.axis(name)
+            axis = data_group.create_dataset(
+                name,
+                data=axis_calibration.values(length),
+            )
+            axis.attrs["units"] = axis_calibration.units
+            axis.attrs["long_name"] = axis_calibration.long_name
 
         data_group.attrs["signal"] = "data"
         data_group.attrs["axes"] = ["frame_time", "y", "x"]
@@ -275,6 +569,95 @@ def write_frames(
         for frame in frames:
             writer.append(frame)
         return writer.frame_count
+
+
+def _axis_calibration_from_values(
+    values: npt.NDArray[np.float64],
+    units: str,
+) -> AxisCalibration:
+    """
+    Recover one axis's calibration from the values and units in a file.
+
+    Parameters
+    ----------
+    values : npt.NDArray[np.float64]
+        The axis dataset's values, in acquisition order.
+    units : str
+        The axis dataset's ``units`` attribute.
+
+    Returns
+    -------
+    AxisCalibration
+        The linear calibration those values encode. A single-sample axis
+        carries no spacing information at all, so its scale falls back to
+        1.0 — the same fallback the analysis adapters already made.
+    """
+    kind = axis_kind_for_units(units)
+    offset = float(values[0]) if len(values) else 0.0
+    scale = float(values[1] - values[0]) if len(values) > 1 else 1.0
+    return AxisCalibration(kind, scale, offset, units)
+
+
+def read_calibration(path: os.PathLike[str] | str) -> FrameCalibration:
+    """
+    Read back the per-axis calibration a written file carries.
+
+    The counterpart to what :class:`NexusWriter` writes, and the single
+    place the ``units``-to-kind inference lives, so the three Phase 4
+    analysis adapters do not each re-derive it. It also gives the LiberTEM
+    adapter something to point at: LiberTEM's ``DataSet`` has nowhere to
+    put axis calibration, so a caller who needs it alongside a UDF result
+    reads it from the file with this.
+
+    Parameters
+    ----------
+    path : os.PathLike[str] | str
+        An HDF5 file written by :class:`NexusWriter`.
+
+    Returns
+    -------
+    FrameCalibration
+        The ``y`` and ``x`` axis calibrations, each with its kind recovered
+        from its units.
+
+    Raises
+    ------
+    ValueError
+        If the file has no ``/entry/data`` group (it recorded no frames),
+        or if an axis's units are outside this project's vocabulary, so its
+        kind cannot be recovered rather than guessed.
+    """
+    with h5py.File(path, "r") as handle:
+        if "data" not in handle["entry"]:
+            msg = f"{path} has no /entry/data group; it recorded no frames"
+            raise ValueError(msg)
+        data_group = handle["entry/data"]
+        axes = {
+            name: _axis_calibration_from_values(
+                data_group[name][()],
+                _decoded(data_group[name].attrs["units"]),
+            )
+            for name in AXIS_NAMES
+        }
+    return FrameCalibration(**axes)
+
+
+def _decoded(value: object) -> str:
+    """
+    Return an HDF5 string attribute as ``str``, whether or not it is bytes.
+
+    Parameters
+    ----------
+    value : object
+        An attribute value read from h5py, which may be ``bytes`` or
+        ``str`` depending on how it was written.
+
+    Returns
+    -------
+    str
+        The decoded value.
+    """
+    return value.decode() if isinstance(value, bytes) else str(value)
 
 
 def read_series(path: os.PathLike[str] | str) -> Iterator[tuple[np.ndarray, float]]:

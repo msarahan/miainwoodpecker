@@ -26,6 +26,20 @@ which the report prints: under software rasterization (llvmpipe, typical
 in CI/containers) display cost is a pessimistic floor, not a verdict for
 real instrument workstations with a GPU.
 
+The **acquire** figure is not comparable with the one first recorded for
+Phase 2. This script originally drove ``devices.nion_adapter``, an
+in-process wrapper around usim that no longer exists: §6's license work
+split it into ``nion_server`` (GPL-3.0, subprocess-only) plus ``remote``
+(MIT, IPC client), and the import here went stale rather than wrong. It
+is now fixed to ``remote_simulated_instrument()`` — deliberately the
+client, not ``nion_server.simulated_instrument()``, because that is what
+``viewer/app.py`` and every other benchmark script use, so the number
+measured is the one the shipped application actually pays. The cost of
+that honesty is that "acquire" now includes the IPC round trip; at
+512x512 a float64 scan frame is 2.1MB, well over
+``_SHARED_MEMORY_THRESHOLD_BYTES``, so it travels through shared memory
+and §6's measurements put that overhead at roughly +3ms.
+
 Needs a real GL canvas, so run under a virtual display:
 
     xvfb-run -a -s "-screen 0 1920x1080x24" \
@@ -44,7 +58,7 @@ import napari
 from qtpy import QtWidgets
 
 from miainwoodpecker.devices.interface import ScanParameters
-from miainwoodpecker.devices.nion_adapter import simulated_instrument
+from miainwoodpecker.devices.remote import remote_simulated_instrument
 from miainwoodpecker.viewer.live import LiveInstrumentWidget
 
 if typing.TYPE_CHECKING:
@@ -146,7 +160,7 @@ def main() -> None:
 
     print(f"scan {args.size}x{args.size} px, dwell {args.dwell_us} us\n")
 
-    with simulated_instrument() as microscope:
+    with remote_simulated_instrument() as microscope:
         parameters = ScanParameters(
             height=args.size,
             width=args.size,
