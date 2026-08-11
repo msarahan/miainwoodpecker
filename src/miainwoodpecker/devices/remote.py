@@ -101,12 +101,18 @@ import typing
 from dataclasses import dataclass
 
 from miainwoodpecker.devices.rpc import (
+    BACKENDS,
+    HARDWARE_BACKEND,
+    SIMULATED_BACKEND,
     Call,
     RemoteCallError,
     RemoteCallTimeoutError,
     RemoteConnectionLostError,
     disable_nagle,
     send_call,
+)
+from miainwoodpecker.devices.rpc import (
+    TARGET_NAMES as _TARGET_NAMES,
 )
 from miainwoodpecker.devices.shared_frame import SharedFrameReader, SharedFrameRef
 
@@ -116,7 +122,31 @@ if typing.TYPE_CHECKING:
 
     from miainwoodpecker.devices.interface import Frame, ScanParameters
 
-_TARGET_NAMES = ("ronchigram_camera", "eels_camera", "scanner", "instrument")
+# Re-exported from rpc.py so callers of this client keep importing the
+# backend vocabulary from the module whose API they are using, while
+# rpc.py stays the one place both peers agree on it.
+__all__ = [
+    "BACKENDS",
+    "HARDWARE_BACKEND",
+    "SERVER_EXITED",
+    "SERVER_RESPONSIVE",
+    "SERVER_UNRESPONSIVE",
+    "SIMULATED_BACKEND",
+    "DeviceServerStartupError",
+    "RemoteCamera",
+    "RemoteInstrument",
+    "RemoteInstrumentDevices",
+    "RemoteScanner",
+    "ServerHealth",
+    "remote_instrument",
+    "remote_simulated_instrument",
+]
+
+# Set by the test suite to arm the device server's test hooks. Read
+# here rather than passed as a parameter so no shipped call site can
+# reach it: remote_instrument() has no argument that turns them on.
+_TEST_HOOKS_ENV_VAR = "MIAINWOODPECKER_ENABLE_TEST_HOOKS"
+
 _CONNECT_TIMEOUT_S = 15.0
 _TERMINATE_TIMEOUT_S = 5.0
 # How long to wait for the graceful-shutdown acknowledgement. Generous
@@ -137,8 +167,6 @@ _HEALTH_TIMEOUT_S = 5.0
 # Only ever paid on the failure path.
 _EXIT_GRACE_S = 0.5
 
-SIMULATED_BACKEND = "simulated"
-HARDWARE_BACKEND = "hardware"
 
 # The three conditions a caller must be able to tell apart, because the
 # right response differs: retry/continue, start a new session, or
@@ -650,8 +678,20 @@ class RemoteInstrument:
                 latency_ms=(time.monotonic() - started) * 1000.0,
             )
         latency_ms = (time.monotonic() - started) * 1000.0
-        answer = typing.cast("dict[str, object]", report)
-        uptime_s = float(typing.cast("float", answer.get("uptime_s", 0.0)))
+        if not isinstance(report, dict):
+            # Documented as never raising, so a server that answered
+            # with something unexpected is reported as unresponsive
+            # rather than raising AttributeError out of a call meant to
+            # be safe to poll from a UI timer.
+            return ServerHealth(
+                state=SERVER_UNRESPONSIVE,
+                detail=f"device server answered health with {type(report).__name__}",
+            )
+        answer = report
+        try:
+            uptime_s = float(answer.get("uptime_s", 0.0))  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            uptime_s = 0.0
         open_devices = typing.cast(
             "Sequence[str]",
             answer.get("open_devices") or (),
@@ -888,6 +928,15 @@ def _spawn_server(
     plugin_arguments = [
         argument for name in plugin_names for argument in ("--plugin", name)
     ]
+    # The server ignores its wedge/delay hooks unless explicitly armed,
+    # so a test that wants one has to say so here. Setting the
+    # environment variable alone no longer does anything, which is the
+    # point: the environment is inherited wholesale, and an operator who
+    # happened to have one set would otherwise get an instrument that
+    # could not be shut down.
+    hook_arguments = (
+        ["--enable-test-hooks"] if os.environ.get(_TEST_HOOKS_ENV_VAR) else []
+    )
     return subprocess.Popen(  # noqa: S603 - fixed argv shape, no shell
         [
             sys.executable,
@@ -896,6 +945,7 @@ def _spawn_server(
             "--backend",
             backend,
             *plugin_arguments,
+            *hook_arguments,
             *(str(ports[name]) for name in _TARGET_NAMES),
         ],
         env=env,
@@ -1029,8 +1079,16 @@ def remote_instrument(
     ----------
     backend : str
         ``"simulated"`` for nionswift-usim, ``"hardware"`` for real
-        devices. Anything else is rejected by the server, which reports
-        the error back before this function returns.
+        devices. Anything else raises :class:`ValueError` here, before a
+        subprocess is spawned.
+
+        This used to say the server rejected it and reported the error
+        back, which was not true: ``open_instrument`` raises,
+        ``main`` catches only ``HardwareNotAvailableError``, so the
+        server died with a traceback and exit 1 and the client surfaced a
+        ``DeviceServerStartupError`` whose message is about missing
+        *hardware* — thoroughly misleading for a typo. The names were
+        already defined here; nothing was checking against them.
     plugin_names : Sequence[str]
         ``nionswift_plugin`` modules providing hardware devices; ignored
         by the simulated backend.
@@ -1039,7 +1097,18 @@ def remote_instrument(
     ------
     RemoteInstrumentDevices
         Handles talking to the cameras, scanner, and instrument over IPC.
+
+    Raises
+    ------
+    ValueError
+        If ``backend`` is not one of :data:`BACKENDS`.
     """
+    if backend not in BACKENDS:
+        msg = (
+            f"unknown backend {backend!r}; expected one of "
+            f"{', '.join(sorted(BACKENDS))}"
+        )
+        raise ValueError(msg)
     ports = {name: _free_port() for name in _TARGET_NAMES}
     authkey = secrets.token_bytes(32)
     process = _spawn_server(ports, authkey, backend, plugin_names)

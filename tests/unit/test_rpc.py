@@ -24,6 +24,12 @@ from multiprocessing.connection import Connection
 import pytest
 
 from miainwoodpecker.devices.rpc import (
+    BACKENDS,
+    DEVICE_TARGET_NAMES,
+    HARDWARE_BACKEND,
+    SHARED_MEMORY_THRESHOLD_BYTES,
+    SIMULATED_BACKEND,
+    TARGET_NAMES,
     Call,
     RemoteCallError,
     RemoteCallTimeoutError,
@@ -252,3 +258,71 @@ def test_call_and_result_survive_a_round_trip_as_plain_data(connection_pair):
     assert received == original
     server.send(Result(value={"ok": True, "uptime_s": 1.5}))
     assert client.recv().value == {"ok": True, "uptime_s": 1.5}
+
+
+def test_a_server_error_carries_its_exception_type(connection_pair):
+    """
+    The class name crosses the boundary, so callers can branch on it.
+
+    Everything used to arrive as one indistinguishable RemoteCallError: a
+    vendor timeout, a bad argument, and a full /dev/shm were separable
+    only by matching on message text.
+    """
+    client, server = connection_pair
+    thread = _serve_once(
+        server,
+        Result(
+            error="TimeoutError: detector did not respond",
+            error_type="TimeoutError",
+        ),
+    )
+    with pytest.raises(RemoteCallError) as raised:
+        send_call(client, threading.Lock(), Call("camera", "acquire_frame"))
+    assert raised.value.error_type == "TimeoutError"
+    thread.join(timeout=5)
+
+
+def test_a_client_side_failure_has_no_server_exception_type(connection_pair):
+    """A timeout never reached the server, so it names no server exception."""
+    client, _server = connection_pair
+    with pytest.raises(RemoteCallError) as raised:
+        send_call(
+            client,
+            threading.Lock(),
+            Call("instrument", "health"),
+            timeout_s=0.05,
+        )
+    assert raised.value.error_type is None
+
+
+def test_a_result_without_an_error_type_still_works(connection_pair):
+    """
+    Wire compatibility in both directions.
+
+    error_type has a default, so a Result pickled by a peer that predates
+    it unpickles here with None rather than failing to construct.
+    """
+    client, server = connection_pair
+    thread = _serve_once(server, Result(error="ValueError: nope"))
+    with pytest.raises(RemoteCallError) as raised:
+        send_call(client, threading.Lock(), Call("scanner", "scan_frame"))
+    assert raised.value.error_type is None
+    thread.join(timeout=5)
+
+
+def test_the_protocol_vocabulary_lives_on_the_mit_side():
+    """
+    Target names, backends, and the threshold are defined here, not in the server.
+
+    The threshold decides whether a client receives a Frame or a
+    SharedFrameRef, which makes it a protocol decision; it lived in the
+    GPL server module, and the MIT test suite had to import that module
+    to learn a number. The argv ordering of TARGET_NAMES is likewise part
+    of the protocol - the client passes one port per target positionally
+    and the server zips them back against the same tuple, so two copies
+    could disagree in a way strict=True cannot catch.
+    """
+    assert TARGET_NAMES[-1] == "instrument"
+    assert set(DEVICE_TARGET_NAMES) == set(TARGET_NAMES) - {"instrument"}
+    assert BACKENDS == (SIMULATED_BACKEND, HARDWARE_BACKEND)
+    assert SHARED_MEMORY_THRESHOLD_BYTES == 64 * 1024

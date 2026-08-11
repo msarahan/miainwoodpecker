@@ -100,11 +100,11 @@ def _read(
         The ``(n_frames, height, width)`` stack, the per-frame elapsed
         times, and the ``y``/``x`` calibration.
 
-    Raises
-    ------
-    NoFramesError
-        If the file was written by an acquisition that produced no
-        frames, so it has no ``NXdata`` group to read.
+    Notes
+    -----
+    Propagates :class:`~miainwoodpecker.storage.layout.NoFramesError`
+    from :func:`~miainwoodpecker.storage.nexus.read_frames` when the file
+    recorded no frames.
     """
     return read_frames(path)
 

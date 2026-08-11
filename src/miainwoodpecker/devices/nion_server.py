@@ -102,29 +102,24 @@ from miainwoodpecker.devices.interface import (
     Frame,
     ScanParameters,
 )
-from miainwoodpecker.devices.rpc import Call, Result, disable_nagle
+from miainwoodpecker.devices.rpc import (
+    BACKENDS,
+    HARDWARE_BACKEND,
+    SIMULATED_BACKEND,
+    Call,
+    Result,
+    disable_nagle,
+)
+from miainwoodpecker.devices.rpc import (
+    DEVICE_TARGET_NAMES as _DEVICE_TARGET_NAMES,
+)
+from miainwoodpecker.devices.rpc import (
+    SHARED_MEMORY_THRESHOLD_BYTES as _SHARED_MEMORY_THRESHOLD_BYTES,
+)
+from miainwoodpecker.devices.rpc import (
+    TARGET_NAMES as _TARGET_NAMES,
+)
 from miainwoodpecker.devices.shared_frame import SharedFrameWriter
-
-# Below this, route Frame results through the plain pickle-over-socket
-# channel instead of shared memory. Measured with
-# scripts/ipc_overhead_benchmark.py against the *reused-segment* writer
-# (shared_frame.py) with Nagle disabled on the RPC connections
-# (rpc.disable_nagle - a real, separate bug this benchmark surfaced: two
-# sizes on the plain-pickle path showed a strikingly consistent ~44ms
-# stall, the signature of Nagle's algorithm and the receiver's delayed ACK
-# waiting on each other; TCP_NODELAY was unset by default and is now set
-# on every connection this project opens, not just those two sizes).
-#
-# With reuse, per-call cost above a first-use/resize is just the memcpy,
-# so pickle and shared memory are within noise of each other from ~30KB
-# up to ~500KB (all +0.3 to +0.5ms overhead over direct in-process calls)
-# and shared memory pulls ahead smoothly above that: +1.5ms at ~1MB,
-# +2.8ms at 2.1MB, +9.5ms at 8.4MB, +13.3ms at 18.9MB, +25ms at 33.6MB
-# (versus a naive per-frame-create/destroy design's +72ms, and naive
-# pickle's +168ms, at that largest size). 64KB sits comfortably in the
-# "doesn't matter much either way" band measured above, so it is kept
-# rather than tuned further.
-_SHARED_MEMORY_THRESHOLD_BYTES = 64 * 1024
 
 if typing.TYPE_CHECKING:
     import types
@@ -146,6 +141,35 @@ _LOG_FILE_ENV_VAR = "MIAINWOODPECKER_DEVICE_LOG_FILE"
 _WEDGE_SHUTDOWN_ENV_VAR = "MIAINWOODPECKER_WEDGE_SHUTDOWN"
 _WEDGE_HEALTH_ENV_VAR = "MIAINWOODPECKER_WEDGE_HEALTH"
 _DELAY_SCAN_ENV_VAR = "MIAINWOODPECKER_DELAY_SCAN_S"
+_ORPHAN_GRACE_ENV_VAR = "MIAINWOODPECKER_ORPHAN_GRACE_S"
+# The hooks above do nothing unless this is set, which only
+# --enable-test-hooks does. The environment alone used to be enough,
+# and the environment is inherited wholesale by the subprocess: an
+# operator with MIAINWOODPECKER_WEDGE_SHUTDOWN left set in a shell
+# profile would have had a real instrument that could not be shut down
+# or health-checked, with no indication why. A flag the launcher never
+# passes cannot be set by accident.
+_TEST_HOOKS_ENABLED = False
+
+
+def _test_hook(name: str) -> str | None:
+    """
+    Return a test hook's value, or None unless test hooks are enabled.
+
+    Parameters
+    ----------
+    name : str
+        The hook's environment variable name.
+
+    Returns
+    -------
+    str | None
+        The value when hooks are armed and the variable is set;
+        ``None`` otherwise, which every caller treats as 'no hook'.
+    """
+    if not _TEST_HOOKS_ENABLED:
+        return None
+    return os.environ.get(name)
 
 # Named rather than taken from ``__name__``: this module's usual entry
 # point is ``python -m miainwoodpecker.devices.nion_server``, under which
@@ -155,12 +179,8 @@ _DELAY_SCAN_ENV_VAR = "MIAINWOODPECKER_DELAY_SCAN_S"
 _LOGGER = logging.getLogger("miainwoodpecker.devices.nion_server")
 _DEFAULT_LOG_LEVEL = "WARNING"
 
-_TARGET_NAMES = ("ronchigram_camera", "eels_camera", "scanner", "instrument")
-_DEVICE_TARGET_NAMES = ("ronchigram_camera", "eels_camera", "scanner")
-
-SIMULATED_BACKEND = "simulated"
-HARDWARE_BACKEND = "hardware"
-BACKENDS = (SIMULATED_BACKEND, HARDWARE_BACKEND)
+# Target names, backend names, and the shared-memory threshold all come
+# from rpc.py: they are protocol vocabulary, and both peers must agree.
 
 # Exit status for "the hardware backend found no instrument". Distinct from
 # 1 so a launcher can tell a missing microscope from a crash.
@@ -177,6 +197,13 @@ PARK_TIMEOUT_EXIT_STATUS = 3
 # (remote._TERMINATE_TIMEOUT_S), so a server that cannot park still dies of
 # its own accord - with a status saying so - rather than being SIGKILLed.
 _PARK_ON_SIGNAL_TIMEOUT_S = 3.0
+
+# How long every client connection must stay gone before the server
+# concludes its client died and parks. Generous because the cost of
+# being wrong is parking a live instrument, and cheap because the
+# alternative failure - an orphaned server holding a column - is only
+# ever resolved by a human noticing.
+_ORPHAN_GRACE_S = 30.0
 
 # Vendor control names behind the neutral controls in interface.py.
 # "C10" (defocus) and "stage_position_m" come from Nion's own device_kit
@@ -301,7 +328,7 @@ class NionScanner:
 
     def scan_frame(self, parameters: ScanParameters, channel: int = 0) -> Frame:
         """Scan and return a single frame from the given detector channel."""
-        delay_s = os.environ.get(_DELAY_SCAN_ENV_VAR)
+        delay_s = _test_hook(_DELAY_SCAN_ENV_VAR)
         if delay_s:
             # Test hook, in the same spirit as the wedge hooks below: hold a
             # scan open for a known duration so a test can kill the server
@@ -493,6 +520,37 @@ class NionInstrument:
             "controls": list(self.available_controls()),
             "stage_size_nm": self.stage_size_nm(),
         }
+
+    def connection_opened(self) -> None:
+        """Record that a client connection was accepted."""
+        with self._connection_lock:
+            self._connections += 1
+            self._ever_connected = True
+        self._connection_change.set()
+
+    def connection_closed(self) -> None:
+        """Record that a client connection ended."""
+        with self._connection_lock:
+            self._connections = max(0, self._connections - 1)
+        self._connection_change.set()
+
+    @property
+    def is_orphaned(self) -> bool:
+        """Return whether every client connection has gone after having some."""
+        with self._connection_lock:
+            return self._ever_connected and self._connections == 0
+
+    def wait_for_connection_change(self, timeout: float | None = None) -> None:
+        """
+        Block until a connection opens or closes, or the timeout elapses.
+
+        Parameters
+        ----------
+        timeout : float | None
+            Seconds to wait, or None to wait indefinitely.
+        """
+        self._connection_change.wait(timeout)
+        self._connection_change.clear()
 
     def health(self) -> dict[str, object]:
         """
@@ -980,6 +1038,13 @@ class _ServerSession:
         self._devices = devices
         self.stop_event = threading.Event()
         self._lock = threading.Lock()
+        # Live client connections across every target, and whether we
+        # have ever had one. Together they are how this server notices
+        # its client died: see _orphan_watchdog.
+        self._connection_lock = threading.Lock()
+        self._connections = 0
+        self._ever_connected = False
+        self._connection_change = threading.Event()
         self._report: dict[str, object] | None = None
         self._started_monotonic = time.monotonic()
         self.targets: dict[str, object] = {}
@@ -1012,7 +1077,7 @@ class _ServerSession:
             See :meth:`NionInstrument.health`, which is the RPC entry
             point and documents the fields.
         """
-        if os.environ.get(_WEDGE_HEALTH_ENV_VAR):
+        if _test_hook(_WEDGE_HEALTH_ENV_VAR):
             # Test hook: behave like a server wedged with its listeners
             # still bound, so the client's bounded-wait path is exercised
             # against a genuinely unresponsive server rather than a mock.
@@ -1051,7 +1116,7 @@ class _ServerSession:
             crosses the RPC boundary unchanged. Idempotent: a second
             call returns the first call's report.
         """
-        if os.environ.get(_WEDGE_SHUTDOWN_ENV_VAR):
+        if _test_hook(_WEDGE_SHUTDOWN_ENV_VAR):
             # Test hook: behave like a server wedged mid-shutdown, so the
             # client's timeout-and-SIGTERM fallback is exercised for real.
             threading.Event().wait()
@@ -1189,7 +1254,10 @@ def _invoke(
         # boundary. This is the per-call diagnostic the whole
         # logging setup exists for.
         _LOGGER.exception("target %s: call %s() raised", name, call.method)
-        return Result(error=f"{type(exc).__name__}: {exc}")
+        return Result(
+            error=f"{type(exc).__name__}: {exc}",
+            error_type=type(exc).__name__,
+        )
     return Result(value=value)
 
 
@@ -1202,6 +1270,7 @@ def _serve_connection(  # noqa: PLR0913 - one dispatch loop, not a call signatur
     *,
     rejected: str | None = None,
     release: threading.Lock | None = None,
+    on_close: typing.Callable[[], None] | None = None,
 ) -> None:
     """
     Handle Calls on one accepted connection until the client disconnects.
@@ -1238,6 +1307,9 @@ def _serve_connection(  # noqa: PLR0913 - one dispatch loop, not a call signatur
     release : threading.Lock | None
         The exclusivity lock this connection holds, released when it ends
         so the next client can take the target over.
+    on_close : typing.Callable[[], None] | None
+        Called when this connection ends, so the session can notice
+        when the last one has gone.
     """
     try:
         while True:
@@ -1269,6 +1341,8 @@ def _serve_connection(  # noqa: PLR0913 - one dispatch loop, not a call signatur
             connection.close()
         if release is not None:
             release.release()
+        if on_close is not None:
+            on_close()
 
 
 def _accept_loop(
@@ -1276,7 +1350,7 @@ def _accept_loop(
     name: str,
     target: object,
     writer: SharedFrameWriter | None,
-    stop_event: threading.Event,
+    session: _ServerSession,
 ) -> None:
     """
     Accept connections for one target, one handler thread per connection.
@@ -1310,16 +1384,75 @@ def _accept_loop(
         else:
             _LOGGER.info("target %s: accepted a connection", name)
         disable_nagle(connection)
+        session.connection_opened()
         thread = threading.Thread(
             target=_serve_connection,
-            args=(connection, name, target, writer, stop_event),
+            args=(connection, name, target, writer, session.stop_event),
             kwargs={
                 "rejected": rejected,
                 "release": None if rejected is not None else in_use,
+                "on_close": session.connection_closed,
             },
             daemon=True,
         )
         thread.start()
+
+
+def _orphan_watchdog(session: _ServerSession, grace_s: float) -> None:
+    """
+    Park and stop the server once its client is gone for good.
+
+    Without this, a client that dies without shutting down — a crash, a
+    ``SIGKILL``, a notebook kernel restart — leaves ``serve()`` blocked on
+    its stop event forever, holding the vendor devices open, the camera
+    acquisition threads running, the ports bound, and the beam unblanked.
+    Nothing reclaims that; on real hardware it is an instrument nobody can
+    use and nobody is watching.
+
+    **"The client is gone" is inferred rather than guessed at**, and that
+    is what makes this safe to act on. Every connection closing would be
+    ambiguous for most servers — a client might be about to reconnect —
+    but this project deliberately does not support reconnect
+    (docs/migration-plan.md, §6: a fresh subprocess is a fresh instrument
+    construction, so silently resuming would hand the operator a session
+    whose device state is quietly wrong). A client therefore holds its
+    connections for its entire life by construction, and their
+    disappearance is that life ending. No idle timeout is involved, so
+    this cannot park an instrument someone is still using: an idle client
+    is still a connected one.
+
+    The grace period is a guard against a torn-down-and-restarting race,
+    not a policy about how long an instrument may sit unused.
+
+    Parameters
+    ----------
+    session : _ServerSession
+        The session to watch, park, and stop.
+    grace_s : float
+        Seconds to wait after the last connection closes before acting,
+        in case another arrives.
+    """
+    while not session.stop_event.is_set():
+        if not session.is_orphaned:
+            session.wait_for_connection_change(timeout=grace_s)
+            continue
+        # Everything closed. Give a moment in case this is a race with a
+        # connection being replaced, then check once more.
+        session.wait_for_connection_change(timeout=grace_s)
+        if session.stop_event.is_set() or not session.is_orphaned:
+            continue
+        _LOGGER.warning(
+            "client gone for %.1fs with no connections left; parking and exiting",
+            grace_s,
+        )
+        try:
+            report = session.park_and_release()
+        except Exception:
+            _LOGGER.exception("park after losing the client failed")
+        else:
+            _LOGGER.info("parked after losing the client: %s", report)
+        session.stop_event.set()
+        return
 
 
 @contextlib.contextmanager
@@ -1428,6 +1561,7 @@ def serve(
     *,
     backend: str = SIMULATED_BACKEND,
     plugin_names: Sequence[str] = (),
+    orphan_grace_s: float = _ORPHAN_GRACE_S,
 ) -> None:
     """
     Build the requested instrument and serve it, one Listener per target.
@@ -1452,6 +1586,9 @@ def serve(
         ``"simulated"`` or ``"hardware"``; see :func:`open_instrument`.
     plugin_names : Sequence[str]
         Plug-in modules for the hardware backend.
+    orphan_grace_s : float
+        Seconds with no client connections before the server parks the
+        instrument and exits. See :func:`_orphan_watchdog`.
     """
     from multiprocessing.connection import Listener as _Listener  # noqa: PLC0415
 
@@ -1473,6 +1610,12 @@ def serve(
             ", ".join(str(ports[name]) for name in names),
         )
         with _parking_signal_handlers(session):
+            threading.Thread(
+                target=_orphan_watchdog,
+                args=(session, orphan_grace_s),
+                name="orphan-watchdog",
+                daemon=True,
+            ).start()
             for listener, name in zip(listeners, names, strict=True):
                 thread = threading.Thread(
                     target=_accept_loop,
@@ -1481,7 +1624,7 @@ def serve(
                         name,
                         session.targets[name],
                         session.writers[name],
-                        session.stop_event,
+                        session,
                     ),
                     daemon=True,
                 )
@@ -1490,6 +1633,30 @@ def serve(
         _LOGGER.info("shutdown acknowledged; closing listeners and exiting")
         for listener in listeners:
             listener.close()
+
+
+def _orphan_grace_from_hook() -> float:
+    """
+    Return the orphan grace period, shortened only by an armed test hook.
+
+    A test cannot wait 30 s to prove the watchdog works, and the value
+    must not be settable in an operator's environment - shortening it
+    there would park instruments during ordinary connection churn. So
+    it rides the same --enable-test-hooks gate as the wedge hooks.
+
+    Returns
+    -------
+    float
+        The configured grace period in seconds.
+    """
+    raw = _test_hook(_ORPHAN_GRACE_ENV_VAR)
+    if raw is None:
+        return _ORPHAN_GRACE_S
+    try:
+        return float(raw)
+    except ValueError:
+        _LOGGER.warning("ignoring unparseable %s=%r", _ORPHAN_GRACE_ENV_VAR, raw)
+        return _ORPHAN_GRACE_S
 
 
 def _plugins_from_environment() -> list[str]:
@@ -1564,6 +1731,11 @@ def _parse_args(argv: Sequence[str]) -> argparse.Namespace:
             "separated); if neither, autodiscovery. Passing this overrides "
             "the environment rather than adding to it."
         ),
+    )
+    parser.add_argument(
+        "--enable-test-hooks",
+        action="store_true",
+        help=argparse.SUPPRESS,  # not an operator-facing option
     )
     arguments = parser.parse_args(list(argv))
     if arguments.plugin is None:
@@ -1650,10 +1822,20 @@ def main(argv: Sequence[str] | None = None) -> None:
     """
     _configure_logging()
     arguments = _parse_args(argv if argv is not None else sys.argv[1:])
+    if arguments.enable_test_hooks:
+        global _TEST_HOOKS_ENABLED  # noqa: PLW0603 - process-wide by nature
+        _TEST_HOOKS_ENABLED = True
+        _LOGGER.warning("test hooks enabled; this is not a production launch")
     ports = dict(zip(_TARGET_NAMES, arguments.ports, strict=True))
     authkey = bytes.fromhex(os.environ[_AUTHKEY_ENV_VAR])
     try:
-        serve(ports, authkey, backend=arguments.backend, plugin_names=arguments.plugin)
+        serve(
+            ports,
+            authkey,
+            backend=arguments.backend,
+            plugin_names=arguments.plugin,
+            orphan_grace_s=_orphan_grace_from_hook(),
+        )
     except HardwareNotAvailableError as error:
         # The expected failure on a machine with no instrument attached, so
         # it gets a message rather than a traceback. Logged at ERROR so it

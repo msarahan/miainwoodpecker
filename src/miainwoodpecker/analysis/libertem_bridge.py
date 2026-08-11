@@ -133,13 +133,12 @@ def load_as_libertem_dataset(
         The frame stack as a LiberTEM ``DataSet``, ready for
         :meth:`Context.run_udf`.
 
-    Raises
-    ------
-    NoFramesError
-        If the file was written by an acquisition that produced no
-        frames, so it has no ``NXdata`` group to read. Checked here
-        rather than left to LiberTEM, whose own "unable to infer
-        dataset" message does not say what is actually wrong.
+    Notes
+    -----
+    Raises :class:`~miainwoodpecker.storage.layout.NoFramesError` (via
+    :func:`~miainwoodpecker.storage.nexus.require_frames`) when the file
+    recorded no frames. Checked here rather than left to LiberTEM, whose
+    own "unable to infer dataset" message does not say what is wrong.
     """
     require_frames(path)
     return ctx.load("hdf5", path=str(path), ds_path=_DATASET_PATH)

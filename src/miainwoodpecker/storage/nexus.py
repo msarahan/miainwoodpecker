@@ -760,12 +760,9 @@ def read_frames(
 
     Raises
     ------
-    NoFramesError
+    layout.NoFramesError
         If the acquisition produced no frames, so there is no ``NXdata``
         group to read.
-    ValueError
-        If an axis's units are outside this project's vocabulary, so its
-        kind cannot be recovered rather than guessed.
     """
     with h5py.File(path, "r") as handle:
         if layout.NXDATA_GROUP not in handle:
@@ -801,7 +798,7 @@ def require_frames(path: os.PathLike[str] | str) -> None:
 
     Raises
     ------
-    NoFramesError
+    layout.NoFramesError
         If the acquisition produced no frames.
     """
     with h5py.File(path, "r") as handle:
@@ -833,10 +830,9 @@ def read_calibration(path: os.PathLike[str] | str) -> FrameCalibration:
 
     Raises
     ------
-    ValueError
-        If the file has no ``/entry/data`` group (it recorded no frames),
-        or if an axis's units are outside this project's vocabulary, so its
-        kind cannot be recovered rather than guessed.
+    layout.NoFramesError
+        If the file has no ``NXdata`` group, i.e. it recorded no frames.
+        A ``ValueError`` subclass, so existing callers catch it unchanged.
     """
     with h5py.File(path, "r") as handle:
         if layout.NXDATA_GROUP not in handle:

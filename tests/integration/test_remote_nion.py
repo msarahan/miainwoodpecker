@@ -530,6 +530,7 @@ def test_shutdown_times_out_against_a_wedged_server(monkeypatch):
     handler (``MIAINWOODPECKER_WEDGE_SHUTDOWN``), so this exercises the
     real socket-timeout path rather than a mocked-out client.
     """
+    monkeypatch.setenv("MIAINWOODPECKER_ENABLE_TEST_HOOKS", "1")
     monkeypatch.setenv("MIAINWOODPECKER_WEDGE_SHUTDOWN", "1")
     monkeypatch.setattr(remote, "_SHUTDOWN_TIMEOUT_S", 1.0)
     with remote_instrument() as instrument, pytest.raises(
@@ -565,6 +566,7 @@ def test_sigterm_fallback_fires_when_the_server_is_wedged(
     reclaimed; ``-SIGKILL`` is the one outcome that would mean the
     handler had made things worse.
     """
+    monkeypatch.setenv("MIAINWOODPECKER_ENABLE_TEST_HOOKS", "1")
     monkeypatch.setenv("MIAINWOODPECKER_WEDGE_SHUTDOWN", "1")
     monkeypatch.setattr(remote, "_SHUTDOWN_TIMEOUT_S", 1.0)
     with remote_instrument() as instrument:
@@ -696,6 +698,7 @@ def test_health_check_detects_a_wedged_server(monkeypatch, spawned_servers):
     from what it already knows instead of sending a second request, since
     the first reply could still arrive and would be misread as the second's.
     """
+    monkeypatch.setenv("MIAINWOODPECKER_ENABLE_TEST_HOOKS", "1")
     monkeypatch.setenv("MIAINWOODPECKER_WEDGE_HEALTH", "1")
     with remote_instrument() as instrument:
         started = time.monotonic()
@@ -779,6 +782,7 @@ def test_killing_the_server_mid_acquisition_fails_the_call_in_flight(
     guessing at anything.
     """
     delay_s = 10.0
+    monkeypatch.setenv("MIAINWOODPECKER_ENABLE_TEST_HOOKS", "1")
     monkeypatch.setenv("MIAINWOODPECKER_DELAY_SCAN_S", str(delay_s))
     with remote_instrument() as instrument:
         server = spawned_servers[0]
@@ -1070,4 +1074,73 @@ def test_sigterm_parks_the_beam_before_the_server_exits(spawned_servers):
         server.send_signal(signal.SIGTERM)
         server.wait(timeout=_FAIL_FAST_BUDGET_S)
         assert server.returncode == 0
+    assert used_names.isdisjoint(_shm_names())
+
+
+def test_the_wedge_hook_does_nothing_without_the_flag(monkeypatch, spawned_servers):
+    """
+    The environment variable alone must not wedge a server.
+
+    This is the safety property the flag exists for. The environment is
+    inherited wholesale by the subprocess, so an operator with
+    MIAINWOODPECKER_WEDGE_SHUTDOWN left set in a shell profile used to
+    get a real instrument whose shutdown blocked forever with nothing
+    saying why. With the hook set but the flag absent, shutdown is
+    ordinary: the handshake succeeds and the server exits 0, rather than
+    timing out and being terminated.
+    """
+    monkeypatch.setenv("MIAINWOODPECKER_WEDGE_SHUTDOWN", "1")
+    monkeypatch.delenv("MIAINWOODPECKER_ENABLE_TEST_HOOKS", raising=False)
+    monkeypatch.setattr(remote, "_SHUTDOWN_TIMEOUT_S", 10.0)
+
+    with remote_instrument() as instrument:
+        used_names = _exercise_shared_memory(instrument)
+
+    assert len(spawned_servers) == 1
+    assert spawned_servers[0].returncode == 0, (
+        "an unarmed wedge hook must leave the graceful shutdown intact"
+    )
+    assert used_names.isdisjoint(_shm_names())
+
+
+def test_an_orphaned_server_parks_itself_and_exits(monkeypatch, spawned_servers):
+    """
+    A server whose client vanished must not hold the instrument forever.
+
+    Without this, ``serve()`` blocks on its stop event indefinitely: the
+    vendor devices stay open, the camera threads keep running, the ports
+    stay bound, and the beam stays unblanked, with nothing to reclaim any
+    of it. On real hardware that is a column nobody can use and nobody is
+    watching.
+
+    Simulated by closing every connection without the shutdown
+    handshake, which is what a crashed client looks like from the
+    server's side. "All connections gone" is a sound signal here
+    specifically because reconnect is deliberately unsupported (migration
+    plan, §6), so a live client holds its connections for its whole life
+    - an *idle* client is still a connected one, and cannot trip this.
+    """
+    monkeypatch.setenv("MIAINWOODPECKER_ENABLE_TEST_HOOKS", "1")
+    monkeypatch.setenv("MIAINWOODPECKER_ORPHAN_GRACE_S", "1.0")
+
+    with remote_instrument() as instrument:
+        used_names = _exercise_shared_memory(instrument)
+        server = spawned_servers[0]
+        devices = [
+            instrument.ronchigram_camera,
+            instrument.eels_camera,
+            instrument.scanner,
+        ]
+        for device in devices:
+            if device is not None:
+                device._connection.close()  # noqa: SLF001 - simulating a crash
+        instrument.instrument._connection.close()  # noqa: SLF001
+        instrument.instrument._health_connection.close()  # noqa: SLF001
+
+        # The watchdog should notice and take the server down on its own.
+        server.wait(timeout=_FAIL_FAST_BUDGET_S)
+        assert server.returncode == 0, (
+            "an orphaned server should park and exit through its normal path"
+        )
+
     assert used_names.isdisjoint(_shm_names())

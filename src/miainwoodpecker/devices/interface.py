@@ -141,7 +141,16 @@ class Camera(typing.Protocol):
         ...
 
     def start(self) -> None:
-        """Begin continuous acquisition; blocks until the first frame is available."""
+        """
+        Begin continuous acquisition.
+
+        Returns as soon as the device has been told to start; it does
+        **not** wait for a frame. ``acquire_frame`` is what blocks.
+        This said 'blocks until the first frame is available' for
+        three phases while no implementation did so - neither the Nion
+        adapter (a bare ``start_live()``) nor the remote client (one
+        RPC) - so a caller trusting it would have raced.
+        """
         ...
 
     def stop(self) -> None:
