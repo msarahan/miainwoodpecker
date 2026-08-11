@@ -1494,12 +1494,26 @@ The invariant now holds mechanically: `nion.*` is imported in
   *with* calibration rather than after it, since binning changes the pixel
   scale. This spans `devices/interface.py`, the viewer, and the session
   layer.
+  - **The plumbing turned out to already exist, on the other side of the
+    boundary.** A Nion camera device publishes a `calibration_controls`
+    mapping naming *instrument control names*, which
+    `camera_base.build_calibration` resolves at acquisition time; usim
+    publishes real ones (Ronchigram 9.83e-05 rad/px centred on the optic
+    axis, EELS 0.5 eV/channel offset -20 eV, EELS slow axis reporting
+    empty units). The server can call Nion's own calibrator and return
+    plain data, so this needs no reimplementation and no hardware.
+    Binning enters as `relative_scale`, which is the mechanical reason
+    the two want doing together. See
+    [work that does not need the instrument](pre-hardware-work.md).
 - **The EELS dispersive-axis default is grounded in the simulator only.**
   `dispersive_axis="x"` was chosen because usim reports its energy
   calibration on axis 1 of a 256×1024 frame; a real spectrometer's
   orientation needs confirming on hardware (it is on the checklist), and it
   is a parameter precisely so a wrong default is a configuration change
-  rather than a code change.
+  rather than a code change. **It may not need confirming at all**: the
+  dispersive axis is the one whose units the device itself reports as
+  `eV` via `calibration_controls`, so reading it demotes the default to a
+  fallback for devices that publish nothing.
 - **Scan data arrives as `float64` for no physical reason.** usim's
   `generate_scan_data` is annotated `-> NDArray[float32]` and builds float32
   internally; the promotion happens in its final line, where

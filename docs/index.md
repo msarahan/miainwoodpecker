@@ -35,7 +35,8 @@ format, no export step, readable by anything that speaks HDF5.
 
 The project is young. Everything works against the bundled microscope
 simulator; validation on real hardware is the current frontier (see the
-[hardware validation checklist](hardware-validation-checklist.md)).
+[hardware validation checklist](hardware-validation-checklist.md), and
+[what can be built before then](pre-hardware-work.md)).
 
 ## For developers
 
@@ -58,5 +59,6 @@ Scripting and automation <scripting-and-automation>
 Migration plan <migration-plan>
 Architecture review <architecture-review>
 Hardware validation checklist <hardware-validation-checklist>
+Work before hardware <pre-hardware-work>
 Development <documentation/index>
 :::

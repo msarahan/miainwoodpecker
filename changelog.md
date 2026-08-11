@@ -45,6 +45,14 @@
   for driving the same capabilities from Python, including what it takes
   to put an AI agent at the controls.
 
+- `docs/pre-hardware-work.md`: the counterpart to the hardware checklist —
+  what can be built before an instrument is available, sourced from the
+  device-layer contracts in Nion's own public acquisition test suites.
+  Records that the calibration plumbing §7 lists as missing already exists
+  on the GPL side (`calibration_controls` resolved by
+  `camera_base.build_calibration`, with real values published by the
+  simulator), so it needs neither hardware nor a reimplementation.
+
 ### Changed
 
 - CI's `integration` job runs its tests in parallel (`pytest -n auto`),

@@ -11,6 +11,13 @@ Context and the reasoning behind each item are in
 assumptions (referenced below as **Assumption 1–6**), §5 Phase 3 for the
 instrument controls, and §6 for shutdown.
 
+For the other side of the line — the work that *can* be done first, and
+where its specification already exists — see
+[work that does not need the instrument](pre-hardware-work.md). Two items
+on this checklist turn out to be avoidable that way rather than
+verifiable: the EELS dispersive axis is reported by the device, and the
+calibration values themselves come from instrument controls.
+
 ## Before touching the instrument
 
 - [ ] List what is actually installed on the instrument control computer:
