@@ -47,10 +47,17 @@ from miainwoodpecker.devices.nion_server import (
     HARDWARE_BACKEND,
     SIMULATED_BACKEND,
     HardwareNotAvailableError,
+    NionCamera,
+    _axis_calibration_spec,
     _parse_args,
     hardware_instrument,
     open_instrument,
     simulated_instrument,
+)
+from miainwoodpecker.storage.calibration import (
+    AxisKind,
+    FrameCalibration,
+    resolve_frame_calibration,
 )
 
 # The usim plug-in, used as a stand-in for a vendor hardware plug-in so the
@@ -366,3 +373,143 @@ def test_park_blanks_the_beam():
         assert not instrument.is_beam_blanked()
         instrument.park()
         assert instrument.is_beam_blanked()
+
+
+# ------------------------------------------------- calibration from the
+#                                                    instrument
+#
+# A Nion camera publishes no calibration *values*. It publishes a
+# ``calibration_controls`` mapping naming the instrument controls that
+# hold them, which ``camera_base.build_calibration`` resolves at
+# acquisition time - because a camera's angular scale depends on the
+# projector lenses, so it is instrument state rather than a device
+# constant. These pin what usim actually reports through that path, which
+# is what the migration plan's §7 "nothing feeds calibration from the
+# instrument" gap needed.
+
+
+class _FakeCalibration:
+    """The two fields ``_axis_calibration_spec`` reads off a nion Calibration."""
+
+    def __init__(self, scale: float, units: str, offset: float = 0.0) -> None:
+        self.scale = scale
+        self.offset = offset
+        self.units = units
+
+
+class _CameraWithoutControls:
+    """A camera device that publishes no calibration controls at all."""
+
+    def __init__(self) -> None:
+        self.calibration_controls = {}
+
+
+def _frame_calibration(camera) -> tuple[FrameCalibration, tuple[int, ...]]:
+    """Acquire one frame and resolve the calibration its metadata carries."""
+    camera.start()
+    try:
+        frame = camera.acquire_frame()
+    finally:
+        camera.stop()
+    calibration = resolve_frame_calibration(frame.data.shape, metadata=frame.metadata)
+    return calibration, frame.data.shape
+
+
+def test_the_ronchigram_camera_reports_angular_axes():
+    """
+    Both Ronchigram axes arrive calibrated in radians, centred on the optic axis.
+
+    The centring is not this project's convention imposed on the data: the
+    offset comes back from the instrument's own ``ronchigram_x_offset``
+    control, and it equals ``-scale * n / 2`` because that is what an axis
+    through the optic axis means. Measured against usim: 2048 pixels at
+    ~9.83e-05 rad each, offset ~-0.1007 rad.
+    """
+    with simulated_instrument() as microscope:
+        calibration, shape = _frame_calibration(microscope.ronchigram_camera)
+        for name, length in zip(("y", "x"), shape, strict=True):
+            axis = calibration.axis(name)
+            assert axis.kind is AxisKind.ANGLE
+            assert axis.units == "rad"
+            assert axis.scale > 0.0
+            assert axis.offset == pytest.approx(-axis.scale * length / 2.0)
+
+
+def test_the_eels_camera_reports_energy_on_the_axis_the_device_names():
+    """
+    The dispersive axis is *reported*, not defaulted.
+
+    usim's EELS camera publishes ``eels_x_scale``/``eels_x_offset`` with
+    units eV and leaves the slow axis's units empty - the device's way of
+    saying that direction is not calibrated. Both halves matter: an
+    honest uncalibrated y axis is what stops a spectrum being flattened
+    along the wrong direction, and ``energy_axis_name`` is what the
+    HyperSpy adapter asks.
+    """
+    with simulated_instrument() as microscope:
+        calibration, _shape = _frame_calibration(microscope.eels_camera)
+        assert calibration.x.kind is AxisKind.ENERGY
+        assert calibration.x.units == "eV"
+        assert calibration.x.scale > 0.0
+        assert calibration.y.kind is AxisKind.UNCALIBRATED
+        assert calibration.energy_axis_name() == "x"
+
+
+def test_a_camera_with_no_controls_yields_an_uncalibrated_frame():
+    """
+    Missing controls produce an uncalibrated axis, not an error.
+
+    This is the failure mode that matters more than the success one: a
+    vendor camera that publishes no ``calibration_controls``, or names
+    controls this instrument does not have, must still acquire. Nion's own
+    ``test_calibrator_with_missing_controls`` asserts the same thing one
+    layer down.
+    """
+    # No instrument reference is needed for either case, and that is the
+    # point: both short-circuit before anything would be read off one.
+    unusable_controller = object()
+    assert (
+        NionCamera(_CameraWithoutControls(), unusable_controller).calibration_metadata(
+            (16, 16),
+        )
+        is None
+    )
+    # And a camera wrapped without an instrument at all, which is how the
+    # in-process helpers may construct one.
+    assert NionCamera(_CameraWithoutControls()).calibration_metadata((16, 16)) is None
+
+
+def test_binning_multiplies_the_calibration_scale():
+    """
+    A binned pixel spans proportionally more of the axis.
+
+    This is why binning and calibration are one piece of work rather than
+    two: adding binning without threading it through here would write axes
+    wrong by an integer factor, silently.
+    """
+    with simulated_instrument() as microscope:
+        camera = microscope.ronchigram_camera
+        unbinned = camera.calibration_metadata((2048, 2048))
+        binned = camera.calibration_metadata((1024, 1024), binning=2.0)
+        assert binned["x"]["scale"] == pytest.approx(2.0 * unbinned["x"]["scale"])
+
+
+def test_an_axis_in_units_this_project_cannot_express_stays_uncalibrated():
+    """
+    An unrecognized unit degrades to pixels rather than propagating.
+
+    Nion's calibration vocabulary is open (its own tests use ``"rad-old"``,
+    ``"counts-old2"``); this project's is a short closed list chosen so an
+    axis kind is recoverable from its units alone. A scale in units
+    nothing downstream can interpret is worth less than an admitted pixel
+    axis, so it is dropped here rather than raised at the writer.
+    """
+    assert _axis_calibration_spec(_FakeCalibration(scale=2.0, units="rad-old")) is None
+    assert _axis_calibration_spec(_FakeCalibration(scale=2.0, units="")) is None
+    assert _axis_calibration_spec(_FakeCalibration(scale=0.0, units="eV")) is None
+    assert _axis_calibration_spec(_FakeCalibration(scale=2.0, units="eV")) == {
+        "kind": "energy",
+        "scale": 2.0,
+        "offset": 0.0,
+        "units": "eV",
+    }

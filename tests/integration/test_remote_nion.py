@@ -61,6 +61,7 @@ from miainwoodpecker.devices.rpc import (
     RemoteCallTimeoutError,
     RemoteConnectionLostError,
 )
+from miainwoodpecker.storage.calibration import AxisKind, resolve_frame_calibration
 
 _DEV_SHM = pathlib.Path("/dev/shm")  # noqa: S108 - inspected read-only, never written to
 _PROC = pathlib.Path("/proc")
@@ -161,6 +162,32 @@ def test_camera_round_trip_over_ipc(microscope):
     assert frame.data.nbytes >= _SHARED_MEMORY_THRESHOLD_BYTES
     assert frame.timestamp.tzinfo is not None
     assert frame.metadata["frame_number"] >= 1
+
+
+def test_camera_calibration_crosses_the_boundary_on_the_shared_memory_path(
+    microscope,
+):
+    """
+    A camera's instrument-resolved calibration survives the IPC boundary.
+
+    Worth asserting over IPC rather than only in-process because the two
+    transports carry metadata differently: a small frame is pickled whole,
+    while a Ronchigram frame goes as a ``SharedFrameRef`` with its metadata
+    alongside. The calibration is a nested mapping, so it is exactly the
+    shape that a transport carrying only the array would drop silently -
+    leaving every recording pixel-calibrated with nothing to say why.
+    """
+    camera = microscope.ronchigram_camera
+    camera.start()
+    try:
+        frame = camera.acquire_frame()
+    finally:
+        camera.stop()
+    assert frame.data.nbytes >= _SHARED_MEMORY_THRESHOLD_BYTES
+    calibration = resolve_frame_calibration(frame.data.shape, metadata=frame.metadata)
+    assert calibration.x.kind is AxisKind.ANGLE
+    assert calibration.x.units == "rad"
+    assert calibration.y.kind is AxisKind.ANGLE
 
 
 def test_small_scan_uses_the_pickle_path_over_ipc(microscope):

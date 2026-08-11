@@ -81,6 +81,7 @@ import contextlib
 import datetime
 import importlib
 import logging
+import math
 import os
 import pkgutil
 import signal
@@ -91,6 +92,7 @@ import typing
 from dataclasses import dataclass
 
 from nion.device_kit import ScanDevice as _ScanDeviceKit
+from nion.instrumentation import camera_base as _camera_base
 from nion.usim_device import DeviceConfiguration as _UsimConfiguration
 from nion.utils import Geometry as _Geometry
 from nion.utils import Registry as _Registry
@@ -120,6 +122,7 @@ from miainwoodpecker.devices.rpc import (
     TARGET_NAMES as _TARGET_NAMES,
 )
 from miainwoodpecker.devices.shared_frame import SharedFrameWriter
+from miainwoodpecker.storage import calibration as _calibration
 
 if typing.TYPE_CHECKING:
     import types
@@ -263,11 +266,64 @@ def _aware_utc(timestamp: datetime.datetime | None) -> datetime.datetime:
     return timestamp
 
 
+def _axis_calibration_spec(
+    calibration: typing.Any,  # noqa: ANN401 - nion.data.Calibration
+) -> dict[str, object] | None:
+    """
+    Translate one Nion ``Calibration`` into this project's plain-data axis spec.
+
+    Returns ``None`` — meaning "this axis is uncalibrated" — for the two
+    ways a device can decline to calibrate an axis, which are deliberately
+    not errors. ``build_calibration`` returns an empty ``Calibration``
+    (no units) when the named controls are missing or nonsensical, and the
+    EELS camera's slow axis reports empty units even when its controls
+    resolve. An axis whose units are outside this project's vocabulary
+    goes the same way, because a scale in units nothing downstream can
+    interpret is worth less than an admitted pixel axis.
+
+    Parameters
+    ----------
+    calibration : typing.Any
+        A ``nion.data.Calibration.Calibration``.
+
+    Returns
+    -------
+    dict[str, object] | None
+        A mapping in the vocabulary
+        :func:`miainwoodpecker.storage.calibration.resolve_frame_calibration`
+        parses, or ``None``.
+    """
+    units = str(getattr(calibration, "units", "") or "").strip()
+    if not units:
+        return None
+    try:
+        kind = _calibration.axis_kind_for_units(units)
+    except ValueError:
+        return None
+    scale = float(calibration.scale)
+    if not math.isfinite(scale) or scale == 0.0:
+        return None
+    offset = float(calibration.offset)
+    if not math.isfinite(offset):
+        return None
+    return {
+        "kind": kind.value,
+        "scale": scale,
+        "offset": offset,
+        "units": units,
+    }
+
+
 class NionCamera:
     """A ``Camera`` implementation wrapping a Nion device-kit camera device."""
 
-    def __init__(self, camera_device: _DeviceKitCamera) -> None:
+    def __init__(
+        self,
+        camera_device: _DeviceKitCamera,
+        controller: typing.Any = None,  # noqa: ANN401 - vendor STEMController
+    ) -> None:
         self._device = camera_device
+        self._controller = controller
         self._closed = False
 
     @property
@@ -280,6 +336,71 @@ class NionCamera:
         """Return the wrapped device's camera id."""
         return self._device.camera_id
 
+    def calibration_metadata(
+        self,
+        shape: tuple[int, ...],
+        binning: float = 1.0,
+    ) -> dict[str, dict[str, object]] | None:
+        """
+        Resolve this camera's axis calibrations from the instrument, as plain data.
+
+        A Nion camera device does not publish calibration *values*: it
+        publishes a ``calibration_controls`` mapping naming the instrument
+        controls that hold them, and ``camera_base.build_calibration``
+        reads those at acquisition time. That indirection is the point — a
+        camera's angular scale depends on the projector lenses, so it is
+        instrument state, not a device constant.
+
+        Calling Nion's own resolver rather than reimplementing it is what
+        keeps this on the right side of the licence boundary *and*
+        correct: the result crosses to the MIT application as a plain
+        mapping of numbers and unit strings, and the resolution rules
+        (including the ``_origin_override: "center"`` convention) stay
+        Nion's.
+
+        Parameters
+        ----------
+        shape : tuple[int, ...]
+            The acquired frame's shape. 1D for a device-binned spectrum,
+            in which case only the ``x`` axis is calibrated, as Nion does.
+        binning : float
+            The camera's binning factor, which multiplies the scale — a
+            2x-binned pixel spans twice the angle.
+
+        Returns
+        -------
+        dict[str, dict[str, object]] | None
+            Axis name to spec for each axis that resolved, or ``None`` if
+            none did — which is the answer for a camera that publishes no
+            controls, and for one wrapped without an instrument.
+        """
+        controls = getattr(self._device, "calibration_controls", None)
+        if self._controller is None or not controls:
+            return None
+        # Nion's own CalibrationControlsCalibrator passes data_shape[1] as
+        # the y axis's length and data_shape[0] as x's. Each axis is given
+        # its own length here instead. The difference is invisible on a
+        # square sensor and only reaches the result through the "center"
+        # origin override, but an axis centred on the *other* axis's
+        # length is not a convention this can adopt knowingly.
+        lengths = (
+            {"x": shape[0]} if len(shape) == 1 else {"y": shape[0], "x": shape[1]}
+        )
+        axes = {}
+        for name, length in lengths.items():
+            spec = _axis_calibration_spec(
+                _camera_base.build_calibration(
+                    self._controller,
+                    controls,
+                    name,
+                    binning,
+                    length,
+                ),
+            )
+            if spec is not None:
+                axes[name] = spec
+        return axes or None
+
     def start(self) -> None:
         """Begin continuous acquisition; blocks until the first frame is available."""
         self._device.start_live()
@@ -291,10 +412,18 @@ class NionCamera:
     def acquire_frame(self) -> Frame:
         """Return the next available frame; requires ``start`` to have been called."""
         data_element = self._device.acquire_image()
+        data = data_element["data"]
+        metadata = dict(data_element.get("properties") or {})
+        calibration = self.calibration_metadata(
+            data.shape,
+            float(metadata.get("binning", 1) or 1),
+        )
+        if calibration is not None:
+            metadata[_calibration.METADATA_KEY] = calibration
         return Frame(
-            data=data_element["data"],
+            data=data,
             timestamp=_aware_utc(data_element.get("timestamp")),
-            metadata=dict(data_element.get("properties") or {}),
+            metadata=metadata,
         )
 
     def close(self) -> None:
@@ -688,10 +817,11 @@ def simulated_instrument() -> Iterator[InstrumentDevices]:
     configuration = _UsimConfiguration.AcquisitionContextConfiguration(
         set_configuration_location=False,
     )
-    ronchigram_camera = NionCamera(configuration.ronchigram_camera_device)
-    eels_camera = NionCamera(configuration.eels_camera_device)
+    controller = configuration.instrument
+    ronchigram_camera = NionCamera(configuration.ronchigram_camera_device, controller)
+    eels_camera = NionCamera(configuration.eels_camera_device, controller)
     scanner = NionScanner(configuration.scan_module.device)
-    instrument = NionInstrument(configuration.instrument)
+    instrument = NionInstrument(controller)
     try:
         yield InstrumentDevices(
             ronchigram_camera=ronchigram_camera,
@@ -823,6 +953,7 @@ def _stop_device_plugins(modules: Sequence[types.ModuleType]) -> None:
 
 def _cameras_from_registry(
     camera_modules: Sequence[typing.Any],
+    controller: typing.Any = None,  # noqa: ANN401 - vendor STEMController
 ) -> tuple[NionCamera | None, NionCamera | None]:
     """
     Sort registered camera modules into (Ronchigram, EELS) by ``camera_type``.
@@ -831,6 +962,9 @@ def _cameras_from_registry(
     ----------
     camera_modules : Sequence[typing.Any]
         ``camera_module`` components from the Nion registry.
+    controller : typing.Any
+        The registered ``stem_controller``, which each camera needs to
+        resolve its calibration controls against.
 
     Returns
     -------
@@ -855,8 +989,8 @@ def _cameras_from_registry(
         ronchigram = unlabelled.pop(0)
     eels = by_type.get("eels")
     return (
-        NionCamera(ronchigram) if ronchigram is not None else None,
-        NionCamera(eels) if eels is not None else None,
+        NionCamera(ronchigram, controller) if ronchigram is not None else None,
+        NionCamera(eels, controller) if eels is not None else None,
     )
 
 
@@ -882,7 +1016,7 @@ def _devices_from_registry(notes: Sequence[str]) -> InstrumentDevices:
     controller = _Registry.get_component("stem_controller")
     scan_module = _Registry.get_component("scan_module")
     camera_modules = list(_Registry.get_components_by_type("camera_module"))
-    ronchigram_camera, eels_camera = _cameras_from_registry(camera_modules)
+    ronchigram_camera, eels_camera = _cameras_from_registry(camera_modules, controller)
     missing = [
         label
         for label, present in (

@@ -10,6 +10,16 @@ labelled everything else ``"pixel"`` (docs/migration-plan.md, §7:
 three Phase 4 analysis adapters: a Ronchigram or EELS frame reached
 HyperSpy, py4DSTEM, and LiberTEM with no physical axis at all.
 
+Since then the device layer has been given a way to *populate* this model
+rather than only express it: a Nion camera publishes the names of the
+instrument controls holding its calibration, and
+``devices/nion_server.py``'s ``_camera_calibration_metadata`` resolves them
+per acquisition into ``metadata["calibration"]``. So the vocabulary below
+is now something acquired frames arrive already speaking, not only
+something a caller can construct by hand — and decision 1 is vindicated
+rather than contradicted, because what the device reports *is* per
+acquisition.
+
 The model this module chooses follows from what the axes actually are, and
 each of the four decisions below is a decision *against* a simpler model
 that would have been wrong.
@@ -34,6 +44,12 @@ dispersive one at 0.5 eV/channel. Hence :meth:`FrameCalibration.spectrum`
 defaults ``dispersive_axis="x"`` and leaves the other axis at the honest
 pixel fallback — and takes the axis as a parameter, because a rotated
 camera or a different spectrometer can put it the other way round.
+
+That default now applies only to hand-built calibrations. An *acquired*
+EELS frame no longer needs it: the same device publishes ``eels_x_units``
+as ``eV`` and leaves ``eels_y_units`` empty, so which direction disperses
+is read rather than assumed, and a rotated spectrometer needs no
+configuration change.
 
 **3. Angles are their own kind, because the alternative is fabrication.**
 The one camera calibration that exists anywhere in this stack is angular:

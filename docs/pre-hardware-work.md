@@ -55,7 +55,7 @@ below; each item names the specific ones.
 
 ## The work, in priority order
 
-### 1. Feed calibration from the instrument
+### 1. Feed calibration from the instrument — **done**
 
 This closes the largest open item in
 [migration plan §7](migration-plan.md): "calibration exists as a model but
@@ -97,18 +97,21 @@ learn:
   without a configuration change — with the current default kept only
   for devices that publish no controls.
 
-Shape of the work: the server resolves the controls with Nion's own
-calibrator and returns `{offset, scale, units}` per axis as plain data in
-the frame metadata; the MIT side turns that into the existing
-`FrameCalibration`. No `nion.*` crosses the boundary.
+Built as `nion_server._camera_calibration_metadata`: the server resolves
+the controls with Nion's own `build_calibration` and puts per-axis
+`{kind, scale, offset, units}` into the frame metadata as plain data,
+where `resolve_frame_calibration` already looks. No `nion.*` crosses the
+boundary.
 
-Contracts to port: `test_camera_calibrator` (control names resolve to
-scale/offset/units, and an index control selects between calibration
-modes), `test_calibrator_with_missing_controls` (**missing controls
-produce an empty calibration, not an error** — the failure mode matters
-more than the success one), `test_ronchigram_calibrations` and
+Ported contracts: `test_ronchigram_calibrations` and
 `test_eels_calibrations` (an acquired frame ends up with `rad` and `eV`
-axes respectively).
+axes), and `test_calibrator_with_missing_controls` — **missing controls
+produce an uncalibrated axis, not an error**, the failure mode that
+matters more than the success one. Two deliberate divergences: an axis is
+centred on its own length rather than the other axis's (Nion passes
+`data_shape[1]` for `y` and `data_shape[0]` for `x`, invisible on a square
+sensor), and units outside this project's closed vocabulary degrade to
+pixels rather than being written as something nothing can interpret.
 
 ### 2. Attach the metadata a frame is supposed to carry
 

@@ -174,17 +174,17 @@ calibration values themselves come from instrument controls.
       declare `definition="NXem"`. Until then they deliberately declare no
       application definition rather than claiming one falsely.
 
-- [ ] **Confirm which EELS axis is the dispersive one.** The default assumes
-      the fast (column) axis, because that is where usim reports its energy
-      calibration on a 256×1024 frame. A real spectrometer's orientation may
-      differ, and getting it backwards would put an eV scale on a spatial axis
-      — wrong physics that looks plausible. It is a parameter, so a wrong
-      default is a configuration change, not a code change.
+- ~~Confirm which EELS axis is the dispersive one.~~ **No longer needed.**
+      The device reports it: the dispersive axis is the one whose
+      `calibration_controls` units are `eV`. A rotated spectrometer needs no
+      configuration change. Worth a glance at a real recording's axes anyway,
+      but there is nothing here to get backwards.
 
-- [ ] Confirm the diffraction-plane scale and units a real camera reports.
-      The calibration model expects reciprocal space as `1/nm` (the spelling
-      NeXus's `NX_WAVENUMBER` actually matches), and converts to Å⁻¹ only at
-      the py4DSTEM boundary. If the vendor reports angle (`rad`/`mrad`)
-      instead, that is a distinct axis kind and converting it to reciprocal
-      space needs the electron wavelength — which the code deliberately
-      refuses to invent.
+- [ ] Confirm the diffraction-plane **units** a real camera reports through
+      its `calibration_controls`. usim reports `rad`, which this project
+      records as an angle axis; a vendor reporting `1/nm` would be recorded
+      as reciprocal space, and one reporting a spelling outside this
+      project's vocabulary degrades to a pixel axis — silently by design, so
+      **check the axes on the first real recording** rather than assuming.
+      Converting angle to reciprocal space needs the electron wavelength,
+      which the code deliberately refuses to invent.
