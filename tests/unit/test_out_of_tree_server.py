@@ -29,6 +29,7 @@ from miainwoodpecker.devices import Camera, Scanner
 from miainwoodpecker.devices.interface import CameraParameters, ScanParameters
 from miainwoodpecker.devices.remote import (
     DEFAULT_SERVER_MODULE,
+    SERVER_RESPONSIVE,
     DeviceServerStartupError,
     remote_instrument,
 )
@@ -210,14 +211,21 @@ def main():
 
     authkey = bytes.fromhex(os.environ["MIAINWOODPECKER_AUTHKEY"])
     stop_event = threading.Event()
-    # A vendor with one detector and one scan unit: two of the four
-    # target names go unserved, which describe() reports.
-    served = ("ronchigram_camera", "scanner")
-    targets = {{
-        "ronchigram_camera": FakeCamera(),
-        "scanner": FakeScanner(),
-        "instrument": FakeInstrument(served, stop_event),
+    # A vendor with one detector and one scan unit by default: two of
+    # the four target names go unserved, which describe() reports.
+    # --plugin is the protocol's general "server-specific configuration"
+    # channel. This project's Nion server reads it as nionswift_plugin
+    # module names; nothing requires that, and this stand-in reads it as
+    # which targets to serve. An adapter is free to use it for a device
+    # address, a config file, or nothing at all.
+    served = tuple(arguments.plugin or ("ronchigram_camera", "scanner"))
+    available = {{
+        "ronchigram_camera": FakeCamera,
+        "eels_camera": FakeCamera,
+        "scanner": FakeScanner,
     }}
+    targets = {{name: available[name]() for name in served}}
+    targets["instrument"] = FakeInstrument(served, stop_event)
     threads = []
     for name, port in zip(TARGET_NAMES, arguments.ports):
         if name not in targets:
@@ -366,3 +374,55 @@ def test_the_stand_in_server_needs_nothing_from_this_package_but_the_protocol(
     }
 
 
+
+
+def test_a_detector_only_server_needs_no_scanner(vendor_server_module):
+    """
+    A camera with no scan unit is a supported instrument, not a KeyError.
+
+    This is the shape of every direct detector — a Direct Electron,
+    DECTRIS, or Hamamatsu camera driven through its own SDK rather than
+    through a microscope vendor's — and of a camera on a bench. The
+    cameras were already optional here; the scanner was not, so
+    "vendor-neutral" quietly meant "must have a scan unit shaped like
+    Nion's". Reachable through ``plugin_names``, which is the protocol's
+    server-specific configuration channel.
+    """
+    with remote_instrument(
+        server_module=vendor_server_module,
+        plugin_names=["ronchigram_camera"],
+    ) as detector:
+        assert detector.scanner is None
+        assert detector.eels_camera is None
+        camera = detector.ronchigram_camera
+        assert camera is not None
+        assert camera.camera_id == _VENDOR_CAMERA_ID
+
+        camera.start()
+        try:
+            frame = camera.acquire_frame()
+        finally:
+            camera.stop()
+        assert float(np.mean(frame.data)) == pytest.approx(_FRAME_VALUE)
+
+        # And the teardown handshake still runs against a device set the
+        # Nion server would never produce.
+        assert detector.instrument.check_health().state == SERVER_RESPONSIVE
+
+
+def test_cameras_can_be_enumerated_without_asking_for_nion_shaped_slots(
+    vendor_server_module,
+):
+    """
+    ``cameras()`` reports what is there, by name.
+
+    The named attributes stay because the viewer and the scripts use
+    them, but a detector-only caller should not have to ask about
+    ``eels_camera`` to find out it does not exist.
+    """
+    with remote_instrument(
+        server_module=vendor_server_module,
+        plugin_names=["ronchigram_camera", "eels_camera"],
+    ) as detector:
+        assert set(detector.cameras()) == {"ronchigram_camera", "eels_camera"}
+        assert detector.scanner is None

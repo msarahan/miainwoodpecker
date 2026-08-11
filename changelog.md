@@ -107,11 +107,21 @@
   regression test and the specification an adapter writes against. The
   startup diagnostic now names the module it failed to launch.
 
+- A detector-only device server is now supported: `scanner` is optional
+  on `RemoteInstrumentDevices`, `cameras()` enumerates what is actually
+  served, and the live viewer says so plainly instead of failing deep. A
+  Direct Electron, DECTRIS, or Hamamatsu camera driven through its own
+  SDK has no scan unit, and `connections["scanner"]` used to be
+  unconditional — so "vendor-neutral" quietly meant "must have a scan
+  unit shaped like Nion's".
+
 - `docs/vendor-support.md`: what Thermo Fisher, JEOL, Zeiss, Hitachi and
-  Bruker actually expose, and costed tasks for a second adapter. Records
-  the one place the framework is still Nion-shaped — the device target
-  names are a fixed positional tuple — and why that redesign should land
-  with the second adapter rather than before it.
+  Bruker actually expose, what the direct detector vendors expose
+  (Direct Electron, DECTRIS, Hamamatsu, Merlin, ASI, Gatan), and costed
+  tasks for each. Records the one place the framework is still
+  Nion-shaped — the device target names are a fixed positional tuple —
+  and why that redesign should land with the second column adapter
+  rather than before it.
 
 ### Changed
 

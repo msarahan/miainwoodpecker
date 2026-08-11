@@ -58,22 +58,106 @@ conversation with Hitachi, and until then it cannot be estimated.
 
 ### Detector SDKs — the `Camera` side
 
-Worth listing separately, because on a real instrument the camera is
-often not the column vendor's, and because **someone has already done
-this work**:
-[LiberTEM-live](https://libertem.github.io/LiberTEM-live/) supports
-Quantum Detectors Merlin (TCP control + data), DECTRIS EIGER2 (ARINA,
-QUADRO), and ASI TPX3, with Gatan K2 IS and others in progress. Its
-detector connections are the closest existing thing to this project's
-`Camera` protocol, and this project already depends on LiberTEM for
+Worth a section of its own rather than a footnote, because on a real
+instrument the camera is usually **not** the column vendor's, and going
+through the column vendor's interface to reach it is often the harder
+path: it adds a licensed intermediary, constrains you to whatever
+subset that vendor chose to expose, and breaks when either side updates.
+Talking to the detector directly is frequently *less* work, not more.
+
+| Detector | Interface | Language | How you get it |
+|---|---|---|---|
+| **Direct Electron** (DE-16, Apollo, Celeritas) | [`deapi`](https://github.com/directelectron/deapi) against DE Mission Control / DE-Server | Python | On PyPI and conda; needs Mission Control and a DE detector |
+| **DECTRIS** (ARINA, QUADRO, EIGER2) | SIMPLON REST API (HTTP/JSON control, ZeroMQ stream) | any | Published; on the detector control unit itself |
+| **Hamamatsu** (ORCA) | [DCAM-API / DCAM-SDK4](https://www.hamamatsu.com/us/en/product/cameras/software/driver-software/dcam-sdk4.html) | C, Windows **and Linux** | Free SDK registration; Python via [`pyDCAM`](https://pypi.org/project/pyDCAM), `pylablib`, or Micro-Manager |
+| **Quantum Detectors** (Merlin) | TCP control + data | any | Documented; already wrapped by LiberTEM-live |
+| **ASI** (TPX3) | Socket to the ASI software | any | Already wrapped by LiberTEM-live |
+| **Gatan** | GMS 3 embedded Python / DM-script | Python inside DM | Ships with GMS — but see below |
+
+Three of these are genuinely easy. **DECTRIS is the easiest interface in
+this whole document**: a REST API over HTTP with a documented JSON
+schema, no vendor library to install, no Windows requirement, no
+in-process anything. **Direct Electron** ships a pip-installable Python
+client. **Hamamatsu** is a C SDK, but it is free, has an official Linux
+build, and has several maintained Python wrappers.
+
+**Gatan is the exception, and it inverts the topology.** GMS 3's Python
+integration runs *inside* DigitalMicrograph and, in Gatan's own words,
+cannot be executed from outside the application. A Gatan adapter is
+therefore not a subprocess this client launches — it is a bridge running
+inside DM that connects *out*. Same wire protocol, opposite direction,
+and the one detector case the current design does not fit.
+
+#### Do not re-plumb high-rate streaming
+
+An ARINA runs to 120 kHz frame rates; an Apollo to thousands per second.
+This project's `Camera` is a **pull-per-frame** interface over
+synchronous RPC, and that is the right shape for a 10–100 fps survey
+camera and the wrong shape for a 4D-STEM stream. Routing a 120 kHz
+detector through `acquire_frame()` would be reinventing, badly, something
+that exists:
+[LiberTEM-live](https://libertem.github.io/LiberTEM-live/) already
+supports Merlin, DECTRIS EIGER2, and ASI TPX3, with Gatan K2 IS and
+others in progress — and this project already depends on LiberTEM for
 analysis.
 
-The exception is **Gatan**: GMS 3's Python integration runs *inside*
-DigitalMicrograph and, in Gatan's own words, cannot be executed from
-outside the application. A Gatan adapter is therefore not a subprocess
-this client launches — it is a bridge running inside DM that connects
-*out*. That inverts the process topology and is the one detector case the
-current design does not fit.
+So the recommended split, and the reason it is not a cop-out:
+
+- **Control, configuration, and survey-rate acquisition** → a device
+  server implementing `Camera`. Exposure, binning, ROI, gain mode, live
+  preview, single shots, focus series.
+- **High-rate streaming acquisition** → hand off to LiberTEM-live, whose
+  UDFs run unmodified on live and offline data.
+
+Those are complementary rather than competing: the same detector wants
+both, and a session that configures through one and streams through the
+other is coherent as long as only one of them owns the detector at a
+time. That interlock is the design question to settle before building
+either, and it is why nothing here is built yet.
+
+#### What a detector-only adapter needs, and now has
+
+A direct detector has **no scan unit**. Until this audit, that did not
+work: the cameras were already optional in `remote_instrument`, but
+`connections["scanner"]` was not, so a detector-only server died with a
+`KeyError` — "vendor-neutral" quietly meant "must have a scan unit shaped
+like Nion's". `RemoteInstrumentDevices.scanner` is now `| None`,
+`cameras()` enumerates what is actually there, and the live viewer says
+so plainly instead of failing three frames deep. Covered by
+`tests/unit/test_out_of_tree_server.py`, which drives a detector-only
+server end to end.
+
+What such an adapter would still have to work around, honestly:
+
+- **`ScanParameters` is irrelevant to it**, which is fine — it implements
+  `Camera` and nothing else.
+- **`InstrumentController` may have nothing to control.** A bench camera
+  has no stage, defocus, or blanker; `available_controls()` returning an
+  empty list is already the supported answer.
+- **Detector settings beyond exposure and binning have no home yet.**
+  ROI/readout area, gain mode (counting vs integrating), and hardware
+  trigger mode are common to all three vendors and absent from
+  `CameraParameters`. That is the next field to add, and it should arrive
+  the way binning did — with a caller that needs it, and wired into the
+  calibration at the same time, since ROI changes the axis offsets.
+- **Calibration.** None of these detectors knows the microscope's
+  magnification or camera length, so nothing analogous to Nion's
+  `calibration_controls` exists. The pixel size is a detector constant
+  (physical pitch) plus an optics-dependent scale someone has to supply —
+  which is exactly what `FrameCalibration`'s explicit constructors are
+  for.
+
+#### Estimates
+
+| Detector | Size | Notes |
+|---|---|---|
+| **DECTRIS** | 3–5 d | REST + JSON, no vendor library, no OS constraint. The reference implementation to write first. |
+| **Direct Electron** | 4–6 d | `deapi` is pip-installable; needs Mission Control running and a detector to test against |
+| **Hamamatsu ORCA** | 5–8 d | C SDK via a Python wrapper; Linux build exists; add ROI and gain mode |
+| **Merlin / ASI** | 2–4 d each | Wrap LiberTEM-live's existing connection behind `Camera` |
+| **Gatan** | 5–8 d | Different topology: a bridge inside DM connecting out, plus a design decision about who owns the detector |
+| **ROI / gain / trigger on `CameraParameters`** | 2–3 d | Shared prerequisite for the three direct vendors |
+| **LiberTEM-live streaming handoff + ownership interlock** | 3–5 d | The design question above, settled once for all detectors |
 
 ## What the framework got right
 
@@ -234,20 +318,26 @@ control would need ESPRIT's scripting environment and a new protocol
 (spectra and maps, not frames), which is a bigger design question than a
 vendor adapter.
 
-### Detectors, if the column vendor's camera is not the one you want
+### Detectors
 
-| Detector | Route | Size |
-|---|---|---|
-| Merlin, DECTRIS, ASI TPX3 | Wrap LiberTEM-live's existing connections behind `Camera` | 2–4 d each |
-| Gatan | **Different topology**: a bridge inside DigitalMicrograph connecting out, not a subprocess launched in | 5–8 d, plus a design decision |
+Estimated in the detector-SDK section above, since a detector adapter is
+a different job from a column adapter and is likely to come first.
 
 ## The short version
 
-Thermo Fisher first, if the question is "prove the interface is neutral"
-— permissive wrapper, offline dummy, best class-map fit. JEOL second.
-Zeiss only if a site already has the agreement. Hitachi needs a phone
-call. Bruker is a file-reading question wearing a device-adapter costume.
+**Start with a detector, not a column.** DECTRIS is the smallest real
+adapter in this document — a documented REST API, no vendor library, no
+OS constraint — and a detector-only server now works end to end, so it
+would prove the whole out-of-tree path at a fraction of the cost of any
+column vendor. Direct Electron is a close second and pip-installable.
 
-And before any of them, the target-name redesign — because it is the one
-piece of this that a second adapter cannot work around, and the only
-place where the framework's shape is still Nion's rather than neutral.
+Among column vendors, Thermo Fisher first — permissive wrapper, offline
+dummy, best class-map fit. JEOL second. Zeiss only if a site already has
+the agreement. Hitachi needs a phone call. Bruker is a file-reading
+question wearing a device-adapter costume.
+
+Two pieces of shared groundwork belong before, or with, the first
+adapter: **ROI, gain mode, and trigger on `CameraParameters`** if it is a
+detector, and the **target-name redesign** if it is a column — the one
+piece a second column adapter cannot work around, and the only place
+where the framework's shape is still Nion's rather than neutral.

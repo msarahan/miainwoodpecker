@@ -1048,7 +1048,10 @@ class RemoteInstrumentDevices:
 
     Same shape as the in-process ``nion_server.InstrumentDevices``
     (deliberately: code written against one works against the other
-    unchanged).
+    unchanged), with one difference that is not an oversight —
+    :attr:`scanner` is optional here and not there. The Nion server
+    always has a scan unit, so its own type says so; this client has to
+    tolerate what *any* server serves, including a detector-only one.
 
     Attributes
     ----------
@@ -1056,8 +1059,13 @@ class RemoteInstrumentDevices:
         The Ronchigram camera, if this instrument has one.
     eels_camera : RemoteCamera | None
         The EELS camera, if this instrument has one.
-    scanner : RemoteScanner
-        The scan device (HAADF/MAADF channels on the simulator).
+    scanner : RemoteScanner | None
+        The scan device (HAADF/MAADF channels on the simulator), if this
+        instrument has one. ``None`` for a detector-only server — a
+        Direct Electron, DECTRIS, or Hamamatsu camera driven directly,
+        with no scan unit of its own. Optional for the same reason the
+        cameras are: what a server serves is what ``describe()`` says,
+        not what the simulator happens to have.
     instrument : RemoteInstrument
         Stage/defocus/blanker controls.
     stage_size_nm : float
@@ -1067,9 +1075,32 @@ class RemoteInstrumentDevices:
 
     ronchigram_camera: RemoteCamera | None
     eels_camera: RemoteCamera | None
-    scanner: RemoteScanner
+    scanner: RemoteScanner | None
     instrument: RemoteInstrument
     stage_size_nm: float
+
+    def cameras(self) -> dict[str, RemoteCamera]:
+        """
+        Return every camera this instrument serves, by target name.
+
+        The named attributes stay, because the viewer and the scripts are
+        written against them. This is what a detector-only caller wants
+        instead: whatever is there, without asking about two Nion-shaped
+        slots by name.
+
+        Returns
+        -------
+        dict[str, RemoteCamera]
+            Target name to camera, omitting those this server lacks.
+        """
+        return {
+            name: camera
+            for name, camera in (
+                ("ronchigram_camera", self.ronchigram_camera),
+                ("eels_camera", self.eels_camera),
+            )
+            if camera is not None
+        }
 
 
 # Historical name, kept because the migration plan and README refer to it.
@@ -1405,8 +1436,19 @@ def remote_instrument(
             for name in ("ronchigram_camera", "eels_camera")
             if name in connections
         }
-        scanner = RemoteScanner(connections["scanner"], "scanner", process)
-        devices: list[_RemoteDevice] = [*cameras.values(), scanner]
+        # Optional for the same reason the cameras are. A detector-only
+        # server - a camera driven directly, with no scan unit - used to
+        # die here with a KeyError, which made "vendor-neutral" quietly
+        # mean "must have a scanner shaped like Nion's".
+        scanner = (
+            RemoteScanner(connections["scanner"], "scanner", process)
+            if "scanner" in connections
+            else None
+        )
+        devices: list[_RemoteDevice] = [
+            *cameras.values(),
+            *([scanner] if scanner is not None else []),
+        ]
         try:
             yield RemoteInstrumentDevices(
                 ronchigram_camera=cameras.get("ronchigram_camera"),
