@@ -40,7 +40,10 @@ from miainwoodpecker.devices import (
     Scanner,
     remote,
 )
-from miainwoodpecker.devices.nion_server import _SHARED_MEMORY_THRESHOLD_BYTES
+from miainwoodpecker.devices.nion_server import (
+    PARK_TIMEOUT_EXIT_STATUS,
+    _SHARED_MEMORY_THRESHOLD_BYTES,
+)
 from miainwoodpecker.devices.remote import (
     HARDWARE_BACKEND,
     SERVER_EXITED,
@@ -541,12 +544,26 @@ def test_sigterm_fallback_fires_when_the_server_is_wedged(
     spawned_servers,
 ):
     """
-    A wedged server is killed, and its shared-memory segments are still freed.
+    A wedged server dies to the fallback, and its segments are still freed.
 
-    Asserts the fallback actually fired rather than inferring it: the
-    server process must have died of SIGTERM, and the three segments the
-    session used must be gone anyway — the per-device ``close()`` fallback
-    is what unlinks them when the handshake cannot.
+    Asserts the fallback actually fired rather than inferring it, and the
+    three segments the session used must be gone anyway — the per-device
+    ``close()`` fallback is what unlinks them when the handshake cannot.
+
+    **How the server dies changed when it grew signal handlers, and the
+    change is the point.** It used to die *of* SIGTERM (``-15``), the
+    default disposition. Now SIGTERM is caught and the server tries to
+    park first — but in this test the park is exactly what is wedged (the
+    hook blocks ``park_and_release`` itself), so the bounded attempt
+    expires and the server exits with ``PARK_TIMEOUT_EXIT_STATUS``. That
+    is the correct outcome and the reason the attempt is bounded at all:
+    an unbounded park here would have made a wedged server survive
+    SIGTERM entirely, forcing the client to escalate to ``SIGKILL`` —
+    which is what this test caught when the handler was first written.
+
+    Either way the process is gone promptly and the segments are
+    reclaimed; ``-SIGKILL`` is the one outcome that would mean the
+    handler had made things worse.
     """
     monkeypatch.setenv("MIAINWOODPECKER_WEDGE_SHUTDOWN", "1")
     monkeypatch.setattr(remote, "_SHUTDOWN_TIMEOUT_S", 1.0)
@@ -555,7 +572,7 @@ def test_sigterm_fallback_fires_when_the_server_is_wedged(
     expected_segment_count = 3  # scanner + both cameras
     assert len(used_names) == expected_segment_count
     assert len(spawned_servers) == 1
-    assert spawned_servers[0].returncode == -signal.SIGTERM
+    assert spawned_servers[0].returncode == PARK_TIMEOUT_EXIT_STATUS
     assert used_names.isdisjoint(_shm_names())
 
 

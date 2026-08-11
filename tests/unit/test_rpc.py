@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import os
 import socket
+import sys
 import threading
 from multiprocessing.connection import Connection
 
@@ -175,10 +176,7 @@ def test_disable_nagle_preserves_the_fds_blocking_mode(connection_pair):
     would report it as a lost connection: the operator is told the device
     server died when it is perfectly healthy.
     """
-    client, _server = connection_pair
-    fileno = client.fileno()
-    assert os.get_blocking(fileno)
-
+    client, server = connection_pair
     previous = socket.getdefaulttimeout()
     socket.setdefaulttimeout(5.0)
     try:
@@ -186,7 +184,12 @@ def test_disable_nagle_preserves_the_fds_blocking_mode(connection_pair):
     finally:
         socket.setdefaulttimeout(previous)
 
-    assert os.get_blocking(fileno), "disable_nagle left the connection non-blocking"
+    # Asserted through behaviour rather than through os.get_blocking, which
+    # is Unix-only: a non-blocking endpoint raises BlockingIOError here
+    # instead of waiting for the reply.
+    thread = _serve_once(server, Result(value="alive"))
+    assert send_call(client, threading.Lock(), Call("instrument", "health")) == "alive"
+    thread.join(timeout=5)
 
 
 def test_disable_nagle_still_delivers_calls_after_a_default_timeout_is_set():
@@ -210,11 +213,16 @@ def test_disable_nagle_still_delivers_calls_after_a_default_timeout_is_set():
         server.close()
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="os.pipe() fds are not valid multiprocessing Connection handles on Windows",
+)
 def test_disable_nagle_is_a_no_op_on_a_non_socket_connection():
     """
     A pipe-backed Connection has no TCP_NODELAY, and that is not an error.
 
-    Windows named pipes take this path; the function documents itself as
+    Windows named pipes take this same path in production - the wrap
+    raises and the function returns - which is why it documents itself as
     silently doing nothing rather than refusing to run there.
     """
     read_fd, write_fd = os.pipe()
@@ -222,7 +230,8 @@ def test_disable_nagle_is_a_no_op_on_a_non_socket_connection():
     writer = Connection(write_fd, readable=False)
     try:
         disable_nagle(reader)  # must not raise
-        assert os.get_blocking(reader.fileno())
+        writer.send(b"still usable")
+        assert reader.recv() == b"still usable"
     finally:
         reader.close()
         writer.close()

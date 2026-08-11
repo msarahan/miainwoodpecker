@@ -392,6 +392,28 @@ class NexusWriter:
         if self._file is not None:
             self._file.flush()
 
+    def _metadata_group(self) -> h5py.Group:
+        """
+        Return ``/entry/metadata``, creating the NXcollection if needed.
+
+        Shared by the per-frame column (created at the first append) and
+        the first frame's blob (written at close), so whichever runs
+        first makes the group and the other joins it.
+
+        Returns
+        -------
+        h5py.Group
+            The ``NXcollection`` holding everything NeXus does not
+            otherwise describe.
+        """
+        assert self._file is not None  # noqa: S101 - guarded by both callers
+        entry = self._file["entry"]
+        collection = entry.get("metadata")
+        if collection is None:
+            collection = entry.create_group("metadata")
+            collection.attrs["NX_class"] = "NXcollection"
+        return collection
+
     def _filter_kwargs(self) -> dict[str, typing.Any]:
         """
         Build the ``create_dataset`` filter-pipeline keyword arguments.
@@ -486,14 +508,19 @@ class NexusWriter:
                 dtype="float64",
             )
             self._times.attrs["units"] = "s"
-            self._frame_metadata = detector.create_dataset(
+            # In the NXcollection, not in NXdetector alongside the frames.
+            # NXcollection is NeXus's own container for data that no base
+            # class or application definition describes, which is exactly
+            # what a JSON blob of vendor keys is; putting it in NXdetector
+            # instead made files claiming NXem fail validation, since a
+            # detector's contents *are* specified. Created here rather
+            # than at close() because it has to grow per frame.
+            collection = self._metadata_group()
+            self._frame_metadata = collection.create_dataset(
                 "frame_metadata_json",
                 shape=(0,),
                 maxshape=(None,),
                 dtype=h5py.string_dtype(encoding="utf-8"),
-            )
-            self._frame_metadata.attrs["long_name"] = (
-                "per-frame vendor metadata, one JSON object per frame"
             )
             # A copy, not the caller's mapping: this is held until close(),
             # and a caller reusing one dict across a series would otherwise
@@ -565,9 +592,10 @@ class NexusWriter:
             if self._data is not None:
                 self._write_nxdata(entry)
             if self._first_metadata:
-                collection = entry.create_group("metadata")
-                collection.attrs["NX_class"] = "NXcollection"
-                collection["vendor_metadata_json"] = json.dumps(
+                # Kept alongside the per-frame column, and kept at all
+                # because read_session_context() reads it: the first
+                # frame's metadata is where a session's own context lands.
+                self._metadata_group()["vendor_metadata_json"] = json.dumps(
                     dict(self._first_metadata),
                     default=_json_default,
                     sort_keys=True,

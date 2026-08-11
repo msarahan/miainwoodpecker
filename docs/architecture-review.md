@@ -42,12 +42,38 @@ Two of the fixes are worth calling out because writing them changed what
 they claimed. The `fov_nm` convention was settled by reading Nion's own
 `get_scan_calibrations` in the pinned release rather than by picking the
 reading that looked tidier — it computes `fov_nm / max(scan_shape)` and
-applies it to both axes, so two of this project's own tests were
-asserting the bug. And the first three display-optimization tests
+applies it to both axes, so **three** of this project's own tests were
+asserting the bug (the third surfaced only in CI, in the HyperSpy
+adapter's round trip). And the first three display-optimization tests
 **passed with the optimization removed**: the fake scanner returns
 zero-filled frames, so the autocontrast they observed through never
 fired. They were rewritten against a gradient frame, and each is now
 verified to fail with its own clause disabled.
+
+**Three of the fixes were themselves wrong on the first attempt, and CI
+is what said so** — worth recording, because each failure was specific
+to an environment this container cannot reproduce:
+
+- *The `disable_nagle` fix broke Windows outright.* Saving the fd's mode
+  with `os.get_blocking` reintroduced the same class of bug it was fixing:
+  that function is Unix-only, and the `AttributeError` fell outside the
+  function's own `except` clause, so **every** connection setup on
+  Windows would have raised. It now calls `raw.setblocking(True)` before
+  detaching — cross-platform, and correct rather than merely portable,
+  since a `multiprocessing.connection` endpoint is always blocking.
+- *The per-frame metadata dataset broke NXem validation.* Putting it in
+  `NXdetector`, next to the frames it describes, is the obvious place and
+  the wrong one: a detector's contents are specified by the standard, so
+  the file stopped validating. It belongs in the `NXcollection` that
+  already exists for exactly this — data no base class describes.
+- *The SIGTERM handler made a wedged server harder to kill, not easier.*
+  Parking straight from the handler meant that when the park itself was
+  what had wedged — the case SIGTERM most needs to reach — the handler
+  blocked forever and the client escalated to `SIGKILL`. The park now
+  runs on its own thread with a deadline inside the client's escalation
+  window, and the process exits with a distinct status if it expires: a
+  termination request that cannot be honoured gracefully must still be
+  honoured. An existing test caught this, which is what it was for.
 
 ## 1. Findings that can corrupt or lose recorded data
 
@@ -412,16 +438,21 @@ Worth stating so a cleanup pass doesn't flatten it:
 Items 1–11 are done, verified by the suite below. Everything a pilot
 cannot discover gently is in that set.
 
-**Verification.** 190 tests pass (164 base + 26 viewer under
-`xvfb-run`), `ruff check` and `pydoclint` clean in a CI-equivalent
-environment. Three fixes were checked against the bug they claim to fix
-by reintroducing it: the two `disable_nagle` tests fail with the
-pre-fix body (`BlockingIOError`, as predicted), and each display test
-fails with its own clause disabled. The device-extra integration tests
+**Verification.** 198 tests pass (172 base + 26 viewer under
+`xvfb-run`); `ruff check`, `pydoclint`, the NXem schema job, and the
+`-W` docs build all clean, each run in a CI-equivalent environment
+rather than assumed. Several fixes were checked against the bug they
+claim to fix by reintroducing it: the `disable_nagle` tests fail with
+the pre-fix body (`BlockingIOError`, as predicted), and each display
+test fails with its own clause disabled.
+
+Coverage gaps that remain, stated because they are where the next
+surprise will come from: the device-extra integration tests
 (`test_remote_nion.py`, including the four new ones for connection
-exclusivity and SIGTERM parking) could not run here — no Nion stack in
-this container — so they are written but unexecuted; CI's `integration`
-job runs them.
+exclusivity and SIGTERM parking) need a Nion stack this container does
+not have, so CI is their first real run; and no Windows machine was
+available, so that platform is covered by CI alone — which is exactly
+where the first round of fixes broke.
 
 ## 7. What was not done, and why
 

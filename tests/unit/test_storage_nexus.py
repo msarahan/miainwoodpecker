@@ -502,3 +502,162 @@ def test_plugin_codecs_are_accepted_as_a_filter_mapping(tmp_path):
     assert np.array_equal(recovered[1][0], np.full((4, 6), 1, dtype=np.float32))
     with h5py.File(path, "r") as handle:
         assert handle["entry/instrument/detector/data"].shuffle is False
+
+
+def test_every_frames_metadata_is_kept_not_just_the_firsts(tmp_path):
+    """
+    Per-frame metadata survives, which is what a focal series depends on.
+
+    ``acquisition.sequence.focal_series`` varies ``defocus_nm`` and
+    ``requested_defocus_nm`` frame by frame precisely so a recording says
+    what the instrument did rather than what it was asked to do. The
+    writer used to keep only the first frame's mapping, so all of that
+    was silently discarded - the recording looked complete and had one
+    defocus value repeated nowhere, only frame 0's stored once.
+    """
+    path = tmp_path / "focal.nxs"
+    frames = [
+        Frame(
+            data=np.full((4, 6), index, dtype=np.float32),
+            timestamp=datetime.datetime(2026, 1, 1, tzinfo=datetime.UTC)
+            + datetime.timedelta(seconds=index),
+            metadata={"requested_defocus_nm": index * 10.0,
+                      "defocus_nm": index * 10.0 + 0.5},
+        )
+        for index in range(4)
+    ]
+    write_frames(path, frames)
+
+    with h5py.File(path, "r") as handle:
+        recorded = [
+            json.loads(entry)
+            for entry in handle["entry/metadata/frame_metadata_json"][()]
+        ]
+    assert [item["requested_defocus_nm"] for item in recorded] == [
+        0.0, 10.0, 20.0, 30.0,
+    ]
+    assert [item["defocus_nm"] for item in recorded] == [0.5, 10.5, 20.5, 30.5]
+
+
+def test_per_frame_metadata_lives_in_the_nxcollection(tmp_path):
+    """
+    Non-standard data goes in NXcollection, never inside NXdetector.
+
+    NXcollection is NeXus's own container for what no base class
+    describes, and a JSON blob of vendor keys is exactly that. Putting it
+    in NXdetector instead made files claiming ``NXem`` fail validation,
+    because a detector's contents *are* specified - caught by the schema
+    job rather than by any test, which is why this one exists.
+    """
+    path = tmp_path / "layout.nxs"
+    write_frames(path, [_frame(i) for i in range(2)])
+
+    with h5py.File(path, "r") as handle:
+        detector = handle["entry/instrument/detector"]
+        assert set(detector) == {"data", "frame_time"}
+        collection = handle["entry/metadata"]
+        assert collection.attrs["NX_class"] == "NXcollection"
+        assert "frame_metadata_json" in collection
+        assert "vendor_metadata_json" in collection
+
+
+def test_the_writer_copies_metadata_rather_than_holding_the_callers_dict(tmp_path):
+    """A caller reusing one dict across a series must not rewrite frame 0."""
+    path = tmp_path / "reused.nxs"
+    shared: dict[str, object] = {"step": 0}
+    frame = Frame(
+        data=np.zeros((4, 6), dtype=np.float32),
+        timestamp=datetime.datetime(2026, 1, 1, tzinfo=datetime.UTC),
+        metadata=shared,
+    )
+    with NexusWriter(path) as writer:
+        writer.append(frame)
+        shared["step"] = 99  # the caller moves on; the file must not follow
+
+    with h5py.File(path, "r") as handle:
+        blob = json.loads(handle["entry/metadata/vendor_metadata_json"][()])
+    assert blob["step"] == 0
+
+
+def test_a_one_dimensional_frame_is_refused_at_append(tmp_path):
+    """
+    A 1D frame fails where the caller can act, not at close().
+
+    Frame.data's docstring allows 1D for binned spectra, but the NXdata
+    layout this writer builds names two frame axes. Before the check, a
+    1D series raised IndexError inside close() - after the whole
+    acquisition had been appended.
+    """
+    path = tmp_path / "spectrum.nxs"
+    spectrum = Frame(
+        data=np.zeros((8,), dtype=np.float32),
+        timestamp=datetime.datetime(2026, 1, 1, tzinfo=datetime.UTC),
+    )
+    with pytest.raises(ValueError, match="stores 2D frames"), NexusWriter(path) as w:
+        w.append(spectrum)
+
+
+def test_a_three_dimensional_frame_is_refused_at_append(tmp_path):
+    """A 3D frame used to write a rank-4 signal described by two axes."""
+    path = tmp_path / "cube.nxs"
+    cube = Frame(
+        data=np.zeros((2, 4, 6), dtype=np.float32),
+        timestamp=datetime.datetime(2026, 1, 1, tzinfo=datetime.UTC),
+    )
+    with pytest.raises(ValueError, match="stores 2D frames"), NexusWriter(path) as w:
+        w.append(cube)
+
+
+def test_a_dtype_change_mid_series_is_refused(tmp_path):
+    """
+    Documented as raising since append() was written; h5py would recast.
+
+    Silently narrowing what it was handed is exactly what the opt-in
+    dtype= parameter exists to prevent the writer doing on its own.
+    """
+    path = tmp_path / "mixed.nxs"
+    first = _frame(0)
+    second = Frame(
+        data=np.zeros((4, 6), dtype=np.float64),
+        timestamp=first.timestamp + datetime.timedelta(seconds=1),
+    )
+    with NexusWriter(path) as w:
+        w.append(first)
+        with pytest.raises(ValueError, match="does not match"):
+            w.append(second)
+
+
+def test_an_explicit_dtype_still_casts_deliberately(tmp_path):
+    """dtype= means the caller asked for one dtype, so mixed input is fine."""
+    path = tmp_path / "cast.nxs"
+    first = _frame(0)
+    second = Frame(
+        data=np.full((4, 6), 1, dtype=np.float64),
+        timestamp=first.timestamp + datetime.timedelta(seconds=1),
+    )
+    assert write_frames(path, [first, second], dtype="float32") == 2  # noqa: PLR2004
+
+    with h5py.File(path, "r") as handle:
+        assert handle["entry/instrument/detector/data"].dtype == np.float32
+
+
+def test_reusing_a_writer_does_not_leave_phantom_frames(tmp_path):
+    """
+    close() resets the frame counter, not only the handles.
+
+    Leaving _count behind made a reused writer resize to count+1 and
+    write at count, so frames 0..count-1 were HDF5 fill values
+    indistinguishable from real data.
+    """
+    path = tmp_path / "reused_writer.nxs"
+    writer = NexusWriter(path)
+    with writer:
+        writer.append(_frame(0))
+        writer.append(_frame(1))
+    with writer:
+        writer.append(_frame(7))
+
+    with h5py.File(path, "r") as handle:
+        data = handle["entry/instrument/detector/data"]
+        assert data.shape == (1, 4, 6)
+        assert np.array_equal(data[0], np.full((4, 6), 7, dtype=np.float32))

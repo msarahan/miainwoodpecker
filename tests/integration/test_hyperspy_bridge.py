@@ -60,10 +60,14 @@ def test_calibrated_recording_round_trips_shape_dtype_and_axes(tmp_path):
 
     assert x_axis.units == "nm"
     assert y_axis.units == "nm"
-    # fov_nm / width and fov_nm / height, sampled at pixel edges (see
-    # storage/nexus.py's _write_nxdata).
-    assert x_axis.scale == pytest.approx(fov_nm / _WIDTH)
-    assert y_axis.scale == pytest.approx(fov_nm / _HEIGHT)
+    # Square pixels: fov_nm spans the *longer* axis, so both scales are
+    # fov_nm / max(height, width). This asserted fov_nm / height on the
+    # slow axis until the convention was pinned against Nion's own
+    # get_scan_calibrations - a 4x6 frame is exactly the non-square case
+    # where the two readings disagree (see ScanParameters.fov_nm).
+    pixel_nm = fov_nm / max(_HEIGHT, _WIDTH)
+    assert x_axis.scale == pytest.approx(pixel_nm)
+    assert y_axis.scale == pytest.approx(pixel_nm)
     assert x_axis.offset == pytest.approx(0.0)
     assert y_axis.offset == pytest.approx(0.0)
 

@@ -22,7 +22,6 @@ one result shape, dispatch by looking up ``target`` then ``getattr`` for
 from __future__ import annotations
 
 import contextlib
-import os
 import socket
 import typing
 from dataclasses import dataclass, field
@@ -53,7 +52,7 @@ def disable_nagle(connection: Connection) -> None:
     connection this project opens, not just the sizes that happened to
     reproduce it in one benchmark run.
 
-    The fd's blocking mode is saved and restored around the wrapping, and
+    The socket is put back into blocking mode before it is detached, and
     that is load-bearing rather than defensive. ``socket.socket(fileno=)``
     applies the process-wide :func:`socket.setdefaulttimeout` at
     construction, and setting a timeout puts the *underlying fd* into
@@ -67,8 +66,16 @@ def disable_nagle(connection: Connection) -> None:
     ``RemoteConnectionLostError`` and the operator is told the device
     server died when it is perfectly healthy. Verified directly rather
     than reasoned about: with a default timeout set, wrapping a blocking
-    fd and detaching leaves ``os.get_blocking(fd)`` False and the next
-    ``recv`` raising ``EAGAIN``.
+    fd and detaching left it non-blocking and the next ``recv`` raising
+    ``EAGAIN``.
+
+    ``setblocking(True)`` rather than saving and restoring
+    ``os.get_blocking``: those two are Unix-only, so reading the old state
+    raised ``AttributeError`` on Windows — outside this function's
+    ``except`` clause, which would have made *every* connection setup
+    fail there. Restoring unconditionally is also correct rather than
+    merely portable, because a ``multiprocessing.connection`` endpoint is
+    always blocking to begin with.
 
     Parameters
     ----------
@@ -79,9 +86,7 @@ def disable_nagle(connection: Connection) -> None:
         this concept and don't need it).
     """
     try:
-        fileno = connection.fileno()
-        blocking = os.get_blocking(fileno)
-        raw = socket.socket(fileno=fileno)
+        raw = socket.socket(fileno=connection.fileno())
     except (OSError, ValueError):
         return
     try:
@@ -89,9 +94,9 @@ def disable_nagle(connection: Connection) -> None:
     except OSError:
         pass
     finally:
-        raw.detach()  # we don't own this fd; multiprocessing.connection does
         with contextlib.suppress(OSError):
-            os.set_blocking(fileno, blocking)
+            raw.setblocking(True)  # noqa: FBT003 - stdlib signature is positional
+        raw.detach()  # we don't own this fd; multiprocessing.connection does
 
 
 @dataclass(frozen=True)

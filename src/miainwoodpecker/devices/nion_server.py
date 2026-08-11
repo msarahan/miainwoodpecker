@@ -166,6 +166,18 @@ BACKENDS = (SIMULATED_BACKEND, HARDWARE_BACKEND)
 # 1 so a launcher can tell a missing microscope from a crash.
 NO_HARDWARE_EXIT_STATUS = 2
 
+# Exit status for "a termination signal arrived and the park did not finish
+# in time". Distinct again, because the operator consequence is specific and
+# serious: the process is gone and the instrument was left in an unknown
+# state, which is worth surfacing rather than folding into a generic crash.
+PARK_TIMEOUT_EXIT_STATUS = 3
+
+# How long a signal handler waits for the park before giving up and exiting.
+# Comfortably inside the client's own 5s terminate-to-kill escalation
+# (remote._TERMINATE_TIMEOUT_S), so a server that cannot park still dies of
+# its own accord - with a status saying so - rather than being SIGKILLed.
+_PARK_ON_SIGNAL_TIMEOUT_S = 3.0
+
 # Vendor control names behind the neutral controls in interface.py.
 # "C10" (defocus) and "stage_position_m" come from Nion's own device_kit
 # reference implementation, which reads/writes exactly these names in its
@@ -1324,12 +1336,28 @@ def _parking_signal_handlers(session: _ServerSession) -> Iterator[None]:
     situation, so it should not be reachable only through the RPC that a
     wedged server cannot serve.
 
-    The handler must finish inside the client's escalation window (5 s
-    between ``terminate()`` and ``kill()``), which blanking a beam
-    comfortably does; :meth:`_ServerSession.park_and_release` is
-    individually guarded per step and memoized, so a signal arriving
-    during a graceful shutdown returns the existing report rather than
-    parking twice.
+    **The park attempt is bounded, and that is the whole subtlety.** The
+    server SIGTERM most needs to reach is a wedged one — and what is
+    wedged may be the park itself, since it drives the same devices the
+    stuck call is holding. Parking straight from the handler therefore
+    made a wedged server *unkillable by SIGTERM*: the handler blocked
+    forever, the client waited out its 5 s and escalated to ``SIGKILL``,
+    and the signal handling achieved nothing except converting a prompt
+    ``-SIGTERM`` into a slower ``-SIGKILL``. (Found by an existing test
+    that pins the wedged-server fallback, which is exactly what it is for.)
+
+    So the park runs on its own thread with a deadline comfortably inside
+    the client's escalation window. If it finishes, the process leaves
+    through :func:`serve`'s normal return. If it does not, the handler
+    stops waiting and exits anyway with
+    :data:`PARK_TIMEOUT_EXIT_STATUS`, because a termination request that
+    cannot be honoured gracefully must still be honoured: refusing to die
+    does not park the beam either, and it denies the operator the one
+    remedy left. The distinct status says which happened.
+
+    :meth:`_ServerSession.park_and_release` is memoized, so a signal
+    arriving during a graceful shutdown returns the existing report
+    rather than parking twice.
 
     Handlers are restored on the way out, and installation is skipped off
     the main thread, so an in-process caller of :func:`serve` does not
@@ -1349,12 +1377,31 @@ def _parking_signal_handlers(session: _ServerSession) -> Iterator[None]:
     def _handle(signum: int, _frame: object) -> None:
         name = signal.Signals(signum).name
         _LOGGER.warning("received %s: parking the instrument before exit", name)
-        try:
-            report = session.park_and_release()
-        except Exception:
-            _LOGGER.exception("park on %s failed", name)
-        else:
-            _LOGGER.info("parked on %s: %s", name, report)
+        parked = threading.Event()
+
+        def _park() -> None:
+            try:
+                report = session.park_and_release()
+            except Exception:
+                _LOGGER.exception("park on %s failed", name)
+            else:
+                _LOGGER.info("parked on %s: %s", name, report)
+            parked.set()
+
+        threading.Thread(target=_park, name="park-on-signal", daemon=True).start()
+        if not parked.wait(_PARK_ON_SIGNAL_TIMEOUT_S):
+            _LOGGER.error(
+                "park did not finish within %.1fs of %s; exiting anyway with "
+                "status %d - the instrument state is unknown",
+                _PARK_ON_SIGNAL_TIMEOUT_S,
+                name,
+                PARK_TIMEOUT_EXIT_STATUS,
+            )
+            # os._exit rather than sys.exit: this runs on the main thread
+            # inside a signal handler, and a SystemExit raised here would
+            # unwind into whatever it interrupted (serve()'s wait, or a
+            # device call) and could block on the same thing the park did.
+            os._exit(PARK_TIMEOUT_EXIT_STATUS)
         # Unblocks serve()'s wait, so the process exits through its normal
         # path (listeners closed, devices released) rather than abruptly.
         session.stop_event.set()
