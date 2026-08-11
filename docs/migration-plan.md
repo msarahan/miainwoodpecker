@@ -35,6 +35,14 @@ interface without touching the acquisition, UI, or storage code. This is
 a design constraint to hold to now, not work to do now — no non-Nion
 adapter is being built until it's actually needed.
 
+That claim has since been audited against what the other vendors actually
+publish, and costed:
+[**Other vendors**](vendor-support.md). Two findings changed the code
+rather than the plan — the client could only ever launch *our* server
+module, which is now a parameter, and the device target names are still a
+fixed Nion-shaped tuple, which is the one redesign a second adapter cannot
+work around.
+
 Reuse directly:
 
 - [`nionswift-instrumentation-kit`](https://github.com/nion-software/nionswift-instrumentation-kit) —

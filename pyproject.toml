@@ -158,6 +158,14 @@ py4dstem = [
 compression = [
     "hdf5plugin>=5",
 ]
+# Commodity cameras - USB microscopes, webcams, and replaying a captured
+# video file as a fixture - through miainwoodpecker.devices.camera_server.
+# Headless because this is a device server: it runs as a subprocess and
+# draws nothing, so the GUI build would pull Qt in beside the viewer's own
+# and give two toolkits in one process tree for no benefit.
+camera = [
+    "opencv-python-headless>=4.9",
+]
 docs = [
     "sphinx>=8.2.3",
     "myst-parser>=4.0.1",
@@ -332,6 +340,12 @@ run = "pytest {args:--cov=miainwoodpecker --cov-report=term-missing}"
 description = """Run the full test suite, including device, viewer, and analysis tests."""
 features = [
     "analysis",
+    # OpenCV, so the commodity-camera server's hardware backend is
+    # covered here rather than only where someone has a webcam: it opens
+    # a generated video file through the same VideoCapture path a USB
+    # microscope uses. The base "test" env deliberately lacks it, which
+    # is what the simulated backend exists for.
+    "camera",
     "compression",
     "device",
     "libertem",

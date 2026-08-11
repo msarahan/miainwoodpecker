@@ -30,7 +30,13 @@ if typing.TYPE_CHECKING:
     import threading
     from multiprocessing.connection import Connection
 
-TARGET_NAMES = ("ronchigram_camera", "eels_camera", "scanner", "instrument")
+TARGET_NAMES = (
+    "ronchigram_camera",
+    "eels_camera",
+    "camera",
+    "scanner",
+    "instrument",
+)
 """
 Every named target a device server can serve, in **argv order**.
 
@@ -43,8 +49,23 @@ because the *count* still agrees. One definition, on the side of the
 boundary that has no vendor dependency, removes the possibility.
 """
 
-DEVICE_TARGET_NAMES = ("ronchigram_camera", "eels_camera", "scanner")
+DEVICE_TARGET_NAMES = ("ronchigram_camera", "eels_camera", "camera", "scanner")
 """The targets that are devices, i.e. everything but ``instrument``."""
+
+CAMERA_TARGET_NAMES = ("ronchigram_camera", "eels_camera", "camera")
+"""
+The targets that are cameras, in the order a client reports them.
+
+``ronchigram_camera`` and ``eels_camera`` are Nion's device list showing
+through, and they stay because the viewer, the scripts and every existing
+recording use them. ``camera`` is the neutral slot: a detector, a webcam,
+or anything else that produces frames and is not one of those two. It
+exists because the alternative was worse — serving a USB microscope as a
+"Ronchigram camera" would put a fiction in every file's target name while
+the frame metadata told the truth. See docs/vendor-support.md for the
+redesign that would remove the fixed list altogether, and why it is
+waiting for a second *column* adapter rather than being done on spec.
+"""
 
 SIMULATED_BACKEND = "simulated"
 """Backend name selecting the software simulator."""

@@ -99,6 +99,50 @@
   field means what they mean, and an approximate one would be a
   confidently wrong claim.
 
+- `remote_instrument(server_module=...)`: the client can launch a device
+  server it did not ship, so a vendor adapter can be an out-of-tree
+  package rather than a fork. `tests/unit/test_out_of_tree_server.py`
+  writes a complete vendor-free server and drives the whole client
+  against it with no `device` extra installed, which is both the
+  regression test and the specification an adapter writes against. The
+  startup diagnostic now names the module it failed to launch.
+
+- A detector-only device server is now supported: `scanner` is optional
+  on `RemoteInstrumentDevices`, `cameras()` enumerates what is actually
+  served, and the live viewer says so plainly instead of failing deep. A
+  Direct Electron, DECTRIS, or Hamamatsu camera driven through its own
+  SDK has no scan unit, and `connections["scanner"]` used to be
+  unconditional — so "vendor-neutral" quietly meant "must have a scan
+  unit shaped like Nion's".
+
+- `docs/vendor-support.md`: what Thermo Fisher, JEOL, Zeiss, Hitachi and
+  Bruker actually expose, what the direct detector vendors expose
+  (Direct Electron, DECTRIS, Hamamatsu, Merlin, ASI, Gatan), what
+  commodity cameras need (pymmcore reaches every UVC microscope in one
+  adapter; a DSLR body is its own small gphoto one), and costed tasks for
+  each. Also records why every adapter is a subprocess even where no
+  licence requires it, and the one place the framework is still
+  Nion-shaped — the device target names are a fixed positional tuple —
+  and why that redesign should land with the second column adapter rather
+  than before it.
+
+- **A device server for commodity cameras**
+  (`miainwoodpecker.devices.camera_server`): USB microscopes, webcams, and
+  recorded video files, over OpenCV's `VideoCapture` — no vendor SDK, MIT,
+  in-tree. Two backends like the Nion server: `simulated` synthesises
+  moving frames and needs nothing installed, `hardware` opens a real
+  device (the `camera` extra). Frames carry `photometrically_linear:
+  False` and name their `colour_conversion`, because a UVC camera's pixels
+  have already been through demosaicing, gamma and white balance and are
+  an image rather than a measurement. Binning other than 1 is refused,
+  since consumer sensors crop. The camera arrives on a new neutral
+  `camera` target rather than being called a Ronchigram camera.
+
+- `devices/serving.py`: the vendor-free half of the server protocol —
+  dispatch, the connection loop, and the accept loop — extracted from
+  `nion_server` and shared with the camera server. Lifecycle deliberately
+  stays with each adapter: a webcam has no beam to park.
+
 ### Changed
 
 - CI's `integration` job runs its tests in parallel (`pytest -n auto`),

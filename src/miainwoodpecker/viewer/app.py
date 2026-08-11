@@ -150,6 +150,12 @@ def main(argv: list[str] | None = None) -> None:
     ----------
     argv : list[str] | None
         Command-line arguments, or None to read ``sys.argv``.
+
+    Raises
+    ------
+    SystemExit
+        If the device server serves no scanner. A detector-only server
+        is a supported thing to connect to, just not with this viewer.
     """
     args = _parse_args(argv)
     session = Session(
@@ -160,6 +166,17 @@ def main(argv: list[str] | None = None) -> None:
     )
     plugins = _hardware_plugins(args.plugin)
     with remote_instrument(backend=args.backend, plugin_names=plugins) as microscope:
+        if microscope.scanner is None:
+            # A detector-only device server is a supported thing to
+            # connect to (see docs/vendor-support.md) - just not with
+            # this viewer, whose whole layout is a live scan image.
+            # Saying so beats an AttributeError three frames deep.
+            msg = (
+                "this device server serves no scanner, so there is no "
+                "scan image to view. The live viewer needs one; a "
+                "detector-only server can still be driven from a script."
+            )
+            raise SystemExit(msg)
         viewer = napari.Viewer(title="miainwoodpecker")
         widget = LiveInstrumentWidget(
             viewer,

@@ -13,6 +13,10 @@ hardware attached (install the `device` extra). On a real instrument,
 swap `remote_simulated_instrument()` for
 `remote_instrument(backend="hardware")` and nothing else changes.
 
+If you have no microscope but do have a USB microscope or a webcam, that
+works too — see [running against a commodity
+camera](#running-against-a-commodity-camera) at the end.
+
 ## Five minutes: connect, scan, record
 
 ```python
@@ -297,6 +301,46 @@ wrapper: expose `remote_instrument`, the acquisition generators, and
 experimenting now, the pragmatic route is to let the agent write and
 run short Python scripts against this API — which also leaves an exact,
 replayable record of what it did.
+
+## Running against a commodity camera
+
+A USB microscope, a webcam, or a recorded video file can drive this whole
+stack — the client, the session layer, the storage and the viewer — with
+no microscope involved. It is the cheapest way to exercise everything
+against real hardware, and it needs only the `camera` extra:
+
+```python
+from miainwoodpecker.acquisition import camera_series, record
+from miainwoodpecker.devices.remote import remote_instrument
+
+with remote_instrument(
+    server_module="miainwoodpecker.devices.camera_server",
+    backend="hardware",
+    plugin_names=["0"],        # camera index, /dev/video0, or a video file
+) as scope:
+    record(camera_series(scope.camera, 20), "usb-scope.nxs")
+```
+
+Drop `backend=` and `plugin_names=` to get a synthetic camera instead,
+which needs nothing installed at all — useful for trying the API out.
+
+Three things are different from a scientific detector, and the files say
+so rather than hiding it:
+
+- Every frame carries **`photometrically_linear: False`**. A UVC camera's
+  pixels have already been through demosaicing, gamma, white balance and
+  in-camera sharpening, and none of that is recoverable — so they are an
+  image, not a measurement, and an analysis step can check before
+  treating them as counts.
+- Colour frames arrive **greyscale**, with `colour_conversion` naming
+  what was done. `Frame.data` is 2D by design.
+- **Binning is refused.** Consumer sensors crop rather than bin, so
+  asking for any factor but 1 raises instead of quietly returning
+  unbinned frames with a wrongly scaled axis.
+
+The camera arrives as `scope.camera` — the neutral target — rather than
+`scope.ronchigram_camera`, because calling a USB microscope a Ronchigram
+camera would put a fiction in every file.
 
 ## API reference
 
