@@ -75,7 +75,7 @@ import numpy as np
 from pynxtools.dataconverter.validation import validate_hdf_group_against
 from pynxtools.units import NXUnitSet
 
-from miainwoodpecker.devices.interface import Frame
+from miainwoodpecker.devices.interface import HIGH_TENSION_V_KEY, Frame
 from miainwoodpecker.storage import FrameCalibration, NexusWriter
 from miainwoodpecker.storage.calibration import (
     NEXUS_UNIT_CATEGORIES,
@@ -115,7 +115,9 @@ def _frames() -> list[Frame]:
     -------
     list[Frame]
         Three frames with a scan-like ``fov_nm`` so the calibrated-axis
-        path is the one exercised.
+        path is the one exercised, and the accelerating voltage every
+        acquired frame now carries, so the ``NXsource`` the writer emits
+        from it is part of what gets validated.
     """
     rng = np.random.default_rng(0)
     return [
@@ -123,7 +125,11 @@ def _frames() -> list[Frame]:
             data=rng.standard_normal((32, 48)),
             timestamp=datetime.datetime(2026, 1, 1, tzinfo=datetime.UTC)
             + datetime.timedelta(seconds=index),
-            metadata={"index": index, "fov_nm": 100.0},
+            metadata={
+                "index": index,
+                "fov_nm": 100.0,
+                HIGH_TENSION_V_KEY: 100000.0,
+            },
         )
         for index in range(3)
     ]

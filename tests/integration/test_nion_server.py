@@ -49,6 +49,7 @@ from miainwoodpecker.devices.nion_server import (
     HardwareNotAvailableError,
     NionCamera,
     _axis_calibration_spec,
+    _instrument_state,
     _parse_args,
     hardware_instrument,
     open_instrument,
@@ -397,6 +398,29 @@ class _FakeCalibration:
         self.units = units
 
 
+class _ControllerWithoutControls:
+    """A STEM controller that reports no control this project asks for."""
+
+    def TryGetVal(  # noqa: N802 - vendor spelling
+        self,
+        name: str,  # noqa: ARG002 - part of the vendor signature being stood in for
+    ) -> tuple[bool, None]:
+        """
+        Report every control as absent, the way a bare STEMController does.
+
+        Parameters
+        ----------
+        name : str
+            The vendor control name, ignored — every one is absent here.
+
+        Returns
+        -------
+        tuple[bool, None]
+            Always ``(False, None)``.
+        """
+        return (False, None)
+
+
 class _CameraWithoutControls:
     """A camera device that publishes no calibration controls at all."""
 
@@ -513,3 +537,143 @@ def test_an_axis_in_units_this_project_cannot_express_stays_uncalibrated():
         "offset": 0.0,
         "units": "eV",
     }
+
+
+# ------------------------------------------- the frame metadata contract
+#
+# Nion has two tests whose entire purpose is to enumerate what must be
+# attached to every acquired frame
+# (CameraControl_test.test_acquire_attaches_required_metadata and
+# ScanControl_test.test_context_scan_attaches_required_metadata). The set
+# is theirs; the names are ours, for the reason interface.py gives. Before
+# this, a scan frame carried four keys and a camera frame carried two.
+
+# usim's instrument: EHT = 100 kV, C10 = 5e-07 m, BeamCurrent = 2e-10 A.
+_EXPECTED_HIGH_TENSION_V = 100000.0
+_EXPECTED_DEFOCUS_NM = 500.0
+
+
+def _assert_instrument_state(metadata) -> None:
+    """Assert the instrument state every frame carries, in operator units."""
+    assert metadata["high_tension_v"] == pytest.approx(_EXPECTED_HIGH_TENSION_V)
+    # In nanometres, not the vendor's metres. A 1e9 error here is the one
+    # the hardware checklist calls the highest-consequence check on it.
+    assert metadata["defocus_nm"] == pytest.approx(_EXPECTED_DEFOCUS_NM)
+    assert metadata["beam_current_a"] > 0.0
+
+
+def test_a_scan_frame_carries_the_required_metadata():
+    """A scan frame says which detector, which region, and under what beam."""
+    with simulated_instrument() as microscope:
+        parameters = ScanParameters(
+            height=32,
+            width=48,
+            pixel_time_us=2.0,
+            fov_nm=microscope.stage_size_nm * 0.1,
+        )
+        metadata = microscope.scanner.scan_frame(parameters, channel=0).metadata
+        assert metadata["device_id"] == microscope.scanner.scanner_id
+        assert metadata["channel_index"] == 0
+        assert metadata["channel_name"] == "HAADF"
+        assert metadata["fov_nm"] == parameters.fov_nm
+        assert metadata["pixel_time_us"] == parameters.pixel_time_us
+        # Derived rather than left to a reader, which cannot know the
+        # flyback convention - so the convention is recorded beside them.
+        assert metadata["line_time_us"] == pytest.approx(48 * 2.0)
+        assert metadata["frame_time_s"] == pytest.approx(32 * 48 * 2.0 / 1e6)
+        assert metadata["flyback_time_us"] > 0.0
+        # Without these the field of view says how much was scanned but
+        # not which region, so two scans of different areas would be
+        # indistinguishable in the file.
+        assert metadata["rotation_rad"] == pytest.approx(0.0)
+        assert metadata["center_nm"] == (0.0, 0.0)
+        _assert_instrument_state(metadata)
+
+
+def test_a_camera_frame_carries_the_required_metadata():
+    """A camera frame names the detector and the beam it was taken under."""
+    with simulated_instrument() as microscope:
+        camera = microscope.eels_camera
+        camera.start()
+        try:
+            metadata = camera.acquire_frame().metadata
+        finally:
+            camera.stop()
+        assert metadata["device_id"] == camera.camera_id
+        # The vendor's own label for the detector, which is what tells an
+        # analysis tool what kind of data this is.
+        assert metadata["camera_type"] == "eels"
+        assert metadata["camera_name"]
+        assert metadata["counts_per_electron"] > 0.0
+        _assert_instrument_state(metadata)
+
+
+def test_frame_index_counts_without_gaps_from_zero():
+    """
+    Frames are numbered so a dropped one is visible rather than absent.
+
+    A recording that simply has fewer frames than expected says nothing
+    about whether any were lost. A gap in a monotonic index does.
+    """
+    with simulated_instrument() as microscope:
+        camera = microscope.ronchigram_camera
+        camera.start()
+        try:
+            indexes = [camera.acquire_frame().metadata["frame_index"] for _ in range(3)]
+        finally:
+            camera.stop()
+        assert indexes == [0, 1, 2]
+
+        parameters = ScanParameters(
+            height=16,
+            width=16,
+            pixel_time_us=1.0,
+            fov_nm=microscope.stage_size_nm * 0.1,
+        )
+        scanner = microscope.scanner
+        # Counted per device, across channels: every frame the scanner
+        # produced, in the order it produced them. Nion's scan_id groups
+        # the channels of one simultaneous scan instead; this interface
+        # has no such call, so a second channel really is a second pass of
+        # the beam and gets its own index rather than a shared id.
+        scan_indexes = [
+            scanner.scan_frame(parameters, channel=channel).metadata["frame_index"]
+            for channel in (0, 1, 0)
+        ]
+        assert scan_indexes == [0, 1, 2]
+
+
+def test_the_defocus_a_frame_reports_is_its_own():
+    """
+    Instrument state is read per frame, not cached when the device opened.
+
+    ``focal_series`` changes the defocus *between* frames, so a cached
+    value would label every frame in a sweep with the first one's
+    defocus — wrong in exactly the workflow that most needs it right.
+    """
+    with simulated_instrument() as microscope:
+        camera = microscope.ronchigram_camera
+        instrument = microscope.instrument
+        original_nm = instrument.defocus_nm()
+        camera.start()
+        try:
+            first = camera.acquire_frame().metadata["defocus_nm"]
+            instrument.set_defocus_nm(original_nm * 2.0)
+            second = camera.acquire_frame().metadata["defocus_nm"]
+        finally:
+            instrument.set_defocus_nm(original_nm)
+            camera.stop()
+        assert first == pytest.approx(original_nm)
+        assert second == pytest.approx(original_nm * 2.0)
+
+
+def test_an_instrument_that_reports_nothing_contributes_no_keys():
+    """
+    A control the instrument does not publish is omitted, never defaulted.
+
+    An absent key reads as "not reported"; a stored zero reads as a
+    measurement — an instrument with its high tension off, a beam with no
+    current. The device layer says nothing rather than something false.
+    """
+    assert _instrument_state(None) == {}
+    assert _instrument_state(_ControllerWithoutControls()) == {}

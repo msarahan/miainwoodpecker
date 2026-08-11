@@ -53,6 +53,24 @@
   `camera_base.build_calibration`, with real values published by the
   simulator), so it needs neither hardware nor a reimplementation.
 
+- Camera axis calibration resolved from the instrument. A Nion camera
+  publishes the *names* of the instrument controls holding its calibration
+  rather than the values; the device server resolves them with Nion's own
+  `camera_base.build_calibration` and puts per-axis
+  `{kind, scale, offset, units}` into the frame metadata as plain data.
+  Ronchigram frames arrive with radian axes centred on the optic axis and
+  EELS frames with an eV axis — and the dispersive axis is now the one the
+  *device* reports, so `dispersive_axis="x"` is no longer an assumption to
+  confirm on hardware.
+
+- Every acquired frame now carries the acquisition metadata Nion's own
+  required-metadata tests enumerate: device id, gapless `frame_index`,
+  high tension, defocus, beam current, and per device either channel and
+  scan geometry (rotation, centre, flyback, derived line and frame times)
+  or the camera's type, name, and gain. The vocabulary is documented on
+  `Frame`. The accelerating voltage is additionally written as
+  `NXsource.voltage`, the one piece of it NeXus specifies a home for.
+
 ### Changed
 
 - CI's `integration` job runs its tests in parallel (`pytest -n auto`),

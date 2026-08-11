@@ -48,6 +48,20 @@ DETECTOR_DATA = f"{DETECTOR_GROUP}/data"
 DETECTOR_FRAME_TIME = f"{DETECTOR_GROUP}/frame_time"
 """Seconds elapsed since the first frame, one per frame."""
 
+SOURCE_GROUP = "entry/instrument/source"
+"""
+``NXsource`` — the electron gun, written when a frame reported its voltage.
+
+Everything else about the instrument's state lives in the per-frame JSON
+of :data:`FRAME_METADATA`, because NeXus describes no home for it. The
+accelerating voltage does have one, and a file that knew the value and
+left the standard field empty would be hiding it from every reader that
+speaks NeXus rather than this project.
+"""
+
+SOURCE_VOLTAGE = f"{SOURCE_GROUP}/voltage"
+"""The accelerating voltage in volts, as ``NXsource``'s own field."""
+
 NXDATA_GROUP = "entry/data"
 """
 ``NXdata`` carrying the plotting hints, created at ``close()``.

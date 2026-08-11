@@ -34,6 +34,18 @@ if typing.TYPE_CHECKING:
     import numpy.typing as npt
 
 
+HIGH_TENSION_V_KEY = "high_tension_v"
+"""
+Frame-metadata key for the accelerating voltage, in volts.
+
+The one key in the vocabulary below with a constant, because it is the
+one NeXus specifies a home for
+(``NXem``'s ``instrument/ebeam_column/electron_source/voltage``) and so
+the one the storage layer reads by name rather than persisting whole.
+Naming the other fifteen here would add constants with one use each.
+"""
+
+
 @dataclass(frozen=True)
 class Frame:
     """
@@ -44,6 +56,66 @@ class Frame:
     storage layer (migration plan, Phase 3) persists ``data`` plus
     ``metadata``.
 
+    **The metadata vocabulary.**
+    Every adapter attaches what it can of the following, and omits what
+    the instrument does not report rather than substituting a default —
+    an absent key means "not reported", which a stored zero would not.
+    Units are the operator's throughout, as everywhere else here.
+
+    The set is Nion's, arrived at by reading the two tests whose entire
+    purpose is to enumerate it
+    (``CameraControl_test.test_acquire_attaches_required_metadata`` and
+    ``ScanControl_test.test_context_scan_attaches_required_metadata``);
+    the *names* are this project's, because adopting ``stem.scan.fov_nm``
+    wholesale would put a vendor's schema in the vendor-neutral layer.
+
+    Every device:
+
+    ``device_id``
+        The scanner's or camera's stable id — which detector produced this.
+    ``frame_index``
+        Frames produced by this device since it was opened, from 0.
+        Monotonic and gapless, so a *missing* index in a recording is
+        visible evidence of a dropped frame rather than silently absent
+        data.
+    ``high_tension_v``, ``defocus_nm``, ``beam_current_a``
+        Instrument state at acquisition time, read per frame rather than
+        cached — a focal series changes the defocus between frames, and
+        it is the workflow that most needs the value to be the frame's
+        own.
+    ``calibration``
+        Per-axis physical axes, when the device reports them; see
+        :mod:`miainwoodpecker.storage.calibration`.
+
+    Scanners additionally:
+
+    ``channel_index``, ``channel_name``
+        Which detector channel this frame came from.
+    ``fov_nm``, ``fov_size_nm``, ``pixel_time_us``
+        The requested scan geometry; see :class:`ScanParameters`.
+    ``line_time_us``, ``frame_time_s``
+        Derived timings, recorded because a reader reconstructing them
+        needs to know the flyback convention and cannot.
+    ``rotation_rad``, ``center_nm``
+        Scan orientation and centre, without which the field of view does
+        not say *which* region was scanned.
+
+    Cameras additionally:
+
+    ``camera_name``, ``camera_type``
+        The vendor's own label for the detector (``"ronchigram"``,
+        ``"eels"``), which is what an analysis tool needs to know what
+        kind of data this is.
+    ``counts_per_electron``
+        Detector gain, where the device publishes it.
+    ``frame_number``, ``integration_count``
+        Passed through from the vendor's own frame properties.
+
+    **No ``scan_id``.** Nion carries one to group the channels of a single
+    simultaneous multi-channel scan. This interface has no such call — a
+    second channel is a second ``scan_frame``, and therefore a second pass
+    of the beam — so an id claiming to group them would be a fiction.
+
     Attributes
     ----------
     data : npt.NDArray[typing.Any]
@@ -51,9 +123,8 @@ class Frame:
     timestamp : datetime.datetime
         Acquisition time. Always timezone-aware (UTC).
     metadata : typing.Mapping[str, typing.Any]
-        Vendor-reported acquisition properties (frame number, channel,
-        field of view, ...). Keys are not standardized yet; mapping them
-        onto NXem is Phase 3 work.
+        Acquisition properties, in the vocabulary above plus whatever
+        else the vendor reported.
     """
 
     data: npt.NDArray[typing.Any]

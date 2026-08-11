@@ -154,6 +154,7 @@ import typing
 
 import h5py
 
+from miainwoodpecker.devices.interface import HIGH_TENSION_V_KEY
 from miainwoodpecker.storage import layout
 from miainwoodpecker.storage.calibration import (
     AXIS_NAMES,
@@ -592,6 +593,7 @@ class NexusWriter:
 
             if self._data is not None:
                 self._write_nxdata(entry)
+            self._write_source(entry)
             if self._first_metadata:
                 # Kept alongside the per-frame column, and kept at all
                 # because read_session_context() reads it: the first
@@ -615,6 +617,49 @@ class NexusWriter:
             self._first_metadata = None
             self._resolved_calibration = None
             self._frame_zero = None
+
+    def _write_source(self, entry: h5py.Group) -> None:
+        """
+        Record the accelerating voltage where a NeXus reader looks for it.
+
+        Every acquired frame now carries the instrument state it was taken
+        under, and all of it is preserved in the per-frame JSON column.
+        That column is where this project puts what NeXus has *no* home
+        for, and the accelerating voltage is not that: ``NXsource``
+        defines ``voltage``, and ``NXinstrument`` documents an
+        ``NXsource`` inside it, so leaving it in a JSON blob would hide a
+        value from every reader that speaks NeXus rather than this
+        project.
+
+        ``NXem``'s own home for this is
+        ``measurement/eventID/instrument/ebeam_column/electron_source``.
+        Measured against ``pynxtools``: putting an ``NXebeam_column``
+        inside this file's ``NXinstrument`` makes the file stop validating
+        — ``NXinstrument`` documents no electron column, and NXem's entry
+        has no ``instrument`` group at all to move to instead. Reaching
+        NXem's path means restructuring the entry around its
+        ``measurement``/``event`` hierarchy, which is a bigger change than
+        one field justifies. ``NXsource`` is a documented home in both,
+        and it validates.
+
+        Written from the first frame, since a recording is one acquisition
+        at one high tension; anything that varied is in the per-frame
+        column. Omitted entirely when no frame reported a voltage, rather
+        than written as zero.
+
+        Parameters
+        ----------
+        entry : h5py.Group
+            The file's ``NXentry`` group.
+        """
+        voltage = (self._first_metadata or {}).get(HIGH_TENSION_V_KEY)
+        if not isinstance(voltage, (int, float)) or isinstance(voltage, bool):
+            return
+        source = entry["instrument"].create_group("source")
+        source.attrs["NX_class"] = "NXsource"
+        source["probe"] = "electron"
+        dataset = source.create_dataset("voltage", data=float(voltage))
+        dataset.attrs["units"] = "V"
 
     def _write_nxdata(self, entry: h5py.Group) -> None:
         """Create the NXdata group describing how to plot the frame stack."""

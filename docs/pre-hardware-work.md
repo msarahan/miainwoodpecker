@@ -113,30 +113,46 @@ centred on its own length rather than the other axis's (Nion passes
 sensor), and units outside this project's closed vocabulary degrade to
 pixels rather than being written as something nothing can interpret.
 
-### 2. Attach the metadata a frame is supposed to carry
+### 2. Attach the metadata a frame is supposed to carry — **done**
 
-Measured, not assumed: a scan frame from this project carries four
-metadata keys, and a camera frame carries two — `frame_number` and
-`integration_count`, whatever the simulator happened to put in
-`properties`.
+Measured before: a scan frame carried four metadata keys, and a camera
+frame carried two — `frame_number` and `integration_count`, whatever the
+simulator happened to put in `properties`.
 
 Nion has two tests whose entire purpose is to enumerate what must be
 there: `test_context_scan_attaches_required_metadata` and
-`test_acquire_attaches_required_metadata`. Between them they require the
-hardware source id and name, high tension, defocus, and — per device —
-binning and exposure, or channel id/name/index, fov, rotation, pixel
-time, line time, frame index, and a per-acquisition `scan_id`.
+`test_acquire_attaches_required_metadata`. The field *set* is now
+adopted; the *names* are not, because putting `stem.scan.fov_nm` in the
+vendor-neutral layer would be a vendor's schema wearing neutral clothing.
+The vocabulary is documented on `Frame` and read entirely from the
+instrument: `EHT` → 100000.0 V, `C10` → 500 nm, `BeamCurrent` → 2e−10 A,
+plus the scan's rotation, centre, flyback, and derived line and frame
+times.
 
-All of it is readable from the simulator today: `EHT` returns 100000.0 V,
-`C10` returns 5e−07 m, `BeamCurrent` returns 2e−10 A. NXem has homes for
-the instrument values, so this is also the missing content for the NeXus
-groups the writer currently leaves thin.
+Three decisions came out of building it.
 
-Two of these are worth calling out as more than bookkeeping. A
-per-acquisition `scan_id` shared by every channel of one scan is what
-makes multi-channel data reassemblable after the fact. And `frame_index`
-is the only thing that makes a dropped frame *visible* in a recording
-rather than silently absent.
+- **Instrument state is read per frame, not cached at connect.** Three
+  `TryGetVal` calls, measured at 4.6 µs, against a `focal_series` that
+  changes defocus *between* frames — a cached value would label every
+  frame in a sweep with the first one's defocus, wrong in exactly the
+  workflow that needs it most.
+- **No `scan_id`.** Nion's groups the channels of one simultaneous
+  multi-channel scan. This interface has no such call — a second channel
+  is a second `scan_frame`, and therefore a second pass of the beam — so
+  an id claiming to group them would be a fiction. `frame_index` is per
+  device, gapless from zero, which is what makes a dropped frame
+  *visible* rather than silently absent.
+- **The accelerating voltage gets a real NeXus home; the rest does not.**
+  `NXsource.voltage` inside the existing `NXinstrument`, measured against
+  the schema validator. NXem's own path for it
+  (`measurement/eventID/instrument/ebeam_column/electron_source`) does
+  **not** work here and it is worth recording why: `NXinstrument`
+  documents no electron column, so an `NXebeam_column` inside one makes
+  the file stop validating, and NXem's entry has no `instrument` group to
+  move to instead. Reaching NXem's path means restructuring the entry
+  around its `measurement`/`event` hierarchy — a bigger change than one
+  field justifies. Everything else stays in the per-frame JSON, which is
+  what that column is for.
 
 ### 3. Exposure and binning control
 

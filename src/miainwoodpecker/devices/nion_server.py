@@ -314,6 +314,62 @@ def _axis_calibration_spec(
     }
 
 
+# Vendor control names for the instrument state every acquired frame
+# carries, mapped to the neutral key and the factor that puts it in the
+# operator's units. "EHT", "C10" and "BeamCurrent" are Nion's own names:
+# its required-metadata tests read EHT and C10 by those names, and
+# device_kit's instrument publishes BeamCurrent alongside them.
+_FRAME_STATE_CONTROLS = (
+    ("high_tension_v", "EHT", 1.0),
+    ("defocus_nm", _DEFOCUS_CONTROL_NAME, _NM_PER_M),
+    ("beam_current_a", "BeamCurrent", 1.0),
+)
+
+
+def _instrument_state(
+    controller: typing.Any,  # noqa: ANN401 - vendor STEMController
+) -> dict[str, float]:
+    """
+    Read the instrument state that belongs on every frame, in operator units.
+
+    Read per frame rather than cached at connect time, deliberately. The
+    cost is negligible (three ``TryGetVal`` calls, measured at 4.6us
+    against usim) and the correctness is not: ``focal_series`` changes the
+    defocus *between* frames, so a cached value would label every frame in
+    the sweep with the defocus of the first one — wrong in exactly the
+    workflow that most needs it right.
+
+    A control the instrument does not publish is omitted rather than
+    defaulted, because an absent key reads as "not reported" while a
+    stored zero reads as a measurement.
+
+    Parameters
+    ----------
+    controller : typing.Any
+        The vendor ``STEMController``, or ``None``.
+
+    Returns
+    -------
+    dict[str, float]
+        Neutral key to value, for each control this instrument reports.
+    """
+    if controller is None:
+        return {}
+    state = {}
+    for key, control_name, factor in _FRAME_STATE_CONTROLS:
+        try:
+            valid, value = controller.TryGetVal(control_name)
+        except Exception:  # noqa: BLE001, S112 - see below
+            # Not logged, deliberately: this runs on the frame path, and a
+            # controller that raises for a control it lacks would log once
+            # per frame forever. The consequence is visible without a log
+            # line anyway - the key is simply absent from every frame.
+            continue
+        if valid and value is not None:
+            state[key] = float(value) * factor
+    return state
+
+
 class NionCamera:
     """A ``Camera`` implementation wrapping a Nion device-kit camera device."""
 
@@ -325,6 +381,7 @@ class NionCamera:
         self._device = camera_device
         self._controller = controller
         self._closed = False
+        self._frame_index = 0
 
     @property
     def is_closed(self) -> bool:
@@ -420,11 +477,42 @@ class NionCamera:
         )
         if calibration is not None:
             metadata[_calibration.METADATA_KEY] = calibration
+        metadata.update(self._frame_metadata())
+        self._frame_index += 1
         return Frame(
             data=data,
             timestamp=_aware_utc(data_element.get("timestamp")),
             metadata=metadata,
         )
+
+    def _frame_metadata(self) -> dict[str, object]:
+        """Return the identity, instrument state, and detector labels for a frame."""
+        device = self._device
+        metadata: dict[str, object] = {
+            "device_id": self.camera_id,
+            "frame_index": self._frame_index,
+        }
+        for key, attribute in (
+            ("camera_name", "camera_name"),
+            ("camera_type", "camera_type"),
+        ):
+            value = getattr(device, attribute, None)
+            if value:
+                metadata[key] = str(value)
+        controls = getattr(device, "calibration_controls", None)
+        if controls and self._controller is not None:
+            # Resolved rather than read straight off the mapping: a device
+            # may publish gain as a *control* name instead of a literal,
+            # and this is the function that knows both spellings.
+            gain = _camera_base.get_instrument_calibration_value(
+                self._controller,
+                controls,
+                "counts_per_electron",
+            )
+            if isinstance(gain, (int, float)):
+                metadata["counts_per_electron"] = float(gain)
+        metadata.update(_instrument_state(self._controller))
+        return metadata
 
     def close(self) -> None:
         """
@@ -439,12 +527,61 @@ class NionCamera:
         self._device.close()
 
 
+def _scan_geometry(
+    frame_parameters: typing.Any,  # noqa: ANN401 - vendor ScanFrameParameters
+) -> dict[str, object]:
+    """
+    Report where and how the beam was scanned, beyond how far.
+
+    A field of view says how *much* was scanned; without the centre and
+    the rotation it does not say *which* region, so two scans of different
+    parts of a specimen are indistinguishable in the file. Both are
+    currently always the device's defaults — this interface offers no way
+    to set them — but they are read off the frame parameters actually used
+    rather than written as constants, so they stay true if that changes.
+
+    ``flyback_time_us`` is recorded for the same reason ``line_time_us``
+    is derived here: the line and frame times deliberately ignore flyback
+    (as Nion's own do), and this is the number a reader needs to correct
+    them.
+
+    Parameters
+    ----------
+    frame_parameters : typing.Any
+        The vendor ``ScanFrameParameters`` the scan was run with.
+
+    Returns
+    -------
+    dict[str, object]
+        Whichever of ``rotation_rad``, ``center_nm`` and
+        ``flyback_time_us`` the vendor object reports.
+    """
+    geometry: dict[str, object] = {}
+    rotation = getattr(frame_parameters, "rotation_rad", None)
+    if rotation is not None:
+        geometry["rotation_rad"] = float(rotation)
+    centre = getattr(frame_parameters, "center_nm", None)
+    if centre is not None:
+        # (y, x), the same axis order as ScanParameters.shape.
+        geometry["center_nm"] = (float(centre.y), float(centre.x))
+    flyback = getattr(frame_parameters, "flyback_time_us", None)
+    if flyback is not None:
+        geometry["flyback_time_us"] = float(flyback)
+    return geometry
+
+
 class NionScanner:
     """A ``Scanner`` implementation wrapping a Nion device-kit scan device."""
 
-    def __init__(self, scan_device: _DeviceKitScanDevice) -> None:
+    def __init__(
+        self,
+        scan_device: _DeviceKitScanDevice,
+        controller: typing.Any = None,  # noqa: ANN401 - vendor STEMController
+    ) -> None:
         self._device = scan_device
+        self._controller = controller
         self._closed = False
+        self._frame_index = 0
 
     @property
     def is_closed(self) -> bool:
@@ -482,20 +619,35 @@ class NionScanner:
             fov_nm=parameters.fov_nm,
         )
         data = self._device.get_scan_data(frame_parameters, channel)
+        metadata: dict[str, object] = {
+            "device_id": self.scanner_id,
+            "frame_index": self._frame_index,
+            "channel_index": channel,
+            "channel_name": self._device.get_channel_name(channel),
+            "fov_nm": parameters.fov_nm,
+            # The per-axis extent alongside the scalar, so storage
+            # divides what the scan actually covered rather than
+            # re-deriving it from a convention it could disagree with.
+            # Square pixels mean these differ on a non-square scan.
+            "fov_size_nm": parameters.fov_size_nm,
+            "pixel_time_us": parameters.pixel_time_us,
+            # Derived here rather than left to a reader, because
+            # reconstructing them needs the flyback convention and a
+            # reader does not have it. Nion's own required-metadata test
+            # notes that its line and frame times ignore flyback too, so
+            # these are the same quantity it records, not a better one.
+            "line_time_us": parameters.width * parameters.pixel_time_us,
+            "frame_time_s": (
+                parameters.height * parameters.width * parameters.pixel_time_us / 1e6
+            ),
+        }
+        metadata.update(_scan_geometry(frame_parameters))
+        metadata.update(_instrument_state(self._controller))
+        self._frame_index += 1
         return Frame(
             data=data,
             timestamp=datetime.datetime.now(tz=datetime.UTC),
-            metadata={
-                "channel_index": channel,
-                "channel_name": self._device.get_channel_name(channel),
-                "fov_nm": parameters.fov_nm,
-                # The per-axis extent alongside the scalar, so storage
-                # divides what the scan actually covered rather than
-                # re-deriving it from a convention it could disagree with.
-                # Square pixels mean these differ on a non-square scan.
-                "fov_size_nm": parameters.fov_size_nm,
-                "pixel_time_us": parameters.pixel_time_us,
-            },
+            metadata=metadata,
         )
 
     def close(self) -> None:
@@ -820,7 +972,7 @@ def simulated_instrument() -> Iterator[InstrumentDevices]:
     controller = configuration.instrument
     ronchigram_camera = NionCamera(configuration.ronchigram_camera_device, controller)
     eels_camera = NionCamera(configuration.eels_camera_device, controller)
-    scanner = NionScanner(configuration.scan_module.device)
+    scanner = NionScanner(configuration.scan_module.device, controller)
     instrument = NionInstrument(controller)
     try:
         yield InstrumentDevices(
@@ -1041,7 +1193,7 @@ def _devices_from_registry(notes: Sequence[str]) -> InstrumentDevices:
     return InstrumentDevices(
         ronchigram_camera=ronchigram_camera,
         eels_camera=eels_camera,
-        scanner=NionScanner(scan_module.device),
+        scanner=NionScanner(scan_module.device, controller),
         instrument=instrument,
         stage_size_nm=instrument.stage_size_nm(),
     )
