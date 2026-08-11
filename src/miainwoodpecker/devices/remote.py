@@ -116,6 +116,10 @@ from miainwoodpecker.devices.rpc import (
 )
 from miainwoodpecker.devices.shared_frame import SharedFrameReader, SharedFrameRef
 
+# The one server-side constant the client must agree on beyond the wire
+# protocol: which exit status means "retry with different ports".
+PORT_UNAVAILABLE_EXIT_STATUS = 4
+
 if typing.TYPE_CHECKING:
     from collections.abc import Iterator, Sequence
     from multiprocessing.connection import Connection
@@ -146,6 +150,14 @@ __all__ = [
 # here rather than passed as a parameter so no shipped call site can
 # reach it: remote_instrument() has no argument that turns them on.
 _TEST_HOOKS_ENV_VAR = "MIAINWOODPECKER_ENABLE_TEST_HOOKS"
+
+# How many times to re-pick ports when the server reports one was taken
+# between the client's probe and the server's bind.
+_PORT_RETRY_ATTEMPTS = 3
+# How long to watch a freshly spawned server for that specific early
+# exit. Short: it happens before the Nion import finishes, and a server
+# still alive after it is simply starting normally.
+_PORT_COLLISION_GRACE_S = 0.4
 
 _CONNECT_TIMEOUT_S = 15.0
 _TERMINATE_TIMEOUT_S = 5.0
@@ -980,6 +992,73 @@ class RemoteInstrumentDevices:
 RemoteSimulatedInstrument = RemoteInstrumentDevices
 
 
+def _start_server(
+    backend: str,
+    plugin_names: Sequence[str],
+) -> tuple[dict[str, int], bytes, subprocess.Popen[bytes]]:
+    """
+    Spawn a device server, retrying if a chosen port was taken meanwhile.
+
+    :func:`_free_port` picks ports by binding to port 0 and *releasing*
+    the socket, so the port is only reserved by convention until the
+    child binds it seconds later — after the subprocess has started and
+    imported the whole Nion stack. Anything else on the machine can claim
+    it in that window, and the more sessions start at once the likelier
+    that is: a parallel test run is the realistic case, and the failure
+    it produced was an anonymous traceback and a dead server.
+
+    Retrying with fresh ports is the fix that fits the existing design.
+    The alternative — binding in the parent and passing inherited fds —
+    removes the window entirely but changes how the server is launched,
+    which is a bigger change than the problem warrants for a race that
+    resolves on the next attempt.
+
+    Only :data:`~miainwoodpecker.devices.nion_server.PORT_UNAVAILABLE_EXIT_STATUS`
+    is retried. A missing instrument or a crash would just fail again, so
+    those surface immediately with their own diagnostics.
+
+    Parameters
+    ----------
+    backend : str
+        ``"simulated"`` or ``"hardware"``.
+    plugin_names : Sequence[str]
+        ``nionswift_plugin`` modules for the hardware backend.
+
+    Returns
+    -------
+    tuple[dict[str, int], bytes, subprocess.Popen[bytes]]
+        The bound ports, the shared authkey, and the running process.
+
+    Raises
+    ------
+    DeviceServerStartupError
+        If every attempt lost its ports to another process.
+    """
+    for _attempt in range(_PORT_RETRY_ATTEMPTS):
+        ports = {name: _free_port() for name in _TARGET_NAMES}
+        authkey = secrets.token_bytes(32)
+        process = _spawn_server(ports, authkey, backend, plugin_names)
+        # The server exits this way *before* serving anything, so a short
+        # wait either catches the collision or finds it still starting up;
+        # a still-running server is the normal case and falls straight
+        # through to the caller's own connect-with-retry.
+        try:
+            status = process.wait(timeout=_PORT_COLLISION_GRACE_S)
+        except subprocess.TimeoutExpired:
+            return ports, authkey, process
+        if status != PORT_UNAVAILABLE_EXIT_STATUS:
+            # Some other startup outcome; hand it back so the connect path
+            # raises with the server's own diagnostic rather than this
+            # function inventing one.
+            return ports, authkey, process
+    msg = (
+        f"the device server could not bind its ports on "
+        f"{_PORT_RETRY_ATTEMPTS} attempts; something on this machine is "
+        f"claiming localhost ports faster than they can be used"
+    )
+    raise DeviceServerStartupError(msg)
+
+
 def _spawn_server(
     ports: typing.Mapping[str, int],
     authkey: bytes,
@@ -1193,9 +1272,7 @@ def remote_instrument(
             f"{', '.join(sorted(BACKENDS))}"
         )
         raise ValueError(msg)
-    ports = {name: _free_port() for name in _TARGET_NAMES}
-    authkey = secrets.token_bytes(32)
-    process = _spawn_server(ports, authkey, backend, plugin_names)
+    ports, authkey, process = _start_server(backend, plugin_names)
     connections: dict[str, Connection] = {}
     try:
         deadline = time.monotonic() + _CONNECT_TIMEOUT_S

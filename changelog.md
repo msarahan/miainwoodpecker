@@ -47,6 +47,14 @@
 
 ### Changed
 
+- CI's `integration` job runs its tests in parallel (`pytest -n auto`),
+  cutting that suite from ~140s to ~52s. The worker count had to be
+  measured against the whole command: without coverage the suite is
+  bound by waiting on subprocesses and `-n 8` wins, but coverage makes
+  it CPU-bound and the ordering inverts (`-n 8` is 132s against `-n 4`'s
+  52s on four cores). The base `test` matrix stays serial, where xdist
+  measured slower than the 3.4s it would save.
+
 - Default HDF5 compression is now gzip + byte shuffle, which measured smaller,
   faster to write, *and* faster to read than plain gzip on every dataset
   (Ronchigram frames 0.694 → 0.532 ratio with write time roughly halved). Faster
@@ -58,6 +66,12 @@
 
 ### Fixed
 
+- The client re-picks ports and respawns when the device server reports
+  one was already bound. `_free_port()` probes a port and *releases* it,
+  so anything on the machine can claim it before the server binds
+  seconds later; the collision previously surfaced as an anonymous
+  traceback and a dead server. Rare serially, and likely enough under a
+  parallel test run to matter.
 - The device server crashed at startup: the connection-accounting methods
   added for orphan detection landed on `NionInstrument` rather than
   `_ServerSession`, so its accept thread and watchdog died with
