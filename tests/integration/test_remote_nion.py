@@ -736,7 +736,9 @@ def test_a_device_call_after_a_kill_fails_fast_and_names_the_cause(spawned_serve
         assert time.monotonic() - started < _FAIL_FAST_BUDGET_S
 
 
-def test_killing_the_server_mid_acquisition_fails_the_call_in_flight(spawned_servers):
+def test_killing_the_server_mid_acquisition_fails_the_call_in_flight(
+    monkeypatch, spawned_servers,
+):
     """
     A kill during a scan raises in the blocked call rather than hanging it.
 
@@ -746,19 +748,33 @@ def test_killing_the_server_mid_acquisition_fails_the_call_in_flight(spawned_ser
     exposure takes as long as it takes — so the only thing that can wake it
     is the socket closing. That it does, and that the resulting error names
     the cause, is what is asserted here.
+
+    "In flight" is arranged deterministically rather than raced for. This
+    originally sized a scan to be slow (4096x4096) and slept a fixed 0.3s
+    before killing, which is a bet on the machine: on a CI runner the scan
+    finished inside the window and the test failed on its own premise,
+    reporting nothing about the behaviour under test. The server's
+    ``MIAINWOODPECKER_DELAY_SCAN_S`` test hook now holds the scan open for a
+    known duration — the same approach the wedge hooks already take — and the
+    worker signals when it has actually issued the call, so no sleep is
+    guessing at anything.
     """
+    delay_s = 10.0
+    monkeypatch.setenv("MIAINWOODPECKER_DELAY_SCAN_S", str(delay_s))
     with remote_instrument() as instrument:
         server = spawned_servers[0]
         parameters = ScanParameters(
-            height=_SLOW_SCAN_SIZE,
-            width=_SLOW_SCAN_SIZE,
+            height=_LARGE_SIZE,
+            width=_LARGE_SIZE,
             pixel_time_us=1.0,
             fov_nm=instrument.stage_size_nm * 0.1,
         )
         outcome: dict[str, object] = {}
+        issued = threading.Event()
 
         def scan() -> None:
             started = time.monotonic()
+            issued.set()
             try:
                 instrument.scanner.scan_frame(parameters, channel=0)
             except BaseException as error:  # noqa: BLE001 - recorded for the assertions
@@ -767,14 +783,18 @@ def test_killing_the_server_mid_acquisition_fails_the_call_in_flight(spawned_ser
 
         worker = threading.Thread(target=scan)
         worker.start()
-        time.sleep(0.3)  # long enough that the scan is genuinely in flight
-        assert worker.is_alive(), "the scan finished before it could be killed"
+        assert issued.wait(timeout=_FAIL_FAST_BUDGET_S), "the scan never started"
+        # The call is issued and the server is sleeping in the hook, so the
+        # client is parked in recv(); killing now is guaranteed mid-flight.
+        assert worker.is_alive()
         server.send_signal(signal.SIGKILL)
         worker.join(timeout=_FAIL_FAST_BUDGET_S)
         assert not worker.is_alive()
 
     assert isinstance(outcome["error"], RemoteConnectionLostError)
-    assert outcome["elapsed_s"] < _FAIL_FAST_BUDGET_S
+    # Well inside the hook's delay, so the error came from the kill waking a
+    # blocked recv() rather than from the scan completing on its own.
+    assert outcome["elapsed_s"] < delay_s
     assert "SIGKILL" in str(outcome["error"])
 
 

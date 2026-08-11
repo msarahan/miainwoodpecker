@@ -144,6 +144,7 @@ _LOG_FILE_ENV_VAR = "MIAINWOODPECKER_DEVICE_LOG_FILE"
 # tests/integration/test_remote_nion.py.
 _WEDGE_SHUTDOWN_ENV_VAR = "MIAINWOODPECKER_WEDGE_SHUTDOWN"
 _WEDGE_HEALTH_ENV_VAR = "MIAINWOODPECKER_WEDGE_HEALTH"
+_DELAY_SCAN_ENV_VAR = "MIAINWOODPECKER_DELAY_SCAN_S"
 
 # Named rather than taken from ``__name__``: this module's usual entry
 # point is ``python -m miainwoodpecker.devices.nion_server``, under which
@@ -287,6 +288,16 @@ class NionScanner:
 
     def scan_frame(self, parameters: ScanParameters, channel: int = 0) -> Frame:
         """Scan and return a single frame from the given detector channel."""
+        delay_s = os.environ.get(_DELAY_SCAN_ENV_VAR)
+        if delay_s:
+            # Test hook, in the same spirit as the wedge hooks below: hold a
+            # scan open for a known duration so a test can kill the server
+            # while a call is genuinely in flight. Sizing a scan to be "slow
+            # enough" instead is a race against whatever machine CI runs on,
+            # and it lost one: a 4096x4096 scan finished inside the window on
+            # a fast runner, so the test failed on its own premise rather
+            # than on the behaviour it checks.
+            time.sleep(float(delay_s))
         frame_parameters = _ScanDeviceKit.ScanFrameParameters(
             pixel_size=(parameters.height, parameters.width),
             pixel_time_us=parameters.pixel_time_us,
