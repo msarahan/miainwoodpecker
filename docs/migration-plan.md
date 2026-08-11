@@ -338,16 +338,63 @@ problem — read their source and docs before designing our own adapters:
   **Verdict: keep napari.** Phase 2's open question is closed for both
   scanned and camera live views.
 
-- [ ] **Unmeasured: display responsiveness while analysis runs.** napari's
-  per-update cost is CPU-side, and this measurement is demonstrably
-  sensitive to contention — the spread was 42% under software rendering
-  against a few percent on an idle GPU. Whether a HyperSpy or LiberTEM
-  job on the same machine degrades a live view is therefore a real
-  question and an unanswered one. `phase2_live_benchmark.py --load N`
-  now runs N CPU-saturating numpy workers during the display measurement
-  (numpy, so it competes for cores the way analysis does rather than for
-  the GIL), and `--source camera` times the camera path directly. Both
-  want running on real GPU hardware.
+- [x] **Measured: display responsiveness while analysis runs — bound the
+  analysis threads, not the viewer.** napari's per-update cost is
+  CPU-side, and this measurement was demonstrably sensitive to contention
+  (42% spread under software rendering against a few percent on an idle
+  GPU), so whether a HyperSpy or LiberTEM job on the same machine
+  degrades a live view was a real and unanswered question.
+  `phase2_live_benchmark.py --load N` runs N CPU-saturating numpy workers
+  during the display measurement — numpy, so they compete for cores the
+  way analysis does rather than for the GIL — and `--source camera` times
+  the camera path directly. Run on the M2 Pro, camera source, 512²:
+
+  | load | acquire median | display median | display p95 | display max |
+  |---|---|---|---|---|
+  | 0 | 5.5 ms | **5.6 ms** | 7.6 ms | 516 ms |
+  | 4 | 5.6 ms | **3.1 ms** | 23.0 ms | 649 ms |
+  | 8 | 5.7 ms | **17.8 ms** | 23.7 ms | **4031 ms** |
+
+  **Acquire does not move: 5.5 → 5.7 ms across zero to eight competing
+  workers, a 3% spread.** The device server is a separate process and the
+  client's side of a grab is IPC plus a shared-memory read, not
+  computation, so contention lands on display alone. That is the design
+  working, and it means the question really was a viewer question.
+
+  **The tail degrades a full load level before the median does, and the
+  median briefly gets *better*.** At four workers the median improves to
+  3.1 ms — the background load holds the CPU in a high-performance state
+  that an idle machine drops out of — while p95 triples, 7.6 → 23.0 ms.
+  Reporting a frame rate off the median (the script prints 318 fps here)
+  is therefore actively misleading at exactly the point where the user
+  first notices something: a distribution going bimodal, not a mean going
+  up. **p95 is the statistic that matters for a live view, and the
+  benchmark's headline fps number is not it.**
+
+  **At eight workers it stops being a statistic and becomes a
+  four-second freeze.** The median follows the tail up (17.8 ms, ~56 fps)
+  and the worst update is 4031 ms — 8× the idle run's worst, which is
+  itself a first-paint outlier rather than a steady-state one. That is
+  the GUI thread being descheduled outright, and no amount of
+  per-update efficiency fixes it: `ndv` would reduce the 5.6 ms, not the
+  4 seconds. **So this is not a second argument for changing viewer; it
+  is a scheduling constraint on our own code.**
+
+  **The actionable form: cap analysis parallelism below the core count.**
+  `viewer/jobs.py` already runs one analysis at a time on one worker
+  thread, so our own fan-out is not the problem — the numpy/BLAS and
+  LiberTEM executor threads *inside* that one job are, and they default
+  to every core. Whatever runs analysis should leave at least two cores
+  for the GUI thread (`OMP_NUM_THREADS`, LiberTEM's executor worker
+  count), which the `--load 4` row says costs the live view nothing.
+
+  **Camera live views measured at half the scan path, as predicted from
+  the code.** 5.6 ms median here against the scan loop's 11–12 ms above,
+  on the same machine — the `autocontrast_every_frame=True`/`False` split
+  in `viewer/live.py` reasoned about in the previous item, now observed
+  rather than inferred. Note the corollary for the item above: the scan
+  figures quoted there are the pessimistic side of the pair, and the
+  cheaper path is the one a Ronchigram or spectrometer view takes.
 
   Earlier figures on this container (llvmpipe software rasterization)
   were acquire ~14.5 ms, display 33.6–47.7 ms across four runs. Real GPU
@@ -391,9 +438,11 @@ problem — read their source and docs before designing our own adapters:
     old 3.35× as "napari is 3× too slow" should note it was size-specific.
     This strengthens rather than weakens the decision to withhold judgement
     until the GPU re-run.
-- [ ] Re-run the benchmark on a GPU workstation at real scan rates. Only a
-  hardware-accelerated result showing display still dominating justifies
-  moving to `ndv` or a custom VisPy canvas.
+- [x] Re-run the benchmark on GPU hardware. Done, on an M2 Pro (Metal-backed
+  OpenGL): the condition set here for moving to `ndv` — display still
+  dominating once hardware-accelerated — is not met at any scan size, and
+  the one regime where the fixed cost would bite is already routed to
+  LiberTEM-live. Keep napari; keep the analysis threads bounded.
 
 **Phase 3 — Acquisition and storage**
 - [x] Acquisition sequences —
