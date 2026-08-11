@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import datetime
 import json
+import logging
 import pathlib
 import typing
 import zipfile
@@ -58,6 +59,9 @@ _METADATA_MEMBER = "metadata.json"
 # Swift records acquisition time under a few different keys depending on
 # the version that wrote the file; try them in order of preference.
 _TIMESTAMP_KEYS = ("created", "datetime_original", "timestamp")
+
+
+_LOGGER = logging.getLogger("miainwoodpecker.storage.legacy")
 
 
 def _parse_timestamp(properties: typing.Mapping[str, typing.Any]) -> datetime.datetime:
@@ -142,9 +146,22 @@ def iter_ndata_directory(
     directory: os.PathLike[str] | str,
     *,
     recursive: bool = True,
+    skip_unreadable: bool = False,
 ) -> Iterator[Frame]:
     """
     Yield frames for every ``.ndata`` file in a directory, sorted by path.
+
+    The migration path for a whole Swift library, so the failure mode
+    matters more than it looks. By default one corrupt file still aborts
+    the run, which is the right default — a migration that silently
+    dropped data would be worse than one that stops and says why, and the
+    caller can see exactly which file it stopped on.
+
+    But "abort on the first bad file" is a poor answer for a ten-thousand
+    file library where one member is truncated, and it contradicted this
+    function's own promise of "one frame per *readable* file". Passing
+    ``skip_unreadable=True`` makes that promise true: unreadable files are
+    logged and skipped, and the rest of the library migrates.
 
     Parameters
     ----------
@@ -152,13 +169,26 @@ def iter_ndata_directory(
         Directory to scan, e.g. an exported Swift library.
     recursive : bool
         Whether to search subdirectories.
+    skip_unreadable : bool
+        Skip files that cannot be read instead of raising. Each skipped
+        file is logged at ``WARNING`` with the reason, so a migration
+        never drops data silently.
 
     Yields
     ------
     Frame
-        One frame per readable ``.ndata`` file.
+        One frame per ``.ndata`` file — per *readable* one when
+        ``skip_unreadable`` is set.
     """
     root = pathlib.Path(directory)
     pattern = "**/*.ndata" if recursive else "*.ndata"
     for path in sorted(root.glob(pattern)):
-        yield read_ndata(path)
+        if not skip_unreadable:
+            yield read_ndata(path)
+            continue
+        try:
+            frame = read_ndata(path)
+        except (ValueError, OSError) as error:
+            _LOGGER.warning("skipping %s: %s", path, error)
+            continue
+        yield frame

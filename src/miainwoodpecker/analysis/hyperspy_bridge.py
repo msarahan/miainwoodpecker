@@ -49,11 +49,10 @@ from __future__ import annotations
 
 import typing
 
-import h5py
 import hyperspy.api as hs
 
 from miainwoodpecker.storage.calibration import AXIS_NAMES
-from miainwoodpecker.storage.nexus import read_calibration
+from miainwoodpecker.storage.nexus import read_frames
 
 if typing.TYPE_CHECKING:
     import os
@@ -103,19 +102,11 @@ def _read(
 
     Raises
     ------
-    ValueError
+    NoFramesError
         If the file was written by an acquisition that produced no
-        frames (so it has no ``/entry/data`` group to read).
+        frames, so it has no ``NXdata`` group to read.
     """
-    with h5py.File(path, "r") as handle:
-        entry = handle["entry"]
-        if "data" not in entry:
-            msg = f"{path} has no /entry/data group; it recorded no frames"
-            raise ValueError(msg)
-        data_group = entry["data"]
-        data = data_group["data"][()]
-        frame_time = data_group["frame_time"][()]
-    return data, frame_time, read_calibration(path)
+    return read_frames(path)
 
 
 def _apply(axis: object, name: str, calibration: AxisCalibration) -> None:

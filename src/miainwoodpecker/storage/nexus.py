@@ -154,6 +154,7 @@ import typing
 
 import h5py
 
+from miainwoodpecker.storage import layout
 from miainwoodpecker.storage.calibration import (
     AXIS_NAMES,
     AxisCalibration,
@@ -725,6 +726,89 @@ def _axis_calibration_from_values(
     return AxisCalibration(kind, scale, offset, units)
 
 
+def read_frames(
+    path: os.PathLike[str] | str,
+) -> tuple[np.ndarray, np.ndarray, FrameCalibration]:
+    """
+    Read a whole recording — stack, times, and calibration — in one open.
+
+    The reader the Phase 4 analysis adapters share. Each of them used to
+    open the file itself for the arrays and then call
+    :func:`read_calibration`, which opens it a *second* time; each also
+    carried its own copy of the "this recording has no frames" check and
+    its message. So the layout was known in four places, the message in
+    four, and every analysis paid two opens of a file that can be tens of
+    megabytes.
+
+    Reads through :data:`~miainwoodpecker.storage.layout.NXDATA_GROUP`
+    rather than the detector group, deliberately: that is the group
+    ``close()`` creates, so a recording whose writer was abandoned is
+    refused here rather than analyzed as if it were complete. The viewer
+    already tells that story in words before it gets this far, and
+    :func:`read_series` is the reader that *does* recover such a file.
+
+    Parameters
+    ----------
+    path : os.PathLike[str] | str
+        An HDF5 file written by :class:`NexusWriter`.
+
+    Returns
+    -------
+    tuple[np.ndarray, np.ndarray, FrameCalibration]
+        The ``(frames, height, width)`` stack, the per-frame elapsed
+        times in seconds, and the ``y``/``x`` calibration.
+
+    Raises
+    ------
+    NoFramesError
+        If the acquisition produced no frames, so there is no ``NXdata``
+        group to read.
+    ValueError
+        If an axis's units are outside this project's vocabulary, so its
+        kind cannot be recovered rather than guessed.
+    """
+    with h5py.File(path, "r") as handle:
+        if layout.NXDATA_GROUP not in handle:
+            raise layout.NoFramesError(path)
+        data_group = handle[layout.NXDATA_GROUP]
+        data = data_group["data"][()]
+        frame_time = data_group["frame_time"][()]
+        calibration = FrameCalibration(
+            **{
+                name: _axis_calibration_from_values(
+                    data_group[name][()],
+                    _decoded(data_group[name].attrs["units"]),
+                )
+                for name in AXIS_NAMES
+            },
+        )
+    return data, frame_time, calibration
+
+
+def require_frames(path: os.PathLike[str] | str) -> None:
+    """
+    Raise unless a file holds an analyzable frame stack.
+
+    For an adapter that hands the path straight to a library rather than
+    reading the arrays itself — LiberTEM's ``Context.load`` opens the file
+    with its own reader — so it can still refuse an unfinalized recording
+    with this project's message instead of the library's much vaguer one.
+
+    Parameters
+    ----------
+    path : os.PathLike[str] | str
+        An HDF5 file written by :class:`NexusWriter`.
+
+    Raises
+    ------
+    NoFramesError
+        If the acquisition produced no frames.
+    """
+    with h5py.File(path, "r") as handle:
+        if layout.NXDATA_GROUP not in handle:
+            raise layout.NoFramesError(path)
+
+
 def read_calibration(path: os.PathLike[str] | str) -> FrameCalibration:
     """
     Read back the per-axis calibration a written file carries.
@@ -755,10 +839,9 @@ def read_calibration(path: os.PathLike[str] | str) -> FrameCalibration:
         kind cannot be recovered rather than guessed.
     """
     with h5py.File(path, "r") as handle:
-        if "data" not in handle["entry"]:
-            msg = f"{path} has no /entry/data group; it recorded no frames"
-            raise ValueError(msg)
-        data_group = handle["entry/data"]
+        if layout.NXDATA_GROUP not in handle:
+            raise layout.NoFramesError(path)
+        data_group = handle[layout.NXDATA_GROUP]
         axes = {
             name: _axis_calibration_from_values(
                 data_group[name][()],
@@ -806,10 +889,9 @@ def read_series(path: os.PathLike[str] | str) -> Iterator[tuple[np.ndarray, floa
         for a file written by an acquisition that produced no frames.
     """
     with h5py.File(path, "r") as handle:
-        detector = handle["entry/instrument/detector"]
-        if "data" not in detector:
+        if layout.DETECTOR_DATA not in handle:
             return
-        data = detector["data"]
-        times = detector["frame_time"]
+        data = handle[layout.DETECTOR_DATA]
+        times = handle[layout.DETECTOR_FRAME_TIME]
         for index in range(data.shape[0]):
             yield data[index], float(times[index])

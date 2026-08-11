@@ -82,6 +82,7 @@ import contextlib
 import dataclasses
 import datetime
 import json
+import os
 import re
 import shutil
 import threading
@@ -92,10 +93,10 @@ import h5py
 import numpy as np
 
 from miainwoodpecker.acquisition.sequence import record as record_frames
+from miainwoodpecker.storage import layout
 from miainwoodpecker.storage.nexus import read_series
 
 if typing.TYPE_CHECKING:
-    import os
     from collections.abc import Callable, Iterable, Iterator
 
     import numpy.typing as npt
@@ -540,16 +541,38 @@ class Session:
                 self._created = datetime.datetime.fromisoformat(created)
 
     def _save_sidecar(self) -> None:
-        """Write the session context sidecar."""
+        """
+        Write the session context sidecar atomically.
+
+        Write-temp-then-``os.replace`` rather than truncate-then-write,
+        for the same reason :meth:`reserve_path` claims a name with
+        ``O_EXCL``: a crash or a full disk part-way through used to leave
+        a truncated ``session.json``, and :meth:`_load_sidecar` swallows
+        the resulting ``ValueError`` and silently reverts the session to
+        blank context. Losing a shift's operator and sample that way is
+        worse than the write failing outright. This runs on every context
+        edit — including a debounced one while the operator is still
+        typing — so it is not a rare path.
+
+        ``os.replace`` is atomic within a filesystem, and the temporary
+        file is created in the session directory itself so the rename
+        never crosses one.
+        """
         payload = {
             "schema": _SIDECAR_SCHEMA,
             "created": self._created.isoformat(),
             **self._context,
         }
-        self._sidecar_path.write_text(
-            json.dumps(payload, indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
+        text = json.dumps(payload, indent=2, sort_keys=True) + "\n"
+        temporary = self._sidecar_path.with_name(
+            f"{self._sidecar_path.name}.{os.getpid()}.tmp",
         )
+        try:
+            temporary.write_text(text, encoding="utf-8")
+            temporary.replace(self._sidecar_path)
+        except OSError:
+            temporary.unlink(missing_ok=True)
+            raise
 
 
 class RecordingJob:
@@ -908,9 +931,21 @@ def read_session_context(path: os.PathLike[str] | str) -> dict[str, str]:
     """
     Read back the session context a recording was made in.
 
-    Reads the ``session_``-prefixed keys out of
-    ``/entry/metadata/vendor_metadata_json`` — one of the three places
-    described in this module's docstring — and strips the prefix.
+    Reads the real NeXus groups first — ``NXsample``, ``NXuser``,
+    ``NXnote`` — and falls back to the ``session_``-prefixed keys in the
+    vendor-metadata JSON blob.
+
+    That order is the correction. This module writes its context to both,
+    and it used to read back *only* the blob — so the groups whose whole
+    justification is "this is where standard tooling looks" were
+    write-only for the project that wrote them. Worse, the blob is the
+    copy that disappears exactly when the file is damaged: it holds the
+    first frame's metadata, written in ``close()``, so a recording with no
+    frames or an unfinalized writer returned ``{}`` while the ``NXuser``
+    group sitting in the same file had the answer. The blob is still read
+    because it carries fields NeXus has no home for (``label``, ``root``,
+    and the per-recording ``note``), and because files written before the
+    writer grew ``sample=``/``user=``/``notes=`` have only that.
 
     Parameters
     ----------
@@ -922,23 +957,86 @@ def read_session_context(path: os.PathLike[str] | str) -> dict[str, str]:
     dict[str, str]
         The context keys (``operator``, ``sample``, ``notes``, ``label``,
         ``root``, and ``note`` if the recording had one of its own). Empty
-        for a file written without a session, one whose acquisition produced
-        no frames (the writer persists the first frame's metadata, so no
-        frames means no metadata), and one whose writer never finalized it
-        (the metadata group is written in ``close()``).
+        only for a file written without a session at all.
     """
     with h5py.File(path, "r") as handle:
-        dataset = handle.get("entry/metadata/vendor_metadata_json")
-        if dataset is None:
-            return {}
-        raw = dataset[()]
-    text = raw.decode("utf-8") if isinstance(raw, bytes) else str(raw)
-    stored = json.loads(text)
-    return {
-        key.removeprefix(_CONTEXT_PREFIX): value
-        for key, value in stored.items()
-        if key.startswith(_CONTEXT_PREFIX) and isinstance(value, str)
-    }
+        context = _context_from_nexus_groups(handle)
+        dataset = handle.get(layout.VENDOR_METADATA)
+        raw = None if dataset is None else dataset[()]
+    if raw is not None:
+        text = raw.decode("utf-8") if isinstance(raw, bytes) else str(raw)
+        stored = json.loads(text)
+        for key, value in stored.items():
+            if key.startswith(_CONTEXT_PREFIX) and isinstance(value, str):
+                # The groups win where both have it: they are what the
+                # file actually declares to a NeXus reader.
+                context.setdefault(key.removeprefix(_CONTEXT_PREFIX), value)
+    return context
+
+
+def _read_text(group: object, field: str) -> str | None:
+    """
+    Return a NeXus text field as ``str``, or None if it is absent.
+
+    Parameters
+    ----------
+    group : object
+        An open ``h5py.File`` to read the field from.
+    field : str
+        Path to the field, relative to the file root.
+
+    Returns
+    -------
+    str | None
+        The decoded text, or None when the field is not there.
+    """
+    dataset = group.get(field)
+    if dataset is None:
+        return None
+    raw = dataset[()]
+    return raw.decode("utf-8") if isinstance(raw, bytes) else str(raw)
+
+
+def _context_from_nexus_groups(handle: object) -> dict[str, str]:
+    """
+    Read session context from the NXsample and NXuser groups.
+
+    **Not ``NXnote``, and that turned out to be the interesting part.**
+    ``sample`` and ``operator`` reach their groups verbatim
+    (``/entry/sample/name``, ``/entry/user/name``), so reading them back
+    is a genuine round trip. The note field is different by design:
+    :func:`_compose_notes` merges the session's standing notes with this
+    recording's own and prefixes each with its scope, precisely so a
+    reader can tell them apart. That makes ``NXnote/description`` a
+    *rendering* of two fields rather than either one of them, and
+    recovering ``notes`` from it would hand back ``"session: grid 3"``
+    where the session holds ``"grid 3"``.
+
+    So the raw notes still come from the JSON blob, which stores the two
+    scopes separately. Worth stating rather than leaving as a silent
+    omission: it is the reason this function does not simply read every
+    group the writer emits, and a future reader who "fixes" the apparent
+    gap would reintroduce the bug.
+
+    Parameters
+    ----------
+    handle : object
+        An open ``h5py.File``.
+
+    Returns
+    -------
+    dict[str, str]
+        Whichever of ``sample`` and ``operator`` the file declares.
+    """
+    found: dict[str, str] = {}
+    for key, field in (
+        ("sample", f"{layout.SAMPLE_GROUP}/name"),
+        ("operator", f"{layout.USER_GROUP}/name"),
+    ):
+        value = _read_text(handle, field)
+        if value:
+            found[key] = value
+    return found
 
 
 def default_root(base: os.PathLike[str] | str | None = None) -> Path:
@@ -1274,6 +1372,36 @@ def _modified_at(path: Path) -> datetime.datetime:
     return datetime.datetime.fromtimestamp(stamp, tz=datetime.UTC)
 
 
+def _is_locked(error: OSError) -> bool:
+    """
+    Return whether an open failed because the file is in use, not broken.
+
+    HDF5 reports a file locked by a concurrent writer as a plain
+    ``OSError`` with the reason in its message rather than as a distinct
+    exception type or ``errno``, so this matches on the text the library
+    actually produces. Matching text is unlovely; the alternative is
+    calling a live acquisition damaged, which is worse. A false negative
+    just restores the old behaviour, so the failure mode is the one that
+    was already there.
+
+    Parameters
+    ----------
+    error : OSError
+        The exception ``h5py.File`` raised.
+
+    Returns
+    -------
+    bool
+        True when the message names a locking or concurrent-access
+        problem.
+    """
+    text = str(error).lower()
+    return any(
+        marker in text
+        for marker in ("unable to lock", "file is already open", "resource temporarily")
+    )
+
+
 def _inspect(path: Path) -> tuple[int, bool, bool]:
     """
     Return a file's frame count, whether it opens, and whether it was finalized.
@@ -1298,11 +1426,24 @@ def _inspect(path: Path) -> tuple[int, bool, bool]:
     """
     try:
         with h5py.File(path, "r") as handle:
-            dataset = handle.get("entry/instrument/detector/data")
+            dataset = handle.get(layout.DETECTOR_DATA)
             count = 0 if dataset is None else int(dataset.shape[0])
-            return count, True, "entry/data" in handle
-    except (OSError, KeyError):
+            return count, True, layout.NXDATA_GROUP in handle
+    except FileNotFoundError:
+        # Vanished between the listing and the open.
+        return 0, False, False
+    except OSError as error:
+        if _is_locked(error):
+            # Being written right now, by a RecordingJob in this process or
+            # another one pointed at the same directory. HDF5 refuses the
+            # read rather than the file being broken, and reporting that as
+            # "damaged - does not open" would tell an operator their
+            # in-progress acquisition had failed. Treated as an
+            # unfinalized-but-live recording, which is what it is.
+            return 0, True, False
         # A reserved-but-unwritten placeholder, or a write killed hard
         # enough to lose the HDF5 container. Both are real states an
         # operator can produce, so report them instead of raising.
+        return 0, False, False
+    except KeyError:
         return 0, False, False
