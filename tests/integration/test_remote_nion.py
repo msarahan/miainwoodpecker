@@ -25,6 +25,7 @@ import threading
 import time
 from multiprocessing.connection import Client
 
+import numpy as np
 import pytest
 
 pytest.importorskip("nion.usim_device", reason="requires the 'device' extra")
@@ -249,6 +250,104 @@ def test_repeated_large_frames_reuse_the_same_segment(microscope):
     scanner.scan_frame(parameters, channel=0)
     second_name = scanner._reader._segment.name  # noqa: SLF001
     assert first_name == second_name
+
+
+# ---------------------------------------------- frame identity
+#
+# Two contracts Nion asserts about its own scan device
+# (ScanControl_test.test_frame_do_not_change_after_acquisition and
+# test_consecutive_frames_have_unique_data). In-process for Nion they are
+# nearly tautological. Here they are not: every frame above the threshold
+# arrives through *one reused* shared-memory segment, so a caller holding
+# frame N while frame N+1 is written is exactly the situation the segment
+# reuse creates and the copy-out exists to survive.
+#
+# Both use frames comfortably above the threshold and identical in shape,
+# which is what guarantees the segment is reused rather than replaced.
+
+_IDENTITY_FRAME_SIZE = 256  # 256x256 float64 = 512KB, 8x the threshold
+_IDENTITY_FRAME_COUNT = 4
+
+
+def _identity_scan_parameters(microscope) -> ScanParameters:
+    """Return scan parameters that put a frame on the shared-memory path."""
+    return ScanParameters(
+        height=_IDENTITY_FRAME_SIZE,
+        width=_IDENTITY_FRAME_SIZE,
+        pixel_time_us=1.0,
+        fov_nm=microscope.stage_size_nm * 0.1,
+    )
+
+
+def test_a_held_frame_does_not_change_when_later_frames_arrive(microscope):
+    """
+    Frames already returned stay as they were, however many follow them.
+
+    The failure this rules out is specific and silent: if ``_frame`` handed
+    back a view onto the shared segment instead of copying out of it, every
+    frame a caller was holding would mutate under them on the next
+    acquisition — a live viewer's history, a recording's buffered frames,
+    a focal series' earlier steps. Checksums are taken as each frame
+    arrives and re-checked at the end, which is Nion's own construction.
+    """
+    scanner = microscope.scanner
+    parameters = _identity_scan_parameters(microscope)
+    frames = []
+    checksums = []
+    for _ in range(_IDENTITY_FRAME_COUNT):
+        frame = scanner.scan_frame(parameters, channel=0)
+        assert frame.data.nbytes >= _SHARED_MEMORY_THRESHOLD_BYTES
+        frames.append(frame)
+        checksums.append(float(np.sum(frame.data)))
+    for checksum, frame in zip(checksums, frames, strict=True):
+        assert float(np.sum(frame.data)) == checksum
+
+
+def test_consecutive_frames_are_not_the_same_frame_twice(microscope):
+    """
+    Successive scans of one region differ, so no frame is a stale re-read.
+
+    The complement of the test above: that one catches a frame being
+    overwritten, this one catches a frame never being written — a reader
+    that returns whatever the segment last held would pass every checksum
+    test while showing the operator a frozen image. Shot noise makes two
+    scans of the same region differ in every row; Nion's version notes
+    this is invalid on a saturated detector, which is why the assertion
+    is on rows rather than on an exact-equality of the whole frame.
+    """
+    scanner = microscope.scanner
+    parameters = _identity_scan_parameters(microscope)
+    first = scanner.scan_frame(parameters, channel=0)
+    for _ in range(_IDENTITY_FRAME_COUNT - 1):
+        later = scanner.scan_frame(parameters, channel=0)
+        identical_rows = int(np.sum(np.all(first.data == later.data, axis=1)))
+        assert identical_rows == 0
+
+
+def test_a_big_scan_does_not_prevent_the_next_one(microscope):
+    """
+    A scan large enough to force a new segment leaves the device usable.
+
+    Ported from Nion's ``test_big_scan_does_not_prevent_further_playing``.
+    The suite already scans 4096² to prove the big scan itself succeeds;
+    what it never checked is the half that actually bites, because the
+    large frame replaces the shared segment — a client that failed to
+    follow the new segment would break on the *next*, ordinary scan
+    rather than on the big one.
+    """
+    scanner = microscope.scanner
+    fov_nm = microscope.stage_size_nm * 0.1
+    big = ScanParameters(
+        height=_LARGE_SIZE,
+        width=_LARGE_SIZE,
+        pixel_time_us=1.0,
+        fov_nm=fov_nm,
+    )
+    scanner.scan_frame(big, channel=0)
+    ordinary = ScanParameters(height=32, width=48, pixel_time_us=1.0, fov_nm=fov_nm)
+    frame = scanner.scan_frame(ordinary, channel=0)
+    assert frame.data.shape == ordinary.shape
+    assert float(np.std(frame.data)) > 0.0
 
 
 def test_outgrowing_the_segment_creates_a_new_one_and_frees_the_old(microscope):
