@@ -66,6 +66,28 @@ to an environment this container cannot reproduce:
   the wrong one: a detector's contents are specified by the standard, so
   the file stopped validating. It belongs in the `NXcollection` that
   already exists for exactly this — data no base class describes.
+- *The orphan-watchdog commit hung every device-server startup — and
+  reached `main` before anything executed it.* A text-anchored patch
+  meant to add the connection-accounting methods to `_ServerSession`
+  anchored on `def health(...)`, which exists on **two** classes, and
+  injected them into `NionInstrument` instead. Every static check passed
+  — methods on the wrong class are perfectly well-formed — and no test
+  runnable without the Nion stack executes `serve()`, so 242 local tests,
+  ruff, and pydoclint stayed green while the server's instrument accept
+  thread and watchdog crashed at startup with `AttributeError`. The PR
+  merged while its `integration` job (the only executor of that path) was
+  still running; the job then hung rather than failed, because the
+  half-dead server accepted TCP but never completed the handshake, and
+  `multiprocessing`'s `Client()` blocks with no timeout — so the
+  client-side connect deadline could never fire. Three fixes: the methods
+  moved to the right class; connection attempts are now bounded by the
+  connect deadline even mid-handshake (`_connect_once`, with a
+  base-environment regression test that simulates the half-dead server
+  with a bare socket); and the Nion stack is now installed in the dev
+  container, so the device suites run before a push instead of first
+  running in CI. The lesson generalizes: a check that has never executed
+  the code it guards is not a check, and merging while it runs is
+  betting it will pass.
 - *The SIGTERM handler made a wedged server harder to kill, not easier.*
   Parking straight from the handler meant that when the park itself was
   what had wedged — the case SIGTERM most needs to reach — the handler

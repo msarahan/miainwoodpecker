@@ -1,42 +1,62 @@
-# Welcome to miainwoodpecker's documentation
+# miainwoodpecker
+
+Instrument control and data analysis for scanning transmission electron
+microscopes — a [Nion Swift](https://github.com/nion-software/nionswift)
+replacement built as thin glue over tools the scientific Python
+community already maintains: napari for display, NeXus/HDF5 for data,
+HyperSpy/LiberTEM/py4DSTEM for analysis.
+
+There are two ways to use it, and they are the same thing underneath —
+every button in the viewer is one call into the Python API, and both
+write identical files into shared sessions:
+
+::::{grid} 2
+
+:::{grid-item-card} At the microscope
+:link: using-the-viewer
+:link-type: doc
+Launch the live viewer, watch the scan and camera, record data, and get
+a first look at it — with a translation table for habits from Nion
+Swift and DigitalMicrograph.
+:::
+
+:::{grid-item-card} From code
+:link: scripting-and-automation
+:link-type: doc
+Script acquisitions and experiments, manage sessions, load recordings
+into HyperSpy/LiberTEM/py4DSTEM, migrate Swift libraries — and what it
+takes to put an AI agent at the controls.
+:::
+
+::::
+
+Data is saved as standard NeXus HDF5 with calibrated axes: no private
+format, no export step, readable by anything that speaks HDF5.
+
+The project is young. Everything works against the bundled microscope
+simulator; validation on real hardware is the current frontier (see the
+[hardware validation checklist](hardware-validation-checklist.md)).
+
+## For developers
+
+The design history is documented unusually thoroughly, decisions and
+measurements included:
+
+- [Migration plan](migration-plan.md) — the architecture, why each
+  piece was built or adopted, and the phased record of getting here.
+- [Architecture review](architecture-review.md) — a full-stack audit of
+  the implementation, findings and fixes.
+- [Development docs](documentation/index.md) — environments, linting,
+  publishing.
 
 :::{toctree}
 :maxdepth: 2
 :hidden:
-:caption: Contents:
 
-Home <self>
+Using the viewer <using-the-viewer>
+Scripting and automation <scripting-and-automation>
 Migration plan <migration-plan>
 Architecture review <architecture-review>
 Hardware validation checklist <hardware-validation-checklist>
-Documentation <documentation/index>
+Development <documentation/index>
 :::
-
-This documentation uses myst as the primary documentation syntax.
-
-:::{button-link} <https://myst-parser.readthedocs.io/en/latest/syntax/syntax.html>
-:color: primary
-:class: sd-rounded-pill float-left
-
-Learn more about myst markdown syntax.
-
-:::
-
-Myst is a version of markdown that has more formatting flexibility.
-This is what a sphinx directive looks like using myst markdown formatting:
-
-```markdown
-:::{toctree}
-:maxdepth: 2
-:caption: Contents:
-:::
-
-```
-
-If you see syntax like the syntax below, you are looking at rst.
-
-```rst
-.. toctree::
-   :maxdepth: 2
-   :caption: Contents:
-```

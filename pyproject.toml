@@ -311,6 +311,11 @@ extra-dependencies = [
 [[tool.hatch.envs.test.matrix]]
 python = ["3.11", "3.12", "3.13"]
 
+# Deliberately serial. This env installs only the base package, so it
+# runs the unit suite - 206 tests in ~3.4s - and xdist made that
+# *slower* (4.0s), because spinning up workers costs more than the
+# tests take. Parallelism is enabled where it was measured to pay: the
+# integration env below.
 [tool.hatch.envs.test.scripts]
 run = "pytest {args:--cov=miainwoodpecker --cov-report=term-missing}"
 
@@ -336,10 +341,21 @@ features = [
 ]
 extra-dependencies = [
     "pytest-cov",
+    # Not inherited from the "test" env; this env does its own resolution.
+    "pytest-xdist",
 ]
 
+# One worker per core, and the worker count had to be measured against
+# the *whole* command rather than the tests alone. Without coverage this
+# suite is dominated by waiting on device-server subprocesses and napari,
+# so oversubscribing pays (-n 8 beat -n 4, 56s to 86s). Coverage
+# instrumentation makes it CPU-bound instead, and the ordering inverts:
+# on these 4 cores, serial 140s, -n 4 52s, -n 8 132s - barely better than
+# serial, because eight CPU-bound workers thrash four cores. `auto` is
+# therefore right for the reason rather than by luck: it tracks the
+# runner's core count, which is what the bound actually is here.
 [tool.hatch.envs.integration.scripts]
-run = "pytest {args:--cov=miainwoodpecker --cov-report=term-missing}"
+run = "pytest {args:-n auto --cov=miainwoodpecker --cov-report=term-missing}"
 
 #--------------- Validate written files against the NeXus schema ---------------#
 

@@ -224,30 +224,45 @@ def test_repeated_large_frames_reuse_the_same_segment(microscope):
     assert first_name == second_name
 
 
-def test_resize_creates_a_new_segment_and_frees_the_old_one(microscope):
-    """A shape change forces a new segment, and the old one is actually gone."""
+def test_outgrowing_the_segment_creates_a_new_one_and_frees_the_old(microscope):
+    """
+    A frame too big for the segment forces a new one, and the old one goes.
+
+    Sized relative to the segment's *current* capacity rather than to
+    fixed constants, because the writer only replaces a segment when a
+    frame does not fit — shrinking deliberately reuses it, which is what
+    stops an alternating workload from paying create/unlink per frame.
+    Fixed sizes made this test depend on what had run before it: any
+    earlier test scanning larger (the 4096² health-check scan, say)
+    left a segment both of these frames fit inside, so no resize
+    happened and the assertion failed. Serial execution in file order
+    hid that; running the module under ``pytest-xdist`` distributes the
+    tests and it surfaces immediately.
+    """
     scanner = microscope.scanner
-    small_large = ScanParameters(
-        height=_LARGE_SIZE,
-        width=_LARGE_SIZE,
-        pixel_time_us=1.0,
-        fov_nm=microscope.stage_size_nm * 0.1,
-    )
-    bigger = ScanParameters(
-        height=_LARGE_SIZE + 256,
-        width=_LARGE_SIZE + 256,
-        pixel_time_us=1.0,
-        fov_nm=microscope.stage_size_nm * 0.1,
-    )
-    scanner.scan_frame(small_large, channel=0)
+    fov_nm = microscope.stage_size_nm * 0.1
+
+    def scan(side: int) -> None:
+        scanner.scan_frame(
+            ScanParameters(
+                height=side, width=side, pixel_time_us=1.0, fov_nm=fov_nm
+            ),
+            channel=0,
+        )
+
+    scan(_LARGE_SIZE)
     first_name = scanner._reader._segment.name  # noqa: SLF001
-    scanner.scan_frame(bigger, channel=0)
+    capacity = scanner._reader._segment.size  # noqa: SLF001
+
+    # Comfortably past the current capacity, whatever earlier tests left it at.
+    side = int((capacity / 8) ** 0.5) + 512
+    scan(side)
+
     second_name = scanner._reader._segment.name  # noqa: SLF001
-    assert first_name != second_name
+    assert second_name != first_name
+    assert scanner._reader._segment.size > capacity  # noqa: SLF001
     if _DEV_SHM.is_dir():
         assert first_name not in _shm_names()
-    # Leave the target back at a size later tests in this module expect.
-    scanner.scan_frame(small_large, channel=0)
 
 
 def test_no_shared_memory_segments_leak_after_teardown():

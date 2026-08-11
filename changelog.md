@@ -38,7 +38,22 @@
 - `docs/hardware-validation-checklist.md`: the ordered procedure for what
   cannot be verified against the simulator.
 
+- Two user-facing guides, cross-linked as the documentation's front door:
+  [Using the viewer](docs/using-the-viewer.md) for operating from the
+  screen (with a translation table for Nion Swift and DigitalMicrograph
+  habits) and [Scripting and automation](docs/scripting-and-automation.md)
+  for driving the same capabilities from Python, including what it takes
+  to put an AI agent at the controls.
+
 ### Changed
+
+- CI's `integration` job runs its tests in parallel (`pytest -n auto`),
+  cutting that suite from ~140s to ~52s. The worker count had to be
+  measured against the whole command: without coverage the suite is
+  bound by waiting on subprocesses and `-n 8` wins, but coverage makes
+  it CPU-bound and the ordering inverts (`-n 8` is 132s against `-n 4`'s
+  52s on four cores). The base `test` matrix stays serial, where xdist
+  measured slower than the 3.4s it would save.
 
 - Default HDF5 compression is now gzip + byte shuffle, which measured smaller,
   faster to write, *and* faster to read than plain gzip on every dataset
@@ -51,6 +66,22 @@
 
 ### Fixed
 
+- The client re-picks ports and respawns when the device server reports
+  one was already bound. `_free_port()` probes a port and *releases* it,
+  so anything on the machine can claim it before the server binds
+  seconds later; the collision previously surfaced as an anonymous
+  traceback and a dead server. Rare serially, and likely enough under a
+  parallel test run to matter.
+- The device server crashed at startup: the connection-accounting methods
+  added for orphan detection landed on `NionInstrument` rather than
+  `_ServerSession`, so its accept thread and watchdog died with
+  `AttributeError`. Nothing caught it before CI, because no test runnable
+  without the `device` extra executes `serve()`.
+- A client connecting to a half-dead server hung forever rather than
+  failing: the crashed accept thread left the port open, so TCP connected
+  but the authentication handshake never completed, and
+  `multiprocessing.connection.Client` has no timeout. Connection attempts
+  are now bounded by the existing connect deadline even mid-handshake.
 - `NexusWriter` no longer declares `definition = "NXem"` by default. Validation
   showed the files did not conform (a required `NXsample` group was missing), so
   they now claim no application definition unless real specimen metadata is

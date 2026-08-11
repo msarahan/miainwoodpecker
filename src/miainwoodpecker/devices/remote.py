@@ -116,6 +116,10 @@ from miainwoodpecker.devices.rpc import (
 )
 from miainwoodpecker.devices.shared_frame import SharedFrameReader, SharedFrameRef
 
+# The one server-side constant the client must agree on beyond the wire
+# protocol: which exit status means "retry with different ports".
+PORT_UNAVAILABLE_EXIT_STATUS = 4
+
 if typing.TYPE_CHECKING:
     from collections.abc import Iterator, Sequence
     from multiprocessing.connection import Connection
@@ -146,6 +150,14 @@ __all__ = [
 # here rather than passed as a parameter so no shipped call site can
 # reach it: remote_instrument() has no argument that turns them on.
 _TEST_HOOKS_ENV_VAR = "MIAINWOODPECKER_ENABLE_TEST_HOOKS"
+
+# How many times to re-pick ports when the server reports one was taken
+# between the client's probe and the server's bind.
+_PORT_RETRY_ATTEMPTS = 3
+# How long to watch a freshly spawned server for that specific early
+# exit. Short: it happens before the Nion import finishes, and a server
+# still alive after it is simply starting normally.
+_PORT_COLLISION_GRACE_S = 0.4
 
 _CONNECT_TIMEOUT_S = 15.0
 _TERMINATE_TIMEOUT_S = 5.0
@@ -346,14 +358,14 @@ def _connect_with_retry(
     Raises
     ------
     DeviceServerStartupError
-        If the server exited before accepting connections.
+        If the server exited before accepting connections, or if the
+        deadline passed with a connection attempt still blocked inside
+        the authentication handshake — the wedged-at-startup case below.
     ConnectionRefusedError
         If ``deadline`` passed with the server still alive but not listening.
     OSError
         For any other socket-level failure past the deadline.
     """
-    from multiprocessing.connection import Client  # noqa: PLC0415
-
     while True:
         if process.poll() is not None:
             msg = (
@@ -366,7 +378,7 @@ def _connect_with_retry(
             )
             raise DeviceServerStartupError(msg)
         try:
-            connection = Client(("localhost", port), authkey=authkey)
+            connection = _connect_once(port, authkey, deadline)
         except (ConnectionRefusedError, OSError):
             if time.monotonic() > deadline:
                 raise
@@ -374,6 +386,90 @@ def _connect_with_retry(
         else:
             disable_nagle(connection)
             return connection
+
+
+def _connect_once(port: int, authkey: bytes, deadline: float) -> Connection:
+    """
+    Make one connection attempt, bounded by the caller's deadline.
+
+    ``multiprocessing.connection.Client`` blocks with **no timeout**
+    through both the TCP connect and the authentication handshake, so
+    the retry loop's deadline could never fire while an attempt was in
+    flight. Against a server that accepts the TCP connection but never
+    completes the handshake, the client hung forever inside its first
+    attempt — not a hypothetical: a server whose instrument accept
+    thread crashed at startup produced exactly this, hanging every test
+    run that touched it until something external killed it.
+
+    The attempt therefore runs on a scrap daemon thread and is abandoned
+    if the deadline passes. Abandoning is safe precisely because the
+    result is discarded: the thread holds only its own socket, which dies
+    with it or the process, and nothing else ever learns the connection
+    existed. A thread rather than a socket timeout, deliberately —
+    bounding it with ``socket.setdefaulttimeout`` would be process-global
+    state, and this project has already been bitten once by fd-mode side
+    effects on this exact path (see ``rpc.disable_nagle``).
+
+    Parameters
+    ----------
+    port : int
+        Port to connect to on localhost.
+    authkey : bytes
+        Shared secret for the connection handshake.
+    deadline : float
+        ``time.monotonic()`` value after which to abandon the attempt.
+
+    Returns
+    -------
+    Connection
+        The connected, authenticated client end.
+
+    Raises
+    ------
+    DeviceServerStartupError
+        If the deadline passed with the attempt still blocked — a server
+        that is alive but not completing handshakes, which retrying will
+        not fix.
+    ConnectionRefusedError
+        If nothing is listening on the port yet (the ordinary
+        during-startup case the retry loop exists for).
+    OSError
+        For other socket-level failures.
+    """
+    from multiprocessing.connection import Client  # noqa: PLC0415
+
+    outcome: list[object] = []
+    done = threading.Event()
+
+    def _attempt() -> None:
+        try:
+            outcome.append(Client(("localhost", port), authkey=authkey))
+        except BaseException as error:  # noqa: BLE001 - re-raised on the caller's thread
+            outcome.append(error)
+        done.set()
+
+    thread = threading.Thread(target=_attempt, name="device-connect", daemon=True)
+    thread.start()
+    if not done.wait(timeout=max(0.05, deadline - time.monotonic())):
+        msg = (
+            f"a connection attempt to the device server (port {port}) was "
+            f"still blocked in the handshake when the connect deadline "
+            f"passed - the server process is alive but not completing "
+            f"connections, which retrying will not fix"
+        )
+        raise DeviceServerStartupError(msg)
+    # Failures cross the thread boundary as objects and are re-raised here
+    # as fresh instances of the concrete classes the retry loop dispatches
+    # on, with the original chained as __cause__ so no diagnostic is lost.
+    result = outcome[0]
+    if isinstance(result, ConnectionRefusedError):
+        raise ConnectionRefusedError(*result.args) from result
+    if isinstance(result, OSError):
+        raise OSError(*result.args) from result
+    if isinstance(result, BaseException):
+        msg = f"the connection attempt failed unexpectedly: {result!r}"
+        raise DeviceServerStartupError(msg) from result
+    return typing.cast("Connection", result)
 
 
 class _RemoteDevice:
@@ -896,6 +992,73 @@ class RemoteInstrumentDevices:
 RemoteSimulatedInstrument = RemoteInstrumentDevices
 
 
+def _start_server(
+    backend: str,
+    plugin_names: Sequence[str],
+) -> tuple[dict[str, int], bytes, subprocess.Popen[bytes]]:
+    """
+    Spawn a device server, retrying if a chosen port was taken meanwhile.
+
+    :func:`_free_port` picks ports by binding to port 0 and *releasing*
+    the socket, so the port is only reserved by convention until the
+    child binds it seconds later — after the subprocess has started and
+    imported the whole Nion stack. Anything else on the machine can claim
+    it in that window, and the more sessions start at once the likelier
+    that is: a parallel test run is the realistic case, and the failure
+    it produced was an anonymous traceback and a dead server.
+
+    Retrying with fresh ports is the fix that fits the existing design.
+    The alternative — binding in the parent and passing inherited fds —
+    removes the window entirely but changes how the server is launched,
+    which is a bigger change than the problem warrants for a race that
+    resolves on the next attempt.
+
+    Only :data:`~miainwoodpecker.devices.nion_server.PORT_UNAVAILABLE_EXIT_STATUS`
+    is retried. A missing instrument or a crash would just fail again, so
+    those surface immediately with their own diagnostics.
+
+    Parameters
+    ----------
+    backend : str
+        ``"simulated"`` or ``"hardware"``.
+    plugin_names : Sequence[str]
+        ``nionswift_plugin`` modules for the hardware backend.
+
+    Returns
+    -------
+    tuple[dict[str, int], bytes, subprocess.Popen[bytes]]
+        The bound ports, the shared authkey, and the running process.
+
+    Raises
+    ------
+    DeviceServerStartupError
+        If every attempt lost its ports to another process.
+    """
+    for _attempt in range(_PORT_RETRY_ATTEMPTS):
+        ports = {name: _free_port() for name in _TARGET_NAMES}
+        authkey = secrets.token_bytes(32)
+        process = _spawn_server(ports, authkey, backend, plugin_names)
+        # The server exits this way *before* serving anything, so a short
+        # wait either catches the collision or finds it still starting up;
+        # a still-running server is the normal case and falls straight
+        # through to the caller's own connect-with-retry.
+        try:
+            status = process.wait(timeout=_PORT_COLLISION_GRACE_S)
+        except subprocess.TimeoutExpired:
+            return ports, authkey, process
+        if status != PORT_UNAVAILABLE_EXIT_STATUS:
+            # Some other startup outcome; hand it back so the connect path
+            # raises with the server's own diagnostic rather than this
+            # function inventing one.
+            return ports, authkey, process
+    msg = (
+        f"the device server could not bind its ports on "
+        f"{_PORT_RETRY_ATTEMPTS} attempts; something on this machine is "
+        f"claiming localhost ports faster than they can be used"
+    )
+    raise DeviceServerStartupError(msg)
+
+
 def _spawn_server(
     ports: typing.Mapping[str, int],
     authkey: bytes,
@@ -1109,9 +1272,7 @@ def remote_instrument(
             f"{', '.join(sorted(BACKENDS))}"
         )
         raise ValueError(msg)
-    ports = {name: _free_port() for name in _TARGET_NAMES}
-    authkey = secrets.token_bytes(32)
-    process = _spawn_server(ports, authkey, backend, plugin_names)
+    ports, authkey, process = _start_server(backend, plugin_names)
     connections: dict[str, Connection] = {}
     try:
         deadline = time.monotonic() + _CONNECT_TIMEOUT_S

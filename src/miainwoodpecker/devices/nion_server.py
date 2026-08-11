@@ -192,6 +192,15 @@ NO_HARDWARE_EXIT_STATUS = 2
 # state, which is worth surfacing rather than folding into a generic crash.
 PARK_TIMEOUT_EXIT_STATUS = 3
 
+# Exit status for "one of the ports handed to us was already taken".
+# Distinct because it is the one startup failure worth *retrying*: the
+# client picks ports by probing and releasing them, so a concurrent
+# process can claim one in between - likelier the more sessions start at
+# once, which is exactly what a parallel test run does. A retry with
+# fresh ports succeeds; retrying a missing instrument or a crash would
+# just repeat the failure, so those keep their own statuses.
+PORT_UNAVAILABLE_EXIT_STATUS = 4
+
 # How long a signal handler waits for the park before giving up and exiting.
 # Comfortably inside the client's own 5s terminate-to-kill escalation
 # (remote._TERMINATE_TIMEOUT_S), so a server that cannot park still dies of
@@ -520,37 +529,6 @@ class NionInstrument:
             "controls": list(self.available_controls()),
             "stage_size_nm": self.stage_size_nm(),
         }
-
-    def connection_opened(self) -> None:
-        """Record that a client connection was accepted."""
-        with self._connection_lock:
-            self._connections += 1
-            self._ever_connected = True
-        self._connection_change.set()
-
-    def connection_closed(self) -> None:
-        """Record that a client connection ended."""
-        with self._connection_lock:
-            self._connections = max(0, self._connections - 1)
-        self._connection_change.set()
-
-    @property
-    def is_orphaned(self) -> bool:
-        """Return whether every client connection has gone after having some."""
-        with self._connection_lock:
-            return self._ever_connected and self._connections == 0
-
-    def wait_for_connection_change(self, timeout: float | None = None) -> None:
-        """
-        Block until a connection opens or closes, or the timeout elapses.
-
-        Parameters
-        ----------
-        timeout : float | None
-            Seconds to wait, or None to wait indefinitely.
-        """
-        self._connection_change.wait(timeout)
-        self._connection_change.clear()
 
     def health(self) -> dict[str, object]:
         """
@@ -1058,6 +1036,37 @@ class _ServerSession:
         self.targets["instrument"] = devices.instrument
         self.writers["instrument"] = None
         devices.instrument.bind_session(self)
+
+    def connection_opened(self) -> None:
+        """Record that a client connection was accepted."""
+        with self._connection_lock:
+            self._connections += 1
+            self._ever_connected = True
+        self._connection_change.set()
+
+    def connection_closed(self) -> None:
+        """Record that a client connection ended."""
+        with self._connection_lock:
+            self._connections = max(0, self._connections - 1)
+        self._connection_change.set()
+
+    @property
+    def is_orphaned(self) -> bool:
+        """Return whether every client connection has gone after having some."""
+        with self._connection_lock:
+            return self._ever_connected and self._connections == 0
+
+    def wait_for_connection_change(self, timeout: float | None = None) -> None:
+        """
+        Block until a connection opens or closes, or the timeout elapses.
+
+        Parameters
+        ----------
+        timeout : float | None
+            Seconds to wait, or None to wait indefinitely.
+        """
+        self._connection_change.wait(timeout)
+        self._connection_change.clear()
 
     def health(self) -> dict[str, object]:
         """
@@ -1589,6 +1598,12 @@ def serve(
     orphan_grace_s : float
         Seconds with no client connections before the server parks the
         instrument and exits. See :func:`_orphan_watchdog`.
+
+    Raises
+    ------
+    SystemExit
+        With :data:`PORT_UNAVAILABLE_EXIT_STATUS` when a listener
+        cannot bind, so the client can retry with fresh ports.
     """
     from multiprocessing.connection import Listener as _Listener  # noqa: PLC0415
 
@@ -1601,9 +1616,18 @@ def serve(
     with open_instrument(backend, plugin_names) as devices:
         session = _ServerSession(devices, backend)
         names = list(session.targets)
-        listeners = [
-            _Listener(("localhost", ports[name]), authkey=authkey) for name in names
-        ]
+        try:
+            listeners = [
+                _Listener(("localhost", ports[name]), authkey=authkey)
+                for name in names
+            ]
+        except OSError as error:
+            _LOGGER.error(  # noqa: TRY400 - a traceback adds nothing here
+                "could not bind a listener (%s); the client will retry with "
+                "fresh ports",
+                error,
+            )
+            raise SystemExit(PORT_UNAVAILABLE_EXIT_STATUS) from error
         _LOGGER.info(
             "serving %s on ports %s",
             ", ".join(names),
