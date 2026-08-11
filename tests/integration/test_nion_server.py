@@ -37,8 +37,10 @@ pytest.importorskip("nion.usim_device", reason="requires the 'device' extra")
 from miainwoodpecker.devices import (
     BEAM_BLANKER_CONTROL,
     DEFOCUS_CONTROL,
+    ENERGY_OFFSET_CONTROL,
     STAGE_POSITION_CONTROL,
     Camera,
+    CameraParameters,
     InstrumentController,
     ScanParameters,
     Scanner,
@@ -47,10 +49,18 @@ from miainwoodpecker.devices.nion_server import (
     HARDWARE_BACKEND,
     SIMULATED_BACKEND,
     HardwareNotAvailableError,
+    NionCamera,
+    _axis_calibration_spec,
+    _instrument_state,
     _parse_args,
     hardware_instrument,
     open_instrument,
     simulated_instrument,
+)
+from miainwoodpecker.storage.calibration import (
+    AxisKind,
+    FrameCalibration,
+    resolve_frame_calibration,
 )
 
 # The usim plug-in, used as a stand-in for a vendor hardware plug-in so the
@@ -257,13 +267,14 @@ def test_open_instrument_dispatches_the_hardware_backend():
 
 
 def test_instrument_reports_the_controls_usim_actually_has():
-    """All three neutral controls resolve to real usim controls."""
+    """All four neutral controls resolve to real usim controls."""
     with simulated_instrument() as microscope:
         controls = set(microscope.instrument.available_controls())
         assert controls == {
             STAGE_POSITION_CONTROL,
             DEFOCUS_CONTROL,
             BEAM_BLANKER_CONTROL,
+            ENERGY_OFFSET_CONTROL,
         }
 
 
@@ -366,3 +377,426 @@ def test_park_blanks_the_beam():
         assert not instrument.is_beam_blanked()
         instrument.park()
         assert instrument.is_beam_blanked()
+
+
+# ------------------------------------------------- calibration from the
+#                                                    instrument
+#
+# A Nion camera publishes no calibration *values*. It publishes a
+# ``calibration_controls`` mapping naming the instrument controls that
+# hold them, which ``camera_base.build_calibration`` resolves at
+# acquisition time - because a camera's angular scale depends on the
+# projector lenses, so it is instrument state rather than a device
+# constant. These pin what usim actually reports through that path, which
+# is what the migration plan's §7 "nothing feeds calibration from the
+# instrument" gap needed.
+
+
+class _FakeCalibration:
+    """The two fields ``_axis_calibration_spec`` reads off a nion Calibration."""
+
+    def __init__(self, scale: float, units: str, offset: float = 0.0) -> None:
+        self.scale = scale
+        self.offset = offset
+        self.units = units
+
+
+class _ControllerWithoutControls:
+    """A STEM controller that reports no control this project asks for."""
+
+    def TryGetVal(  # noqa: N802 - vendor spelling
+        self,
+        name: str,  # noqa: ARG002 - part of the vendor signature being stood in for
+    ) -> tuple[bool, None]:
+        """
+        Report every control as absent, the way a bare STEMController does.
+
+        Parameters
+        ----------
+        name : str
+            The vendor control name, ignored — every one is absent here.
+
+        Returns
+        -------
+        tuple[bool, None]
+            Always ``(False, None)``.
+        """
+        return (False, None)
+
+
+class _CameraWithoutControls:
+    """A camera device that publishes no calibration controls at all."""
+
+    def __init__(self) -> None:
+        self.calibration_controls = {}
+
+
+def _frame_calibration(camera) -> tuple[FrameCalibration, tuple[int, ...]]:
+    """Acquire one frame and resolve the calibration its metadata carries."""
+    camera.start()
+    try:
+        frame = camera.acquire_frame()
+    finally:
+        camera.stop()
+    calibration = resolve_frame_calibration(frame.data.shape, metadata=frame.metadata)
+    return calibration, frame.data.shape
+
+
+def test_the_ronchigram_camera_reports_angular_axes():
+    """
+    Both Ronchigram axes arrive calibrated in radians, centred on the optic axis.
+
+    The centring is not this project's convention imposed on the data: the
+    offset comes back from the instrument's own ``ronchigram_x_offset``
+    control, and it equals ``-scale * n / 2`` because that is what an axis
+    through the optic axis means. Measured against usim: 2048 pixels at
+    ~9.83e-05 rad each, offset ~-0.1007 rad.
+    """
+    with simulated_instrument() as microscope:
+        calibration, shape = _frame_calibration(microscope.ronchigram_camera)
+        for name, length in zip(("y", "x"), shape, strict=True):
+            axis = calibration.axis(name)
+            assert axis.kind is AxisKind.ANGLE
+            assert axis.units == "rad"
+            assert axis.scale > 0.0
+            assert axis.offset == pytest.approx(-axis.scale * length / 2.0)
+
+
+def test_the_eels_camera_reports_energy_on_the_axis_the_device_names():
+    """
+    The dispersive axis is *reported*, not defaulted.
+
+    usim's EELS camera publishes ``eels_x_scale``/``eels_x_offset`` with
+    units eV and leaves the slow axis's units empty - the device's way of
+    saying that direction is not calibrated. Both halves matter: an
+    honest uncalibrated y axis is what stops a spectrum being flattened
+    along the wrong direction, and ``energy_axis_name`` is what the
+    HyperSpy adapter asks.
+    """
+    with simulated_instrument() as microscope:
+        calibration, _shape = _frame_calibration(microscope.eels_camera)
+        assert calibration.x.kind is AxisKind.ENERGY
+        assert calibration.x.units == "eV"
+        assert calibration.x.scale > 0.0
+        assert calibration.y.kind is AxisKind.UNCALIBRATED
+        assert calibration.energy_axis_name() == "x"
+
+
+def test_a_camera_with_no_controls_yields_an_uncalibrated_frame():
+    """
+    Missing controls produce an uncalibrated axis, not an error.
+
+    This is the failure mode that matters more than the success one: a
+    vendor camera that publishes no ``calibration_controls``, or names
+    controls this instrument does not have, must still acquire. Nion's own
+    ``test_calibrator_with_missing_controls`` asserts the same thing one
+    layer down.
+    """
+    # No instrument reference is needed for either case, and that is the
+    # point: both short-circuit before anything would be read off one.
+    unusable_controller = object()
+    assert (
+        NionCamera(_CameraWithoutControls(), unusable_controller).calibration_metadata(
+            (16, 16),
+        )
+        is None
+    )
+    # And a camera wrapped without an instrument at all, which is how the
+    # in-process helpers may construct one.
+    assert NionCamera(_CameraWithoutControls()).calibration_metadata((16, 16)) is None
+
+
+def test_binning_multiplies_the_calibration_scale():
+    """
+    A binned pixel spans proportionally more of the axis.
+
+    This is why binning and calibration are one piece of work rather than
+    two: adding binning without threading it through here would write axes
+    wrong by an integer factor, silently.
+    """
+    with simulated_instrument() as microscope:
+        camera = microscope.ronchigram_camera
+        unbinned = camera.calibration_metadata((2048, 2048))
+        binned = camera.calibration_metadata((1024, 1024), binning=2.0)
+        assert binned["x"]["scale"] == pytest.approx(2.0 * unbinned["x"]["scale"])
+
+
+def test_an_axis_in_units_this_project_cannot_express_stays_uncalibrated():
+    """
+    An unrecognized unit degrades to pixels rather than propagating.
+
+    Nion's calibration vocabulary is open (its own tests use ``"rad-old"``,
+    ``"counts-old2"``); this project's is a short closed list chosen so an
+    axis kind is recoverable from its units alone. A scale in units
+    nothing downstream can interpret is worth less than an admitted pixel
+    axis, so it is dropped here rather than raised at the writer.
+    """
+    assert _axis_calibration_spec(_FakeCalibration(scale=2.0, units="rad-old")) is None
+    assert _axis_calibration_spec(_FakeCalibration(scale=2.0, units="")) is None
+    assert _axis_calibration_spec(_FakeCalibration(scale=0.0, units="eV")) is None
+    assert _axis_calibration_spec(_FakeCalibration(scale=2.0, units="eV")) == {
+        "kind": "energy",
+        "scale": 2.0,
+        "offset": 0.0,
+        "units": "eV",
+    }
+
+
+# ------------------------------------------- the frame metadata contract
+#
+# Nion has two tests whose entire purpose is to enumerate what must be
+# attached to every acquired frame
+# (CameraControl_test.test_acquire_attaches_required_metadata and
+# ScanControl_test.test_context_scan_attaches_required_metadata). The set
+# is theirs; the names are ours, for the reason interface.py gives. Before
+# this, a scan frame carried four keys and a camera frame carried two.
+
+# usim's instrument: EHT = 100 kV, C10 = 5e-07 m, BeamCurrent = 2e-10 A.
+_EXPECTED_HIGH_TENSION_V = 100000.0
+_EXPECTED_DEFOCUS_NM = 500.0
+
+
+def _assert_instrument_state(metadata) -> None:
+    """Assert the instrument state every frame carries, in operator units."""
+    assert metadata["high_tension_v"] == pytest.approx(_EXPECTED_HIGH_TENSION_V)
+    # In nanometres, not the vendor's metres. A 1e9 error here is the one
+    # the hardware checklist calls the highest-consequence check on it.
+    assert metadata["defocus_nm"] == pytest.approx(_EXPECTED_DEFOCUS_NM)
+    assert metadata["beam_current_a"] > 0.0
+
+
+def test_a_scan_frame_carries_the_required_metadata():
+    """A scan frame says which detector, which region, and under what beam."""
+    with simulated_instrument() as microscope:
+        parameters = ScanParameters(
+            height=32,
+            width=48,
+            pixel_time_us=2.0,
+            fov_nm=microscope.stage_size_nm * 0.1,
+        )
+        metadata = microscope.scanner.scan_frame(parameters, channel=0).metadata
+        assert metadata["device_id"] == microscope.scanner.scanner_id
+        assert metadata["channel_index"] == 0
+        assert metadata["channel_name"] == "HAADF"
+        assert metadata["fov_nm"] == parameters.fov_nm
+        assert metadata["pixel_time_us"] == parameters.pixel_time_us
+        # Derived rather than left to a reader, which cannot know the
+        # flyback convention - so the convention is recorded beside them.
+        assert metadata["line_time_us"] == pytest.approx(48 * 2.0)
+        assert metadata["frame_time_s"] == pytest.approx(32 * 48 * 2.0 / 1e6)
+        assert metadata["flyback_time_us"] > 0.0
+        # Without these the field of view says how much was scanned but
+        # not which region, so two scans of different areas would be
+        # indistinguishable in the file.
+        assert metadata["rotation_rad"] == pytest.approx(0.0)
+        assert metadata["center_nm"] == (0.0, 0.0)
+        _assert_instrument_state(metadata)
+
+
+def test_a_camera_frame_carries_the_required_metadata():
+    """A camera frame names the detector and the beam it was taken under."""
+    with simulated_instrument() as microscope:
+        camera = microscope.eels_camera
+        camera.start()
+        try:
+            metadata = camera.acquire_frame().metadata
+        finally:
+            camera.stop()
+        assert metadata["device_id"] == camera.camera_id
+        # The vendor's own label for the detector, which is what tells an
+        # analysis tool what kind of data this is.
+        assert metadata["camera_type"] == "eels"
+        assert metadata["camera_name"]
+        assert metadata["counts_per_electron"] > 0.0
+        _assert_instrument_state(metadata)
+
+
+def test_frame_index_counts_without_gaps_from_zero():
+    """
+    Frames are numbered so a dropped one is visible rather than absent.
+
+    A recording that simply has fewer frames than expected says nothing
+    about whether any were lost. A gap in a monotonic index does.
+    """
+    with simulated_instrument() as microscope:
+        camera = microscope.ronchigram_camera
+        camera.start()
+        try:
+            indexes = [camera.acquire_frame().metadata["frame_index"] for _ in range(3)]
+        finally:
+            camera.stop()
+        assert indexes == [0, 1, 2]
+
+        parameters = ScanParameters(
+            height=16,
+            width=16,
+            pixel_time_us=1.0,
+            fov_nm=microscope.stage_size_nm * 0.1,
+        )
+        scanner = microscope.scanner
+        # Counted per device, across channels: every frame the scanner
+        # produced, in the order it produced them. Nion's scan_id groups
+        # the channels of one simultaneous scan instead; this interface
+        # has no such call, so a second channel really is a second pass of
+        # the beam and gets its own index rather than a shared id.
+        scan_indexes = [
+            scanner.scan_frame(parameters, channel=channel).metadata["frame_index"]
+            for channel in (0, 1, 0)
+        ]
+        assert scan_indexes == [0, 1, 2]
+
+
+def test_the_defocus_a_frame_reports_is_its_own():
+    """
+    Instrument state is read per frame, not cached when the device opened.
+
+    ``focal_series`` changes the defocus *between* frames, so a cached
+    value would label every frame in a sweep with the first one's
+    defocus — wrong in exactly the workflow that most needs it right.
+    """
+    with simulated_instrument() as microscope:
+        camera = microscope.ronchigram_camera
+        instrument = microscope.instrument
+        original_nm = instrument.defocus_nm()
+        camera.start()
+        try:
+            first = camera.acquire_frame().metadata["defocus_nm"]
+            instrument.set_defocus_nm(original_nm * 2.0)
+            second = camera.acquire_frame().metadata["defocus_nm"]
+        finally:
+            instrument.set_defocus_nm(original_nm)
+            camera.stop()
+        assert first == pytest.approx(original_nm)
+        assert second == pytest.approx(original_nm * 2.0)
+
+
+def test_an_instrument_that_reports_nothing_contributes_no_keys():
+    """
+    A control the instrument does not publish is omitted, never defaulted.
+
+    An absent key reads as "not reported"; a stored zero reads as a
+    measurement — an instrument with its high tension off, a beam with no
+    current. The device layer says nothing rather than something false.
+    """
+    assert _instrument_state(None) == {}
+    assert _instrument_state(_ControllerWithoutControls()) == {}
+
+
+# ------------------------------------------------- exposure and binning
+#
+# §7 wanted these done *with* calibration rather than after it, and the
+# reason is now mechanical rather than stylistic: binning multiplies the
+# calibration scale (build_calibration's relative_scale), so a binning
+# control that did not reach the calibration would write axes wrong by an
+# integer factor on every binned frame.
+
+_UNSUPPORTED_BINNING = 3
+# A supported factor big enough that a wrongly-scaled axis is unmistakable.
+_TEST_BINNING = 4
+
+
+def test_binning_values_are_reported_and_not_empty():
+    """A camera says what binning it supports, so a caller need not guess."""
+    with simulated_instrument() as microscope:
+        values = microscope.eels_camera.binning_values
+        assert values
+        assert list(values) == sorted(values)
+        assert values[0] == 1
+
+
+def test_configuring_before_start_takes_effect_on_the_first_frame():
+    """
+    Settings applied to a stopped camera are in force from its first frame.
+
+    This is the path a caller who needs a frame taken at known settings
+    should use, and the reason it is worth stating: configuring a camera
+    that is already running does *not* affect the frame already in
+    flight — see the test below.
+    """
+    with simulated_instrument() as microscope:
+        camera = microscope.eels_camera
+        binned = camera.configure(
+            CameraParameters(exposure_ms=20.0, binning=_TEST_BINNING),
+        )
+        assert binned.binning == _TEST_BINNING
+        assert camera.parameters() == binned
+        camera.start()
+        try:
+            frame = camera.acquire_frame()
+        finally:
+            camera.stop()
+        assert frame.data.shape == camera._device.get_expected_dimensions(_TEST_BINNING)  # noqa: SLF001
+        assert frame.metadata["binning"] == _TEST_BINNING
+        assert frame.metadata["exposure_ms"] == pytest.approx(20.0)
+
+
+def test_a_frame_in_flight_keeps_the_settings_it_was_started_with():
+    """
+    Reconfiguring a running camera does not relabel the frame already begun.
+
+    Nion asserts the same thing one layer up
+    (``test_changing_frame_parameters_during_view_does_not_affect_current_acquisition``).
+    What makes it matter here is the calibration: binning multiplies the
+    axis scale, so labelling an unbinned frame with the new binning would
+    put an axis on stored data that is wrong by the whole factor. The
+    binning a frame reports is therefore recovered from its shape, not
+    from the setting.
+    """
+    with simulated_instrument() as microscope:
+        camera = microscope.eels_camera
+        camera.start()
+        try:
+            unbinned = camera.acquire_frame()
+            camera.configure(CameraParameters(exposure_ms=20.0, binning=_TEST_BINNING))
+            in_flight = camera.acquire_frame()
+            settled = camera.acquire_frame()
+        finally:
+            camera.stop()
+        assert in_flight.data.shape == unbinned.data.shape
+        assert in_flight.metadata["binning"] == 1
+        assert settled.data.shape != unbinned.data.shape
+        assert settled.metadata["binning"] == _TEST_BINNING
+
+
+def test_binning_multiplies_the_axis_scale_of_the_frame_it_applied_to():
+    """
+    A binned frame's calibration scale grows with the binning, per frame.
+
+    The whole reason binning and calibration are one piece of work: a
+    binned pixel spans proportionally more of the axis, and the frame
+    that was *not* binned must not be scaled as though it were.
+    """
+    with simulated_instrument() as microscope:
+        camera = microscope.eels_camera
+        camera.start()
+        try:
+            unbinned = camera.acquire_frame()
+            camera.configure(CameraParameters(exposure_ms=20.0, binning=_TEST_BINNING))
+            camera.acquire_frame()  # the in-flight frame, still unbinned
+            binned = camera.acquire_frame()
+        finally:
+            camera.stop()
+        unbinned_scale = unbinned.metadata["calibration"]["x"]["scale"]
+        binned_scale = binned.metadata["calibration"]["x"]["scale"]
+        assert binned_scale == pytest.approx(float(_TEST_BINNING) * unbinned_scale)
+
+
+def test_an_unsupported_binning_is_refused_rather_than_rounded():
+    """
+    A binning the camera does not advertise raises, naming what it accepts.
+
+    usim's ``validate_frame_parameters`` is a pass-through — measured, it
+    returns ``binning=3`` unchanged on a camera advertising [1, 2, 4, 8] —
+    so nothing downstream would have caught it. Refused rather than
+    rounded to a neighbour, because a caller asking for 3 has a bug and
+    silently giving them 2 makes every axis wrong by a third.
+    """
+    with simulated_instrument() as microscope:
+        camera = microscope.eels_camera
+        assert _UNSUPPORTED_BINNING not in camera.binning_values
+        with pytest.raises(ValueError, match="not supported"):
+            camera.configure(
+                CameraParameters(exposure_ms=10.0, binning=_UNSUPPORTED_BINNING),
+            )
+        # And the camera is unchanged, not left half-configured.
+        assert camera.parameters().binning == 1

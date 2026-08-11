@@ -29,14 +29,24 @@ Three places, each for a reason:
   module first landed, ``NexusWriter`` had no fields for operator, sample,
   or notes and the ``session_`` metadata prefix below was explicitly
   flagged as a stand-in for them. The writer has since grown
-  ``sample=``/``user=``/``notes=``, writing genuine ``NXsample``,
-  ``NXuser``, and ``NXnote`` groups, so :meth:`Session.record` now passes
-  them: the sample identifier becomes ``/entry/sample/name``, the operator
-  ``/entry/user/name``, and the notes ``/entry/notes/description``. Note
-  this does **not** make the file claim ``NXem`` — that additionally needs
-  specimen facts (``is_simulation``, ``preparation_date``, ``atom_types``)
-  no session knows, and ``nexus.py``'s own docstring explains why it
-  refuses to invent them.
+  ``sample=``/``user=``/``instrument=``/``notes=``, writing genuine
+  ``NXsample``, ``NXuser``, ``NXinstrument`` and ``NXnote`` groups, so
+  :meth:`Session.record` now passes them: the sample becomes
+  ``/entry/sample/name``, the sample area ``/entry/sample/description``,
+  the operator ``/entry/user/name``, the microscope
+  ``/entry/instrument/name``, and the notes
+  ``/entry/notes/description``. Note this does **not** make the file
+  claim ``NXem`` — that additionally needs specimen facts
+  (``is_simulation``, ``preparation_date``, ``atom_types``) no session
+  knows, and ``nexus.py``'s own docstring explains why it refuses to
+  invent them.
+
+  **Four of the seven fields, not all seven.** ``site`` and ``task`` have
+  no NeXus field that means what they mean — ``NXuser/affiliation`` is
+  who the *operator* belongs to, not where the microscope is — and this
+  project's standing rule is that a confidently wrong value in a standard
+  field is worse than an honest absence. They live in the other two
+  places below, which is where everything NeXus has no home for lives.
 - **Injected into frame metadata** under a ``session_`` key prefix, kept
   rather than removed: it is the only place the *label* and session *root*
   land, it round-trips through one call
@@ -110,7 +120,26 @@ _SUFFIX = ".nxs"
 _STAMP_FORMAT = "%Y%m%dT%H%M%SZ"
 _INDEX_DIGITS = 4
 _CONTEXT_PREFIX = "session_"
-_CONTEXT_FIELDS = ("operator", "sample", "notes")
+# Nion's own documented session vocabulary, from its scripting guide:
+# stem.session.{instrument, microscopist, sample, sample_area, site, task}.
+# Adopted rather than invented, because a vocabulary someone else
+# maintains is easier to defend than one made up here, and because these
+# are the facts that make a recording identifiable a year later.
+#
+# Two divergences. "microscopist" stays "operator": it is the same field
+# under plainer English, it is what the viewer, the sidecar files already
+# on disk, and this API all say, and renaming it would cost a migration
+# for no gain. And "notes" is ours - Nion has no free-text session field,
+# and NXnote is the obvious home for one.
+_CONTEXT_FIELDS = (
+    "operator",
+    "instrument",
+    "site",
+    "sample",
+    "sample_area",
+    "task",
+    "notes",
+)
 # 1000, not 1024: operators compare this against what the OS file manager
 # and `df -h` report, and those use decimal units.
 _BYTES_PER_UNIT = 1000.0
@@ -217,8 +246,18 @@ class Session:
         Session directory. Created (with parents) if it does not exist.
     operator : str | None
         Who is running the instrument. None keeps any stored value.
+    instrument : str | None
+        Which microscope. None keeps any stored value.
+    site : str | None
+        Where the instrument is — the facility or laboratory. None keeps
+        any stored value.
     sample : str | None
         Sample identifier. None keeps any stored value.
+    sample_area : str | None
+        Which region of the sample is under the beam. None keeps any
+        stored value.
+    task : str | None
+        What this session is trying to do. None keeps any stored value.
     notes : str | None
         Free-text notes about the session. None keeps any stored value.
 
@@ -228,12 +267,16 @@ class Session:
         If ``root`` exists but is not a directory.
     """
 
-    def __init__(
+    def __init__(  # noqa: PLR0913 - one keyword per context field, by design
         self,
         root: os.PathLike[str] | str,
         *,
         operator: str | None = None,
+        instrument: str | None = None,
+        site: str | None = None,
         sample: str | None = None,
+        sample_area: str | None = None,
+        task: str | None = None,
         notes: str | None = None,
     ) -> None:
         self._root = Path(root)
@@ -246,7 +289,15 @@ class Session:
         self._recording_cache: dict[Path, tuple[tuple[float, int], Recording]] = {}
         self._created = _now()
         self._load_sidecar()
-        self.update_context(operator=operator, sample=sample, notes=notes)
+        self.update_context(
+            operator=operator,
+            instrument=instrument,
+            site=site,
+            sample=sample,
+            sample_area=sample_area,
+            task=task,
+            notes=notes,
+        )
 
     @property
     def root(self) -> Path:
@@ -259,9 +310,29 @@ class Session:
         return self._context["operator"]
 
     @property
+    def instrument(self) -> str:
+        """Return which microscope this session is running on."""
+        return self._context["instrument"]
+
+    @property
+    def site(self) -> str:
+        """Return where the instrument is — the facility or laboratory."""
+        return self._context["site"]
+
+    @property
     def sample(self) -> str:
         """Return the sample identifier."""
         return self._context["sample"]
+
+    @property
+    def sample_area(self) -> str:
+        """Return which region of the sample is under the beam."""
+        return self._context["sample_area"]
+
+    @property
+    def task(self) -> str:
+        """Return what this session is trying to do."""
+        return self._context["task"]
 
     @property
     def notes(self) -> str:
@@ -273,11 +344,15 @@ class Session:
         """Return a copy of the session context (operator, sample, notes)."""
         return dict(self._context)
 
-    def update_context(
+    def update_context(  # noqa: PLR0913 - one keyword per context field
         self,
         *,
         operator: str | None = None,
+        instrument: str | None = None,
+        site: str | None = None,
         sample: str | None = None,
+        sample_area: str | None = None,
+        task: str | None = None,
         notes: str | None = None,
     ) -> None:
         """
@@ -291,14 +366,27 @@ class Session:
         ----------
         operator : str | None
             New operator, or None to leave unchanged.
+        instrument : str | None
+            New microscope name, or None to leave unchanged.
+        site : str | None
+            New facility or laboratory, or None to leave unchanged.
         sample : str | None
             New sample identifier, or None to leave unchanged.
+        sample_area : str | None
+            New region of the sample, or None to leave unchanged.
+        task : str | None
+            New description of what the session is doing, or None to
+            leave unchanged.
         notes : str | None
             New notes, or None to leave unchanged.
         """
         for field, value in (
             ("operator", operator),
+            ("instrument", instrument),
+            ("site", site),
             ("sample", sample),
+            ("sample_area", sample_area),
+            ("task", task),
             ("notes", notes),
         ):
             if value is not None:
@@ -486,16 +574,28 @@ class Session:
         Returns
         -------
         dict[str, object]
-            ``sample``/``user``/``notes`` keyword arguments for the writer.
+            ``sample``/``user``/``instrument``/``notes`` keyword arguments
+            for the writer.
         """
         arguments: dict[str, object] = {}
-        if self.sample:
-            # NXsample's own descriptive-name field; the specimen facts NXem
-            # additionally requires are not the session's to state (see
-            # nexus.py's docstring).
-            arguments["sample"] = {"name": self.sample}
+        # NXsample's own fields; the specimen facts NXem additionally
+        # requires are not the session's to state (see nexus.py's
+        # docstring). `sample_area` is `description` because that is what
+        # it is — which part of the specimen was under the beam.
+        specimen = {
+            name: value
+            for name, value in (
+                ("name", self.sample),
+                ("description", self.sample_area),
+            )
+            if value
+        }
+        if specimen:
+            arguments["sample"] = specimen
         if self.operator:
             arguments["user"] = {"name": self.operator}
+        if self.instrument:
+            arguments["instrument"] = self.instrument
         combined = _compose_notes(self.notes, note)
         if combined is not None:
             arguments["notes"] = combined
@@ -940,7 +1040,7 @@ def _read_text(group: object, field: str) -> str | None:
 
 def _context_from_nexus_groups(handle: object) -> dict[str, str]:
     """
-    Read session context from the NXsample and NXuser groups.
+    Read session context from the NXsample, NXuser, and NXinstrument groups.
 
     **Not ``NXnote``, and that turned out to be the interesting part.**
     ``sample`` and ``operator`` reach their groups verbatim
@@ -959,6 +1059,14 @@ def _context_from_nexus_groups(handle: object) -> dict[str, str]:
     group the writer emits, and a future reader who "fixes" the apparent
     gap would reintroduce the bug.
 
+    **Four of the seven context fields, for a related reason.** ``site``
+    and ``task`` have no NeXus field that means what they mean —
+    ``NXuser/affiliation`` is who the *operator* belongs to, not where the
+    microscope is — and writing them into an approximate one would be a
+    confidently wrong claim in a standard field, which this project
+    already argues is worse than an admitted absence. They stay in the
+    JSON blob, and the caller's fallback path reads them from there.
+
     Parameters
     ----------
     handle : object
@@ -967,12 +1075,15 @@ def _context_from_nexus_groups(handle: object) -> dict[str, str]:
     Returns
     -------
     dict[str, str]
-        Whichever of ``sample`` and ``operator`` the file declares.
+        Whichever of ``sample``, ``sample_area``, ``operator``, and
+        ``instrument`` the file declares.
     """
     found: dict[str, str] = {}
     for key, field in (
         ("sample", f"{layout.SAMPLE_GROUP}/name"),
+        ("sample_area", f"{layout.SAMPLE_GROUP}/description"),
         ("operator", f"{layout.USER_GROUP}/name"),
+        ("instrument", layout.INSTRUMENT_NAME),
     ):
         value = _read_text(handle, field)
         if value:

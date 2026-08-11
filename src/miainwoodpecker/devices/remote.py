@@ -124,7 +124,11 @@ if typing.TYPE_CHECKING:
     from collections.abc import Iterator, Sequence
     from multiprocessing.connection import Connection
 
-    from miainwoodpecker.devices.interface import Frame, ScanParameters
+    from miainwoodpecker.devices.interface import (
+        CameraParameters,
+        Frame,
+        ScanParameters,
+    )
 
 # Re-exported from rpc.py so callers of this client keep importing the
 # backend vocabulary from the module whose API they are using, while
@@ -600,6 +604,31 @@ class RemoteCamera(_RemoteDevice):
         """Return the remote device's camera id."""
         return typing.cast("str", self._call("camera_id"))
 
+    @property
+    def binning_values(self) -> typing.Sequence[int]:
+        """Return the binning factors the remote device supports."""
+        return typing.cast("typing.Sequence[int]", self._call("binning_values"))
+
+    def parameters(self) -> CameraParameters:
+        """Return the settings the remote device's next frame will use."""
+        return typing.cast("CameraParameters", self._call("parameters"))
+
+    def configure(self, parameters: CameraParameters) -> CameraParameters:
+        """
+        Apply settings to the remote device and return what it accepted.
+
+        Parameters
+        ----------
+        parameters : CameraParameters
+            The requested exposure and binning.
+
+        Returns
+        -------
+        CameraParameters
+            What the device took, which is not necessarily what was asked.
+        """
+        return typing.cast("CameraParameters", self._call("configure", parameters))
+
     def start(self) -> None:
         """Begin continuous acquisition on the remote device."""
         self._call("start")
@@ -920,6 +949,21 @@ class RemoteInstrument:
             Target defocus, in nanometres.
         """
         self._call("set_defocus_nm", defocus_nm)
+
+    def energy_offset_ev(self) -> float:
+        """Return the spectrometer energy offset, in electronvolts."""
+        return typing.cast("float", self._call("energy_offset_ev"))
+
+    def set_energy_offset_ev(self, offset_ev: float) -> None:
+        """
+        Set the spectrometer energy offset, in electronvolts.
+
+        Parameters
+        ----------
+        offset_ev : float
+            Target offset, in electronvolts.
+        """
+        self._call("set_energy_offset_ev", offset_ev)
 
     def is_beam_blanked(self) -> bool:
         """Return whether the beam is currently blanked."""

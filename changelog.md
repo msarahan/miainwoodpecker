@@ -45,6 +45,60 @@
   for driving the same capabilities from Python, including what it takes
   to put an AI agent at the controls.
 
+- `docs/pre-hardware-work.md`: the counterpart to the hardware checklist —
+  what can be built before an instrument is available, sourced from the
+  device-layer contracts in Nion's own public acquisition test suites.
+  Records that the calibration plumbing §7 lists as missing already exists
+  on the GPL side (`calibration_controls` resolved by
+  `camera_base.build_calibration`, with real values published by the
+  simulator), so it needs neither hardware nor a reimplementation.
+
+- Camera axis calibration resolved from the instrument. A Nion camera
+  publishes the *names* of the instrument controls holding its calibration
+  rather than the values; the device server resolves them with Nion's own
+  `camera_base.build_calibration` and puts per-axis
+  `{kind, scale, offset, units}` into the frame metadata as plain data.
+  Ronchigram frames arrive with radian axes centred on the optic axis and
+  EELS frames with an eV axis — and the dispersive axis is now the one the
+  *device* reports, so `dispersive_axis="x"` is no longer an assumption to
+  confirm on hardware.
+
+- Every acquired frame now carries the acquisition metadata Nion's own
+  required-metadata tests enumerate: device id, gapless `frame_index`,
+  high tension, defocus, beam current, and per device either channel and
+  scan geometry (rotation, centre, flyback, derived line and frame times)
+  or the camera's type, name, and gain. The vocabulary is documented on
+  `Frame`. The accelerating voltage is additionally written as
+  `NXsource.voltage`, the one piece of it NeXus specifies a home for.
+
+- Camera exposure and binning control: `CameraParameters(exposure_ms,
+  binning)`, `Camera.binning_values`/`parameters()`/`configure()`, through
+  the device server and over IPC. `configure` reports what the device took
+  rather than echoing the request, and refuses a binning the camera does
+  not advertise instead of rounding it. Binning multiplies the calibration
+  scale, and the binning a *frame* reports is recovered from its shape, so
+  a camera reconfigured mid-acquisition cannot mislabel the frame already
+  in flight.
+
+- `energy_offset_series`: step the spectrometer's energy offset across a
+  series of EELS frames, recording the read-back offset beside the request
+  and restoring the original afterwards — the acquisition half of Nion's
+  multiple-shift EELS acquire. The camera is stopped around each step,
+  because a running camera returns a frame generated before the control
+  changed, which would mislabel the whole series by one. Brings a fourth
+  control to `InstrumentController` (`energy_offset_ev`), which the
+  camera's own calibration already tracks, so the recorded energy axis
+  follows the sweep for free.
+
+- Session context adopts Nion Swift's own documented vocabulary:
+  `instrument`, `site`, `sample_area`, and `task` join `operator`,
+  `sample`, and `notes`. Four map onto real NeXus fields — sample and
+  sample area to `NXsample`, the operator to `NXuser`, the microscope to
+  `NXinstrument/name`, which had been sitting empty — and are
+  schema-checked in CI. `site` and `task` deliberately do not: no NeXus
+  field means what they mean, and an approximate one would be a
+  confidently wrong claim.
+
 ### Changed
 
 - CI's `integration` job runs its tests in parallel (`pytest -n auto`),

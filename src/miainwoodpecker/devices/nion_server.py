@@ -81,6 +81,7 @@ import contextlib
 import datetime
 import importlib
 import logging
+import math
 import os
 import pkgutil
 import signal
@@ -91,6 +92,7 @@ import typing
 from dataclasses import dataclass
 
 from nion.device_kit import ScanDevice as _ScanDeviceKit
+from nion.instrumentation import camera_base as _camera_base
 from nion.usim_device import DeviceConfiguration as _UsimConfiguration
 from nion.utils import Geometry as _Geometry
 from nion.utils import Registry as _Registry
@@ -98,7 +100,9 @@ from nion.utils import Registry as _Registry
 from miainwoodpecker.devices.interface import (
     BEAM_BLANKER_CONTROL,
     DEFOCUS_CONTROL,
+    ENERGY_OFFSET_CONTROL,
     STAGE_POSITION_CONTROL,
+    CameraParameters,
     Frame,
     ScanParameters,
 )
@@ -120,6 +124,7 @@ from miainwoodpecker.devices.rpc import (
     TARGET_NAMES as _TARGET_NAMES,
 )
 from miainwoodpecker.devices.shared_frame import SharedFrameWriter
+from miainwoodpecker.storage import calibration as _calibration
 
 if typing.TYPE_CHECKING:
     import types
@@ -226,6 +231,11 @@ _ORPHAN_GRACE_S = 30.0
 _DEFOCUS_CONTROL_NAME = "C10"
 _BLANKER_CONTROL_NAME = "C_Blank"
 _STAGE_POSITION_CONTROL_NAME = "stage_position_m"
+# The spectrometer's energy offset. Nion's name for it, and already in eV
+# rather than the metres/volts the other controls use - confirmed against
+# usim, whose eels_x_offset calibration control tracks it exactly, so the
+# recorded energy axis follows the offset with no conversion between them.
+_ENERGY_OFFSET_CONTROL_NAME = "ZLPoffset"
 
 _NM_PER_M = 1e9
 # Only a geometry hint for choosing a field of view. Nion's device_kit
@@ -263,12 +273,131 @@ def _aware_utc(timestamp: datetime.datetime | None) -> datetime.datetime:
     return timestamp
 
 
+def _axis_calibration_spec(
+    calibration: typing.Any,  # noqa: ANN401 - nion.data.Calibration
+) -> dict[str, object] | None:
+    """
+    Translate one Nion ``Calibration`` into this project's plain-data axis spec.
+
+    Returns ``None`` — meaning "this axis is uncalibrated" — for the two
+    ways a device can decline to calibrate an axis, which are deliberately
+    not errors. ``build_calibration`` returns an empty ``Calibration``
+    (no units) when the named controls are missing or nonsensical, and the
+    EELS camera's slow axis reports empty units even when its controls
+    resolve. An axis whose units are outside this project's vocabulary
+    goes the same way, because a scale in units nothing downstream can
+    interpret is worth less than an admitted pixel axis.
+
+    Parameters
+    ----------
+    calibration : typing.Any
+        A ``nion.data.Calibration.Calibration``.
+
+    Returns
+    -------
+    dict[str, object] | None
+        A mapping in the vocabulary
+        :func:`miainwoodpecker.storage.calibration.resolve_frame_calibration`
+        parses, or ``None``.
+    """
+    units = str(getattr(calibration, "units", "") or "").strip()
+    if not units:
+        return None
+    try:
+        kind = _calibration.axis_kind_for_units(units)
+    except ValueError:
+        return None
+    scale = float(calibration.scale)
+    if not math.isfinite(scale) or scale == 0.0:
+        return None
+    offset = float(calibration.offset)
+    if not math.isfinite(offset):
+        return None
+    return {
+        "kind": kind.value,
+        "scale": scale,
+        "offset": offset,
+        "units": units,
+    }
+
+
+# Vendor control names for the instrument state every acquired frame
+# carries, mapped to the neutral key and the factor that puts it in the
+# operator's units. "EHT", "C10" and "BeamCurrent" are Nion's own names:
+# its required-metadata tests read EHT and C10 by those names, and
+# device_kit's instrument publishes BeamCurrent alongside them.
+_FRAME_STATE_CONTROLS = (
+    ("high_tension_v", "EHT", 1.0),
+    ("defocus_nm", _DEFOCUS_CONTROL_NAME, _NM_PER_M),
+    ("beam_current_a", "BeamCurrent", 1.0),
+)
+
+
+def _instrument_state(
+    controller: typing.Any,  # noqa: ANN401 - vendor STEMController
+) -> dict[str, float]:
+    """
+    Read the instrument state that belongs on every frame, in operator units.
+
+    Read per frame rather than cached at connect time, deliberately. The
+    cost is negligible (three ``TryGetVal`` calls, measured at 4.6us
+    against usim) and the correctness is not: ``focal_series`` changes the
+    defocus *between* frames, so a cached value would label every frame in
+    the sweep with the defocus of the first one — wrong in exactly the
+    workflow that most needs it right.
+
+    A control the instrument does not publish is omitted rather than
+    defaulted, because an absent key reads as "not reported" while a
+    stored zero reads as a measurement.
+
+    Parameters
+    ----------
+    controller : typing.Any
+        The vendor ``STEMController``, or ``None``.
+
+    Returns
+    -------
+    dict[str, float]
+        Neutral key to value, for each control this instrument reports.
+    """
+    if controller is None:
+        return {}
+    state = {}
+    for key, control_name, factor in _FRAME_STATE_CONTROLS:
+        try:
+            valid, value = controller.TryGetVal(control_name)
+        except Exception:  # noqa: BLE001, S112 - see below
+            # Not logged, deliberately: this runs on the frame path, and a
+            # controller that raises for a control it lacks would log once
+            # per frame forever. The consequence is visible without a log
+            # line anyway - the key is simply absent from every frame.
+            continue
+        if valid and value is not None:
+            state[key] = float(value) * factor
+    return state
+
+
 class NionCamera:
     """A ``Camera`` implementation wrapping a Nion device-kit camera device."""
 
-    def __init__(self, camera_device: _DeviceKitCamera) -> None:
+    def __init__(
+        self,
+        camera_device: _DeviceKitCamera,
+        controller: typing.Any = None,  # noqa: ANN401 - vendor STEMController
+    ) -> None:
         self._device = camera_device
+        self._controller = controller
         self._closed = False
+        self._frame_index = 0
+        # The vendor's own defaults, read rather than assumed: a bare
+        # CameraFrameParameters is what the device starts from, so this
+        # reports what the next frame really will be taken with before
+        # anyone has configured anything.
+        defaults = _camera_base.CameraFrameParameters()
+        self._parameters = CameraParameters(
+            exposure_ms=float(defaults.exposure_ms),
+            binning=int(defaults.binning),
+        )
 
     @property
     def is_closed(self) -> bool:
@@ -279,6 +408,140 @@ class NionCamera:
     def camera_id(self) -> str:
         """Return the wrapped device's camera id."""
         return self._device.camera_id
+
+    @property
+    def binning_values(self) -> Sequence[int]:
+        """Return the binning factors the wrapped device supports, ascending."""
+        return sorted(int(value) for value in self._device.binning_values)
+
+    def parameters(self) -> CameraParameters:
+        """Return the settings the next frame will be acquired with."""
+        return self._parameters
+
+    def configure(self, parameters: CameraParameters) -> CameraParameters:
+        """
+        Apply exposure and binning to the device, and report what it took.
+
+        Binning is checked against the device's own ``binning_values``
+        here rather than left to the vendor. Nion's ``CameraDevice``
+        protocol has a ``validate_frame_parameters`` for this, but usim's
+        is a pass-through — measured: it returns ``binning=3`` unchanged
+        on a camera advertising ``[1, 2, 4, 8]``. An unsupported factor
+        that reaches the device produces frames of an unexpected shape
+        and a calibration scale wrong by the ratio, neither of which
+        announces itself, so it is refused rather than silently rounded
+        to a neighbour the caller did not ask for.
+
+        **When the change takes effect is the device's business.**
+        Measured against usim: configured while running, the frame
+        already in flight completes at the old settings and the one after
+        that is the first to change; configured while stopped, the first
+        frame after ``start`` is already correct. So a caller who needs a
+        frame taken at known settings should configure before starting,
+        and one configuring live should expect a frame or two of overlap.
+        The frames themselves stay honest about binning either way, since
+        it is recovered from their shape.
+
+        Parameters
+        ----------
+        parameters : CameraParameters
+            The requested exposure and binning.
+
+        Returns
+        -------
+        CameraParameters
+            What the device accepted, after its own validation.
+
+        Raises
+        ------
+        ValueError
+            If ``binning`` is not one the device advertises.
+        """
+        supported = self.binning_values
+        if parameters.binning not in supported:
+            msg = (
+                f"binning {parameters.binning} is not supported by "
+                f"{self.camera_id}; it accepts {supported}"
+            )
+            raise ValueError(msg)
+        frame_parameters = _camera_base.CameraFrameParameters(
+            exposure_ms=parameters.exposure_ms,
+            binning=parameters.binning,
+        )
+        validate = getattr(self._device, "validate_frame_parameters", None)
+        if callable(validate):
+            frame_parameters = validate(frame_parameters)
+        self._device.set_frame_parameters(frame_parameters)
+        self._parameters = CameraParameters(
+            exposure_ms=float(frame_parameters.exposure_ms),
+            binning=int(frame_parameters.binning),
+        )
+        return self._parameters
+
+    def calibration_metadata(
+        self,
+        shape: tuple[int, ...],
+        binning: float = 1.0,
+    ) -> dict[str, dict[str, object]] | None:
+        """
+        Resolve this camera's axis calibrations from the instrument, as plain data.
+
+        A Nion camera device does not publish calibration *values*: it
+        publishes a ``calibration_controls`` mapping naming the instrument
+        controls that hold them, and ``camera_base.build_calibration``
+        reads those at acquisition time. That indirection is the point — a
+        camera's angular scale depends on the projector lenses, so it is
+        instrument state, not a device constant.
+
+        Calling Nion's own resolver rather than reimplementing it is what
+        keeps this on the right side of the licence boundary *and*
+        correct: the result crosses to the MIT application as a plain
+        mapping of numbers and unit strings, and the resolution rules
+        (including the ``_origin_override: "center"`` convention) stay
+        Nion's.
+
+        Parameters
+        ----------
+        shape : tuple[int, ...]
+            The acquired frame's shape. 1D for a device-binned spectrum,
+            in which case only the ``x`` axis is calibrated, as Nion does.
+        binning : float
+            The camera's binning factor, which multiplies the scale — a
+            2x-binned pixel spans twice the angle.
+
+        Returns
+        -------
+        dict[str, dict[str, object]] | None
+            Axis name to spec for each axis that resolved, or ``None`` if
+            none did — which is the answer for a camera that publishes no
+            controls, and for one wrapped without an instrument.
+        """
+        controls = getattr(self._device, "calibration_controls", None)
+        if self._controller is None or not controls:
+            return None
+        # Nion's own CalibrationControlsCalibrator passes data_shape[1] as
+        # the y axis's length and data_shape[0] as x's. Each axis is given
+        # its own length here instead. The difference is invisible on a
+        # square sensor and only reaches the result through the "center"
+        # origin override, but an axis centred on the *other* axis's
+        # length is not a convention this can adopt knowingly.
+        lengths = (
+            {"x": shape[0]} if len(shape) == 1 else {"y": shape[0], "x": shape[1]}
+        )
+        axes = {}
+        for name, length in lengths.items():
+            spec = _axis_calibration_spec(
+                _camera_base.build_calibration(
+                    self._controller,
+                    controls,
+                    name,
+                    binning,
+                    length,
+                ),
+            )
+            if spec is not None:
+                axes[name] = spec
+        return axes or None
 
     def start(self) -> None:
         """Begin continuous acquisition; blocks until the first frame is available."""
@@ -291,11 +554,102 @@ class NionCamera:
     def acquire_frame(self) -> Frame:
         """Return the next available frame; requires ``start`` to have been called."""
         data_element = self._device.acquire_image()
+        data = data_element["data"]
+        metadata = dict(data_element.get("properties") or {})
+        binning = self._binning_of(data.shape)
+        calibration = self.calibration_metadata(data.shape, float(binning))
+        if calibration is not None:
+            metadata[_calibration.METADATA_KEY] = calibration
+        metadata.update(self._frame_metadata(binning))
+        self._frame_index += 1
         return Frame(
-            data=data_element["data"],
+            data=data,
             timestamp=_aware_utc(data_element.get("timestamp")),
-            metadata=dict(data_element.get("properties") or {}),
+            metadata=metadata,
         )
+
+    def _binning_of(self, shape: tuple[int, ...]) -> int:
+        """
+        Return the binning this frame was actually taken at, from its shape.
+
+        Not simply the configured binning, because a camera configured
+        while it is running finishes the frame already in flight at the
+        old settings first — measured against usim: the frame *after* a
+        ``configure`` is still unbinned, and the one after that is not.
+        Labelling that frame with the new binning would put a calibration
+        scale on it that is wrong by the whole binning factor, which is
+        not a label problem but a wrong axis on stored data.
+
+        The device's own ``get_expected_dimensions`` is the mapping used,
+        so a camera that bins asymmetrically is handled by its own rules
+        rather than by dividing and hoping.
+
+        Parameters
+        ----------
+        shape : tuple[int, ...]
+            The acquired frame's shape.
+
+        Returns
+        -------
+        int
+            The matching supported binning, or the configured one if no
+            supported factor produces this shape.
+        """
+        expected = getattr(self._device, "get_expected_dimensions", None)
+        if callable(expected):
+            for value in self.binning_values:
+                with contextlib.suppress(Exception):
+                    if tuple(expected(value)) == tuple(shape):
+                        return value
+        return self._parameters.binning
+
+    def _frame_metadata(self, binning: int) -> dict[str, object]:
+        """
+        Return the identity, instrument state, and detector labels for a frame.
+
+        Parameters
+        ----------
+        binning : int
+            The binning the frame was taken at, from :meth:`_binning_of`.
+
+        Returns
+        -------
+        dict[str, object]
+            The metadata to merge into the frame's own.
+        """
+        device = self._device
+        metadata: dict[str, object] = {
+            "device_id": self.camera_id,
+            "frame_index": self._frame_index,
+            "binning": binning,
+            # The configured exposure, which the frame in flight during a
+            # `configure` was *not* taken at. Unlike binning that leaves
+            # no trace in the data to recover it from, so a caller who
+            # needs certainty should configure before start(); see
+            # `configure`.
+            "exposure_ms": self._parameters.exposure_ms,
+        }
+        for key, attribute in (
+            ("camera_name", "camera_name"),
+            ("camera_type", "camera_type"),
+        ):
+            value = getattr(device, attribute, None)
+            if value:
+                metadata[key] = str(value)
+        controls = getattr(device, "calibration_controls", None)
+        if controls and self._controller is not None:
+            # Resolved rather than read straight off the mapping: a device
+            # may publish gain as a *control* name instead of a literal,
+            # and this is the function that knows both spellings.
+            gain = _camera_base.get_instrument_calibration_value(
+                self._controller,
+                controls,
+                "counts_per_electron",
+            )
+            if isinstance(gain, (int, float)):
+                metadata["counts_per_electron"] = float(gain)
+        metadata.update(_instrument_state(self._controller))
+        return metadata
 
     def close(self) -> None:
         """
@@ -310,12 +664,61 @@ class NionCamera:
         self._device.close()
 
 
+def _scan_geometry(
+    frame_parameters: typing.Any,  # noqa: ANN401 - vendor ScanFrameParameters
+) -> dict[str, object]:
+    """
+    Report where and how the beam was scanned, beyond how far.
+
+    A field of view says how *much* was scanned; without the centre and
+    the rotation it does not say *which* region, so two scans of different
+    parts of a specimen are indistinguishable in the file. Both are
+    currently always the device's defaults — this interface offers no way
+    to set them — but they are read off the frame parameters actually used
+    rather than written as constants, so they stay true if that changes.
+
+    ``flyback_time_us`` is recorded for the same reason ``line_time_us``
+    is derived here: the line and frame times deliberately ignore flyback
+    (as Nion's own do), and this is the number a reader needs to correct
+    them.
+
+    Parameters
+    ----------
+    frame_parameters : typing.Any
+        The vendor ``ScanFrameParameters`` the scan was run with.
+
+    Returns
+    -------
+    dict[str, object]
+        Whichever of ``rotation_rad``, ``center_nm`` and
+        ``flyback_time_us`` the vendor object reports.
+    """
+    geometry: dict[str, object] = {}
+    rotation = getattr(frame_parameters, "rotation_rad", None)
+    if rotation is not None:
+        geometry["rotation_rad"] = float(rotation)
+    centre = getattr(frame_parameters, "center_nm", None)
+    if centre is not None:
+        # (y, x), the same axis order as ScanParameters.shape.
+        geometry["center_nm"] = (float(centre.y), float(centre.x))
+    flyback = getattr(frame_parameters, "flyback_time_us", None)
+    if flyback is not None:
+        geometry["flyback_time_us"] = float(flyback)
+    return geometry
+
+
 class NionScanner:
     """A ``Scanner`` implementation wrapping a Nion device-kit scan device."""
 
-    def __init__(self, scan_device: _DeviceKitScanDevice) -> None:
+    def __init__(
+        self,
+        scan_device: _DeviceKitScanDevice,
+        controller: typing.Any = None,  # noqa: ANN401 - vendor STEMController
+    ) -> None:
         self._device = scan_device
+        self._controller = controller
         self._closed = False
+        self._frame_index = 0
 
     @property
     def is_closed(self) -> bool:
@@ -353,20 +756,35 @@ class NionScanner:
             fov_nm=parameters.fov_nm,
         )
         data = self._device.get_scan_data(frame_parameters, channel)
+        metadata: dict[str, object] = {
+            "device_id": self.scanner_id,
+            "frame_index": self._frame_index,
+            "channel_index": channel,
+            "channel_name": self._device.get_channel_name(channel),
+            "fov_nm": parameters.fov_nm,
+            # The per-axis extent alongside the scalar, so storage
+            # divides what the scan actually covered rather than
+            # re-deriving it from a convention it could disagree with.
+            # Square pixels mean these differ on a non-square scan.
+            "fov_size_nm": parameters.fov_size_nm,
+            "pixel_time_us": parameters.pixel_time_us,
+            # Derived here rather than left to a reader, because
+            # reconstructing them needs the flyback convention and a
+            # reader does not have it. Nion's own required-metadata test
+            # notes that its line and frame times ignore flyback too, so
+            # these are the same quantity it records, not a better one.
+            "line_time_us": parameters.width * parameters.pixel_time_us,
+            "frame_time_s": (
+                parameters.height * parameters.width * parameters.pixel_time_us / 1e6
+            ),
+        }
+        metadata.update(_scan_geometry(frame_parameters))
+        metadata.update(_instrument_state(self._controller))
+        self._frame_index += 1
         return Frame(
             data=data,
             timestamp=datetime.datetime.now(tz=datetime.UTC),
-            metadata={
-                "channel_index": channel,
-                "channel_name": self._device.get_channel_name(channel),
-                "fov_nm": parameters.fov_nm,
-                # The per-axis extent alongside the scalar, so storage
-                # divides what the scan actually covered rather than
-                # re-deriving it from a convention it could disagree with.
-                # Square pixels mean these differ on a non-square scan.
-                "fov_size_nm": parameters.fov_size_nm,
-                "pixel_time_us": parameters.pixel_time_us,
-            },
+            metadata=metadata,
         )
 
     def close(self) -> None:
@@ -433,6 +851,8 @@ class NionInstrument:
             available.append(DEFOCUS_CONTROL)
         if self._has_control(_BLANKER_CONTROL_NAME):
             available.append(BEAM_BLANKER_CONTROL)
+        if self._has_control(_ENERGY_OFFSET_CONTROL_NAME):
+            available.append(ENERGY_OFFSET_CONTROL)
         return available
 
     def stage_position_nm(self) -> tuple[float, float]:
@@ -471,6 +891,24 @@ class NionInstrument:
         self._controller.set_control_output(
             _DEFOCUS_CONTROL_NAME,
             defocus_nm / _NM_PER_M,
+        )
+
+    def energy_offset_ev(self) -> float:
+        """Return the spectrometer energy offset in eV (the vendor's ``ZLPoffset``)."""
+        return float(self._controller.get_control_output(_ENERGY_OFFSET_CONTROL_NAME))
+
+    def set_energy_offset_ev(self, offset_ev: float) -> None:
+        """
+        Set the spectrometer energy offset, in electronvolts.
+
+        Parameters
+        ----------
+        offset_ev : float
+            Target offset, in electronvolts.
+        """
+        self._controller.set_control_output(
+            _ENERGY_OFFSET_CONTROL_NAME,
+            offset_ev,
         )
 
     def is_beam_blanked(self) -> bool:
@@ -688,10 +1126,11 @@ def simulated_instrument() -> Iterator[InstrumentDevices]:
     configuration = _UsimConfiguration.AcquisitionContextConfiguration(
         set_configuration_location=False,
     )
-    ronchigram_camera = NionCamera(configuration.ronchigram_camera_device)
-    eels_camera = NionCamera(configuration.eels_camera_device)
-    scanner = NionScanner(configuration.scan_module.device)
-    instrument = NionInstrument(configuration.instrument)
+    controller = configuration.instrument
+    ronchigram_camera = NionCamera(configuration.ronchigram_camera_device, controller)
+    eels_camera = NionCamera(configuration.eels_camera_device, controller)
+    scanner = NionScanner(configuration.scan_module.device, controller)
+    instrument = NionInstrument(controller)
     try:
         yield InstrumentDevices(
             ronchigram_camera=ronchigram_camera,
@@ -823,6 +1262,7 @@ def _stop_device_plugins(modules: Sequence[types.ModuleType]) -> None:
 
 def _cameras_from_registry(
     camera_modules: Sequence[typing.Any],
+    controller: typing.Any = None,  # noqa: ANN401 - vendor STEMController
 ) -> tuple[NionCamera | None, NionCamera | None]:
     """
     Sort registered camera modules into (Ronchigram, EELS) by ``camera_type``.
@@ -831,6 +1271,9 @@ def _cameras_from_registry(
     ----------
     camera_modules : Sequence[typing.Any]
         ``camera_module`` components from the Nion registry.
+    controller : typing.Any
+        The registered ``stem_controller``, which each camera needs to
+        resolve its calibration controls against.
 
     Returns
     -------
@@ -855,8 +1298,8 @@ def _cameras_from_registry(
         ronchigram = unlabelled.pop(0)
     eels = by_type.get("eels")
     return (
-        NionCamera(ronchigram) if ronchigram is not None else None,
-        NionCamera(eels) if eels is not None else None,
+        NionCamera(ronchigram, controller) if ronchigram is not None else None,
+        NionCamera(eels, controller) if eels is not None else None,
     )
 
 
@@ -882,7 +1325,7 @@ def _devices_from_registry(notes: Sequence[str]) -> InstrumentDevices:
     controller = _Registry.get_component("stem_controller")
     scan_module = _Registry.get_component("scan_module")
     camera_modules = list(_Registry.get_components_by_type("camera_module"))
-    ronchigram_camera, eels_camera = _cameras_from_registry(camera_modules)
+    ronchigram_camera, eels_camera = _cameras_from_registry(camera_modules, controller)
     missing = [
         label
         for label, present in (
@@ -907,7 +1350,7 @@ def _devices_from_registry(notes: Sequence[str]) -> InstrumentDevices:
     return InstrumentDevices(
         ronchigram_camera=ronchigram_camera,
         eels_camera=eels_camera,
-        scanner=NionScanner(scan_module.device),
+        scanner=NionScanner(scan_module.device, controller),
         instrument=instrument,
         stage_size_nm=instrument.stage_size_nm(),
     )

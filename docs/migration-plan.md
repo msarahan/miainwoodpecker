@@ -1482,24 +1482,42 @@ The invariant now holds mechanically: `nion.*` is imported in
   is the ordered procedure. Highest-consequence item on it: sanity-check
   the defocus *magnitude* before trusting it, because a metres/nanometres
   mix-up is a factor of 1e9 sent to the column, not a rounding error.
-- **Calibration exists as a model but nothing feeds it from the
-  instrument.** §5 Phase 3's calibration work closed the "camera frames have
-  no physical axes" half of this: a per-axis, per-acquisition model now
-  exists and writes correct NeXus units. What remains is the *plumbing* —
-  nothing reads calibration off a device (`camera_base.CameraSettings` and
-  `camera_module.camera_settings` are still read-but-unused in the nion
-  stack), and no UI selects a microscope mode, so today an operator cannot
-  choose between real-space, reciprocal, and energy axes without writing
-  code. Exposure and binning control are also still absent, and want doing
-  *with* calibration rather than after it, since binning changes the pixel
-  scale. This spans `devices/interface.py`, the viewer, and the session
-  layer.
-- **The EELS dispersive-axis default is grounded in the simulator only.**
-  `dispersive_axis="x"` was chosen because usim reports its energy
-  calibration on axis 1 of a 256×1024 frame; a real spectrometer's
-  orientation needs confirming on hardware (it is on the checklist), and it
-  is a parameter precisely so a wrong default is a configuration change
-  rather than a code change.
+- ~~**Calibration exists as a model but nothing feeds it from the
+  instrument.**~~ **Closed.** §5 Phase 3's calibration work built the model;
+  the plumbing turned out to already exist, on the far side of the licence
+  boundary. A Nion camera device publishes no calibration *values* — it
+  publishes a `calibration_controls` mapping naming the *instrument
+  controls* that hold them, because a camera's angular scale depends on the
+  projector lenses and is therefore instrument state. `nion_server`'s
+  `NionCamera.calibration_metadata` resolves them with Nion's own
+  `camera_base.build_calibration` and returns per-axis
+  `{kind, scale, offset, units}` as plain data in the frame metadata, which
+  `resolve_frame_calibration` already reads. No reimplementation, no
+  `nion.*` across the boundary, and no hardware: usim publishes real values
+  (Ronchigram 9.83e-05 rad/px offset -0.1007 rad, EELS 0.5 eV/channel offset
+  -20 eV, EELS slow axis reporting empty units for "not calibrated").
+  Two divergences from Nion, both deliberate: an axis is given its own
+  length rather than the other axis's when centring, and an axis whose units
+  fall outside this project's closed vocabulary degrades to pixels rather
+  than propagating a unit nothing downstream can interpret.
+  Exposure and binning control landed with it, for the mechanical reason
+  the two want doing together: binning multiplies the calibration scale
+  (`build_calibration`'s `relative_scale`). `CameraParameters` and
+  `Camera.configure` carry them, and the binning a frame *reports* is
+  recovered from its shape rather than from the setting, because a camera
+  reconfigured while running finishes the frame in flight at the old
+  settings — measured against usim, and a frame mislabelled there would
+  carry an axis wrong by the whole binning factor.
+  What remains of this bullet is the *operator-facing* half: no UI selects a
+  microscope mode or exposes these controls, so a mode the device does not
+  describe still needs code.
+- ~~**The EELS dispersive-axis default is grounded in the simulator only.**~~
+  **Closed, by removal.** `dispersive_axis="x"` remains a parameter of
+  `FrameCalibration.spectrum` for hand-built calibrations, but no acquired
+  EELS frame reaches it any more: the dispersive axis is the one whose units
+  the *device* reports as `eV`, which the calibration path above now reads.
+  A rotated spectrometer is handled without a configuration change, and this
+  is off the hardware checklist rather than on it.
 - **Scan data arrives as `float64` for no physical reason.** usim's
   `generate_scan_data` is annotated `-> NDArray[float32]` and builds float32
   internally; the promotion happens in its final line, where

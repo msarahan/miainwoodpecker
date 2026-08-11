@@ -8,11 +8,13 @@ import numpy as np
 import pytest
 
 from miainwoodpecker.devices import Frame
+from miainwoodpecker.devices.interface import HIGH_TENSION_V_KEY
 from miainwoodpecker.storage import (
     AxisCalibration,
     AxisKind,
     FrameCalibration,
     NexusWriter,
+    layout,
     read_calibration,
     read_series,
     write_frames,
@@ -661,3 +663,49 @@ def test_reusing_a_writer_does_not_leave_phantom_frames(tmp_path):
         data = handle["entry/instrument/detector/data"]
         assert data.shape == (1, 4, 6)
         assert np.array_equal(data[0], np.full((4, 6), 7, dtype=np.float32))
+
+
+def test_the_accelerating_voltage_becomes_an_nxsource(tmp_path):
+    """
+    A frame's high tension is written where a NeXus reader looks for it.
+
+    Everything else a frame reports about the instrument stays in the
+    per-frame JSON, because NeXus describes no home for it. This one has
+    a home — ``NXsource.voltage``, inside the ``NXinstrument`` the file
+    already has — so leaving it in a blob would hide it from every reader
+    that speaks NeXus rather than this project.
+    """
+    path = tmp_path / "voltage.nxs"
+    frame = _frame(0)
+    with NexusWriter(path) as writer:
+        writer.append(
+            Frame(
+                data=frame.data,
+                timestamp=frame.timestamp,
+                metadata={**frame.metadata, HIGH_TENSION_V_KEY: 100000.0},
+            ),
+        )
+
+    with h5py.File(path, "r") as handle:
+        source = handle[layout.SOURCE_GROUP]
+        assert source.attrs["NX_class"] == "NXsource"
+        assert source["probe"][()].decode() == "electron"
+        assert handle[layout.SOURCE_VOLTAGE][()] == pytest.approx(100000.0)
+        assert handle[layout.SOURCE_VOLTAGE].attrs["units"] == "V"
+
+
+def test_no_source_group_is_written_when_no_frame_reported_a_voltage(tmp_path):
+    """
+    An unreported voltage is absent, never zero.
+
+    A stored 0 V would read as a measurement — an instrument with its high
+    tension off — which is a specific and wrong claim about the
+    acquisition. The same rule the device layer follows for every other
+    control it cannot read.
+    """
+    path = tmp_path / "no_voltage.nxs"
+    with NexusWriter(path) as writer:
+        writer.append(_frame(0))
+
+    with h5py.File(path, "r") as handle:
+        assert layout.SOURCE_GROUP not in handle

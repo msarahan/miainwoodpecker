@@ -25,16 +25,19 @@ import threading
 import time
 from multiprocessing.connection import Client
 
+import numpy as np
 import pytest
 
 pytest.importorskip("nion.usim_device", reason="requires the 'device' extra")
 
-from miainwoodpecker.acquisition import focal_series
+from miainwoodpecker.acquisition import energy_offset_series, focal_series
 from miainwoodpecker.devices import (
     BEAM_BLANKER_CONTROL,
     DEFOCUS_CONTROL,
+    ENERGY_OFFSET_CONTROL,
     STAGE_POSITION_CONTROL,
     Camera,
+    CameraParameters,
     InstrumentController,
     ScanParameters,
     Scanner,
@@ -58,9 +61,11 @@ from miainwoodpecker.devices.remote import (
 )
 from miainwoodpecker.devices.rpc import (
     Call,
+    RemoteCallError,
     RemoteCallTimeoutError,
     RemoteConnectionLostError,
 )
+from miainwoodpecker.storage.calibration import AxisKind, resolve_frame_calibration
 
 _DEV_SHM = pathlib.Path("/dev/shm")  # noqa: S108 - inspected read-only, never written to
 _PROC = pathlib.Path("/proc")
@@ -81,6 +86,9 @@ _HEALTH_LATENCY_BUDGET_MS = 500.0
 # Enough polls to be a meaningful sample while a scan runs, capped so a fast
 # machine cannot spin here indefinitely.
 _MAX_HEALTH_POLLS = 20
+# A supported camera binning big enough that the frame shape change is
+# unmistakable, and enough to force the shared segment to be replaced.
+_TEST_BINNING = 4
 
 
 def _shm_names() -> set[str]:
@@ -163,6 +171,71 @@ def test_camera_round_trip_over_ipc(microscope):
     assert frame.metadata["frame_number"] >= 1
 
 
+def test_camera_settings_configure_over_ipc_and_resize_the_segment(microscope):
+    """
+    Exposure and binning cross the boundary, and a shape change is survived.
+
+    Binning is the one camera setting that changes the *shape* of every
+    subsequent frame, which on this transport means the shared-memory
+    segment the frames arrive through has to be replaced. Configured
+    while the camera is stopped, so the first frame afterwards is already
+    at the new settings.
+    """
+    camera = microscope.ronchigram_camera
+    assert _TEST_BINNING in camera.binning_values
+    original = camera.parameters()
+    camera.start()
+    try:
+        unbinned = camera.acquire_frame()
+    finally:
+        camera.stop()
+    binned_settings = camera.configure(
+        CameraParameters(exposure_ms=20.0, binning=_TEST_BINNING),
+    )
+    assert binned_settings.binning == _TEST_BINNING
+    assert camera.parameters() == binned_settings
+    camera.start()
+    try:
+        binned = camera.acquire_frame()
+    finally:
+        camera.stop()
+        camera.configure(original)
+    assert binned.metadata["binning"] == _TEST_BINNING
+    assert binned.metadata["exposure_ms"] == pytest.approx(20.0)
+    calibration = resolve_frame_calibration(binned.data.shape, metadata=binned.metadata)
+    assert calibration.x.kind is AxisKind.ANGLE
+    # A quarter the size in each direction, so the frames no longer fill
+    # the segment the unbinned ones sized - the reader has to follow the
+    # writer's rather than read the old shape out of the old one.
+    assert binned.data.shape[0] * _TEST_BINNING == unbinned.data.shape[0]
+
+
+def test_camera_calibration_crosses_the_boundary_on_the_shared_memory_path(
+    microscope,
+):
+    """
+    A camera's instrument-resolved calibration survives the IPC boundary.
+
+    Worth asserting over IPC rather than only in-process because the two
+    transports carry metadata differently: a small frame is pickled whole,
+    while a Ronchigram frame goes as a ``SharedFrameRef`` with its metadata
+    alongside. The calibration is a nested mapping, so it is exactly the
+    shape that a transport carrying only the array would drop silently -
+    leaving every recording pixel-calibrated with nothing to say why.
+    """
+    camera = microscope.ronchigram_camera
+    camera.start()
+    try:
+        frame = camera.acquire_frame()
+    finally:
+        camera.stop()
+    assert frame.data.nbytes >= _SHARED_MEMORY_THRESHOLD_BYTES
+    calibration = resolve_frame_calibration(frame.data.shape, metadata=frame.metadata)
+    assert calibration.x.kind is AxisKind.ANGLE
+    assert calibration.x.units == "rad"
+    assert calibration.y.kind is AxisKind.ANGLE
+
+
 def test_small_scan_uses_the_pickle_path_over_ipc(microscope):
     """A scan frame below the shared-memory threshold round-trips correctly."""
     scanner = microscope.scanner
@@ -222,6 +295,177 @@ def test_repeated_large_frames_reuse_the_same_segment(microscope):
     scanner.scan_frame(parameters, channel=0)
     second_name = scanner._reader._segment.name  # noqa: SLF001
     assert first_name == second_name
+
+
+# ---------------------------------------------- frame identity
+#
+# Two contracts Nion asserts about its own scan device
+# (ScanControl_test.test_frame_do_not_change_after_acquisition and
+# test_consecutive_frames_have_unique_data). In-process for Nion they are
+# nearly tautological. Here they are not: every frame above the threshold
+# arrives through *one reused* shared-memory segment, so a caller holding
+# frame N while frame N+1 is written is exactly the situation the segment
+# reuse creates and the copy-out exists to survive.
+#
+# Both use frames comfortably above the threshold and identical in shape,
+# which is what guarantees the segment is reused rather than replaced.
+
+_IDENTITY_FRAME_SIZE = 256  # 256x256 float64 = 512KB, 8x the threshold
+_IDENTITY_FRAME_COUNT = 4
+
+
+def _identity_scan_parameters(microscope) -> ScanParameters:
+    """Return scan parameters that put a frame on the shared-memory path."""
+    return ScanParameters(
+        height=_IDENTITY_FRAME_SIZE,
+        width=_IDENTITY_FRAME_SIZE,
+        pixel_time_us=1.0,
+        fov_nm=microscope.stage_size_nm * 0.1,
+    )
+
+
+def test_a_held_frame_does_not_change_when_later_frames_arrive(microscope):
+    """
+    Frames already returned stay as they were, however many follow them.
+
+    The failure this rules out is specific and silent: if ``_frame`` handed
+    back a view onto the shared segment instead of copying out of it, every
+    frame a caller was holding would mutate under them on the next
+    acquisition — a live viewer's history, a recording's buffered frames,
+    a focal series' earlier steps. Checksums are taken as each frame
+    arrives and re-checked at the end, which is Nion's own construction.
+    """
+    scanner = microscope.scanner
+    parameters = _identity_scan_parameters(microscope)
+    frames = []
+    checksums = []
+    for _ in range(_IDENTITY_FRAME_COUNT):
+        frame = scanner.scan_frame(parameters, channel=0)
+        assert frame.data.nbytes >= _SHARED_MEMORY_THRESHOLD_BYTES
+        frames.append(frame)
+        checksums.append(float(np.sum(frame.data)))
+    for checksum, frame in zip(checksums, frames, strict=True):
+        assert float(np.sum(frame.data)) == checksum
+
+
+def test_consecutive_frames_are_not_the_same_frame_twice(microscope):
+    """
+    Successive scans of one region differ, so no frame is a stale re-read.
+
+    The complement of the test above: that one catches a frame being
+    overwritten, this one catches a frame never being written — a reader
+    that returns whatever the segment last held would pass every checksum
+    test while showing the operator a frozen image. Shot noise makes two
+    scans of the same region differ in every row; Nion's version notes
+    this is invalid on a saturated detector, which is why the assertion
+    is on rows rather than on an exact-equality of the whole frame.
+    """
+    scanner = microscope.scanner
+    parameters = _identity_scan_parameters(microscope)
+    first = scanner.scan_frame(parameters, channel=0)
+    for _ in range(_IDENTITY_FRAME_COUNT - 1):
+        later = scanner.scan_frame(parameters, channel=0)
+        identical_rows = int(np.sum(np.all(first.data == later.data, axis=1)))
+        assert identical_rows == 0
+
+
+def test_a_big_scan_does_not_prevent_the_next_one(microscope):
+    """
+    A scan large enough to force a new segment leaves the device usable.
+
+    Ported from Nion's ``test_big_scan_does_not_prevent_further_playing``.
+    The suite already scans 4096² to prove the big scan itself succeeds;
+    what it never checked is the half that actually bites, because the
+    large frame replaces the shared segment — a client that failed to
+    follow the new segment would break on the *next*, ordinary scan
+    rather than on the big one.
+    """
+    scanner = microscope.scanner
+    fov_nm = microscope.stage_size_nm * 0.1
+    big = ScanParameters(
+        height=_LARGE_SIZE,
+        width=_LARGE_SIZE,
+        pixel_time_us=1.0,
+        fov_nm=fov_nm,
+    )
+    scanner.scan_frame(big, channel=0)
+    ordinary = ScanParameters(height=32, width=48, pixel_time_us=1.0, fov_nm=fov_nm)
+    frame = scanner.scan_frame(ordinary, channel=0)
+    assert frame.data.shape == ordinary.shape
+    assert float(np.std(frame.data)) > 0.0
+
+
+# ------------------------------------------ device errors and recovery
+#
+# Nion asserts that a device error stops acquisition, surfaces, and leaves
+# the device restartable (test_exception_during_view_halts_scan and
+# test_able_to_restart_scan_after_exception_scan). In-process, for Nion,
+# the first two are exception propagation. Across this boundary they are a
+# genuinely different question - the exception raises in another process,
+# and what reaches the caller is a Result carrying a string - and the
+# third is the one that matters: is the *server* still usable afterwards,
+# or does the client have to respawn it and lose every device setting and
+# instrument control with it?
+
+_BAD_CHANNEL = 99
+
+
+def test_a_device_error_surfaces_with_its_type_and_leaves_the_device_usable(
+    microscope,
+):
+    """
+    A vendor exception crosses as a typed error, and the device works after.
+
+    Scanning a channel that does not exist raises ``IndexError`` inside
+    Nion's own scan device — a plain operator mistake rather than a
+    contrived failure. What matters is both halves: the caller learns
+    *what* failed rather than getting one indistinguishable
+    ``RemoteCallError``, and the very next scan on the same device and
+    the same connection succeeds. Without the second half, every bad
+    argument would cost a session.
+    """
+    scanner = microscope.scanner
+    parameters = ScanParameters(
+        height=16,
+        width=16,
+        pixel_time_us=1.0,
+        fov_nm=microscope.stage_size_nm * 0.1,
+    )
+    with pytest.raises(RemoteCallError) as failure:
+        scanner.scan_frame(parameters, channel=_BAD_CHANNEL)
+    assert failure.value.error_type == "IndexError"
+
+    recovered = scanner.scan_frame(parameters, channel=0)
+    assert recovered.data.shape == parameters.shape
+
+
+def test_a_device_error_leaves_the_server_and_its_other_targets_alive(microscope):
+    """
+    One device's failure is not the server's, nor the other devices'.
+
+    Each target is served on its own connection and its own handler
+    thread, so this is the property that makes a bad call cheap: after
+    the scanner raises, the server still answers a health check and the
+    camera still acquires. A failure that took the process down would
+    also drop the instrument controls and leave the column unparked.
+    """
+    scanner = microscope.scanner
+    parameters = ScanParameters(
+        height=16,
+        width=16,
+        pixel_time_us=1.0,
+        fov_nm=microscope.stage_size_nm * 0.1,
+    )
+    with pytest.raises(RemoteCallError):
+        scanner.scan_frame(parameters, channel=_BAD_CHANNEL)
+
+    assert microscope.instrument.check_health().state == SERVER_RESPONSIVE
+    camera = microscope.eels_camera
+    camera.start()
+    try:
+        assert camera.acquire_frame().data.ndim == 2  # noqa: PLR2004 - a 2D detector
+    finally:
+        camera.stop()
 
 
 def test_outgrowing_the_segment_creates_a_new_one_and_frees_the_old(microscope):
@@ -391,6 +635,7 @@ def test_describe_reports_the_backend_targets_and_controls(microscope):
         STAGE_POSITION_CONTROL,
         DEFOCUS_CONTROL,
         BEAM_BLANKER_CONTROL,
+        ENERGY_OFFSET_CONTROL,
     }
     assert description["stage_size_nm"] == microscope.stage_size_nm
 
@@ -462,6 +707,50 @@ def test_focal_series_sweeps_real_defocus_over_ipc(microscope):
     # A defocus sweep leaves the field of view alone.
     assert all(frame.metadata["fov_nm"] == parameters.fov_nm for frame in frames)
     assert instrument.defocus_nm() == pytest.approx(original)
+
+
+def test_energy_offset_series_moves_the_spectrum_it_labels(microscope):
+    """
+    An energy sweep changes the data, not just the metadata.
+
+    The claim ``focal_series`` explicitly cannot make against the
+    simulator, and the reason this sweep is the better documentation
+    example: stepping the spectrometer offset visibly moves the zero-loss
+    peak across the detector, so the frames a reader gets really do
+    differ. Both halves are asserted — the recorded energy axis follows
+    the offset, *and* the spectrum underneath it moved.
+
+    This is also the regression guard for the reason the generator stops
+    the camera between steps: acquired continuously, the frame returned
+    after a control change was generated before it, so the peak would
+    stay put while the axis moved.
+    """
+    instrument = microscope.instrument
+    assert ENERGY_OFFSET_CONTROL in instrument.available_controls()
+    original = instrument.energy_offset_ev()
+    values = [-20.0, 20.0]
+    frames = list(
+        energy_offset_series(microscope.eels_camera, values, instrument=instrument),
+    )
+
+    assert [frame.metadata["requested_energy_offset_ev"] for frame in frames] == values
+    assert [
+        frame.metadata["energy_offset_ev"] for frame in frames
+    ] == pytest.approx(values)
+    # The camera resolves its energy axis from the same instrument
+    # control, so the recorded calibration tracks the sweep for free.
+    axis_offsets = [
+        resolve_frame_calibration(
+            frame.data.shape,
+            metadata=frame.metadata,
+        ).x.offset
+        for frame in frames
+    ]
+    assert axis_offsets == pytest.approx(values)
+    # And the data moved: the zero-loss peak is in a different channel.
+    peaks = [int(np.argmax(frame.data.sum(axis=0))) for frame in frames]
+    assert peaks[0] != peaks[1]
+    assert instrument.energy_offset_ev() == pytest.approx(original)
 
 
 # ----------------------------------------------------- graceful shutdown
