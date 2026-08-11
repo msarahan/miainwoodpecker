@@ -126,6 +126,24 @@ def _finish_load(widget: LiveInstrumentWidget) -> None:
     assert _wait_until(done)
 
 
+def _finish_analysis(widget: LiveInstrumentWidget) -> None:
+    """
+    Drive the widget's own poll path until its analysis job completes.
+
+    Same reasoning as :func:`_finish_recording`: the analysis buttons hand
+    their work to a worker thread and only the poll path, on the GUI
+    thread, adds the layers and writes the status label. A test that
+    asserted straight after the click would be asserting on a job that had
+    barely started.
+    """
+
+    def done() -> bool:
+        widget.refresh_display()
+        return widget._analysis_job is None  # noqa: SLF001
+
+    assert _wait_until(done)
+
+
 def _abandon_a_writer(path, frame_count: int = 3) -> None:
     """
     Leave the file an abandoned-but-cleanly-exited writer leaves.
@@ -194,12 +212,50 @@ def test_analyze_camera_in_hyperspy_adds_a_projection_layer():
     widget = LiveInstrumentWidget(viewer, _FakeScanner(), camera=camera)
     try:
         widget._analyze_camera_in_hyperspy()  # noqa: SLF001 - simulating a button click
+        _finish_analysis(widget)
 
         layer_name = "HyperSpy mean projection (Camera)"
         assert layer_name in viewer.layers
         projection_shape = (8, 8)
         assert viewer.layers[layer_name].data.shape == projection_shape
         assert not camera.started  # the burst starts and stops the camera itself
+        assert widget._analyze_status.text().startswith("done")  # noqa: SLF001
+    finally:
+        widget.shutdown()
+        viewer.close()
+
+
+def test_analysis_click_returns_before_the_work_is_done():
+    """
+    The handler hands off to a worker thread instead of doing the work inline.
+
+    This is the property the ``AnalysisJob`` change exists for: an analysis
+    used to run to completion inside the click handler, so the window did
+    not repaint and "Stop scan" did not answer for its duration.
+
+    The assertions are deliberately race-free rather than timing-based.
+    Layers and the status text are only ever touched by ``_poll_analysis``,
+    which only runs from ``refresh_display`` — so as long as the test does
+    not call that, it does not matter whether the worker has already
+    finished: the layer cannot exist yet and the label must still read
+    "working...". A handler that did the work inline would fail both, every
+    time, regardless of machine speed.
+    """
+    pytest.importorskip("hyperspy", reason="requires the 'analysis' extra")
+    viewer = napari.Viewer(show=False)
+    widget = LiveInstrumentWidget(viewer, _FakeScanner(), camera=_FakeCamera())
+    try:
+        widget._analyze_camera_in_hyperspy()  # noqa: SLF001 - simulating a button click
+
+        # Returned to the caller with the work outstanding, and nothing
+        # drawn: the GUI thread is free.
+        assert widget._analysis_job is not None  # noqa: SLF001
+        assert widget._analyze_status.text() == "working..."  # noqa: SLF001
+        assert "HyperSpy mean projection (Camera)" not in viewer.layers
+
+        _finish_analysis(widget)
+
+        assert "HyperSpy mean projection (Camera)" in viewer.layers
         assert widget._analyze_status.text().startswith("done")  # noqa: SLF001
     finally:
         widget.shutdown()
@@ -223,6 +279,7 @@ def test_analyze_camera_in_libertem_adds_a_sum_projection_layer():
     widget = LiveInstrumentWidget(viewer, _FakeScanner(), camera=camera)
     try:
         widget._analyze_camera_in_libertem()  # noqa: SLF001 - simulating a button click
+        _finish_analysis(widget)
 
         layer_name = "LiberTEM sum projection (Camera)"
         assert layer_name in viewer.layers
@@ -253,6 +310,7 @@ def test_fit_central_disk_in_py4dstem_adds_a_frame_and_shapes_layer():
     widget = LiveInstrumentWidget(viewer, _FakeScanner(), camera=camera)
     try:
         widget._fit_central_disk_in_py4dstem()  # noqa: SLF001 - simulating a button click
+        _finish_analysis(widget)
 
         frame_layer_name = "py4DSTEM disk fit (Camera)"
         assert frame_layer_name in viewer.layers
@@ -596,6 +654,7 @@ def test_analysis_runs_against_a_file_on_disk_without_acquiring(tmp_path):
         widget._analyze_from_file_check.setChecked(True)  # noqa: SLF001 - user input
 
         widget._analyze_camera_in_hyperspy()  # noqa: SLF001 - simulating a button click
+        _finish_analysis(widget)
 
         assert "HyperSpy mean projection (Camera)" in viewer.layers
         status = widget._analyze_status.text()  # noqa: SLF001
@@ -631,6 +690,7 @@ def test_analysis_against_an_unfinalized_file_is_refused_with_the_reason(tmp_pat
         widget._analyze_from_file_check.setChecked(True)  # noqa: SLF001 - user input
 
         widget._analyze_camera_in_hyperspy()  # noqa: SLF001 - simulating a button click
+        _finish_analysis(widget)
 
         status = widget._analyze_status.text()  # noqa: SLF001
         assert "never finalized" in status
@@ -766,6 +826,7 @@ def test_analysis_burst_is_kept_in_the_session_when_one_is_attached(tmp_path):
     try:
         widget.set_session(Session(tmp_path / "shift", operator="M. Sarahan"))
         widget._analyze_camera_in_hyperspy()  # noqa: SLF001 - simulating a button click
+        _finish_analysis(widget)
 
         assert "HyperSpy mean projection (Camera)" in viewer.layers
         assert widget._analyze_status.text().startswith("done")  # noqa: SLF001

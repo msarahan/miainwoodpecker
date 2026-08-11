@@ -948,9 +948,29 @@ problem — read their source and docs before designing our own adapters:
     the load job for display, once by the adapter — because the adapters take
     a path rather than an array. Harmless at pilot scale, wasteful at
     2048×2048.
-  - **The analysis buttons still block the GUI thread** for the length of
-    their burst — pre-existing, and the obvious next candidate for the
-    `RecordingJob` treatment the recording path already uses.
+  - ~~**The analysis buttons still block the GUI thread**~~ — **done**. All
+    three now hand off to
+    [`AnalysisJob`](../src/miainwoodpecker/viewer/jobs.py), which has
+    `LoadJob`'s exact shape: daemon thread, state behind a lock, exceptions
+    captured rather than raised, no Qt, polled from the same display timer
+    that already collects the recording and load jobs.
+    - The split is what makes it safe, and it is the caller's job rather
+      than the job class's: `_start_analysis` resolves the Recordings
+      checkbox and the note field *before* the thread starts, and defers
+      every layer and label update to `_poll_analysis`. `_analysis_input`
+      correspondingly takes `existing`/`note` as arguments instead of
+      reading the widgets itself, and no longer refreshes the session
+      labels from inside the worker.
+    - Each button supplies a `compute` (runs on the worker, must not touch
+      Qt) and a `display` (runs on the GUI thread, draws and returns the
+      status text). That is the whole difference between them; everything
+      else — stopping the live camera, acquiring or opening, error
+      reporting, refusing a second concurrent run — is now shared.
+    - Covered by a race-free test rather than a timing one: layers and
+      status text are only ever touched by the poll path, so asserting
+      straight after the click that the layer is absent and the label reads
+      "working..." holds regardless of how fast the worker finishes, and
+      fails every time for a handler that works inline.
 
 ## 6. License — resolved: process-boundary isolation
 
