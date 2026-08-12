@@ -1418,18 +1418,20 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         checkbox), read it back as a LiberTEM ``DataSet`` with
         :func:`~miainwoodpecker.analysis.libertem_bridge.load_as_libertem_dataset`,
         run one real LiberTEM UDF (``libertem.udf.sum.SumUDF``, summing
-        across the frame/navigation axis) with an inline ``Context``, and
-        push the result into napari as a new image layer. Requires the
+        across the frame/navigation axis) on the thread-bounded inline
+        ``Context`` from
+        :func:`~miainwoodpecker.analysis.libertem_bridge.analysis_context`,
+        and push the result into napari as a new image layer. Requires the
         ``libertem`` optional dependency group; reports that in the status
         label rather than crashing the widget if it is missing.
         """
         if self._camera is None:
             return
         try:
-            from libertem.api import Context  # noqa: PLC0415
             from libertem.udf.sum import SumUDF  # noqa: PLC0415
 
             from miainwoodpecker.analysis.libertem_bridge import (  # noqa: PLC0415
+                analysis_context,
                 load_as_libertem_dataset,
             )
         except ImportError:
@@ -1437,12 +1439,13 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
             return
 
         def compute(source: _AnalysisInput) -> object:
-            # Inline executor: this is a single UDF run over one small,
-            # already-in-memory burst, not the large-dataset workload
-            # LiberTEM's default dask executor is built for - spinning
-            # up a local cluster per button click would be pure
-            # overhead here.
-            with Context.make_with("inline") as ctx:
+            # An inline executor, sized to leave cores for this thread's
+            # own event loop: one UDF over one small, already-in-memory
+            # burst is not the large-dataset workload LiberTEM's default
+            # dask executor is built for, and an unbounded inline
+            # executor still asks for every physical core underneath
+            # itself. See analysis/threads.py for the measurement.
+            with analysis_context() as ctx:
                 dataset = load_as_libertem_dataset(ctx, source.path)
                 result = ctx.run_udf(dataset=dataset, udf=SumUDF())
                 return result["intensity"].data

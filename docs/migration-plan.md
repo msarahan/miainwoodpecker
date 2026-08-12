@@ -380,13 +380,48 @@ problem — read their source and docs before designing our own adapters:
   4 seconds. **So this is not a second argument for changing viewer; it
   is a scheduling constraint on our own code.**
 
-  **The actionable form: cap analysis parallelism below the core count.**
-  `viewer/jobs.py` already runs one analysis at a time on one worker
-  thread, so our own fan-out is not the problem — the numpy/BLAS and
-  LiberTEM executor threads *inside* that one job are, and they default
-  to every core. Whatever runs analysis should leave at least two cores
-  for the GUI thread (`OMP_NUM_THREADS`, LiberTEM's executor worker
-  count), which the `--load 4` row says costs the live view nothing.
+  **The actionable form, now implemented rather than recommended:
+  analysis parallelism is capped below the core count.**
+  [`src/miainwoodpecker/analysis/threads.py`](../src/miainwoodpecker/analysis/threads.py)
+  holds the whole policy as one number — `os.cpu_count()` minus two,
+  floored at one — and two places apply it. `AnalysisJob` runs every
+  analysis inside `limit_analysis_threads()`, which caps the
+  OpenBLAS/MKL/OpenMP pools with `threadpoolctl` and restores them
+  afterwards; the LiberTEM button builds its `Context` from
+  `analysis_context()`, which hands the same number to
+  `InlineJobExecutor(inline_threads=...)`. The second is not redundant
+  with the first: **"inline" bounds the executor, not the numerics under
+  it** — an `InlineJobExecutor` with no `inline_threads` asks for
+  `psutil.cpu_count(logical=False)` fine-grained threads and applies that
+  to numba (which `threadpoolctl` cannot reach), pyfftw and the BLAS
+  pools around every partition it processes. `viewer/jobs.py` already ran
+  one analysis at a time on one worker thread, so our own fan-out never
+  was the problem; the library threads inside that one job were. The
+  target is the `--load 4` row — two cores left free — which that row
+  says costs the live view nothing.
+
+  **The floor is not a detail.** On one or two cores the subtraction is
+  zero or negative, and both consumers read that badly: a BLAS pool takes
+  zero as "decide for yourself" and goes back to every core, and LiberTEM
+  passes the number to `numba.set_num_threads`, which refuses anything
+  below one. So the smallest machines would have been the ones where the
+  cap either did nothing or crashed. One thread means a slow analysis
+  that still shares the machine.
+
+  **`OMP_NUM_THREADS` and friends are deliberately not used**, and would
+  not have worked: those are read when the native library loads — for
+  numpy, at `import numpy` — so setting them from inside a running Qt
+  application is a no-op that looks like a fix. `threadpoolctl` calls each
+  library's own runtime setter instead, which is the same thing LiberTEM
+  reaches for internally. The honest limitation is scope: those setters
+  are process-global, so the cap is bounded in *time* (lifted when the job
+  finishes) rather than confined to the worker thread. That costs nothing
+  here, since the GUI thread's own work is Qt repaints and napari
+  bookkeeping rather than BLAS calls, but it is a real difference from
+  "the analysis thread is limited". A second known gap: `os.cpu_count()`
+  reports the machine, not a container's CPU quota — `os.process_cpu_count()`
+  is the correct call and needs Python 3.13, above this package's 3.11
+  floor.
 
   **Camera live views measured at half the scan path, as predicted from
   the code.** 5.6 ms median here against the scan loop's 11–12 ms above,
@@ -442,7 +477,8 @@ problem — read their source and docs before designing our own adapters:
   OpenGL): the condition set here for moving to `ndv` — display still
   dominating once hardware-accelerated — is not met at any scan size, and
   the one regime where the fixed cost would bite is already routed to
-  LiberTEM-live. Keep napari; keep the analysis threads bounded.
+  LiberTEM-live. Keep napari — and the analysis threads are bounded, in
+  `analysis/threads.py`, rather than left as advice.
 
 **Phase 3 — Acquisition and storage**
 - [x] Acquisition sequences —

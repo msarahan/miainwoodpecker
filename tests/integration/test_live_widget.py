@@ -425,7 +425,7 @@ def test_editing_session_context_persists_it_for_later_recordings(tmp_path):
 
 
 def test_save_displayed_scan_frame_keeps_the_frame_on_screen(tmp_path):
-    """ "Save displayed frame" writes the live frame without stopping the loop."""
+    """Saving the displayed frame writes it without stopping the live loop."""
     viewer = napari.Viewer(show=False)
     widget = LiveInstrumentWidget(viewer, _FakeScanner())
     try:
@@ -455,7 +455,7 @@ def test_save_displayed_scan_frame_keeps_the_frame_on_screen(tmp_path):
 
 
 def test_record_scan_frames_writes_the_requested_count(tmp_path):
-    """ "Record frames" streams a scan series into the session off the GUI thread."""
+    """Recording frames streams a scan series to disk off the GUI thread."""
     viewer = napari.Viewer(show=False)
     widget = LiveInstrumentWidget(viewer, _FakeScanner())
     try:

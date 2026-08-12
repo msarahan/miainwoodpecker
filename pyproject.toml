@@ -103,8 +103,18 @@ viewer = [
 # describes, just judged unlikely to bite for this dependency. Revisit
 # with an exact pin if a hatch env build ever actually resolves a HyperSpy
 # release that breaks this adapter.
+# threadpoolctl is here for src/miainwoodpecker/analysis/threads.py, which
+# caps the BLAS thread pools underneath an analysis so the GUI thread keeps
+# a core (measured: docs/migration-plan.md, Phase 2 - eight competing
+# workers froze the viewer for four seconds). It is checked, not assumed,
+# to be new weight only here: uv.lock has libertem and py4dstem both
+# depending on it directly, and scikit-learn (which both pull in) as well,
+# so the other two analysis extras already ship it. Bare "analysis" did
+# not - hyperspy's own tree stops at dask/scipy/rosettasciio - and neither
+# does napari's. One pure-Python wheel with no dependencies of its own.
 analysis = [
     "hyperspy>=2.0",
+    "threadpoolctl>=3",
 ]
 # LiberTEM: kept as its own extra, not folded into "analysis" above.
 # Measured (docs/migration-plan.md section 5): `pip install libertem` alone

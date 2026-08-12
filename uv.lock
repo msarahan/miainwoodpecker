@@ -1658,6 +1658,7 @@ dependencies = [
 [package.optional-dependencies]
 analysis = [
     { name = "hyperspy" },
+    { name = "threadpoolctl" },
 ]
 camera = [
     { name = "opencv-python-headless" },
@@ -1727,6 +1728,7 @@ requires-dist = [
     { name = "sphinx-autobuild", marker = "extra == 'docs'", specifier = ">=2024.10.3" },
     { name = "sphinx-copybutton", marker = "extra == 'docs'", specifier = ">=0.5.2" },
     { name = "sphinx-design", marker = "extra == 'docs'", specifier = ">=0.6.1" },
+    { name = "threadpoolctl", marker = "extra == 'analysis'", specifier = ">=3" },
 ]
 provides-extras = ["analysis", "camera", "compression", "dev", "device", "docs", "libertem", "py4dstem", "tests", "viewer"]
 

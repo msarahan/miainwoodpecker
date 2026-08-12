@@ -93,6 +93,7 @@ from __future__ import annotations
 
 import typing
 
+from miainwoodpecker.analysis.threads import analysis_thread_count
 from miainwoodpecker.storage import layout
 from miainwoodpecker.storage.nexus import require_frames
 
@@ -103,6 +104,50 @@ if typing.TYPE_CHECKING:
     from libertem.io.dataset.base import DataSet
 
 _DATASET_PATH = layout.ABSOLUTE_NXDATA_DATA
+
+
+def analysis_context(cpu_count: int | None = None) -> Context:
+    """
+    Return a ``Context`` whose threads leave room for the GUI thread.
+
+    The executor choice is unchanged and deliberate: an inline executor,
+    because a button click here is one UDF over one small, already
+    in-memory burst, and standing up a local dask cluster per click would
+    be pure overhead. What changes is the number under it. **"Inline"
+    bounds the executor, not the numerics**: ``InlineJobExecutor`` with no
+    ``inline_threads`` asks for ``psutil.cpu_count(logical=False)``
+    fine-grained threads and applies that to numba, pyfftw and the BLAS
+    pools around every partition it processes
+    (``libertem.common.threading.set_num_threads``), which on an idle
+    machine is every physical core — the thing
+    :mod:`miainwoodpecker.analysis.threads` exists to stop.
+
+    This is LiberTEM's own knob rather than an environment variable, which
+    is why the LiberTEM path gets a factory of its own instead of relying
+    on the process-wide limit
+    :func:`~miainwoodpecker.analysis.threads.limit_analysis_threads`
+    applies: numba's pool is not one ``threadpoolctl`` can reach, and
+    LiberTEM already sets it correctly when told a worker count.
+
+    Parameters
+    ----------
+    cpu_count : int | None
+        Cores to size the cap against; defaults to the machine's. See
+        :func:`~miainwoodpecker.analysis.threads.analysis_thread_count`.
+
+    Returns
+    -------
+    Context
+        A LiberTEM ``Context``, ready for :func:`load_as_libertem_dataset`
+        and :meth:`Context.run_udf`. It is a context manager and owns an
+        executor, so close it (``with analysis_context() as ctx:``).
+    """
+    from libertem.api import Context  # noqa: PLC0415
+    from libertem.executor.inline import InlineJobExecutor  # noqa: PLC0415
+
+    return Context(
+        executor=InlineJobExecutor(inline_threads=analysis_thread_count(cpu_count))
+    )
 
 
 def load_as_libertem_dataset(
@@ -123,7 +168,9 @@ def load_as_libertem_dataset(
         An existing LiberTEM ``Context`` (owns the executor the
         ``DataSet`` will run UDFs on). Not created here: a ``Context``'s
         lifecycle — inline vs. dask executor, one per app run vs. one
-        per call — is a caller concern, not a file-reading one.
+        per call — is a caller concern, not a file-reading one. This
+        app's own callers use :func:`analysis_context`, which makes the
+        one this project's GUI can afford to share a machine with.
     path : os.PathLike[str] | str
         An HDF5 file written by :class:`~miainwoodpecker.storage.nexus.NexusWriter`.
 

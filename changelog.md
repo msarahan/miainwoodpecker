@@ -198,14 +198,38 @@
   the benchmark's median-derived frame rate misleading exactly where a
   user first notices trouble. At eight workers the worst update is 4031
   ms — the GUI thread descheduled outright, which no per-update
-  efficiency addresses. The conclusion is a scheduling constraint:
-  whatever runs analysis must leave cores for the GUI thread
-  (`OMP_NUM_THREADS`, LiberTEM executor workers), since our own
-  `viewer/jobs.py` already runs one job at a time and it is the
-  numpy/BLAS threads inside it that take every core. Also confirms by
-  measurement what `viewer/live.py` implied: the camera path costs half
-  the scan path (5.6 ms against 11–12 ms), because only the scan view
-  autocontrasts every frame.
+  efficiency addresses. The conclusion is a scheduling constraint on our
+  own code, fixed in the next entry: our `viewer/jobs.py` already runs one
+  job at a time, and it is the numpy/BLAS and LiberTEM threads inside it
+  that take every core. Also confirms by measurement what `viewer/live.py`
+  implied: the camera path costs half the scan path (5.6 ms against 11–12
+  ms), because only the scan view autocontrasts every frame.
+
+- **Analysis no longer takes every core out from under the GUI thread.**
+  New `analysis/threads.py` resolves one number — `os.cpu_count()` minus
+  two, floored at one — and two places apply it: `AnalysisJob` runs every
+  analysis inside a `threadpoolctl` limit of that many threads, and the
+  LiberTEM button's `Context` now comes from `analysis_context()`, which
+  passes the same number to `InlineJobExecutor(inline_threads=...)`. The
+  executor knob is needed separately because "inline" bounds the
+  *executor*, not the numerics: unconfigured, it still asks for one
+  fine-grained thread per physical core and hands that to numba, which
+  `threadpoolctl` cannot reach. The floor matters most on the machines
+  least able to absorb the problem — a two-core laptop would otherwise get
+  a zero-thread limit, which BLAS reads as "use everything" and numba
+  refuses outright.
+
+  `OMP_NUM_THREADS` and friends are deliberately not set: they are read
+  when the native library loads, so writing them from inside a running
+  application is a no-op that looks like a fix. Two limitations stated
+  rather than papered over, both also in the module docstring: the runtime
+  setters underneath `threadpoolctl` are process-global, so the cap is
+  scoped to the *duration* of an analysis rather than to the worker
+  thread; and `os.cpu_count()` reports the machine rather than a
+  container's CPU quota, since `os.process_cpu_count()` needs Python 3.13
+  and this package supports 3.11. New dependency: `threadpoolctl` in the
+  `analysis` extra only — `libertem` and `py4dstem` already carried it
+  transitively.
 
 - `scripts/phase2_live_benchmark.py` compared display cost against the
   *simulator's* acquire time, which is not what gates a live view. On the
