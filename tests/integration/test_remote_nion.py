@@ -38,7 +38,7 @@ from miainwoodpecker.devices import (
     STAGE_POSITION_CONTROL,
     Camera,
     CameraParameters,
-    InstrumentController,
+    Instrument,
     ScanParameters,
     Scanner,
     remote,
@@ -612,9 +612,16 @@ def _exercise_shared_memory(
 # --------------------------------------------------- instrument controls
 
 
-def test_remote_instrument_satisfies_the_controller_protocol(microscope):
-    """RemoteInstrument is recognized by the runtime-checkable protocol."""
-    assert isinstance(microscope.instrument, InstrumentController)
+def test_remote_instrument_satisfies_the_instrument_protocol(microscope):
+    """
+    RemoteInstrument is recognized by the runtime-checkable core.
+
+    The check is against ``Instrument`` — identity, capability,
+    ``park()`` — because that is the runtime question; the full control
+    surface is a static-typing protocol, and this proxy's conformance to
+    it is what the sweeps and control tests below exercise for real.
+    """
+    assert isinstance(microscope.instrument, Instrument)
 
 
 def test_describe_reports_the_backend_targets_and_controls(microscope):

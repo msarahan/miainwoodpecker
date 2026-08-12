@@ -4,6 +4,7 @@ import datetime
 import typing
 
 import numpy as np
+import pytest
 
 from miainwoodpecker.devices import (
     BEAM_BLANKER_CONTROL,
@@ -13,6 +14,7 @@ from miainwoodpecker.devices import (
     Camera,
     CameraParameters,
     Frame,
+    Instrument,
     InstrumentController,
     ScanParameters,
     Scanner,
@@ -210,9 +212,26 @@ def test_scan_frame_uses_requested_shape():
     assert frame.data.shape == parameters.shape
 
 
-def test_fake_instrument_satisfies_instrument_controller_protocol():
-    """A structural implementation is recognized by the runtime-checkable protocol."""
-    assert isinstance(_FakeInstrument(), InstrumentController)
+def test_fake_instrument_satisfies_the_instrument_protocol():
+    """A structural implementation is recognized by the runtime-checkable core."""
+    assert isinstance(_FakeInstrument(), Instrument)
+
+
+def test_the_full_controller_is_not_a_runtime_check():
+    """
+    ``isinstance`` against ``InstrumentController`` is a ``TypeError``.
+
+    Deliberate, and worth pinning so it cannot quietly regress: the full
+    control surface used to be ``runtime_checkable``, and its
+    all-or-nothing ``isinstance`` failed two working adapters (a
+    spectrometer with one control, a webcam with none) — it tested for
+    Nion-shapedness rather than conformance. The runtime question is now
+    :class:`Instrument` plus ``available_controls()``; the controller
+    exists for static typing, and asking it at runtime should fail
+    loudly rather than reintroduce the wrong question.
+    """
+    with pytest.raises(TypeError, match="runtime_checkable"):
+        isinstance(_FakeInstrument(), InstrumentController)
 
 
 def test_stage_position_is_y_then_x_like_scan_parameters_shape():
@@ -235,4 +254,4 @@ def test_available_controls_can_report_a_partial_instrument():
     """An instrument without a blanker says so rather than failing on use."""
     instrument = _FakeInstrument(controls=[DEFOCUS_CONTROL])
     assert BEAM_BLANKER_CONTROL not in instrument.available_controls()
-    assert isinstance(instrument, InstrumentController)
+    assert isinstance(instrument, Instrument)

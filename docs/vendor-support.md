@@ -410,6 +410,46 @@ executable specification an adapter writes against, and the measurement
 it gives is the useful one: **the protocol plumbing is about eighty lines**.
 Everything beyond that in a real adapter is vendor work.
 
+**`InstrumentController` was all-or-nothing to `isinstance`.**
+`available_controls()` exists precisely so an instrument can serve some
+controls and not others — a webcam has no defocus, a detector-only server
+has no stage — but the protocol was `runtime_checkable`, and a
+`runtime_checkable` Protocol's `isinstance` check demands every method
+regardless of what the instrument says it supports. Two adapters failed
+that check while working perfectly (`camera_server.ServerInstrument` and
+`gatan_bridge.BridgeInstrument`), which meant the check was testing for
+Nion-shapedness rather than for protocol conformance. Found twice, by two
+independent adapters — the signal that it was the abstraction and not the
+adapters, and what mapping the `isinstance` call sites confirmed: every
+one was asking "is this an instrument target I can hold a session
+against", never "does it have a defocus".
+
+The fix splits the protocol along that question. `Instrument` is the
+`runtime_checkable` core every instrument target serves — identity
+(`stage_size_nm`), capability (`available_controls`), lifecycle (`park`)
+— and is what `isinstance` now checks. `InstrumentController` is that
+core plus the per-control methods, for static typing, and is
+deliberately no longer `runtime_checkable`: `isinstance` against it
+raises `TypeError`, so the all-or-nothing question cannot quietly come
+back. (A superset by re-declaration rather than subclassing, because
+`runtime_checkable` is inherited and has no opt-out; protocols are
+structural, so nothing is lost.) Per-control capability is asked through
+`available_controls()`, exactly as the sweep generators already did — an
+instrument that does not serve a control still gets the graceful "control
+not available" refusal, not a call it cannot answer.
+
+Both previously-failing adapters now pass the runtime check, each pinned
+by its own test
+(`test_gatan_bridge.test_a_one_control_instrument_satisfies_the_instrument_protocol`,
+`test_camera_server.test_a_controlless_instrument_satisfies_the_instrument_protocol`),
+and the full Nion controller passes it trivially, being a superset. The
+widening is pinned from the other side too: `test_gatan_bridge.
+test_passing_the_runtime_check_does_not_make_a_missing_control_callable`
+runs `focal_series` against the one-control bridge — whose defocus
+methods are *absent*, not merely unimplemented — and requires the
+documented `ValueError` naming the control, so a skipped capability check
+would show up as an `AttributeError` rather than passing quietly.
+
 ## What is still the wrong shape
 
 Two, neither fixed, both estimated below rather than pre-emptively built.
@@ -429,19 +469,6 @@ frame correctly labelled. Model the *readout mode* instead, and route a
 projected readout into `SpectrumWriter` so it lands in the same
 `NXspectrum` layout as EDX. 2–4 days; specification in
 [spectrum detectors](adapters/spectrum-detectors.md) §6.
-
-### `InstrumentController` is all-or-nothing to `isinstance`
-
-`available_controls()` exists precisely so an instrument can serve some
-controls and not others — a webcam has no defocus, a detector-only server
-has no stage. But `InstrumentController` is `runtime_checkable`, and a
-`runtime_checkable` Protocol's `isinstance` check is all-or-nothing: it
-demands every method regardless of what the instrument says it supports.
-Two adapters now fail that check while working perfectly
-(`camera_server.ServerInstrument` and `gatan_bridge.BridgeInstrument`),
-which means the check is testing for Nion-shapedness rather than for
-protocol conformance. Found twice, by two independent adapters, which is
-the signal that it is the abstraction and not the adapters.
 
 ### The target names are a fixed tuple
 

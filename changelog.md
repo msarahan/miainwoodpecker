@@ -456,15 +456,16 @@
   on an SU9000II rather than an SU7000) is settled by looking at the
   instrument PC rather than by a negotiation.
 
-- **`InstrumentController` is all-or-nothing to `isinstance`.**
+- **`InstrumentController` was all-or-nothing to `isinstance`.**
   `available_controls()` exists so an instrument can serve some controls
-  and not others, but the protocol is `runtime_checkable`, and that check
-  demands every method regardless of what the instrument says it
-  supports. Two adapters now fail it while working perfectly
+  and not others, but the protocol was `runtime_checkable`, and that
+  check demands every method regardless of what the instrument says it
+  supports. Two adapters failed it while working perfectly
   (`camera_server.ServerInstrument`, `gatan_bridge.BridgeInstrument`), so
-  the check tests for Nion-shapedness rather than conformance. Found
-  independently by two adapters, which is the signal that it is the
-  abstraction rather than the adapters. Recorded, not yet fixed.
+  the check tested for Nion-shapedness rather than conformance. Found
+  independently by two adapters, which was the signal that it was the
+  abstraction rather than the adapters. Now fixed — see the split into
+  `Instrument` and `InstrumentController` under Fixed below.
 
 - **A protocol gap in the instrument we already drive.** `Scanner`
   produces one channel per `scan_frame` call, on the stated premise that
@@ -533,6 +534,21 @@
   a shape would put a number on screen that no acquisition would produce.
 
 ### Fixed
+
+- **The instrument runtime check no longer demands controls an
+  instrument does not serve.** The `isinstance` question every call site
+  was actually asking — "is this an instrument target I can hold a
+  session against" — is now its own `runtime_checkable` protocol,
+  `Instrument`: identity (`stage_size_nm`), capability
+  (`available_controls`), lifecycle (`park`). `InstrumentController` is
+  that core plus the per-control methods, for static typing, and is
+  deliberately no longer `runtime_checkable`, so the old all-or-nothing
+  question raises `TypeError` instead of quietly failing partial
+  adapters. `camera_server.ServerInstrument` (zero controls) and
+  `gatan_bridge.BridgeInstrument` (one control) both pass the runtime
+  check now, each pinned by a test; which *controls* exist is asked
+  through `available_controls()`, and the sweep generators' graceful
+  "control not available" refusals are unchanged.
 
 - **EDS beam current reached eXSpy a billion times too small.**
   `load_as_eds_signal` wrote `beam_current_a` straight into

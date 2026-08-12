@@ -1702,7 +1702,9 @@ def _parking_signal_handlers(session: _ServerSession) -> Iterator[None]:
     precisely the wedged-server case the fallback exists for — and a
     signal-less server answers that by dying with the column live. The
     same applies to a Ctrl-C reaching the process group. Parking is the
-    one thing :meth:`InstrumentController.park` promises for exactly this
+    one thing
+    :meth:`~miainwoodpecker.devices.interface.Instrument.park` promises
+    for exactly this
     situation, so it should not be reachable only through the RPC that a
     wedged server cannot serve.
 

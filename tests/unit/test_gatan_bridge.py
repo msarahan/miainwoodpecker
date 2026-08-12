@@ -17,10 +17,18 @@ server.
 
 from __future__ import annotations
 
+import typing
+
 import numpy as np
 import pytest
 
-from miainwoodpecker.devices import Camera, InstrumentController
+from miainwoodpecker.acquisition.sequence import focal_series
+from miainwoodpecker.devices import (
+    DEFOCUS_CONTROL,
+    Camera,
+    Instrument,
+    InstrumentController,
+)
 from miainwoodpecker.devices.gatan_bridge import (
     BridgeInstrument,
     DigitalMicrographCamera,
@@ -30,7 +38,7 @@ from miainwoodpecker.devices.gatan_bridge import (
     SimulatedSpectrometer,
     _build_targets,
 )
-from miainwoodpecker.devices.interface import CameraParameters
+from miainwoodpecker.devices.interface import CameraParameters, Frame, ScanParameters
 
 _DISPERSION_EV = 0.5
 _BINNING = 4
@@ -52,36 +60,110 @@ def test_the_simulated_camera_satisfies_the_neutral_camera_protocol():
     assert isinstance(camera, Camera)
 
 
-def test_a_one_control_instrument_cannot_satisfy_instrumentcontroller():
+def test_a_one_control_instrument_satisfies_the_instrument_protocol():
     """
-    Pinning a real gap in the interfaces, rather than working around it.
+    A spectrometer with one control is a whole instrument to the runtime check.
 
-    ``InstrumentController`` is all-or-nothing to ``isinstance``: a
-    ``runtime_checkable`` protocol checks that every method is present,
-    so an instrument target with one genuine control and no stage, no
-    defocus and no blanker does **not** satisfy it — even though
-    ``available_controls()`` exists precisely so that partial instruments
-    are supported, and even though this one works perfectly over the
-    protocol. The commodity-camera server's ``ServerInstrument`` has the
-    same property, so this is the second adapter to hit it rather than a
-    quirk of the first.
-
-    That is a finding worth a test rather than a fix here. The workable
-    resolutions — splitting the protocol into per-control pieces, or
-    dropping the unimplemented methods from it entirely — are interface
-    changes that should land with a caller that needs them, and this test
-    exists so the next person meets the fact deliberately instead of
-    reading an ``isinstance`` failure as a broken adapter.
+    This adapter used to be one of the two that *pinned a gap*: the old
+    all-or-nothing ``isinstance`` against the full controller demanded a
+    stage, a defocus and a blanker this bridge honestly does not have, so
+    a working adapter read as a broken one. The interface was split for
+    exactly this case — the ``Instrument`` core is identity, capability
+    and ``park``, which every instrument target serves — so the check now
+    passes here, and the control the bridge does not implement is asked
+    about through ``available_controls()`` rather than through the type.
+    The commodity-camera server's ``ServerInstrument`` was the second
+    adapter with the same shape, and its own test pins the same fact.
     """
     import threading  # noqa: PLC0415 - one line, only this test needs it
 
     spectrometer = SimulatedSpectrometer(_DISPERSION_EV)
     instrument = BridgeInstrument({}, spectrometer, threading.Event(), "simulated")
-    assert not isinstance(instrument, InstrumentController)
-    # But every method it *does* claim works, which is what the protocol
-    # boundary actually depends on: available_controls() is the contract,
-    # and it is honest.
+    assert isinstance(instrument, Instrument)
+    # And the capability list stays the honest, load-bearing answer:
+    # available_controls() is the contract callers consult before driving
+    # a control, and this bridge claims exactly what it serves.
     assert list(instrument.available_controls()) == ["energy_offset"]
+
+
+def test_passing_the_runtime_check_does_not_make_a_missing_control_callable():
+    """
+    The other half of the split: a whole instrument is still a partial controller.
+
+    Widening the runtime check would be a bad trade if it let a caller
+    conclude "it is an ``Instrument``, so I may drive its defocus" — the
+    old check was wrong, but it was at least *safe*. It stays safe
+    because nothing was ever gated on the ``isinstance``: the sweeps ask
+    ``available_controls()``, and they asked it before this change too.
+
+    This bridge is the strongest available witness for that, because its
+    defocus methods are not merely unimplemented, they are *absent*. If
+    ``focal_series`` skipped its capability check the failure would be an
+    ``AttributeError`` from inside the generator, after the scanner had
+    already been set up; getting the documented ``ValueError`` naming the
+    control instead is proof the graceful path fires first and nothing
+    downstream is calling what this instrument does not serve.
+    """
+    import threading  # noqa: PLC0415 - one line, only this test needs it
+
+    spectrometer = SimulatedSpectrometer(_DISPERSION_EV)
+    instrument = BridgeInstrument({}, spectrometer, threading.Event(), "simulated")
+    assert isinstance(instrument, Instrument)
+    assert not hasattr(instrument, "defocus_nm")
+
+    scanner = _RefusingScanner()
+    with pytest.raises(ValueError, match=DEFOCUS_CONTROL):
+        list(
+            focal_series(
+                scanner,
+                ScanParameters(height=4, width=4, pixel_time_us=1.0, fov_nm=10.0),
+                [0.0, 100.0],
+                instrument=typing.cast("InstrumentController", instrument),
+            ),
+        )
+    assert scanner.scans == 0
+
+
+class _RefusingScanner:
+    """A scanner that fails the test if the refused sweep ever reaches it."""
+
+    def __init__(self) -> None:
+        self.scans = 0
+
+    @property
+    def scanner_id(self) -> str:
+        """Return a name no vendor uses, since nothing should ask."""
+        return "refusing_scanner"
+
+    @property
+    def channel_names(self) -> list[str]:
+        """Return one channel; the sweep never gets far enough to pick one."""
+        return ["HAADF"]
+
+    def scan_frame(self, parameters: ScanParameters, channel: int = 0) -> Frame:  # noqa: ARG002 - signature fixed by the Scanner protocol
+        """
+        Count the call and refuse it.
+
+        Parameters
+        ----------
+        parameters : ScanParameters
+            Ignored; reaching here at all is the failure.
+        channel : int
+            Ignored, for the same reason.
+
+        Returns
+        -------
+        Frame
+            Never; this always raises.
+
+        Raises
+        ------
+        AssertionError
+            Always. A refused sweep must not cost a pass of the beam.
+        """
+        self.scans += 1
+        msg = "the sweep was refused, so no frame should have been scanned"
+        raise AssertionError(msg)
 
 
 def test_binning_multiplies_the_energy_dispersion():
