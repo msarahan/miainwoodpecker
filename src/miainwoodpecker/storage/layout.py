@@ -128,6 +128,100 @@ Matches the ``(height, width)`` convention the device layer pins and the
 """
 
 
+# ---------------------------------------------------------------------------
+# Spectrum recordings.
+#
+# A different layout, in the same NXentry, because NeXus already defines
+# one and it is not the frame one. NXspectrum's NXdata children name their
+# signal `intensity` and their energy axis `axis_energy`, with energy
+# always the fastest dimension and spatial axes called `axis_j` (slow) and
+# `axis_i` (fast) - so a reader tells a spectrum recording from a frame
+# recording by which signal dataset is present, and nothing about either
+# layout had to be invented.
+#
+# Measured, not assumed, with pynxtools against the NXem application
+# definition: an NXspectrum *group* placed directly in the NXentry makes
+# the file stop validating (NXem documents NXspectrum only under
+# `measurement/eventID`, exactly as it documents NXebeam_column only
+# there), while the same NXdata written at `entry/data` validates. So the
+# spectrum data lives at the NXdata path NXem does document, spelled in
+# NXspectrum's vocabulary. See scripts/validate_nexus_schema.py, which
+# checks both halves of that claim.
+# ---------------------------------------------------------------------------
+
+SPECTRUM_DETECTOR_GROUP = "entry/instrument/spectrum_detector"
+"""
+``NXdetector`` describing the spectrum detector and its geometry.
+
+A second detector group beside :data:`DETECTOR_GROUP`, named rather than
+shared, because a recording may reasonably carry both one day and because
+these fields are about a specific piece of hardware. Every field written
+here is one ``NXdetector`` already defines - ``real_time``,
+``count_time`` (which is NeXus's name for live time: "elapsed actual
+counting time"), ``dead_time``, ``azimuthal_angle``, ``polar_angle``,
+``solid_angle``, ``type``, ``description`` - so none of it is invention.
+"""
+
+SPECTRUM_DATA_GROUP = "entry/data"
+"""
+``NXdata`` holding the spectra, in ``NXspectrum``'s own field vocabulary.
+
+The same path a frame recording's plottable data lives at, so the
+``@default`` chain and every NeXus viewer work unchanged; the *contents*
+say which kind of recording it is.
+"""
+
+SPECTRUM_INTENSITY = f"{SPECTRUM_DATA_GROUP}/intensity"
+"""
+Counts, with energy on the last axis. ``NXspectrum``'s signal name.
+
+Its presence is what identifies a spectrum recording, the way
+:data:`NXDATA_DATA`'s identifies a frame recording.
+"""
+
+SPECTRUM_ENERGY_AXIS = f"{SPECTRUM_DATA_GROUP}/axis_energy"
+"""The energy axis in electronvolts. ``NXspectrum``'s ``axis_energy``."""
+
+SPECTRUM_SLOW_AXIS = f"{SPECTRUM_DATA_GROUP}/axis_j"
+"""A spectrum image's slow spatial axis. ``NXspectrum``'s ``axis_j``."""
+
+SPECTRUM_FAST_AXIS = f"{SPECTRUM_DATA_GROUP}/axis_i"
+"""A spectrum image's fast spatial axis. ``NXspectrum``'s ``axis_i``."""
+
+SPECTRUM_INDEX_AXIS = f"{SPECTRUM_DATA_GROUP}/indices_spectrum"
+"""
+Which spectrum each row of a series is. ``NXspectrum``'s ``stack_0d`` field.
+
+Written only for a recording of several spot spectra, which is
+``stack_0d``'s case: one spectrum is ``spectrum_0d`` and has no such
+axis, and a map is ``spectrum_2d`` and is indexed by position instead.
+"""
+
+SPECTRUM_METADATA = f"{METADATA_GROUP}/spectrum_metadata_json"
+"""One JSON object per recorded spectrum, in acquisition order."""
+
+
+class NoSpectraError(ValueError):
+    """
+    Raised when a file holds no spectrum recording to read.
+
+    The spectrum-side twin of :class:`NoFramesError`, and a separate
+    class rather than a shared one because the two mean different
+    things to a caller: a file with frames in it is not an empty file,
+    it is a file of the other kind, and telling someone "it recorded no
+    frames" about a perfectly good spectrum recording is the class of
+    false message :class:`NoFramesError`'s own docstring exists to
+    prevent.
+    """
+
+    def __init__(self, path: os.PathLike[str] | str) -> None:
+        super().__init__(
+            f"{path} has no /{SPECTRUM_INTENSITY} dataset; it is not a "
+            f"spectrum recording. A frame recording's signal is "
+            f"/{NXDATA_DATA} and is read with storage.nexus.read_frames",
+        )
+
+
 class NoFramesError(ValueError):
     """
     Raised when a recording holds no frames to read.

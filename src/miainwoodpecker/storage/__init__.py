@@ -25,6 +25,11 @@ from miainwoodpecker.storage.nexus import (
     read_series,
     write_frames,
 )
+from miainwoodpecker.storage.spectra import (
+    SpectrumWriter,
+    read_spectra,
+    write_spectra,
+)
 
 __all__ = [
     "PIXELS",
@@ -33,8 +38,11 @@ __all__ = [
     "FrameCalibration",
     "FrameStack",
     "NexusWriter",
+    "SpectrumWriter",
     "read_calibration",
     "read_frames",
     "read_series",
+    "read_spectra",
     "write_frames",
+    "write_spectra",
 ]

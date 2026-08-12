@@ -77,5 +77,6 @@ Analysis parity <analysis-parity>
 Hitachi SU9000II <adapters/hitachi>
 DECTRIS detectors <adapters/dectris>
 Gatan <adapters/gatan>
+Spectrum detectors <adapters/spectrum-detectors>
 Development <documentation/index>
 :::

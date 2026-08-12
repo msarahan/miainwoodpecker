@@ -143,6 +143,83 @@
   that `hyperspy` and `py4dstem` are themselves GPL-3.0 and imported
   in-process, which §6 does not currently speak to.
 
+- **A device-layer shape for spectrum-producing detectors.** `Spectrum`,
+  `SpectrumParameters` and the `SpectrumDetector` protocol in
+  `devices/interface.py`; a `spectrum_detector` RPC target; a simulated
+  EDX device server (`devices/spectrum_server.py`, needing nothing
+  installed); NeXus storage in `NXspectrum`'s layout
+  (`storage/spectra.py`); and `analysis.hyperspy_bridge.load_as_eds_signal`,
+  producing an eXSpy `EDSTEMSpectrum` with a real energy axis. Designed
+  against the two detectors actually fitted at SuperSTEM — a Bruker
+  XFlash 6T-100 and an Oxford Ultim Extreme — without being an adapter
+  for either. See `docs/adapters/spectrum-detectors.md`.
+
+  **A spectrum is its own type rather than a `Frame` with a 1D array**,
+  and the deciding reason is the calibration model: `FrameCalibration` is
+  exactly two axes named `y`/`x`, so a one-axis spot spectrum and a
+  three-axis map would each have to lie about one. The false economy
+  would have been a document-only invariant on `Frame` plus a rank branch
+  in `NexusWriter` choosing between two different NeXus layouts.
+
+  **Storage placement was measured, not read.** `NXem` documents
+  `NXspectrum` only under `measurement/eventID*/spectrumID*`, and putting
+  it there fails validation for the same reason `ebeam_column` did. Four
+  layouts were validated with `pynxtools`; the one that passes is
+  `NXdata` at `entry/data` in `NXspectrum`'s field names beside an
+  `NXdetector`. `NXfluo` was rejected on evidence rather than taste — it
+  requires `NXsource/probe = "x-ray"` and a monochromator wavelength, and
+  electron-excited EDX has neither. There is no `NXxrf` in the
+  definitions at all.
+
+  **`load_as_hyperspy_spectrum` now reads both storage layouts**, so an
+  EELS camera stack and an EDX recording reach one `Signal1D` through one
+  function, dispatching on what the file holds rather than on what the
+  caller believes. EELS behaviour is unchanged and asserted so. That
+  follows from the physics: EELS disperses onto a *camera* and arrives as
+  a 2D frame, EDX is natively 1D, and both are a spectrum by the time
+  anyone analyses them.
+
+  **`exspy` joins the `analysis` extra.** HyperSpy 2.x moved its EELS and
+  EDS classes out; measured on 2.4.0, `hs.print_known_signal_types()`
+  returns an empty table, so `set_signal_type("EDS_TEM")` silently leaves
+  a plain `Signal1D`. An extra that could not load an EDS signal would be
+  claiming something false.
+
+  **No `scan_id` was added.** Concurrency composes already — each target
+  has its own connection and thread, and a test shows the detector
+  integrating while another target is driven — but *correlation* does
+  not, and no transport work fixes it. An identifier nothing establishes
+  is a claim, which this project has been bitten by before
+  (`probe_position`, accepted and echoed and silently dropped).
+  `metadata["simultaneous_with"]` is in the vocabulary instead, absent by
+  default, meaning nothing claimed.
+
+  `TARGET_NAMES` gained `spectrum_detector` immediately before
+  `instrument`, so every existing name keeps its argv position and
+  `instrument` stays last. That is the minimal change, not an endorsement:
+  the tuple is now Nion's device list *plus a detector class Nion does not
+  have*, which is the clearest evidence yet that a fixed positional tuple
+  is the wrong mechanism.
+
+- **Anisotropic binning: investigated, specified, deliberately not
+  built.** EELS is run with vertical binning to trade dynamic range
+  against SNR, and `CameraParameters.binning` is a scalar that cannot say
+  so. The reason for not fixing it here is a measurement rather than
+  scope: Nion's `CameraFrameParameters` has no per-axis binning at all —
+  `get_expected_dimensions(binning)` and `build_calibration(..., binning,
+  ...)` both take a scalar multiplying both axes — and what Nion offers
+  for "bin vertically" is `processing = "sum_project"`, a full projection
+  to 1D that its own tests mark as sequence/SI only. So a `(y, x)` tuple
+  would be a field the only adapter behind it must refuse, which is the
+  "vendor-neutral in name only" failure `ScanParameters.fov_nm` already
+  warns about, and it would break `_binning_of(shape)`, which recovers a
+  frame's real binning by matching `get_expected_dimensions` per scalar
+  factor — the thing that keeps an in-flight frame correctly labelled.
+  The specification models the *readout mode* instead, and routes a
+  projected readout into `SpectrumWriter` so it lands in the same
+  `NXspectrum` layout as EDX. 2–4 days, spec in
+  `docs/adapters/spectrum-detectors.md` §6.
+
 - **`remote.attached_instrument()`: drive a device server this client did
   not launch.** The subprocess rule has one structural exception — an
   adapter whose SDK exists only inside another running application cannot

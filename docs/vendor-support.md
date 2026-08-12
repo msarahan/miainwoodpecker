@@ -414,6 +414,22 @@ Everything beyond that in a real adapter is vendor work.
 
 Two, neither fixed, both estimated below rather than pre-emptively built.
 
+### `CameraParameters.binning` is scalar, and EELS is not
+
+EELS is run with vertical binning — bin along the non-dispersive
+direction to trade dynamic range against SNR, leaving the energy axis at
+full resolution. A single `int` cannot say that. But the fix is *not* a
+`(y, x)` tuple: Nion's `CameraFrameParameters` has no per-axis binning at
+all, and what it offers for "bin vertically" is
+`processing = "sum_project"`, a full projection to 1D. A tuple would
+therefore be a field the only adapter behind it must refuse — the exact
+"vendor-neutral in name only" failure `ScanParameters.fov_nm` warns about
+— and it would break the shape-recovery trick that keeps an in-flight
+frame correctly labelled. Model the *readout mode* instead, and route a
+projected readout into `SpectrumWriter` so it lands in the same
+`NXspectrum` layout as EDX. 2–4 days; specification in
+[spectrum detectors](adapters/spectrum-detectors.md) §6.
+
 ### `InstrumentController` is all-or-nothing to `isinstance`
 
 `available_controls()` exists precisely so an instrument can serve some
@@ -609,6 +625,19 @@ constant supplies and that changes with working distance and kV.
 All four need the common second-vendor block, and three of them need a
 **simultaneous multi-channel scan call** (3–5 d) that does not exist yet
 — see "What is still the wrong shape" above.
+
+### Bruker ESPRIT / Oxford AZtec — the protocol now exists
+
+The deferral below ("a new protocol — spectra and maps, not frames") is
+discharged: `SpectrumDetector`, `Spectrum` and `NXspectrum`-shaped
+storage ship, with a simulated server and a verified HyperSpy EDS round
+trip ([spectrum detectors](adapters/spectrum-detectors.md)). Neither
+vendor's control library is redistributable, so a *live* adapter is
+out-of-tree — and the offline answer is still the right first question.
+RosettaSciIO reads Bruker `bcf`/`spx` and the EMSA `msa` both vendors
+export. Note that RosettaSciIO 0.14 has **no** Oxford/H5OINA reader, so
+that answer is weaker for AZtec than for ESPRIT: SuperSTEM 2's Bruker is
+covered, SuperSTEM 4's Oxford needs AZtec asked for `.msa` export.
 
 ### Bruker ESPRIT — 3–5 days, and probably the wrong question
 
