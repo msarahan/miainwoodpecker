@@ -143,6 +143,38 @@
   `nion_server` and shared with the camera server. Lifecycle deliberately
   stays with each adapter: a webcam has no beam to park.
 
+- **The viewer runs against a camera-only device server.**
+  `--server-module MODULE` names the module the client launches, so the
+  shipped application can drive `miainwoodpecker.devices.camera_server`
+  (a USB microscope, a webcam, or a video file replayed as a fixture) or
+  an out-of-tree vendor adapter, instead of only the Nion server it ships
+  with. This does not weaken the licence boundary: the named module is
+  launched as a subprocess, never imported by the application.
+  `--backend simulated --server-module
+  miainwoodpecker.devices.camera_server` needs nothing installed beyond
+  the viewer and exercises the whole live path — display, recording,
+  session, analysis buttons — which makes it the cheapest end-to-end test
+  of the application.
+
+  `LiveInstrumentWidget` accordingly takes an *optional* scanner, and
+  requires a scanner or a camera rather than assuming both. The Scan
+  group is not built at all without a scanner, so the absent device is
+  missing from the window rather than present and broken, and every scan
+  entry point is inert instead of raising — `stop_scan()` in particular
+  returns True, because its callers read False as "the device is still
+  busy, do not proceed". The camera is chosen through `cameras()` with
+  the Ronchigram still preferred, so a server this viewer has never heard
+  of can supply the live view. `app.py` previously exited with "this
+  device server serves no scanner"; it now exits only when there is
+  neither a scanner nor a camera.
+
+  The disk-space warning follows the same rule. A scan's frame shape is
+  set by the operator before anything is acquired, so it can be estimated
+  up front; a commodity camera's is whatever the driver negotiated, so
+  without a scanner the estimate waits for a real frame and stays silent
+  until one arrives. Free space is still reported throughout — inventing
+  a shape would put a number on screen that no acquisition would produce.
+
 ### Fixed
 
 - **Phase 2's napari-versus-`ndv` question is closed: keep napari.**

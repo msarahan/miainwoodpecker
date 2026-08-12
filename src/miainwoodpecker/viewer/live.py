@@ -207,7 +207,7 @@ def _analysis_refusal(recording: Recording) -> str | None:
 
 class LiveInstrumentWidget(QtWidgets.QWidget):
     """
-    Dock widget with live scan (and optionally camera) view controls.
+    Dock widget with live scan and/or camera view controls.
 
     A session is attached with :meth:`set_session` rather than passed
     here: where data goes is operator-editable state that can change
@@ -216,29 +216,54 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
     widget still works as a live display, and the recording controls say
     so instead of pretending to save anything.
 
+    **Both devices are optional, and at least one is required.** A
+    detector-only device server — a Direct Electron, DECTRIS or Hamamatsu
+    camera driven through its own SDK, or the commodity USB camera server
+    — has no scan unit, and a scan-only server has no camera. The Scan
+    group is built only when there is a scanner to drive, so the absent
+    device is missing from the window rather than present and broken.
+    Everything downstream of the two groups (session, recordings,
+    analysis) is shared and unconditional, because none of it is
+    scan-specific: the analysis buttons already acquire from the camera.
+
     Parameters
     ----------
     viewer : napari.Viewer
         The napari viewer whose layers display the live frames.
-    scanner : Scanner
-        The scan device to drive.
+    scanner : Scanner | None
+        The scan device to drive, or None for a detector-only instrument.
     camera : Camera | None
-        An optional camera to offer a live view for (e.g. Ronchigram).
+        An optional camera to offer a live view for (e.g. Ronchigram, or
+        a commodity USB camera).
     display_interval_ms : int
         How often the display polls for new frames.
     parent : QtWidgets.QWidget | None
         Optional Qt parent widget.
+
+    Raises
+    ------
+    ValueError
+        If neither a scanner nor a camera is given. There would be
+        nothing to show and nothing to record, and every control would
+        be disabled — a window worth refusing to build rather than
+        opening empty.
     """
 
     def __init__(
         self,
         viewer: napari.Viewer,
-        scanner: Scanner,
+        scanner: Scanner | None,
         *,
         camera: Camera | None = None,
         display_interval_ms: int = _DEFAULT_DISPLAY_INTERVAL_MS,
         parent: QtWidgets.QWidget | None = None,
     ) -> None:
+        if scanner is None and camera is None:
+            msg = (
+                "LiveInstrumentWidget needs a scanner, a camera, or both - "
+                "an instrument with neither has nothing to display"
+            )
+            raise ValueError(msg)
         super().__init__(parent)
         self._viewer = viewer
         self._scanner = scanner
@@ -259,9 +284,7 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         # status label and layers. One job at a time is enforced in
         # _start_analysis; all three buttons share the device.
         self._analysis_status: QtWidgets.QLabel | None = None
-        self._analysis_display: (
-            Callable[[object, _AnalysisInput], str] | None
-        ) = None
+        self._analysis_display: Callable[[object, _AnalysisInput], str] | None = None
         self._opened_file: Path | None = None
         self._scan_request: tuple[ScanParameters, int, str] = (
             ScanParameters(
@@ -271,10 +294,11 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
                 fov_nm=_DEFAULT_FOV_NM,
             ),
             0,
-            scanner.channel_names[0],
+            scanner.channel_names[0] if scanner is not None else "",
         )
         self._build_ui()
-        self._on_scan_settings_changed()
+        if scanner is not None:
+            self._on_scan_settings_changed()
         self._timer = QtCore.QTimer(self)
         self._timer.setInterval(display_interval_ms)
         self._timer.timeout.connect(self.refresh_display)
@@ -283,7 +307,8 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         layout = QtWidgets.QVBoxLayout(self)
         layout.addWidget(self._build_session_group())
         layout.addWidget(self._build_recordings_group())
-        layout.addWidget(self._build_scan_group())
+        if self._scanner is not None:
+            layout.addWidget(self._build_scan_group())
         if self._camera is not None:
             layout.addWidget(self._build_camera_group())
         layout.addStretch(1)
@@ -420,10 +445,17 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         self._notes_edit.textChanged.connect(self._context_save_timer.start)
 
     def _build_scan_group(self) -> QtWidgets.QGroupBox:
+        # Only reached when there is a scanner: _build_ui skips this group
+        # entirely for a detector-only instrument, so the widgets it
+        # creates (_channel_combo, _scan_count_spin, _scan_status, ...) do
+        # not exist in that case. Every method that touches them checks
+        # _scanner rather than hasattr, because the scanner is the reason
+        # they exist and is the honest thing to ask about.
+        scanner = typing.cast("Scanner", self._scanner)
         scan_group = QtWidgets.QGroupBox("Scan", self)
         scan_form = QtWidgets.QFormLayout(scan_group)
         self._channel_combo = QtWidgets.QComboBox(scan_group)
-        self._channel_combo.addItems(list(self._scanner.channel_names))
+        self._channel_combo.addItems(list(scanner.channel_names))
         scan_form.addRow("Channel", self._channel_combo)
         self._size_combo = QtWidgets.QComboBox(scan_group)
         self._size_combo.addItems([str(size) for size in _SCAN_SIZES])
@@ -546,7 +578,8 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
     def _grab_scan(self) -> Frame:
         # Runs on the worker thread: reads the request tuple, never Qt state.
         parameters, channel_index, _ = self._scan_request
-        return self._scanner.scan_frame(parameters, channel_index)
+        scanner = typing.cast("Scanner", self._scanner)
+        return scanner.scan_frame(parameters, channel_index)
 
     def _toggle_scan(self) -> None:
         if self._scan_loop is not None and self._scan_loop.is_running:
@@ -561,7 +594,9 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
             self.start_camera()
 
     def start_scan(self) -> None:
-        """Start the live scan loop and the display timer."""
+        """Start the live scan loop and the display timer. No-op with no scanner."""
+        if self._scanner is None:
+            return
         if self._scan_loop is not None and self._scan_loop.is_running:
             return
         self._scan_loop = LiveAcquisition(self._grab_scan)
@@ -579,8 +614,12 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         bool
             True if the worker actually finished. False means a grab is
             still in flight and the scanner is still in use — callers
-            about to drive the scanner themselves must not proceed.
+            about to drive the scanner themselves must not proceed. True
+            with no scanner at all: nothing is holding the device, which
+            is what the callers are asking about.
         """
+        if self._scanner is None:
+            return True
         stopped = True
         if self._scan_loop is not None:
             stopped = self._scan_loop.stop()
@@ -827,21 +866,58 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
             self._space_label.setText("")
             return
         free = free_space(self._session.root)
-        frames = self._scan_count_spin.value()
-        planned = estimate_size(self._scan_request[0].shape, frames)
         text = f"{format_bytes(free)} free"
-        if free and planned > free:
-            # An upper bound compared against the real number: erring high
-            # here means warning slightly early, which is the right way to
-            # be wrong about running out of disk mid-acquisition.
-            text += (
-                f" - warning: {frames} scan frames need up to "
-                f"{format_bytes(planned)}"
-            )
+        plan = self._planned_recording_size()
+        if free and plan is not None:
+            frames, planned, source = plan
+            if planned > free:
+                # An upper bound compared against the real number: erring
+                # high here means warning slightly early, which is the
+                # right way to be wrong about running out of disk
+                # mid-acquisition.
+                text += (
+                    f" - warning: {frames} {source} frames need up to "
+                    f"{format_bytes(planned)}"
+                )
         self._space_label.setText(text)
+
+    def _planned_recording_size(self) -> tuple[int, int, str] | None:
+        """
+        Estimate the largest recording the current controls would write.
+
+        Returns
+        -------
+        tuple[int, int, str] | None
+            Frame count, upper-bound byte size, and what to call the
+            source, or None when no size can be estimated honestly.
+
+        Notes
+        -----
+        A scan's size is known before anything is acquired, because the
+        operator sets it: the Size combo *is* the frame shape. A camera's
+        is not — the sensor decides, and a commodity USB camera's
+        resolution is whatever the driver negotiated. So with no scanner
+        the estimate waits for a frame to arrive and then uses its real
+        shape, and stays silent until then. Inventing a shape to warn
+        about would put a number on screen that no acquisition would
+        produce, which is worse than saying nothing: the free-space
+        figure beside it is still true.
+        """
+        if self._scanner is not None:
+            frames = self._scan_count_spin.value()
+            return frames, estimate_size(self._scan_request[0].shape, frames), "scan"
+        if self._camera is None:  # pragma: no cover - one device is required
+            return None
+        frame = self._camera_loop.latest() if self._camera_loop is not None else None
+        if frame is None:
+            return None
+        frames = self._camera_count_spin.value()
+        return frames, estimate_size(frame.data.shape, frames), "camera"
 
     def save_scan_frame(self) -> None:
         """Save the scan frame currently on screen into the session."""
+        if self._scanner is None:
+            return
         label = f"scan-{self._scan_request[2]}-frame"
         self._save_displayed_frame(self._scan_loop, label)
 
@@ -867,6 +943,8 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
 
     def record_scan_frames(self) -> None:
         """Record the requested number of scan frames into the session."""
+        if self._scanner is None:
+            return
         if self._session is None:
             self._recording_status.setText(_NO_SESSION_MESSAGE)
             return
@@ -883,7 +961,7 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         parameters, channel_index, channel_name = self._scan_request
         self._start_recording(
             scan_series(
-                self._scanner,
+                typing.cast("Scanner", self._scanner),
                 parameters,
                 self._scan_count_spin.value(),
                 channel=channel_index,
@@ -1468,9 +1546,7 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
 
     def _maybe_stop_timer(self) -> None:
         scan_running = self._scan_loop is not None and self._scan_loop.is_running
-        camera_running = (
-            self._camera_loop is not None and self._camera_loop.is_running
-        )
+        camera_running = self._camera_loop is not None and self._camera_loop.is_running
         recording = self._recording_job is not None and self._recording_job.is_running
         loading = self._load_job is not None and self._load_job.is_running
         analyzing = self._analysis_job is not None

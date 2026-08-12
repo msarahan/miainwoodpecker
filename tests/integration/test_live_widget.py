@@ -19,6 +19,7 @@ import pytest
 pytest.importorskip("napari", reason="requires the 'viewer' extra")
 
 import napari
+from qtpy import QtWidgets
 
 from miainwoodpecker.devices import Frame, ScanParameters
 from miainwoodpecker.storage.nexus import NexusWriter, read_series
@@ -424,7 +425,7 @@ def test_editing_session_context_persists_it_for_later_recordings(tmp_path):
 
 
 def test_save_displayed_scan_frame_keeps_the_frame_on_screen(tmp_path):
-    """"Save displayed frame" writes the live frame without stopping the loop."""
+    """ "Save displayed frame" writes the live frame without stopping the loop."""
     viewer = napari.Viewer(show=False)
     widget = LiveInstrumentWidget(viewer, _FakeScanner())
     try:
@@ -454,7 +455,7 @@ def test_save_displayed_scan_frame_keeps_the_frame_on_screen(tmp_path):
 
 
 def test_record_scan_frames_writes_the_requested_count(tmp_path):
-    """"Record frames" streams a scan series into the session off the GUI thread."""
+    """ "Record frames" streams a scan series into the session off the GUI thread."""
     viewer = napari.Viewer(show=False)
     widget = LiveInstrumentWidget(viewer, _FakeScanner())
     try:
@@ -1087,6 +1088,121 @@ def test_a_grab_error_stops_the_display_timer():
         widget.refresh_display()
         assert not widget._timer.isActive()  # noqa: SLF001
         assert "detector went away" in widget._scan_status.text()  # noqa: SLF001
+    finally:
+        widget.shutdown()
+        viewer.close()
+
+
+def test_camera_only_instrument_builds_a_window_with_no_scan_group():
+    """
+    A detector-only server gets a working window, minus the Scan group.
+
+    The commodity camera server and every direct-detector adapter serve
+    no scan unit (docs/vendor-support.md), so the widget has to be
+    usable without one rather than refusing to open. The absent device
+    is *missing* from the window rather than present and disabled: a
+    greyed-out Scan group would invite an operator to look for the
+    scanner that is not there.
+    """
+    viewer = napari.Viewer(show=False)
+    camera = _FakeCamera()
+    widget = LiveInstrumentWidget(viewer, None, camera=camera)
+    try:
+        titles = {box.title() for box in widget.findChildren(QtWidgets.QGroupBox)}
+        assert "Camera" in titles
+        assert "Scan" not in titles
+
+        widget.start_camera()
+        assert camera.started
+        assert _wait_until(
+            lambda: widget._camera_loop.latest() is not None  # noqa: SLF001
+        )
+        widget.refresh_display()
+        camera_shape = (8, 8)
+        assert viewer.layers["Camera"].data.shape == camera_shape
+        assert not any(layer.name.startswith("Scan") for layer in viewer.layers)
+    finally:
+        widget.shutdown()
+        viewer.close()
+    assert not camera.started
+
+
+def test_scan_controls_are_inert_rather_than_raising_without_a_scanner():
+    """
+    Every scan entry point is a no-op with no scanner, not an AttributeError.
+
+    ``shutdown()`` calls ``stop_scan()`` unconditionally, and a caller
+    driving the widget from a script has no reason to know which devices
+    this server happens to serve. ``stop_scan()`` returning True is the
+    load-bearing part: ``record_scan_frames`` and the analysis buttons
+    treat False as "the scanner is still busy, do not proceed", and with
+    no scanner nothing is holding the device.
+    """
+    viewer = napari.Viewer(show=False)
+    widget = LiveInstrumentWidget(viewer, None, camera=_FakeCamera())
+    try:
+        widget.start_scan()
+        assert widget._scan_loop is None  # noqa: SLF001
+        assert widget.stop_scan() is True
+        widget.save_scan_frame()
+        widget.record_scan_frames()
+        assert widget._recording_job is None  # noqa: SLF001
+    finally:
+        widget.shutdown()
+        viewer.close()
+
+
+def test_an_instrument_with_neither_device_is_refused():
+    """
+    No scanner and no camera is refused at construction, with a reason.
+
+    There would be nothing to display, nothing to record, and every
+    control would be dead. Failing here beats opening an empty window
+    that looks like a bug in the viewer rather than a misconfigured
+    server.
+    """
+    viewer = napari.Viewer(show=False)
+    try:
+        with pytest.raises(ValueError, match="scanner, a camera, or both"):
+            LiveInstrumentWidget(viewer, None)
+    finally:
+        viewer.close()
+
+
+def test_disk_warning_uses_the_camera_shape_when_there_is_no_scanner(
+    tmp_path, monkeypatch
+):
+    """
+    Without a scanner the size estimate waits for a real camera frame.
+
+    A scan's frame shape is set by the operator before anything is
+    acquired; a camera's is whatever the sensor gives, and on a
+    commodity USB camera that is whatever the driver negotiated. So the
+    warning stays silent until a frame has actually arrived and then
+    uses its shape — rather than inventing one, which would put a number
+    on screen that no acquisition would produce.
+    """
+    viewer = napari.Viewer(show=False)
+    widget = LiveInstrumentWidget(viewer, None, camera=_FakeCamera())
+    try:
+        cramped = 10
+        monkeypatch.setattr(
+            "miainwoodpecker.viewer.live.free_space", lambda _path: cramped
+        )
+        widget.set_session(Session(tmp_path / "shift"))
+
+        # No frame yet: free space is still reported, the plan is not.
+        assert "free" in widget._space_label.text()  # noqa: SLF001
+        assert "warning" not in widget._space_label.text()  # noqa: SLF001
+
+        widget.start_camera()
+        assert _wait_until(
+            lambda: widget._camera_loop.latest() is not None  # noqa: SLF001
+        )
+        widget._refresh_session_labels()  # noqa: SLF001
+
+        assert "warning" in widget._space_label.text()  # noqa: SLF001
+        assert "camera frames need up to" in widget._space_label.text()  # noqa: SLF001
     finally:
         widget.shutdown()
         viewer.close()
