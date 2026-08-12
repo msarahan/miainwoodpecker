@@ -22,6 +22,7 @@ one result shape, dispatch by looking up ``target`` then ``getattr`` for
 from __future__ import annotations
 
 import contextlib
+import pickle
 import socket
 import typing
 from dataclasses import dataclass, field
@@ -92,6 +93,36 @@ BACKENDS = (SIMULATED_BACKEND, HARDWARE_BACKEND)
 # size. 64KB sits inside the band measured as "doesn't matter much either
 # way", so it is kept rather than tuned further.
 SHARED_MEMORY_THRESHOLD_BYTES = 64 * 1024
+
+COMPATIBLE_PICKLE_PROTOCOL = 4
+"""
+The highest pickle protocol an older embedded interpreter can still read.
+
+Only relevant when the two ends of this protocol are **different
+interpreters**, which the spawn path never produces (it launches
+``sys.executable``) and an attached device server routinely does. The
+motivating case is Gatan's: GMS embeds its own Miniconda environment, and
+Gatan's own FAQ names Python 3.7.2 for it, while this project requires
+3.11 or newer.
+
+That combination breaks silently in one direction, which is why the
+number is pinned here rather than left to chance.
+``multiprocessing.connection.Connection.send`` serialises with
+``_ForkingPickler.dumps(obj)`` — no protocol argument, so the *sender's*
+``pickle.DEFAULT_PROTOCOL``. On 3.8 and later that is 5; Python 3.7's
+``pickle.HIGHEST_PROTOCOL`` is 4, so it cannot read a protocol-5 stream at
+all. Every ``Call`` this client sent would arrive as an unpickling error,
+while every ``Result`` coming back (written by the older end at protocol 3
+or 4) would decode perfectly — a failure that looks like a broken server
+rather than a version mismatch.
+
+Protocol 4 is readable by every Python 3.4 and later, and costs nothing:
+protocol 5's addition is out-of-band buffers, which a plain
+``pickle.dumps`` without a ``buffer_callback`` never emits anyway.
+
+The *reply* direction needs no such cap. An older peer writes protocol 3
+or 4 by default, and a newer interpreter reads both.
+"""
 
 
 def disable_nagle(connection: Connection) -> None:
@@ -288,6 +319,7 @@ def send_call(
     call: Call,
     *,
     timeout_s: float | None = None,
+    pickle_protocol: int | None = None,
 ) -> object:
     """
     Send a call and return its result, raising on a server-side error.
@@ -308,6 +340,15 @@ def send_call(
         wrong guess would abort a good exposure — and wrong only for
         calls whose whole purpose is to not hang the application, which
         is why this is opt-in per call rather than a global setting.
+    pickle_protocol : int | None
+        Cap the pickle protocol this call is serialised with, or ``None``
+        (the default) to use the sending interpreter's own default. Set
+        it when the peer is a *different, older* interpreter — see
+        :data:`COMPATIBLE_PICKLE_PROTOCOL`. The bytes on the wire are
+        otherwise identical: ``Connection.send`` is
+        ``send_bytes(pickle.dumps(...))`` with the framing this reuses,
+        so a capped call is indistinguishable from an ordinary one except
+        in its protocol byte.
 
     Returns
     -------
@@ -327,7 +368,10 @@ def send_call(
     """
     with lock:
         try:
-            connection.send(call)
+            if pickle_protocol is None:
+                connection.send(call)
+            else:
+                connection.send_bytes(pickle.dumps(call, protocol=pickle_protocol))
             if timeout_s is not None and not connection.poll(timeout_s):
                 msg = (
                     f"remote call {call.target}.{call.method}() did not reply "

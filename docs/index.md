@@ -50,6 +50,9 @@ measurements included:
 - [Other vendors](vendor-support.md) — what Thermo Fisher, JEOL, Zeiss,
   Hitachi and Bruker actually expose, and what a second device adapter
   would cost.
+- [Gatan](adapters/gatan.md) — the one adapter that cannot be a
+  subprocess, the inbound transport built for it, and why the facility
+  that prompted it probably does not need it.
 - [Development docs](documentation/index.md) — environments, linting,
   publishing.
 
@@ -64,5 +67,6 @@ Architecture review <architecture-review>
 Hardware validation checklist <hardware-validation-checklist>
 Work before hardware <pre-hardware-work>
 Other vendors <vendor-support>
+Gatan <adapters/gatan>
 Development <documentation/index>
 :::
