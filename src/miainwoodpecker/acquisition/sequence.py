@@ -14,10 +14,15 @@ Generators are lazy, so a caller can stop early (``itertools.islice``,
 from __future__ import annotations
 
 import dataclasses
+import itertools
 import typing
 
 from miainwoodpecker.devices.interface import DEFOCUS_CONTROL, ENERGY_OFFSET_CONTROL
 from miainwoodpecker.storage.nexus import write_frames
+from miainwoodpecker.storage.spectra import (
+    spectrum_from_projected_frame,
+    write_spectra,
+)
 
 if typing.TYPE_CHECKING:
     import os
@@ -329,7 +334,30 @@ def record(
     **kwargs: object,
 ) -> int:
     """
-    Stream frames to a NeXus HDF5 file as they are produced.
+    Stream frames to a NeXus HDF5 file, in the layout the frames call for.
+
+    **This is the seam where a projected readout changes layout, and it
+    dispatches on what the frames *are*.** A 2D frame goes to
+    :class:`~miainwoodpecker.storage.nexus.NexusWriter` exactly as it
+    always has, byte for byte. A 1D frame — a camera's
+    :data:`~miainwoodpecker.devices.interface.PROJECTED_READOUT` — is a
+    spectrum with its energy axis in its calibration metadata, and it
+    goes through
+    :func:`~miainwoodpecker.storage.spectra.spectrum_from_projected_frame`
+    into :class:`~miainwoodpecker.storage.spectra.SpectrumWriter`'s
+    ``NXspectrum`` layout, the same file shape EDX lands in.
+
+    Here rather than anywhere else, deliberately. Every recording path
+    funnels through this function — ``Session.record`` wraps it, the
+    viewer's recording job goes through ``Session.record`` — so one
+    branch covers them all; and putting the branch *inside* either writer
+    would turn a single-layout writer into one whose every method
+    branches on which of two formats it is writing, which is exactly what
+    ``storage/spectra.py``'s module docstring rejects (and why
+    ``NexusWriter`` refuses 1D by design rather than guessing a layout).
+    The decision is per *recording*, from its first frame, not per frame:
+    the writers themselves enforce that later frames match, so a series
+    that changes rank mid-stream fails with the writers' own sentence.
 
     Parameters
     ----------
@@ -338,11 +366,45 @@ def record(
     path : os.PathLike[str] | str
         Destination HDF5 file.
     **kwargs : object
-        Passed through to :class:`~miainwoodpecker.storage.nexus.NexusWriter`.
+        Passed through to
+        :class:`~miainwoodpecker.storage.nexus.NexusWriter` for image
+        frames, or to :func:`~miainwoodpecker.storage.spectra.write_spectra`
+        (and so :class:`~miainwoodpecker.storage.spectra.SpectrumWriter`)
+        for projected ones. The shared options (``title``, ``sample``,
+        ``user``, ``instrument``, ``notes``, compression) mean the same
+        thing on both; an option only one writer has is refused by the
+        other's signature rather than silently dropped.
 
     Returns
     -------
     int
         The number of frames recorded.
+
+    Notes
+    -----
+    Propagates ``ValueError`` from
+    :func:`~miainwoodpecker.storage.spectra.spectrum_from_projected_frame`
+    when a 1D frame carries no energy calibration — a projected frame
+    that cannot say what its axis is cannot be stored as a spectrum, and
+    storing it as anything else would be a layout guess.
+
+    One behaviour did change, and it is the price of dispatching on the
+    frames rather than on what the caller believes: the first frame is
+    pulled *before* the file is opened, so a device that fails on its
+    very first frame now leaves no file at all where it used to leave an
+    empty, finalized one. Failing later is unchanged — the writers' own
+    ``close()`` still finalizes what arrived, which is the interruption
+    mode that matters — and recording an empty series still writes the
+    empty frame file it always did.
     """
-    return write_frames(path, frames, **kwargs)
+    iterator = iter(frames)
+    first = next(iterator, None)
+    if first is None:
+        # An empty series writes the same (empty, finalized) frame file
+        # it always has.
+        return write_frames(path, (), **kwargs)
+    series = itertools.chain([first], iterator)
+    if first.data.ndim == 1:
+        spectra = (spectrum_from_projected_frame(frame) for frame in series)
+        return write_spectra(path, spectra, **kwargs)
+    return write_frames(path, series, **kwargs)

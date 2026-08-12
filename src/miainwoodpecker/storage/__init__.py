@@ -28,6 +28,7 @@ from miainwoodpecker.storage.nexus import (
 from miainwoodpecker.storage.spectra import (
     SpectrumWriter,
     read_spectra,
+    spectrum_from_projected_frame,
     write_spectra,
 )
 
@@ -43,6 +44,7 @@ __all__ = [
     "read_frames",
     "read_series",
     "read_spectra",
+    "spectrum_from_projected_frame",
     "write_frames",
     "write_spectra",
 ]

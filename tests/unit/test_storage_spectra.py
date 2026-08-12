@@ -23,14 +23,17 @@ import h5py
 import numpy as np
 import pytest
 
-from miainwoodpecker.devices.interface import Spectrum
+from miainwoodpecker.devices.interface import PROJECTED_READOUT, Frame, Spectrum
 from miainwoodpecker.storage import layout
 from miainwoodpecker.storage.calibration import AxisKind
 from miainwoodpecker.storage.spectra import (
+    EELS_TECHNIQUE,
     MAP_LAYOUT,
     SERIES_LAYOUT,
+    TECHNIQUE_KEY,
     SpectrumWriter,
     read_spectra,
+    spectrum_from_projected_frame,
     write_spectra,
 )
 
@@ -369,3 +372,202 @@ def test_an_unopened_writer_refuses_rather_than_failing_obscurely(tmp_path):
     writer = SpectrumWriter(tmp_path / "unused.nxs")
     with pytest.raises(RuntimeError, match="not open"):
         writer.append(_spectrum(0))
+
+
+def _projected_frame(
+    *,
+    kind: str = "energy",
+    units: str = "eV",
+    scale: float = _SCALE_EV,
+    offset: float = _OFFSET_EV,
+    axes: dict | None = None,
+    **metadata: object,
+) -> Frame:
+    """
+    Build the 1D frame a camera's projected readout produces.
+
+    Parameters
+    ----------
+    kind : str
+        The surviving axis's calibration kind.
+    units : str
+        The surviving axis's units.
+    scale : float
+        Dispersion per channel, in ``units``.
+    offset : float
+        The axis value at channel 0, in ``units``.
+    axes : dict | None
+        Replace the whole ``calibration`` mapping; ``{}`` means the frame
+        carries none at all.
+    **metadata : object
+        Extra frame metadata, overriding the defaults.
+
+    Returns
+    -------
+    Frame
+        A 1D frame shaped like one a projected EELS readout delivers.
+    """
+    calibration = (
+        {"x": {"kind": kind, "scale": scale, "offset": offset, "units": units}}
+        if axes is None
+        else axes
+    )
+    return Frame(
+        data=np.arange(_CHANNELS, dtype="float32"),
+        timestamp=datetime.datetime(2024, 5, 6, 7, 8, 9, tzinfo=datetime.UTC),
+        metadata={
+            "device_id": "eels_camera",
+            "camera_type": "eels",
+            "readout": PROJECTED_READOUT,
+            "projected_by": "server",
+            "exposure_ms": 25.0,
+            **({"calibration": calibration} if calibration else {}),
+            **metadata,
+        },
+    )
+
+
+def test_a_projected_frame_keeps_its_dispersive_axis_verbatim():
+    """
+    The surviving axis's calibration crosses unchanged; the summed axis is gone.
+
+    This is the whole correctness claim of the projected readout: the
+    non-dispersive direction was summed away, so nothing about the energy
+    axis may move. An offset or dispersion altered here would put every
+    eV in the recording wrong with the file still perfectly readable.
+    """
+    spectrum = spectrum_from_projected_frame(_projected_frame())
+
+    assert spectrum.energy_offset_ev == pytest.approx(_OFFSET_EV)
+    assert spectrum.energy_scale_ev == pytest.approx(_SCALE_EV)
+    assert spectrum.channel_count == _CHANNELS
+    assert spectrum.navigation_shape == ()
+    assert spectrum.timestamp.tzinfo is not None
+
+
+def test_a_projected_frames_energy_axis_is_converted_into_this_layouts_ev():
+    """
+    A meV axis arrives as eV, converted once rather than left loose.
+
+    ``SpectrumWriter``'s layout is electronvolts by definition, and a
+    camera calibrated in meV is an ordinary high-resolution EELS setup —
+    so the conversion has to happen somewhere, and doing it here means
+    the number written and the number read back are the same quantity.
+    """
+    spectrum = spectrum_from_projected_frame(
+        _projected_frame(units="meV", scale=200.0, offset=-40_000.0),
+    )
+
+    assert spectrum.energy_scale_ev == pytest.approx(0.2)
+    assert spectrum.energy_offset_ev == pytest.approx(-40.0)
+
+
+def test_an_eels_camera_readout_says_so_where_the_layout_cannot():
+    """
+    ``technique`` is stamped, because the shape stops distinguishing here.
+
+    Once a projected EELS readout is in the same ``NXspectrum`` layout as
+    EDX the two files are the same shape, and the only thing standing
+    between eXSpy and fitting X-ray lines to electron energy losses is
+    the recording saying which it is.
+    """
+    spectrum = spectrum_from_projected_frame(_projected_frame())
+    assert spectrum.metadata[TECHNIQUE_KEY] == EELS_TECHNIQUE
+    # The frame's own facts travel with it, so the exposure and who did
+    # the summing survive into the file's per-spectrum metadata.
+    assert spectrum.metadata["projected_by"] == "server"
+    assert spectrum.metadata["exposure_ms"] == pytest.approx(25.0)
+
+
+def test_an_adapter_that_already_named_its_technique_is_not_overruled():
+    """
+    A camera that says what it is keeps saying it.
+
+    ``camera_type == "eels"`` is evidence, not authority: a spectrometer
+    doing cathodoluminescence on the same camera would be mislabelled by
+    an unconditional stamp, and the adapter is the layer that knows.
+    """
+    spectrum = spectrum_from_projected_frame(_projected_frame(technique="cl"))
+    assert spectrum.metadata[TECHNIQUE_KEY] == "cl"
+
+
+def test_a_camera_that_is_not_a_spectrometer_claims_no_technique():
+    """
+    Nothing is stamped when nothing said so, which is what keeps the claim real.
+
+    An absent ``technique`` means "the recording does not say" — the
+    honest state — rather than a default the EELS loader would then
+    accept as a claim.
+    """
+    spectrum = spectrum_from_projected_frame(
+        _projected_frame(camera_type="ronchigram"),
+    )
+    assert TECHNIQUE_KEY not in spectrum.metadata
+
+
+def test_an_image_frame_is_refused_by_name_rather_than_flattened():
+    """
+    A 2D frame belongs to ``NexusWriter``, and is told so.
+
+    Flattening it here would be the layout guess this project refuses on
+    both sides: ``NexusWriter`` declines 1D rather than inventing a
+    spectrum layout, and this declines 2D rather than inventing a
+    projection direction.
+    """
+    frame = Frame(
+        data=np.zeros((4, _CHANNELS), dtype="float32"),
+        timestamp=datetime.datetime.now(tz=datetime.UTC),
+        metadata={},
+    )
+    with pytest.raises(ValueError, match="belongs to NexusWriter"):
+        spectrum_from_projected_frame(frame)
+
+
+def test_a_projected_frame_with_no_calibration_is_refused():
+    """
+    A spectrum cannot exist without its energy axis, so none is invented.
+
+    An uncalibrated *image* is still an image and this project supports
+    that state deliberately. An array of counts with no dispersion is not
+    a spectrum, and writing one with a fabricated axis would produce a
+    file whose every energy is made up.
+    """
+    with pytest.raises(ValueError, match="cannot exist without its energy axis"):
+        spectrum_from_projected_frame(_projected_frame(axes={}))
+
+
+def test_a_projected_frame_whose_axis_is_not_energy_is_refused():
+    """
+    Projecting a diffraction camera gives counts against angle, not a spectrum.
+
+    The refusal is what keeps the ``NXspectrum`` layout meaning what it
+    says: its ``axis_energy`` is of NeXus unit category ``NX_ENERGY``, so
+    a summed Ronchigram has no home in it and should not be given one.
+    """
+    with pytest.raises(ValueError, match="not energy"):
+        spectrum_from_projected_frame(
+            _projected_frame(kind="angle", units="rad", scale=0.001, offset=0.0),
+        )
+
+
+def test_a_projected_frame_round_trips_through_the_spectrum_layout(tmp_path):
+    """
+    The end of the route: a projected frame reads back as an eV spectrum.
+
+    Written through the same ``SpectrumWriter`` an EDX detector uses and
+    read back through the same ``read_spectra``, which is the point of
+    routing it here rather than growing a third layout.
+    """
+    path = tmp_path / "projected.nxs"
+    write_spectra(path, [spectrum_from_projected_frame(_projected_frame())])
+
+    recording = read_spectra(path)
+    assert recording.data.shape == (1, _CHANNELS)
+    assert recording.energy_offset_ev == pytest.approx(_OFFSET_EV)
+    assert recording.energy_scale_ev == pytest.approx(_SCALE_EV)
+    assert recording.metadata[0][TECHNIQUE_KEY] == EELS_TECHNIQUE
+    with h5py.File(path, "r") as handle:
+        # NXdetector's description is where the technique lands, which is
+        # what the typed loaders read to tell EELS from EDX.
+        description = handle[f"{layout.SPECTRUM_DETECTOR_GROUP}/description"][()]
+    assert description.decode() == EELS_TECHNIQUE

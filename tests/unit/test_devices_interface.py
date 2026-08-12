@@ -11,6 +11,9 @@ from miainwoodpecker.devices import (
     BEAM_BLANKER_CONTROL,
     DEFOCUS_CONTROL,
     ENERGY_OFFSET_CONTROL,
+    IMAGE_READOUT,
+    PROJECTED_READOUT,
+    READOUT_MODES,
     STAGE_POSITION_CONTROL,
     Camera,
     CameraParameters,
@@ -328,3 +331,43 @@ def test_available_controls_can_report_a_partial_instrument():
     instrument = _FakeInstrument(controls=[DEFOCUS_CONTROL])
     assert BEAM_BLANKER_CONTROL not in instrument.available_controls()
     assert isinstance(instrument, Instrument)
+
+
+def test_camera_parameters_default_to_the_image_readout():
+    """
+    The default readout is today's behaviour, so nothing existing changes shape.
+
+    ``readout`` arrived after every caller and every adapter, so its
+    default has to be the mode they were all written against; a default
+    of ``projected`` would silently turn every existing camera call into
+    a 1D acquisition.
+    """
+    assert CameraParameters(exposure_ms=10.0).readout == IMAGE_READOUT
+
+
+def test_camera_parameters_reject_a_readout_no_camera_could_act_on():
+    """
+    A misspelt mode is refused at construction, not silently imaged.
+
+    The vocabulary is closed on purpose: an adapter that fell through to
+    imaging on an unrecognised mode would answer an operator asking for a
+    spectrum with a picture, and the frame's own metadata would agree
+    with the picture.
+    """
+    with pytest.raises(ValueError, match="readout must be one of"):
+        CameraParameters(exposure_ms=10.0, readout="sum_project")
+
+
+def test_the_readout_vocabulary_is_exactly_the_two_modes():
+    """
+    Both modes are in ``READOUT_MODES``, which is what adapters validate against.
+
+    Pinned because the tuple is the shared contract: an adapter that
+    cannot project compares against these names, and a third mode added
+    without an adapter behind it would be a field every adapter must
+    refuse.
+    """
+    expected = (IMAGE_READOUT, PROJECTED_READOUT)
+    assert expected == READOUT_MODES
+    for mode in READOUT_MODES:
+        assert CameraParameters(exposure_ms=1.0, readout=mode).readout == mode

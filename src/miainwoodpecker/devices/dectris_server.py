@@ -135,7 +135,11 @@ from collections import deque
 
 import numpy as np
 
-from miainwoodpecker.devices.interface import CameraParameters, Frame
+from miainwoodpecker.devices.interface import (
+    IMAGE_READOUT,
+    CameraParameters,
+    Frame,
+)
 from miainwoodpecker.devices.rpc import BACKENDS, SIMULATED_BACKEND
 from miainwoodpecker.devices.serving import accept_loop
 from miainwoodpecker.devices.shared_frame import SharedFrameWriter
@@ -866,7 +870,8 @@ class DectrisCamera:
         Raises
         ------
         ValueError
-            If a binning other than 1 is requested.
+            If a binning other than 1, or a readout other than
+            ``image``, is requested.
         """
         if parameters.binning != 1:
             msg = (
@@ -875,6 +880,16 @@ class DectrisCamera:
                 f"charge to sum, and summing on the host would report a "
                 f"pixel size the sensor does not have. Use the detector's "
                 f"ROI instead, once CameraParameters has somewhere to put it"
+            )
+            raise ValueError(msg)
+        if parameters.readout != IMAGE_READOUT:
+            msg = (
+                f"readout {parameters.readout!r} is not supported by "
+                f"{self.camera_id}: SIMPLON offers no projection readout, and "
+                f"this adapter does not know which direction an ELA's "
+                f"spectrometer disperses along, so a host-side sum would "
+                f"guess the axis it collapses. The monitor path delivers "
+                f"images; project in analysis instead"
             )
             raise ValueError(msg)
         with self._lock:

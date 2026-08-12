@@ -18,7 +18,13 @@ import numpy as np
 import pytest
 
 from miainwoodpecker.acquisition import camera_series, record
-from miainwoodpecker.devices import Camera, CameraParameters, Instrument
+from miainwoodpecker.devices import (
+    IMAGE_READOUT,
+    PROJECTED_READOUT,
+    Camera,
+    CameraParameters,
+    Instrument,
+)
 from miainwoodpecker.devices.camera_server import (
     CAMERA_TARGET,
     NO_CAMERA_EXIT_STATUS,
@@ -257,3 +263,23 @@ def test_the_simulated_camera_needs_no_opencv():
     frame = camera.acquire_frame()
     assert frame.data.dtype == np.uint8
     camera.close()
+
+
+def test_a_projected_readout_is_refused_by_a_camera_with_no_dispersive_axis(
+    camera_microscope,
+):
+    """
+    A consumer sensor has nothing to project along, and refuses in a sentence.
+
+    The same rule as the binning refusal above and for a sharper reason:
+    silently imaging would hand back a 2D frame to a caller that asked
+    for a spectrum, and the recording path — which dispatches on the
+    frames' rank — would then write it as an image with nothing
+    anywhere saying the request was ignored.
+    """
+    camera = camera_microscope.camera
+    with pytest.raises(Exception, match="no dispersive axis to project along"):
+        camera.configure(
+            CameraParameters(exposure_ms=10.0, readout=PROJECTED_READOUT),
+        )
+    assert camera.parameters().readout == IMAGE_READOUT

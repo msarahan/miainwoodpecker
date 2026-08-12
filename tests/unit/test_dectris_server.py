@@ -27,7 +27,12 @@ import numpy as np
 import pytest
 
 from miainwoodpecker.acquisition import camera_series, record
-from miainwoodpecker.devices import Camera, CameraParameters
+from miainwoodpecker.devices import (
+    IMAGE_READOUT,
+    PROJECTED_READOUT,
+    Camera,
+    CameraParameters,
+)
 from miainwoodpecker.devices.dectris_server import (
     CAMERA_TARGET,
     NO_DETECTOR_EXIT_STATUS,
@@ -260,6 +265,26 @@ def test_binning_other_than_one_is_refused_for_a_physical_reason(dectris_microsc
             CameraParameters(exposure_ms=10.0, binning=_UNSUPPORTED_BINNING),
         )
     assert camera.parameters().binning == 1
+
+
+def test_a_projected_readout_is_refused_rather_than_guessing_a_direction(
+    dectris_microscope,
+):
+    """
+    SIMPLON has no projection readout, and this adapter will not invent one.
+
+    The refusal is not "DECTRIS cannot sum" — a host can sum anything.
+    It is that nothing here knows *which* direction an ELA's spectrometer
+    disperses along, and a host-side sum picks that direction. Getting it
+    wrong collapses the energy axis instead of the spatial one and
+    returns a plausible spectrum of nothing.
+    """
+    camera = dectris_microscope.camera
+    with pytest.raises(Exception, match="SIMPLON offers no projection readout"):
+        camera.configure(
+            CameraParameters(exposure_ms=10.0, readout=PROJECTED_READOUT),
+        )
+    assert camera.parameters().readout == IMAGE_READOUT
 
 
 def test_exposure_reaches_the_detector_and_is_read_back(detector):
