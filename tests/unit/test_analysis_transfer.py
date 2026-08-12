@@ -45,7 +45,22 @@ from miainwoodpecker.storage.calibration import FrameCalibration
 from miainwoodpecker.storage.nexus import FrameStack
 
 _SHM_DIR = pathlib.Path("/dev/shm")  # noqa: S108 - the POSIX shared-memory
-# mount this module's transport manages, not a temp directory.
+# mount the transport under test manages, not a temp directory.
+_CAN_SEE_SEGMENTS = _SHM_DIR.is_dir()
+"""
+Whether this platform exposes POSIX shared memory as a directory.
+
+Linux does, and enumerating it is how these tests observe that a segment
+was or was not created. macOS and Windows do not, and offer no
+equivalent to enumerate -- the transport itself works there (Windows has
+named shared memory, macOS has POSIX shm without a mount), only the
+*inspection* is Linux-only.
+
+So the segment assertions are made where they can be made, and skipped
+where they cannot, rather than comparing two empty sets and reporting
+that as a pass. Every test guarded by this also asserts the same
+property in a platform-independent way where one exists.
+"""
 
 
 @pytest.fixture
@@ -108,11 +123,20 @@ def test_a_frame_stack_round_trips_with_its_axes(writer, reader):
 
 
 def test_a_file_source_moves_no_array_at_all(writer, reader):
-    """The fresh-burst case sends a path, so nothing large crosses."""
-    before = set(_SHM_DIR.iterdir())
+    """
+    The fresh-burst case sends a path, so nothing large crosses.
+
+    ``source.stack is None`` is the claim, and it holds everywhere. The
+    ``/dev/shm`` comparison beside it is corroboration on the one
+    platform that can offer any: it catches a segment published as a side
+    effect that the encoded source does not mention, which the first
+    assertion alone would not notice.
+    """
+    before = set(_SHM_DIR.iterdir()) if _CAN_SEE_SEGMENTS else None
     source = publish_source(writer, AnalysisInput(path="/tmp/burst.nxs"))  # noqa: S108
     assert source.stack is None
-    assert set(_SHM_DIR.iterdir()) == before
+    if before is not None:
+        assert set(_SHM_DIR.iterdir()) == before
 
     decoded = read_source(reader, source)
     assert decoded.path == "/tmp/burst.nxs"  # noqa: S108
