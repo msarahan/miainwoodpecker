@@ -12,4 +12,14 @@ optional dependency group; and the py4DSTEM adapter in
 ``py4dstem`` group (see that module's docstring for why it is scoped to
 single diffraction patterns, not py4DSTEM's 4D ``DataCube``). None of
 them is re-exported here — import whichever one is needed directly.
+
+Four newer modules make up an optional process boundary around those
+three: :mod:`miainwoodpecker.analysis.operations` (the analyses the
+viewer runs, as plain functions),
+:mod:`miainwoodpecker.analysis.transfer` (the wire vocabulary),
+:mod:`miainwoodpecker.analysis.worker` (the subprocess that imports the
+libraries) and :mod:`miainwoodpecker.analysis.remote` (the MIT client
+that picks between in-process and isolated). It is **off by default**;
+docs/analysis-isolation.md sets out what it buys, what it deliberately
+does not settle, and what it costs.
 """
