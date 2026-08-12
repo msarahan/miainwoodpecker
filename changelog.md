@@ -126,6 +126,23 @@
   and why that redesign should land with the second column adapter rather
   than before it.
 
+- `docs/analysis-parity.md`: every analysis Nion Swift offers — roughly
+  ninety operations across `nionswift`, `nionswift-eels-analysis`,
+  `nionswift-experimental` and the instrumentation kit — mapped onto
+  HyperSpy, LiberTEM and py4DSTEM, with the genuine gaps costed and the
+  ones not worth porting argued rather than listed. Closes the last open
+  Phase 4 item. Three findings change what that item meant: `niondata` is
+  **Apache-2.0**, so Swift's whole core processing menu is a dependency
+  declaration on the MIT side rather than fifty ports (four packages
+  installed, against HyperSpy's ~35 and LiberTEM's ~102, and it runs
+  standalone on plain NumPy arrays); **HyperSpy 2.x contains no EELS** —
+  it moved to `exspy` at the 2.0 split — so the `analysis` extra covers
+  none of Swift's EELS menu, which is the largest real gap and is this
+  project's rather than Swift's; and only five gaps are genuinely
+  Swift-specific and worth porting, at 9–15 days in total. Also records
+  that `hyperspy` and `py4dstem` are themselves GPL-3.0 and imported
+  in-process, which §6 does not currently speak to.
+
 - **A device server for commodity cameras**
   (`miainwoodpecker.devices.camera_server`): USB microscopes, webcams, and
   recorded video files, over OpenCV's `VideoCapture` — no vendor SDK, MIT,

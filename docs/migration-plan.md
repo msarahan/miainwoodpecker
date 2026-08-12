@@ -1084,12 +1084,43 @@ problem — read their source and docs before designing our own adapters:
     — heavier than HyperSpy's ~35 and close to the ~70 the Phase 3 notes
     measured for `pynxtools-em` — so installing one analysis library
     doesn't tax someone who only wanted the other.
-- [ ] Port Swift-specific analyses not already covered upstream, as small
-  adapter functions. **Deferred, not attempted**: this PoC's scope was
-  proving the wiring shape (adapter + one real menu action) works end to
-  end, not auditing Swift's analysis feature set for gaps HyperSpy/
-  py4DSTEM/LiberTEM don't already cover. That audit is real work for a
-  follow-up, not a checkbox to wave through here.
+- [x] Port Swift-specific analyses not already covered upstream, as small
+  adapter functions. **Audited, and the audit changed the shape of the
+  answer** — [`docs/analysis-parity.md`](analysis-parity.md) enumerates
+  roughly ninety operator-reachable operations across `nionswift`,
+  `nionswift-eels-analysis`, `nionswift-experimental` and the
+  instrumentation kit, maps each onto HyperSpy/LiberTEM/py4DSTEM (or
+  admits it doesn't map), and costs what's left. Three findings are worth
+  repeating here because they move Phase 4's premise:
+  - **"Port as small adapter functions" is the wrong verb for the core
+    menu.** All 56 Processing-menu operations are thin expressions over
+    one `nion.data.xdata_1_0` call, and `niondata` is **Apache-2.0**, not
+    GPL-3.0 — checked in three places, including the installed metadata
+    of the 15.9.1 this project already pins in the `device` extra. It
+    installs into a bare venv in four packages (against HyperSpy's ~35,
+    py4DSTEM's 65, LiberTEM's ~102) and runs standalone on plain NumPy
+    arrays with no Swift and no GUI, verified rather than assumed. So the
+    core menu is a dependency declaration on the MIT side plus a
+    calibration conversion, not fifty reimplementations.
+  - **This project has no EELS capability at all today, and that was
+    invisible.** HyperSpy 2.x does not contain EELS — verified by
+    introspecting the installed 2.4.0, whose `hs.signals` has no
+    `EELSSpectrum` — because EELS and EDS moved to `exspy` at the 2.0
+    split. The `analysis` extra is `hyperspy>=2.0`, so it covers none of
+    Swift's EELS menu. That is the largest real gap the audit found, and
+    it is ours rather than Swift's.
+  - **Only five gaps are genuinely Swift-specific and worth porting**, at
+    9–15 days total: thermometry (2–3 d), Fourier-filter mask shapes
+    (2–4 d), Double Gaussian (1 d), radial power spectrum (1–2 d), and
+    a two-area EELS background (1–2 d, on request only). Everything else
+    is either covered, subsumed by a better upstream implementation
+    (Swift's quantification is K-shell hydrogenic only, against eXSpy's
+    tabulated DFT/Dirac databases), display-only, or acquisition-time
+    work belonging to the synchronized-acquisition item rather than here.
+  - The audit also surfaces, without resolving, that `hyperspy` and
+    `py4dstem` are themselves GPL-3.0 and are imported in-process by
+    `viewer/live.py` — the shape §6 avoided for the device layer. §6
+    should say explicitly whether its boundary covers analysis extras.
 
 **Phase 5 — Parity and cutover**
 - Audit which Swift features the team actually uses day to day (not the
