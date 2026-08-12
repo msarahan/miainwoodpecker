@@ -143,6 +143,49 @@
   `nion_server` and shared with the camera server. Lifecycle deliberately
   stays with each adapter: a webcam has no beam to park.
 
+### Fixed
+
+- **Phase 2's napari-versus-`ndv` question is closed: keep napari.**
+  Measured on an M2 Pro across a 16× range of frame sizes, display cost
+  is flat — 12.2 / 11.2 / 11.4 ms at 512² / 1024² / 2048² — so it is
+  napari's fixed per-update overhead rather than upload or draw. That
+  diagnosis is the one `ndv` addresses, and it inverts the conclusion: a
+  fixed cost is amortised exactly where it would hurt, since every real
+  workload's frame time scales with data and this does not. Display is
+  4.7% of a 512² scan frame's beam time and 0.27% of a 2048² one. The
+  one regime where 11 ms would bite — small frames at high rate — is
+  already routed to LiberTEM-live.
+
+- **Display responsiveness under analysis load is measured, and the fix
+  is ours rather than the viewer's.** On the M2 Pro, acquire is unmoved
+  by CPU contention (5.5 → 5.7 ms median from zero to eight competing
+  numpy workers) because a grab is IPC and a shared-memory read, not
+  computation — so contention lands on display alone. Display degrades
+  in the tail a full load level before the median: at four workers the
+  median *improves* to 3.1 ms while p95 triples to 23.0 ms, which makes
+  the benchmark's median-derived frame rate misleading exactly where a
+  user first notices trouble. At eight workers the worst update is 4031
+  ms — the GUI thread descheduled outright, which no per-update
+  efficiency addresses. The conclusion is a scheduling constraint:
+  whatever runs analysis must leave cores for the GUI thread
+  (`OMP_NUM_THREADS`, LiberTEM executor workers), since our own
+  `viewer/jobs.py` already runs one job at a time and it is the
+  numpy/BLAS threads inside it that take every core. Also confirms by
+  measurement what `viewer/live.py` implied: the camera path costs half
+  the scan path (5.6 ms against 11–12 ms), because only the scan view
+  autocontrasts every frame.
+
+- `scripts/phase2_live_benchmark.py` compared display cost against the
+  *simulator's* acquire time, which is not what gates a live view. On the
+  first hardware-accelerated run that denominator produced "display
+  dominates … the empirical argument for ndv" from a 2.05× ratio that
+  meant nothing of the sort: the simulator makes a 512² frame in 5.4 ms
+  where a real 1 µs-dwell scan takes 262 ms, against which display is
+  4.2% of a frame. The verdict now divides by the scan's physical
+  duration, reports the sustainable frame rate separately as the ceiling
+  a camera-rate source actually faces, and says what experiment would
+  decide the remaining question.
+
 ### Changed
 
 - CI's `integration` job runs its tests in parallel (`pytest -n auto`),
