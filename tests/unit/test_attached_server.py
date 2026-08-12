@@ -34,7 +34,7 @@ import time
 import numpy as np
 import pytest
 
-from miainwoodpecker.devices import Camera, InstrumentController
+from miainwoodpecker.devices import Camera, Instrument
 from miainwoodpecker.devices.gatan_bridge import start_bridge
 from miainwoodpecker.devices.remote import (
     ACCEPT_TRANSPORT,
@@ -106,7 +106,7 @@ def test_an_unlaunchable_device_server_can_be_driven_end_to_end(accepting_bridge
 
     The point of the test is everything it does *not* have to say. There
     is no new device API here: the same ``Camera`` protocol, the same
-    ``InstrumentController``, the same ``describe()``-first handshake, the
+    ``Instrument`` core, the same ``describe()``-first handshake, the
     same ``RemoteInstrumentDevices``. A caller written against
     ``remote_instrument`` works against this one by changing which context
     manager it opens, which is the whole claim being made — that the
@@ -114,7 +114,7 @@ def test_an_unlaunchable_device_server_can_be_driven_end_to_end(accepting_bridge
     """
     with attached_instrument(accepting_bridge, timeout_s=_ATTACH_TIMEOUT_S) as scope:
         assert isinstance(scope.eels_camera, Camera)
-        assert isinstance(scope.instrument, InstrumentController)
+        assert isinstance(scope.instrument, Instrument)
         description = scope.instrument.describe()
         assert list(description["targets"]) == ["eels_camera"]
         # A spectrometer is not a microscope: one control, and honestly

@@ -456,15 +456,16 @@
   on an SU9000II rather than an SU7000) is settled by looking at the
   instrument PC rather than by a negotiation.
 
-- **`InstrumentController` is all-or-nothing to `isinstance`.**
+- **`InstrumentController` was all-or-nothing to `isinstance`.**
   `available_controls()` exists so an instrument can serve some controls
-  and not others, but the protocol is `runtime_checkable`, and that check
-  demands every method regardless of what the instrument says it
-  supports. Two adapters now fail it while working perfectly
+  and not others, but the protocol was `runtime_checkable`, and that
+  check demands every method regardless of what the instrument says it
+  supports. Two adapters failed it while working perfectly
   (`camera_server.ServerInstrument`, `gatan_bridge.BridgeInstrument`), so
-  the check tests for Nion-shapedness rather than conformance. Found
-  independently by two adapters, which is the signal that it is the
-  abstraction rather than the adapters. Recorded, not yet fixed.
+  the check tested for Nion-shapedness rather than conformance. Found
+  independently by two adapters, which was the signal that it was the
+  abstraction rather than the adapters. Now fixed — see the split into
+  `Instrument` and `InstrumentController` under Fixed below.
 
 - **A protocol gap in the instrument we already drive.** `Scanner`
   produces one channel per `scan_frame` call, on the stated premise that
@@ -533,6 +534,48 @@
   a shape would put a number on screen that no acquisition would produce.
 
 ### Fixed
+
+- **The instrument runtime check no longer demands controls an
+  instrument does not serve.** The `isinstance` question every call site
+  was actually asking — "is this an instrument target I can hold a
+  session against" — is now its own `runtime_checkable` protocol,
+  `Instrument`: identity (`stage_size_nm`), capability
+  (`available_controls`), lifecycle (`park`). `InstrumentController` is
+  that core plus the per-control methods, for static typing, and is
+  deliberately no longer `runtime_checkable`, so the old all-or-nothing
+  question raises `TypeError` instead of quietly failing partial
+  adapters. `camera_server.ServerInstrument` (zero controls) and
+  `gatan_bridge.BridgeInstrument` (one control) both pass the runtime
+  check now, each pinned by a test; which *controls* exist is asked
+  through `available_controls()`, and the sweep generators' graceful
+  "control not available" refusals are unchanged.
+
+- **The port-collision retry no longer depends on a stopwatch.**
+  `_free_port()` probes a port and releases it, so the server binds it
+  seconds later and can find it taken; the loser exits with status 4 and
+  the client is meant to re-pick and respawn. Detection was
+  `process.wait(0.4)` immediately after the spawn, which was wrong in
+  both directions: a healthy server never exits, so **every** good
+  startup paid the full 0.4 s for an answer already known, and a machine
+  loaded enough to take longer than 0.4 s to reach its bind — the machine
+  most likely to collide in the first place — turned a curable collision
+  into an anonymous startup error. Seen once in CI after `TARGET_NAMES`
+  grew to five ports.
+
+  The fixed wait is gone and the retry now spans the whole
+  spawn-and-connect. `_connect_with_retry` already polls the child on
+  every attempt, so when it finds it dead with the port-collision status
+  it raises a distinguishable internal error rather than the generic
+  diagnostic, and `_spawn_and_connect` answers that with fresh ports, a
+  fresh child, and a fresh connect deadline — releasing any connections
+  the doomed attempt had already made, since the health connection and
+  the per-target connects come *after* the first one. Every other exit
+  status keeps its diagnostic verbatim, because a missing instrument or
+  an unimportable adapter module would only fail again. A persistent
+  collision still ends at the existing attempt budget with the "claiming
+  localhost ports faster than they can be used" message. Net: healthy
+  startups are 0.4 s faster, and a collision noticed at any point before
+  the session is connected is retried rather than fatal.
 
 - **EDS beam current reached eXSpy a billion times too small.**
   `load_as_eds_signal` wrote `beam_current_a` straight into

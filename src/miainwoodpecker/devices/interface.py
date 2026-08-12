@@ -12,12 +12,13 @@ scanner produces one frame per request (live scanning is a repeated
 ``scan_frame`` loop). Exposure/settings modeling and hardware-synchronized
 multi-signal acquisition are still deferred.
 
-:class:`InstrumentController` is the Phase 3 addition, and holds to the
-same rule. It exposes four controls — stage position, defocus, beam
-blanker, spectrometer energy offset — because those are what a parameter
-sweep (``acquisition.sequence.focal_series``,
+:class:`Instrument` and :class:`InstrumentController` are the Phase 3
+addition, and hold to the same rule. The controller exposes four controls
+— stage position, defocus, beam blanker, spectrometer energy offset —
+because those are what a parameter sweep
+(``acquisition.sequence.focal_series``,
 ``acquisition.sequence.energy_offset_series``) and a safe teardown
-(:meth:`InstrumentController.park`) actually need, not because the
+(:meth:`Instrument.park`) actually need, not because the
 underlying instruments expose only four. A real Nion STEM controller has
 hundreds of named controls (``C10``, ``C12``, ``CAperture``, ``EHT``, …);
 proxying all of them would be a vendor API in vendor-neutral clothing.
@@ -685,7 +686,7 @@ class SpectrumDetector(typing.Protocol):
     **Which modes exist is asked, not assumed.** A detector reports
     :attr:`acquisition_modes`, and a caller consults it before driving
     one, exactly as it consults
-    :meth:`InstrumentController.available_controls` before driving a
+    :meth:`Instrument.available_controls` before driving a
     control. This project has been bitten before by treating "the setter
     returned" as "the control works" (docs/migration-plan.md, §7), and a
     map on an unsynchronised detector is the same trap with a much more
@@ -828,6 +829,55 @@ ENERGY_OFFSET_CONTROL = "energy_offset"
 
 
 @typing.runtime_checkable
+class Instrument(typing.Protocol):
+    """
+    What every ``instrument`` target implements, and the one runtime check.
+
+    Three methods, and exactly three on purpose: an identity a caller can
+    size a field of view against (:meth:`stage_size_nm`), the capability
+    question (:meth:`available_controls`), and the safe-state hook every
+    teardown calls (:meth:`park`). That is the whole of what the
+    ``isinstance`` call sites were actually asking — "is this an
+    instrument target I can hold a session against" — and it is what a
+    detector-only server can honestly provide: a Gatan spectrometer has
+    an energy offset and no stage, a commodity camera has no controls at
+    all, and both are complete instruments *of their kind*.
+
+    Which controls exist is asked through :meth:`available_controls`, not
+    through ``isinstance``. The per-control methods live on
+    :class:`InstrumentController`, the full control surface for static
+    typing, which is deliberately **not** ``runtime_checkable``: a
+    ``runtime_checkable`` Protocol's ``isinstance`` is all-or-nothing, so
+    checking against the full control surface demanded every method
+    regardless of what the instrument said it supported. Two adapters
+    (``camera_server.ServerInstrument``, ``gatan_bridge.BridgeInstrument``)
+    failed that check while working perfectly, which meant it was testing
+    for Nion-shapedness rather than for conformance. This split is the
+    fix: the runtime check tests the core every instrument has, and the
+    capability list carries the rest.
+    """
+
+    def stage_size_nm(self) -> float:
+        """Return the usable stage extent, for choosing a sensible field of view."""
+        ...
+
+    def available_controls(self) -> typing.Sequence[str]:
+        """Return the ``*_CONTROL`` names this instrument actually implements."""
+        ...
+
+    def park(self) -> None:
+        """
+        Put the instrument in a safe unattended state.
+
+        Blanks the beam if a blanker exists, and does nothing — honestly —
+        on an instrument with no beam to blank. Deliberately *not* a full
+        teardown: stopping detectors and releasing devices belongs to the
+        code that owns them (the device server's shutdown handshake), not
+        to a single-instrument control surface.
+        """
+        ...
+
+
 class InstrumentController(typing.Protocol):
     """
     Instrument-level controls that are not owned by any single detector.
@@ -841,6 +891,26 @@ class InstrumentController(typing.Protocol):
     must consult :meth:`available_controls` before driving one rather than
     assuming a successful setter means a working control — a distinction
     this project has already been bitten by (docs/migration-plan.md, §7).
+
+    This is the *static* face of an instrument: annotate with it when the
+    code genuinely calls the control methods (a defocus sweep, an energy
+    series), and the type checker holds the implementation to them. It is
+    deliberately not ``runtime_checkable`` — ``isinstance`` against it
+    raises ``TypeError`` — because the runtime question is never "does
+    this object have every method" but "is this an instrument"
+    (:class:`Instrument`) followed by "does it serve this control"
+    (:meth:`~Instrument.available_controls`). An adapter that implements
+    a subset of the controls is a partial *controller* but a whole
+    *instrument*, and the type system now says exactly that.
+
+    A superset of :class:`Instrument` by re-declaration rather than by
+    inheritance, and the distinction is load-bearing: ``runtime_checkable``
+    is *inherited* by protocol subclasses (the flag is a class attribute,
+    and there is no opt-out), so a subclass of :class:`Instrument` would
+    quietly keep the all-or-nothing ``isinstance`` this split exists to
+    remove. Protocols are structural, so every implementation — and every
+    value typed as this protocol — still satisfies :class:`Instrument`
+    without naming it.
     """
 
     def stage_size_nm(self) -> float:
@@ -849,6 +919,14 @@ class InstrumentController(typing.Protocol):
 
     def available_controls(self) -> typing.Sequence[str]:
         """Return the ``*_CONTROL`` names this instrument actually implements."""
+        ...
+
+    def park(self) -> None:
+        """
+        Put the instrument in a safe unattended state.
+
+        See :meth:`Instrument.park`, whose contract this repeats.
+        """
         ...
 
     def stage_position_nm(self) -> tuple[float, float]:
@@ -881,15 +959,4 @@ class InstrumentController(typing.Protocol):
 
     def set_beam_blanked(self, *, blanked: bool) -> None:
         """Blank or unblank the beam."""
-        ...
-
-    def park(self) -> None:
-        """
-        Put the instrument in a safe unattended state.
-
-        Blanks the beam if a blanker exists. Deliberately *not* a full
-        teardown: stopping detectors and releasing devices belongs to the
-        code that owns them (the device server's shutdown handshake), not
-        to a single-instrument control surface.
-        """
         ...

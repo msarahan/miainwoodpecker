@@ -41,7 +41,7 @@ from miainwoodpecker.devices import (
     STAGE_POSITION_CONTROL,
     Camera,
     CameraParameters,
-    InstrumentController,
+    Instrument,
     ScanParameters,
     Scanner,
 )
@@ -245,7 +245,7 @@ def test_hardware_backend_discovers_devices_from_a_named_plugin():
         assert microscope.ronchigram_camera.camera_id == "usim_ronchigram_camera"
         assert microscope.eels_camera.camera_id == "usim_eels_camera"
         assert microscope.scanner.scanner_id == "usim_scan_device"
-        assert isinstance(microscope.instrument, InstrumentController)
+        assert isinstance(microscope.instrument, Instrument)
         assert microscope.stage_size_nm > 0
 
 

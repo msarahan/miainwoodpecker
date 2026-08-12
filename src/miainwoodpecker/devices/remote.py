@@ -224,12 +224,12 @@ __all__ = [
 _TEST_HOOKS_ENV_VAR = "MIAINWOODPECKER_ENABLE_TEST_HOOKS"
 
 # How many times to re-pick ports when the server reports one was taken
-# between the client's probe and the server's bind.
+# between the client's probe and the server's bind. There is no fixed
+# watch window paired with this any more: the connect loop already polls
+# the process, so the collision is recognised whenever it happens rather
+# than only within a stopwatch's grace — and a healthy startup pays
+# nothing for the vigilance.
 _PORT_RETRY_ATTEMPTS = 3
-# How long to watch a freshly spawned server for that specific early
-# exit. Short: it happens before the Nion import finishes, and a server
-# still alive after it is simply starting normally.
-_PORT_COLLISION_GRACE_S = 0.4
 
 _CONNECT_TIMEOUT_S = 15.0
 _TERMINATE_TIMEOUT_S = 5.0
@@ -275,6 +275,25 @@ closed socket, and that is all this state asserts.
 
 class DeviceServerStartupError(RuntimeError):
     """Raised when the device server process died before it served anything."""
+
+
+class _PortsLostError(DeviceServerStartupError):
+    """
+    A spawned server exited because a chosen port was already bound.
+
+    Internal, and a subclass of :class:`DeviceServerStartupError` on
+    purpose: the condition *is* a startup failure, but it is the one
+    startup failure that is not the server's fault and resolves on a
+    respawn with fresh ports — ``_free_port()`` probes and releases, so
+    anything on the machine can claim a port in the seconds before the
+    child binds it. The connect loop raises this instead of the generic
+    diagnostic whenever the dead server's exit status is
+    :data:`PORT_UNAVAILABLE_EXIT_STATUS`, and the orchestration in
+    :func:`remote_instrument` catches it and re-picks ports up to
+    :data:`_PORT_RETRY_ATTEMPTS` times. Every other exit status keeps its
+    existing message, because retrying a missing instrument or an import
+    error would just fail again while hiding the diagnostic that matters.
+    """
 
 
 class DeviceServerAttachError(RuntimeError):
@@ -719,6 +738,12 @@ def _connect_with_retry(  # noqa: PLR0913, PLR0917 - one call site each, all nam
 
     Raises
     ------
+    _PortsLostError
+        If the server exited with
+        :data:`PORT_UNAVAILABLE_EXIT_STATUS` — a port this client probed
+        as free was bound by something else before the server could take
+        it. Distinguishable because it is the one startup failure the
+        caller can cure, by re-picking ports and respawning.
     DeviceServerStartupError
         If the server exited before accepting connections, or if the
         deadline passed with a connection attempt still blocked inside
@@ -730,6 +755,14 @@ def _connect_with_retry(  # noqa: PLR0913, PLR0917 - one call site each, all nam
     """
     while True:
         if process is not None and process.poll() is not None:
+            if process.returncode == PORT_UNAVAILABLE_EXIT_STATUS:
+                msg = (
+                    f"the device server ({server_module}) exited with "
+                    f"status {PORT_UNAVAILABLE_EXIT_STATUS}: a port this "
+                    f"client probed as free was claimed by another process "
+                    f"before the server could bind it"
+                )
+                raise _PortsLostError(msg)
             msg = (
                 f"the device server ({server_module}) exited with status "
                 f"{process.returncode} before accepting connections. Its "
@@ -1625,7 +1658,7 @@ def _start_server(
     server_module: str = DEFAULT_SERVER_MODULE,
 ) -> tuple[dict[str, int], bytes, subprocess.Popen[bytes]]:
     """
-    Spawn a device server, retrying if a chosen port was taken meanwhile.
+    Pick ports and spawn a device server, without waiting on it at all.
 
     :func:`_free_port` picks ports by binding to port 0 and *releasing*
     the socket, so the port is only reserved by convention until the
@@ -1635,15 +1668,27 @@ def _start_server(
     that is: a parallel test run is the realistic case, and the failure
     it produced was an anonymous traceback and a dead server.
 
+    This function used to watch the fresh child for the port-collision
+    exit inside a fixed 0.4 s grace window, which had both costs of a
+    stopwatch: every *healthy* startup paid the full window (a healthy
+    server never exits, so the wait always timed out), and a loaded
+    machine that took longer than the window to reach its bind turned a
+    curable collision into an anonymous startup error — observed once in
+    CI after the target list grew to five ports. Detection now lives
+    where the process is already being polled anyway:
+    :func:`_connect_with_retry` raises :class:`_PortsLostError` when it
+    finds the child dead with
+    :data:`PORT_UNAVAILABLE_EXIT_STATUS`, and :func:`_spawn_and_connect`
+    catches it and calls back here for fresh ports and a fresh child, up
+    to :data:`_PORT_RETRY_ATTEMPTS` spawns.
+    A collision is therefore recognised *whenever* it happens before the
+    session is connected, and a healthy startup no longer waits at all.
+
     Retrying with fresh ports is the fix that fits the existing design.
     The alternative — binding in the parent and passing inherited fds —
     removes the window entirely but changes how the server is launched,
     which is a bigger change than the problem warrants for a race that
     resolves on the next attempt.
-
-    Only :data:`~miainwoodpecker.devices.nion_server.PORT_UNAVAILABLE_EXIT_STATUS`
-    is retried. A missing instrument or a crash would just fail again, so
-    those surface immediately with their own diagnostics.
 
     Parameters
     ----------
@@ -1658,38 +1703,12 @@ def _start_server(
     Returns
     -------
     tuple[dict[str, int], bytes, subprocess.Popen[bytes]]
-        The bound ports, the shared authkey, and the running process.
-
-    Raises
-    ------
-    DeviceServerStartupError
-        If every attempt lost its ports to another process.
+        The chosen ports, the shared authkey, and the running process.
     """
-    for _attempt in range(_PORT_RETRY_ATTEMPTS):
-        ports = {name: _free_port() for name in _TARGET_NAMES}
-        authkey = secrets.token_bytes(32)
-        process = _spawn_server(
-            ports, authkey, backend, plugin_names, server_module,
-        )
-        # The server exits this way *before* serving anything, so a short
-        # wait either catches the collision or finds it still starting up;
-        # a still-running server is the normal case and falls straight
-        # through to the caller's own connect-with-retry.
-        try:
-            status = process.wait(timeout=_PORT_COLLISION_GRACE_S)
-        except subprocess.TimeoutExpired:
-            return ports, authkey, process
-        if status != PORT_UNAVAILABLE_EXIT_STATUS:
-            # Some other startup outcome; hand it back so the connect path
-            # raises with the server's own diagnostic rather than this
-            # function inventing one.
-            return ports, authkey, process
-    msg = (
-        f"the device server could not bind its ports on "
-        f"{_PORT_RETRY_ATTEMPTS} attempts; something on this machine is "
-        f"claiming localhost ports faster than they can be used"
-    )
-    raise DeviceServerStartupError(msg)
+    ports = {name: _free_port() for name in _TARGET_NAMES}
+    authkey = secrets.token_bytes(32)
+    process = _spawn_server(ports, authkey, backend, plugin_names, server_module)
+    return ports, authkey, process
 
 
 def _spawn_server(
@@ -1759,6 +1778,247 @@ def _spawn_server(
         # signalling the process directly, which is unaffected.
         start_new_session=True,
     )
+
+
+@dataclass(frozen=True)
+class _ConnectedSession:
+    """
+    One spawned device server, fully connected and wrapped.
+
+    The unit :func:`_spawn_and_connect` retries: everything here belongs
+    to a single child process, so a port collision discards the whole
+    value and a fresh spawn builds a fresh one — including fresh
+    connections and a fresh connect deadline. ``connections`` is kept
+    alongside the wrapped devices because teardown closes the raw
+    connections itself, exactly as it always has.
+    """
+
+    process: subprocess.Popen[bytes]
+    connections: dict[str, Connection]
+    instrument: RemoteInstrument
+    description: dict[str, object]
+    cameras: dict[str, RemoteCamera]
+    scanner: RemoteScanner | None
+    spectrum_detectors: dict[str, RemoteSpectrumDetector]
+    devices: tuple[_RemoteDevice, ...]
+
+
+def _connect_session(
+    ports: typing.Mapping[str, int],
+    authkey: bytes,
+    process: subprocess.Popen[bytes],
+    server_module: str,
+    connections: dict[str, Connection],
+) -> _ConnectedSession:
+    """
+    Connect to a freshly spawned server and wrap everything it serves.
+
+    The connect deadline is computed here rather than by the caller, so a
+    respawn after a port collision starts with the full budget — the
+    health connection and the per-target connects share one deadline
+    within an attempt, and sharing it *across* attempts would make the
+    retry a shorter and shorter straw.
+
+    Parameters
+    ----------
+    ports : typing.Mapping[str, int]
+        Port each target's Listener was told to bind.
+    authkey : bytes
+        Shared secret for every connection.
+    process : subprocess.Popen[bytes]
+        The freshly spawned server, watched for early exit on every
+        connect attempt.
+    server_module : str
+        The module that was launched, named in failure diagnostics.
+    connections : dict[str, Connection]
+        Filled in place as connections are made, so the caller can close
+        whatever this attempt opened even when it fails partway.
+
+    Returns
+    -------
+    _ConnectedSession
+        The connected session, ready to yield to the caller.
+
+    Every connect here can raise :class:`_PortsLostError`, propagated
+    from :func:`_connect_with_retry` at whatever point the child's
+    port-collision exit becomes visible — before the first connection or
+    between the tenth and the eleventh. Nothing is caught here: the
+    caller owns the respawn, and owns ``connections`` so it can release
+    whatever this attempt opened to a server that is already gone.
+    """
+    deadline = time.monotonic() + _CONNECT_TIMEOUT_S
+    lifecycle = _SpawnedServer(process)
+    connections["instrument"] = _connect_with_retry(
+        ports["instrument"], authkey, deadline, process, server_module,
+    )
+    # A second connection to the same target, reserved for health
+    # checks: see RemoteInstrument for why sharing the control
+    # connection would make the check both slower and riskier. The
+    # server accepts any number of connections per target, one handler
+    # thread each, so this costs one socket and one idle thread.
+    connections["instrument:health"] = _connect_with_retry(
+        ports["instrument"], authkey, deadline, process, server_module,
+    )
+    instrument = RemoteInstrument(
+        connections["instrument"],
+        health_connection=connections["instrument:health"],
+        lifecycle=lifecycle,
+    )
+    description = instrument.describe()
+    served = typing.cast("Sequence[str]", description["targets"])
+    for name in served:
+        connections[name] = _connect_with_retry(
+            ports[name], authkey, deadline, process, server_module,
+        )
+
+    cameras = {
+        name: RemoteCamera(connections[name], name, lifecycle)
+        for name in _CAMERA_TARGET_NAMES
+        if name in connections
+    }
+    # Optional for the same reason the cameras are. A detector-only
+    # server - a camera driven directly, with no scan unit - used to
+    # die here with a KeyError, which made "vendor-neutral" quietly
+    # mean "must have a scanner shaped like Nion's".
+    scanner = (
+        RemoteScanner(connections["scanner"], "scanner", lifecycle)
+        if "scanner" in connections
+        else None
+    )
+    # Optional in exactly the way the cameras and the scanner are:
+    # what a server serves is what describe() says. Most instruments
+    # have no X-ray detector, and the ones that do may have it on a
+    # separate analyser entirely.
+    spectrum_detectors = {
+        name: RemoteSpectrumDetector(connections[name], name, lifecycle)
+        for name in _SPECTRUM_TARGET_NAMES
+        if name in connections
+    }
+    return _ConnectedSession(
+        process=process,
+        connections=connections,
+        instrument=instrument,
+        description=description,
+        cameras=cameras,
+        scanner=scanner,
+        spectrum_detectors=spectrum_detectors,
+        devices=(
+            *cameras.values(),
+            *([scanner] if scanner is not None else []),
+            *spectrum_detectors.values(),
+        ),
+    )
+
+
+def _spawn_and_connect(
+    backend: str,
+    plugin_names: Sequence[str],
+    server_module: str,
+) -> _ConnectedSession:
+    """
+    Spawn a device server and connect to it, respawning on a port collision.
+
+    The retry spans the *whole* spawn-and-connect rather than a fixed
+    watch window after the spawn: a collision is only provable by the
+    server exiting with :data:`PORT_UNAVAILABLE_EXIT_STATUS`, and on a
+    loaded machine that exit can come after any fixed stopwatch has
+    given up. :func:`_connect_with_retry` polls the process on every
+    attempt anyway, so the moment the exit is visible — before the first
+    connection or between the tenth and the eleventh — it surfaces as
+    :class:`_PortsLostError`, this loop closes whatever connections were
+    already made to the dead server, and a fresh spawn gets fresh ports
+    and a fresh deadline. Healthy startups never wait on any of this.
+
+    Parameters
+    ----------
+    backend : str
+        ``"simulated"`` or ``"hardware"``.
+    plugin_names : Sequence[str]
+        ``nionswift_plugin`` modules for the hardware backend.
+    server_module : str
+        Module to run with ``python -m``; see
+        :data:`DEFAULT_SERVER_MODULE`.
+
+    Returns
+    -------
+    _ConnectedSession
+        The connected session for the one spawn that succeeded.
+
+    Every startup failure that is *not* a collision propagates unchanged,
+    keeping the diagnostic :func:`_connect_with_retry` composed for it —
+    a missing instrument or an unimportable adapter module would fail the
+    same way on the next attempt, so retrying would only hide the one
+    message worth reading.
+
+    Raises
+    ------
+    DeviceServerStartupError
+        If every attempt lost its ports to something else on the machine.
+    """
+    for _attempt in range(_PORT_RETRY_ATTEMPTS):
+        ports, authkey, process = _start_server(
+            backend, plugin_names, server_module,
+        )
+        connections: dict[str, Connection] = {}
+        session: _ConnectedSession | None = None
+        try:
+            session = _connect_session(
+                ports, authkey, process, server_module, connections,
+            )
+        except _PortsLostError:
+            # Discard this attempt and take fresh ports on the next pass.
+            # The cleanup below is in a finally rather than here because
+            # a failure that is *not* a collision has to leave the same
+            # nothing behind on its way out.
+            pass
+        finally:
+            if session is None:
+                _release_spawned_server(process, connections)
+        if session is not None:
+            return session
+    msg = (
+        f"the device server could not bind its ports on "
+        f"{_PORT_RETRY_ATTEMPTS} attempts; something on this machine is "
+        f"claiming localhost ports faster than they can be used"
+    )
+    raise DeviceServerStartupError(msg)
+
+
+def _release_spawned_server(
+    process: subprocess.Popen[bytes],
+    connections: typing.Mapping[str, Connection],
+) -> None:
+    """
+    Close this client's end of a spawned session and stop the child.
+
+    The last thing a session does, and also what a spawn attempt does
+    when it will not become the session. Both need exactly this: release
+    every connection the client opened, then stop the child if it is
+    still running.
+
+    "If it is still running" is doing real work rather than being
+    defensive. After a port collision the child has already exited to
+    report it, so there is nothing to terminate and only the connections
+    made before that exit became visible need releasing — the same
+    branch that covers a server which shut down through the handshake.
+
+    Parameters
+    ----------
+    process : subprocess.Popen[bytes]
+        The spawned device server.
+    connections : typing.Mapping[str, Connection]
+        Every connection this client opened to it, by target name.
+    """
+    for connection in connections.values():
+        with contextlib.suppress(Exception):
+            connection.close()
+    if process.poll() is None:
+        process.terminate()
+        try:
+            process.wait(timeout=_TERMINATE_TIMEOUT_S)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=_TERMINATE_TIMEOUT_S)
 
 
 def _release_segments_of_a_dead_server(
@@ -1916,87 +2176,32 @@ def remote_instrument(
             f"{', '.join(sorted(BACKENDS))}"
         )
         raise ValueError(msg)
-    ports, authkey, process = _start_server(backend, plugin_names, server_module)
-    connections: dict[str, Connection] = {}
+    # The spawn and every connection to the child are one retryable unit:
+    # a port collision discovered at any point before the session is
+    # fully connected is answered with fresh ports and a fresh child
+    # rather than surfacing as a startup failure. See _spawn_and_connect.
+    session = _spawn_and_connect(backend, plugin_names, server_module)
     try:
-        deadline = time.monotonic() + _CONNECT_TIMEOUT_S
-        lifecycle = _SpawnedServer(process)
-        connections["instrument"] = _connect_with_retry(
-            ports["instrument"], authkey, deadline, process, server_module,
-        )
-        # A second connection to the same target, reserved for health
-        # checks: see RemoteInstrument for why sharing the control
-        # connection would make the check both slower and riskier. The
-        # server accepts any number of connections per target, one handler
-        # thread each, so this costs one socket and one idle thread.
-        connections["instrument:health"] = _connect_with_retry(
-            ports["instrument"], authkey, deadline, process, server_module,
-        )
-        instrument = RemoteInstrument(
-            connections["instrument"],
-            health_connection=connections["instrument:health"],
-            lifecycle=lifecycle,
-        )
-        description = instrument.describe()
-        served = typing.cast("Sequence[str]", description["targets"])
-        for name in served:
-            connections[name] = _connect_with_retry(
-                ports[name], authkey, deadline, process, server_module,
-            )
-
-        cameras = {
-            name: RemoteCamera(connections[name], name, lifecycle)
-            for name in _CAMERA_TARGET_NAMES
-            if name in connections
-        }
-        # Optional for the same reason the cameras are. A detector-only
-        # server - a camera driven directly, with no scan unit - used to
-        # die here with a KeyError, which made "vendor-neutral" quietly
-        # mean "must have a scanner shaped like Nion's".
-        scanner = (
-            RemoteScanner(connections["scanner"], "scanner", lifecycle)
-            if "scanner" in connections
-            else None
-        )
-        # Optional in exactly the way the cameras and the scanner are:
-        # what a server serves is what describe() says. Most instruments
-        # have no X-ray detector, and the ones that do may have it on a
-        # separate analyser entirely.
-        spectrum_detectors = {
-            name: RemoteSpectrumDetector(connections[name], name, process)
-            for name in _SPECTRUM_TARGET_NAMES
-            if name in connections
-        }
-        devices: list[_RemoteDevice] = [
-            *cameras.values(),
-            *([scanner] if scanner is not None else []),
-            *spectrum_detectors.values(),
-        ]
         try:
             yield RemoteInstrumentDevices(
-                ronchigram_camera=cameras.get("ronchigram_camera"),
-                eels_camera=cameras.get("eels_camera"),
-                camera=cameras.get("camera"),
-                scanner=scanner,
-                instrument=instrument,
+                ronchigram_camera=session.cameras.get("ronchigram_camera"),
+                eels_camera=session.cameras.get("eels_camera"),
+                camera=session.cameras.get("camera"),
+                scanner=session.scanner,
+                instrument=session.instrument,
                 stage_size_nm=float(
-                    typing.cast("float", description["stage_size_nm"]),
+                    typing.cast("float", session.description["stage_size_nm"]),
                 ),
-                spectrum_detector=spectrum_detectors.get("spectrum_detector"),
+                spectrum_detector=session.spectrum_detectors.get(
+                    "spectrum_detector",
+                ),
             )
         finally:
-            _shut_down_server(instrument, devices, process)
+            _shut_down_server(
+                session.instrument, session.devices, session.process,
+            )
     finally:
-        for connection in connections.values():
-            with contextlib.suppress(Exception):
-                connection.close()
-        if process.poll() is None:
-            process.terminate()
-            try:
-                process.wait(timeout=_TERMINATE_TIMEOUT_S)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait(timeout=_TERMINATE_TIMEOUT_S)
+        _release_spawned_server(session.process, session.connections)
 
 
 @contextlib.contextmanager
