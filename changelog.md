@@ -143,6 +143,39 @@
   that `hyperspy` and `py4dstem` are themselves GPL-3.0 and imported
   in-process, which §6 does not currently speak to.
 
+- **Hitachi is estimable after all.** `docs/vendor-support.md` said "no
+  public API … not estimable", written without a search. The search found
+  undocumented Python external-control modules (`MfExtCont`,
+  `MfKeyMouse`, `MfCommon`) driving a Hitachi SU7000 FE-SEM in public
+  code — `SetHv`, `GetStagePosition`, `RunStageMove`, `RunAutoAfc`,
+  `RunScan`, which is `InstrumentController` and `Scanner` in everything
+  but spelling — on the same product lineage as SuperSTEM 4's SU9000II.
+  And the SEM external scan connector, which makes the scan purchasable
+  from a third party even if the vendor says no, so unlike every other
+  column vendor here a refusal still leaves a route to a scanned image.
+  `docs/adapters/hitachi.md` has the full working: what drives the
+  instrument, where the search looked and found nothing, what is
+  reachable without vendor cooperation, what file-watching can and cannot
+  do, a sendable vendor question list, and costed estimates for all four
+  answers the vendor could give. Every claim is marked verified,
+  reported, generalising or unverified — thirteen are unverified, each
+  with what would settle it, and the central one (whether `MfExtCont` is
+  on an SU9000II rather than an SU7000) is settled by looking at the
+  instrument PC rather than by a negotiation.
+
+- **A protocol gap with a named instrument behind it.** `Scanner`
+  produces one channel per `scan_frame` call, on the stated premise that
+  a second channel is a second pass of the beam. A segmented-detector SEM
+  produces BF, HAADF segments, SE, LA-BSE and HA-BSE from *one* pass, so
+  requesting them serially multiplies dose, loses the grouping, and makes
+  DPC/iDPC/centre-of-mass invalid — those take differences between
+  segments at the same probe position, and segments from different passes
+  differ by drift. Recorded under "What is still the wrong shape", sized
+  (3–5 d), and deliberately not built ahead of the adapter that needs it.
+  The fix is a multi-channel call, not a `scan_id`: an identifier alone
+  would assert a shared acquisition that did not happen, which is the
+  fiction the `Frame` docstring was right to refuse.
+
 - **A device server for commodity cameras**
   (`miainwoodpecker.devices.camera_server`): USB microscopes, webcams, and
   recorded video files, over OpenCV's `VideoCapture` — no vendor SDK, MIT,

@@ -67,6 +67,7 @@ Architecture review <architecture-review>
 Hardware validation checklist <hardware-validation-checklist>
 Work before hardware <pre-hardware-work>
 Other vendors <vendor-support>
+Hitachi SU9000II <adapters/hitachi>
 Analysis parity <analysis-parity>
 Development <documentation/index>
 :::

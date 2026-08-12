@@ -32,7 +32,7 @@ first; `Camera` faces the other two.
 | **Thermo Fisher** (SEM/DualBeam) | [AutoScript 4](https://www.thermofisher.com/us/en/home/electron-microscopy/products/software-em-3d-vis/autoscript-4-software.html) | Python | Paid add-on | Yes |
 | **JEOL** | [PyJEM](https://www.jeolusa.com/PRODUCTS/Transmission-Electron-Microscopes-TEM/Analytical-Data-Optimization/PyJEM) over TEM_External/TEMCenter | Python | On the TEM PC; [docs are public](https://github.com/PyJEM/PyJEM), package is not on PyPI | Yes |
 | **Zeiss** | [SmartSEM Remote API](https://www.zeiss.com/microscopy/en/products/software/zeiss-smartsem.html) (`CZEMApi.ocx`) | ActiveX/COM | **Requires an agreement with Zeiss** to develop against | Yes, on Windows |
-| **Hitachi** | None published | — | EM Wizard / EM Flow Creator are GUI automation, not an API | Unknown — ask the vendor |
+| **Hitachi** | Undocumented Python external control (`MfExtCont`), evidenced on an SU7000 FE-SEM | Python | Not published; on the instrument PC, apparently with sample scripts | Presumed yes — unverified |
 | **Bruker** | ESPRIT scripting | In-app | Analyzer software (EDS/EBSD/µXRF), **not a column API** | No |
 
 Three things fall out of that table.
@@ -54,10 +54,13 @@ its own protocol, and the honest first question is whether
 [RosettaSciIO's `bcf` reader](https://github.com/hyperspy/rosettasciio)
 covers the need by reading the files ESPRIT already writes.
 
-**Hitachi publishes nothing.** No documented API surfaced for SU-series
-SEMs or the TEMs; the automation products are workflow recorders. That is
-a finding, not a gap in the search: an adapter would start with a
-conversation with Hitachi, and until then it cannot be estimated.
+**Hitachi publishes nothing, which is not the same as having nothing.**
+No manual, no package, no documented surface — but third parties do
+drive Hitachi FE-SEMs from Python using modules that arrive on the
+instrument, and on a SEM the scan is separately purchasable through the
+external scan connector. So the honest description is "undocumented and
+probably obtainable", not "absent". See
+[adapters/hitachi.md](adapters/hitachi.md).
 
 ### Detector SDKs — the `Camera` side
 
@@ -417,6 +420,21 @@ This is cheap to handle and expensive to get wrong, so the note belongs
 here: a second adapter converts *into* this convention and records what it
 converted from in the frame metadata.
 
+### `scan_frame` cannot express a simultaneous multi-channel scan
+
+`scan_frame(parameters, channel)` returns one channel per call, and
+`Frame`'s docstring declines a `scan_id` on the grounds that "a second
+channel is a second pass of the beam". A segmented-detector SEM breaks
+that premise: BF, each HAADF segment, SE, LA-BSE and HA-BSE arrive
+together from one pass. Asking one at a time multiplies dose, loses the
+grouping, and makes DPC/iDPC/centre-of-mass invalid — those take
+differences between segments *at the same probe position*, and segments
+from different passes differ by drift. The fix is a multi-channel call
+returning frames that share a scan identity **only when the device really
+acquired them together**; `scan_id` alone would be the fiction the
+docstring was right to refuse. 3–5 d, and it should land with the adapter
+that needs it.
+
 ## Task estimates
 
 Sizes assume the framework as it stands plus the target-name redesign
@@ -486,11 +504,46 @@ The 8-bit remote mode is worth flagging early: it would silently halve
 the dynamic range of everything recorded. An adapter should refuse remote
 mode for recording, or record what mode it used.
 
-### Hitachi — not estimable
+### Hitachi (SU9000II) — 12–18 days, or 10–16, or 3–5
 
-No public API. Step one is a vendor conversation. If the answer is "no
-API", the honest options are file-watching whatever EM Flow Creator
-writes, or nothing.
+Estimable now, in four scenarios, because the placeholder here was
+written without a search and the search found something. Full working:
+[adapters/hitachi.md](adapters/hitachi.md).
+
+**There is very likely an API, and it is undocumented.** Public code
+drives a Hitachi SU7000 FE-SEM from Python through modules named
+`MfExtCont`, `MfKeyMouse` and `MfCommon` — `EXT.SetHv()`,
+`EXT.GetStagePosition()`, `EXT.RunStageMove()`, `EXT.RunAutoAfc()`,
+`EXT.RunScan()` — which is `InstrumentController` and `Scanner` in
+everything but spelling. Nothing about it is published: no manual, no
+PyPI package, three files across all of GitHub. Whether it is on an
+SU9000II is the question, and it is answered by looking at the
+instrument PC, not by a negotiation.
+
+**EM Flow Creator is not that.** It is a recipe engine that "can execute
+scripts written in Python" — the instrument owns the loop and calls your
+block. That is the Gatan topology, a bridge running inside the vendor's
+application connecting out, and it cannot give an interactive session at
+all.
+
+**On a SEM the scan is purchasable.** The external scan connector, there
+since EDS mapping systems needed it, takes third-party scan generators;
+point electronic's DISS6 digitises 4 analog and 12 digital inputs
+simultaneously and ships an SDK. So unlike every other column vendor
+here, a flat refusal still leaves a route to a scanned image — at the
+cost of a measured volts-to-nanometres calibration that no vendor
+constant supplies and that changes with working distance and kV.
+
+| Scenario | Size | Drives the microscope? |
+|---|---|---|
+| Callable control library on the instrument PC | 12–18 d | Yes |
+| EM Flow Creator Python blocks only | 10–16 d | Batch, not interactive |
+| External scan generator, no vendor cooperation | 10–16 d + hardware | Scan and detectors; not optics or stage |
+| Files only — TIFF plus `.txt` sidecar | 3–5 d | No. Ingest, not a device |
+
+All four need the common second-vendor block, and three of them need a
+**simultaneous multi-channel scan call** (3–5 d) that does not exist yet
+— see "What is still the wrong shape" above.
 
 ### Bruker ESPRIT — 3–5 days, and probably the wrong question
 
@@ -522,7 +575,8 @@ and wrapping it is adopting that work rather than admiring it.
 
 Among column vendors, Thermo Fisher first — permissive wrapper, offline
 dummy, best class-map fit. JEOL second. Zeiss only if a site already has
-the agreement. Hitachi needs a phone call. Bruker is a file-reading
+the agreement. Hitachi needs someone to look at the instrument PC
+first, and *then* a phone call. Bruker is a file-reading
 question wearing a device-adapter costume.
 
 Two pieces of shared groundwork belong before, or with, the first
