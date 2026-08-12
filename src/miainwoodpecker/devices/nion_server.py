@@ -89,6 +89,7 @@ import sys
 import threading
 import time
 import typing
+import uuid
 from dataclasses import dataclass
 
 from nion.device_kit import ScanDevice as _ScanDeviceKit
@@ -744,12 +745,284 @@ class NionScanner:
             # a fast runner, so the test failed on its own premise rather
             # than on the behaviour it checks.
             time.sleep(float(delay_s))
-        frame_parameters = _ScanDeviceKit.ScanFrameParameters(
+        frame_parameters = self._frame_parameters(parameters)
+        data = self._device.get_scan_data(frame_parameters, channel)
+        metadata = self._scan_metadata(parameters, frame_parameters, channel)
+        metadata.update(_instrument_state(self._controller))
+        self._frame_index += 1
+        return Frame(
+            data=data,
+            timestamp=datetime.datetime.now(tz=datetime.UTC),
+            metadata=metadata,
+        )
+
+    def scan_frames(
+        self,
+        parameters: ScanParameters,
+        channels: typing.Sequence[int],
+    ) -> list[Frame]:
+        """
+        Scan once and return one frame per requested channel, from that one pass.
+
+        This is Nion's own multi-channel mechanism, not an emulation.
+        ``scan_base.ScanDevice`` — the vendor interface
+        ``nion.device_kit.ScanDevice.Device`` implements and every Nion
+        scan adapter must — models a scan as *channel enabling plus one
+        frame*: ``set_channel_enabled`` chooses which detectors read out,
+        ``start_frame`` begins a single traversal of the specimen, and
+        ``read_partial`` fills **every** enabled channel's buffer from
+        the same scan-box pixel advance, returning one data element per
+        enabled channel, each naming itself in
+        ``properties["channel_id"]``. The read loop below is that
+        interface's own ``ScanDevice.wait_for_frame``, kept open only
+        because the data elements have to be caught rather than
+        discarded.
+
+        It is the identical device path
+        ``scan_base.ScanAcquisitionTask`` drives one layer up — and that
+        class is also the precedent for the identity this call
+        establishes. It mints ``uuid.uuid4()`` per frame and stamps it
+        through ``update_scan_properties`` onto *every* channel's
+        metadata as ``scan_id``: Nion, driving real columns, groups
+        simultaneously-read channels by a per-pass uuid rather than by
+        anything derived from the data.
+        ``scan_pass_id`` is that quantity under this project's own name
+        (``devices/interface.py`` explains why the vendor's spelling is
+        not adopted wholesale).
+
+        The single-channel :meth:`scan_frame` deliberately keeps its
+        direct ``get_scan_data`` path (no channel enabling, no shared
+        identity): its frames never shared a pass with anything.
+
+        Channel enablement is restored on the way out, so this call does
+        not silently reconfigure which detectors a subsequent vendor-level
+        operation would read. And if the device does not deliver the pass
+        it was asked for, :meth:`_acquire_pass` raises ``RuntimeError``
+        rather than let a shared ``scan_pass_id`` be stamped on frames
+        that may not have shared one.
+
+        Parameters
+        ----------
+        parameters : ScanParameters
+            Scan geometry and timing, shared by every returned frame.
+        channels : typing.Sequence[int]
+            Channel indices to read out during the pass, without
+            duplicates.
+
+        Returns
+        -------
+        list[Frame]
+            One frame per requested channel, in request order. All carry
+            the same ``scan_pass_id``, the same ``simultaneous_channels``,
+            the same timestamp, and the same scan geometry; each keeps
+            its own ``frame_index``, which stays per-*frame* monotonic
+            and gapless (the shared identity is the pass id's job).
+
+        Raises
+        ------
+        ValueError
+            If ``channels`` is empty or contains a duplicate — a channel
+            cannot be read out twice during one pass.
+        IndexError
+            If a channel index is outside the device's range. The same
+            exception type the single-channel path raises for the same
+            mistake, so a caller branching on the error kind sees one
+            vocabulary.
+        """
+        requested = [int(channel) for channel in channels]
+        if not requested:
+            msg = "scan_frames() needs at least one channel to read out"
+            raise ValueError(msg)
+        if len(set(requested)) != len(requested):
+            msg = (
+                f"scan_frames() got duplicate channels {requested}; a channel "
+                f"cannot be read out twice during one pass"
+            )
+            raise ValueError(msg)
+        channel_count = int(self._device.channel_count)
+        for channel in requested:
+            if not 0 <= channel < channel_count:
+                msg = (
+                    f"channel {channel} does not exist on {self.scanner_id}; "
+                    f"it has channels 0..{channel_count - 1}"
+                )
+                raise IndexError(msg)
+        frame_parameters = self._frame_parameters(parameters)
+        data_by_channel = self._acquire_pass(frame_parameters, requested)
+        # One pass, one identity, one clock, one instrument state: read
+        # once and stamped onto every sibling, because a per-frame re-read
+        # could disagree with itself about a single acquisition.
+        pass_id = str(uuid.uuid4())
+        timestamp = datetime.datetime.now(tz=datetime.UTC)
+        state = _instrument_state(self._controller)
+        frames = []
+        for channel in requested:
+            metadata = self._scan_metadata(parameters, frame_parameters, channel)
+            metadata["scan_pass_id"] = pass_id
+            metadata["simultaneous_channels"] = list(requested)
+            metadata.update(state)
+            self._frame_index += 1
+            frames.append(
+                Frame(
+                    data=data_by_channel[channel],
+                    timestamp=timestamp,
+                    metadata=metadata,
+                ),
+            )
+        return frames
+
+    def _acquire_pass(
+        self,
+        frame_parameters: typing.Any,  # noqa: ANN401 - vendor ScanFrameParameters
+        requested: Sequence[int],
+    ) -> dict[int, typing.Any]:
+        """
+        Run one hardware pass with the requested channels enabled.
+
+        **Everything this returns is checked against what the device
+        actually did**, because the shared ``scan_pass_id`` its caller
+        stamps is only true if the device really ran one pass and really
+        read every requested channel out of it. Enabling a channel is a
+        setter, and this project's rule about setters is that a returned
+        ``True`` is not evidence (docs/migration-plan.md, §7 —
+        ``probe_position`` accepted values it then ignored). So the three
+        ways the claim could be false are refused rather than papered
+        over: a bad frame, a frame number that moved (a second traversal
+        began), and a channel that produced no data element.
+
+        Parameters
+        ----------
+        frame_parameters : typing.Any
+            The vendor ``ScanFrameParameters`` to scan with.
+        requested : Sequence[int]
+            Validated channel indices to enable for the pass.
+
+        Returns
+        -------
+        dict[int, typing.Any]
+            Channel index to that channel's completed frame array.
+
+        Raises
+        ------
+        RuntimeError
+            If the device reported a bad frame, advanced its frame
+            counter mid-pass, or returned no data for a requested
+            channel. A plain ``RuntimeError`` rather than a class of this
+            module's own, deliberately: the client is MIT and cannot
+            import anything from this GPL-3.0 module, so the only part of
+            an exception that crosses the boundary is its *name*
+            (``rpc.Result.error_type``) — a name from the standard
+            library is one both sides already share.
+        """
+        previous_enabled = tuple(self._device.channels_enabled)
+        try:
+            for index in range(len(previous_enabled)):
+                self._device.set_channel_enabled(index, index in requested)
+            self._device.set_frame_parameters(frame_parameters)
+            started = self._device.start_frame(False)  # noqa: FBT003 - vendor signature
+            frame_number = started
+            pixels_to_skip = 0
+            while True:
+                (
+                    data_elements,
+                    complete,
+                    bad_frame,
+                    _sub_area,
+                    frame_number,
+                    pixels_to_skip,
+                ) = self._device.read_partial(frame_number, pixels_to_skip)
+                # Nion's own task loop leaves the frame on either
+                # condition; a bad frame that never completes would
+                # otherwise spin here forever.
+                if complete or bad_frame:
+                    break
+        finally:
+            for index, enabled in enumerate(previous_enabled):
+                self._device.set_channel_enabled(index, enabled)
+        if bad_frame:
+            msg = (
+                f"{self.scanner_id} reported a bad frame during a "
+                f"{len(requested)}-channel pass; its channels cannot be said "
+                f"to share one, so no frames are returned"
+            )
+            raise RuntimeError(msg)
+        if started is not None and frame_number is not None and frame_number != started:
+            # The device moved on to another frame while this pass was
+            # being read out, so the data elements in hand did not all
+            # come from one traversal of the specimen.
+            msg = (
+                f"{self.scanner_id} advanced from frame {started} to "
+                f"{frame_number} during what should have been a single pass"
+            )
+            raise RuntimeError(msg)
+        # read_partial returns one element per enabled channel, each
+        # naming its channel in properties["channel_id"] - mapped by that
+        # rather than by position, so this cannot depend on the device's
+        # enumeration order agreeing with the request's.
+        data_by_channel = {
+            int(element["properties"]["channel_id"]): element["data"]
+            for element in data_elements
+        }
+        missing = [channel for channel in requested if channel not in data_by_channel]
+        if missing:
+            msg = (
+                f"{self.scanner_id} read out channels "
+                f"{sorted(data_by_channel)} during the pass, but "
+                f"{missing} were requested and did not report; the device did "
+                f"not accept the channel enabling this call depends on"
+            )
+            raise RuntimeError(msg)
+        return data_by_channel
+
+    def _frame_parameters(
+        self,
+        parameters: ScanParameters,
+    ) -> typing.Any:  # noqa: ANN401 - vendor ScanFrameParameters
+        """
+        Translate neutral scan parameters into the vendor's own type.
+
+        Parameters
+        ----------
+        parameters : ScanParameters
+            Scan geometry and timing, in operator units.
+
+        Returns
+        -------
+        typing.Any
+            The equivalent ``ScanFrameParameters``.
+        """
+        return _ScanDeviceKit.ScanFrameParameters(
             pixel_size=(parameters.height, parameters.width),
             pixel_time_us=parameters.pixel_time_us,
             fov_nm=parameters.fov_nm,
         )
-        data = self._device.get_scan_data(frame_parameters, channel)
+
+    def _scan_metadata(
+        self,
+        parameters: ScanParameters,
+        frame_parameters: typing.Any,  # noqa: ANN401 - vendor ScanFrameParameters
+        channel: int,
+    ) -> dict[str, object]:
+        """
+        Build the scan metadata one frame carries, in the neutral vocabulary.
+
+        Parameters
+        ----------
+        parameters : ScanParameters
+            The neutral scan request.
+        frame_parameters : typing.Any
+            The vendor parameters the scan actually ran with.
+        channel : int
+            The detector channel this frame came from.
+
+        Returns
+        -------
+        dict[str, object]
+            Identity, geometry, and derived timings — everything except
+            the instrument state, which the caller reads at its own
+            cadence (per frame on the single-channel path, once per pass
+            on the multi-channel one).
+        """
         metadata: dict[str, object] = {
             "device_id": self.scanner_id,
             "frame_index": self._frame_index,
@@ -773,13 +1046,7 @@ class NionScanner:
             ),
         }
         metadata.update(_scan_geometry(frame_parameters))
-        metadata.update(_instrument_state(self._controller))
-        self._frame_index += 1
-        return Frame(
-            data=data,
-            timestamp=datetime.datetime.now(tz=datetime.UTC),
-            metadata=metadata,
-        )
+        return metadata
 
     def close(self) -> None:
         """Release the device; idempotent, for the same reason as ``NionCamera``."""

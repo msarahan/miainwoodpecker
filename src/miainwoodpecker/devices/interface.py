@@ -8,9 +8,11 @@ adapter without touching those layers (see docs/migration-plan.md, §2).
 
 These are deliberately the *smallest* interfaces that support the phase
 that needs them: a camera produces frames continuously once started, and a
-scanner produces one frame per request (live scanning is a repeated
-``scan_frame`` loop). Exposure/settings modeling and hardware-synchronized
-multi-signal acquisition are still deferred.
+scanner produces the frames of one scanned pass per request — one channel
+through ``scan_frame`` (live scanning is a repeated loop of it), several
+channels simultaneously through ``scan_frames``, because one pass of the
+probe reads every enabled detector out at once. Synchronising a *camera*
+to the scan (the cross-device pass 4D-STEM needs) is still deferred.
 
 :class:`InstrumentController` is the Phase 3 addition, and holds to the
 same rule. It exposes four controls — stage position, defocus, beam
@@ -88,7 +90,11 @@ class Frame:
         Frames produced by this device since it was opened, from 0.
         Monotonic and gapless, so a *missing* index in a recording is
         visible evidence of a dropped frame rather than silently absent
-        data.
+        data. It counts **frames, not passes**: a two-channel
+        :meth:`Scanner.scan_frames` advances it by two, because two
+        frames were produced. What groups those two is ``scan_pass_id``
+        below, and keeping the two jobs apart is what lets the
+        dropped-frame check keep working unchanged.
     ``high_tension_v``, ``defocus_nm``, ``beam_current_a``
         Instrument state at acquisition time, read per frame rather than
         cached — a focal series changes the defocus between frames, and
@@ -111,6 +117,44 @@ class Frame:
         Scan orientation and centre, without which the field of view does
         not say *which* region was scanned.
 
+    Frames from a simultaneous multi-channel scan
+    (:meth:`Scanner.scan_frames`) additionally:
+
+    ``scan_pass_id``
+        The identity of the **one pass of the probe** these frames came
+        from, as an opaque unique string minted by the device adapter
+        inside the multi-channel acquisition path — never supplied by a
+        caller, and never attached by :meth:`Scanner.scan_frame`, whose
+        frames genuinely are one pass each and have no siblings to name.
+        Two frames with equal ``scan_pass_id`` were read out during the
+        same traversal of the specimen, so per-pixel arithmetic between
+        them (DPC, iDPC, centre of mass) compares the same probe
+        positions.
+
+        Opaque, and specifically **not derived from the vendor's frame
+        counter**: those restart at zero with the device, so two
+        recordings made on two days would claim to share passes. A
+        random unique string cannot make that mistake. This is also what
+        Nion itself does one layer above the device
+        (``scan_base.ScanAcquisitionTask`` mints a ``uuid4`` per frame
+        and writes it to every simultaneously-read channel as
+        ``stem.scan.scan_id``), so the concept is the vendor's; only the
+        neutral spelling — and the rule that a call must establish it —
+        is this project's.
+    ``simultaneous_channels``
+        The channel indices that shared that pass, in the order they were
+        requested — each frame names its siblings, including itself, so a
+        single frame pulled out of a recording still says what else
+        exists and where to look for it.
+
+        Channel indices rather than device ids, which is what the
+        spectrum side's :class:`Spectrum` ``simultaneous_with`` names,
+        because these siblings are channels of *one* scan unit reading
+        out together. A pass shared across separate devices — the
+        scan unit and an EDX detector, or a camera per probe position —
+        is a different and still-missing claim; see
+        :meth:`SpectrumDetector.acquire_map`.
+
     Cameras additionally:
 
     ``camera_name``, ``camera_type``
@@ -131,10 +175,18 @@ class Frame:
     ``frame_number``, ``integration_count``
         Passed through from the vendor's own frame properties.
 
-    **No ``scan_id``.** Nion carries one to group the channels of a single
-    simultaneous multi-channel scan. This interface has no such call — a
-    second channel is a second ``scan_frame``, and therefore a second pass
-    of the beam — so an id claiming to group them would be a fiction.
+    **Why the pass identity is earned, not declared.** An earlier
+    revision of this docstring declined a ``scan_id`` outright, on the
+    grounds that "a second channel is a second pass of the beam". That
+    premise was false on real hardware — a scanned instrument reads every
+    enabled detector out during *one* pass, always — but the refusal had
+    the right instinct: an identifier nothing establishes is a claim,
+    which is exactly how ``probe_position`` bit this project
+    (docs/migration-plan.md, §7). So the identity exists now that a call
+    exists to establish it: ``scan_pass_id`` is produced by
+    :meth:`Scanner.scan_frames` and only by it, and the single-channel
+    :meth:`Scanner.scan_frame` still attaches nothing — its frames never
+    shared a pass with anything, and a recording must not say otherwise.
 
     Attributes
     ----------
@@ -353,12 +405,31 @@ class Camera(typing.Protocol):
 @typing.runtime_checkable
 class Scanner(typing.Protocol):
     """
-    A scan generator that produces one scanned frame per request.
+    A scan generator that produces the frames of one scanned pass per request.
+
+    Two acquisition calls, one physics distinction between them.
+    ``scan_frame`` is one pass of the probe read out on one detector
+    channel; ``scan_frames`` is one pass read out on *several* channels at
+    once, which is what a scanned instrument natively does — every
+    enabled detector sees the same traversal of the specimen. Serial
+    single-channel acquisition is the special case, not the general one,
+    and asking for k channels through ``scan_frame`` costs k passes of
+    dose with drift between them.
 
     Continuous live imaging is a repeated ``scan_frame`` loop (migration
-    plan, Phase 2). Hardware-synchronized multi-signal acquisition
-    (e.g. camera-per-probe-position spectrum imaging) is deliberately not
-    part of this interface yet; it arrives with Phase 3.
+    plan, Phase 2). Synchronising a *camera* to the scan
+    (camera-per-probe-position spectrum imaging, 4D-STEM) is still
+    deliberately not part of this interface: that is a cross-device pass,
+    and ``scan_frames`` covers only the scan unit's own channels.
+
+    ``scan_frames`` is part of the protocol rather than an optional
+    extra, so an adapter written before it exists no longer satisfies
+    this ``isinstance`` check and a remote one answers *unknown method*.
+    That is the intended reading: every scanned instrument reads its
+    enabled detectors out together, so an adapter that cannot say what
+    happens when two are asked for has not finished describing its
+    device. What it must not do is loop ``scan_frame`` — see that
+    method.
     """
 
     @property
@@ -373,6 +444,60 @@ class Scanner(typing.Protocol):
 
     def scan_frame(self, parameters: ScanParameters, channel: int = 0) -> Frame:
         """Scan and return a single frame from the given detector channel."""
+        ...
+
+    def scan_frames(
+        self,
+        parameters: ScanParameters,
+        channels: typing.Sequence[int],
+    ) -> typing.Sequence[Frame]:
+        """
+        Scan **once** and return one frame per requested channel.
+
+        The contract is the physics: every returned frame comes from the
+        same single pass of the probe, so the device is asked for one
+        scan, not ``len(channels)`` of them — one pass of dose, no drift
+        between channels, and per-pixel arithmetic between the returned
+        frames (DPC, iDPC, centre of mass) compares the same probe
+        positions. Each frame carries ``scan_pass_id`` and
+        ``simultaneous_channels`` in its metadata (see :class:`Frame`)
+        precisely because this call is what establishes them.
+
+        An implementation whose hardware cannot read the requested
+        channels out simultaneously must raise rather than quietly loop
+        ``scan_frame`` — k sequential passes labelled as one shared pass
+        would put a false identity on stored data, which is worse than an
+        honest error. A single-channel request is always satisfiable:
+        one pass with one readout is still one pass.
+
+        Frames are returned in the order the channels were requested.
+
+        **One error vocabulary across adapters**, so a caller (or the
+        conformance suite docs/vendor-support.md proposes) can branch on
+        the kind of mistake rather than on an adapter's phrasing:
+        ``ValueError`` for a request no scanner could honour (no
+        channels, or the same channel twice — a detector cannot read
+        itself out twice in one pass), and ``IndexError`` for a channel
+        index this scanner does not have, which is the exception the
+        single-channel path already raises for that mistake. Across the
+        device-server boundary those arrive as the ``error_type`` on
+        :class:`~miainwoodpecker.devices.rpc.RemoteCallError`.
+
+        Parameters
+        ----------
+        parameters : ScanParameters
+            Scan geometry and timing, shared by every returned frame.
+        channels : typing.Sequence[int]
+            Detector channel indices to read out during the pass. Must
+            be non-empty and without duplicates; a channel index the
+            scanner does not have is an error.
+
+        Returns
+        -------
+        typing.Sequence[Frame]
+            One frame per requested channel, in request order, all from
+            the same pass.
+        """
         ...
 
     def close(self) -> None:
@@ -784,22 +909,20 @@ class SpectrumDetector(typing.Protocol):
         alongside them. Serial acquisition is the special case, not
         simultaneity.
 
-        Nothing in this project can currently express that: :class:`Scanner`
-        returns one channel per call, so a second channel costs a second
-        pass of dose and lets the specimen drift between them; and the
-        transport gives each target its own connection with no shared
-        trigger, so two overlapping calls overlap in *wall-clock time*
-        rather than sharing a probe position. (:class:`Frame`'s note
-        declining a ``scan_id`` reasons from the premise that "a second
-        channel is a second pass of the beam", which is false on real
-        hardware; that note is superseded and belongs with the
-        ``Scanner`` change rather than with this one.)
+        Within one scan unit that is now expressed:
+        :meth:`Scanner.scan_frames` reads several detector channels out
+        of one pass and stamps the frames with the shared
+        ``scan_pass_id`` that call establishes. What is still missing is
+        the *cross-device* pass: the transport gives each target its own
+        connection with no shared trigger, so a scan overlapping this
+        map's acquisition overlaps in *wall-clock time* rather than
+        sharing a probe position.
 
         So this method is deliberately the *device-level* primitive and
         not the acquisition-level answer. The acquisition-level answer is
-        a pass that yields a set of correlated outputs, and it is the
-        same missing concept that blocks multi-channel scanning,
-        simultaneous EELS, and 4D-STEM — one change, not four. See
+        a pass that yields a set of correlated outputs across devices,
+        and it is the same missing concept that blocks simultaneous EELS
+        and 4D-STEM — one change, not three. See
         docs/adapters/spectrum-detectors.md for the options and the
         recommendation.
         """

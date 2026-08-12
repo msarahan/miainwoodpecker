@@ -410,6 +410,57 @@ executable specification an adapter writes against, and the measurement
 it gives is the useful one: **the protocol plumbing is about eighty lines**.
 Everything beyond that in a real adapter is vendor work.
 
+**`scan_frame` could not express a simultaneous multi-channel scan.** The
+most consequential wrong shape this page has carried, and the one that
+was not waiting on a second vendor — it was wrong for the instrument this
+project already drives. `scan_frame(parameters, channel)` returns one
+channel per call, and `Frame`'s docstring declined a `scan_id` on the
+grounds that "a second channel is a second pass of the beam". **That
+premise is false, and not as an edge case: a scanned instrument gives you
+one or more signals simultaneously, always.** One pass of the probe,
+every detector reading out at once — HAADF and MAADF together on a Nion
+UltraSTEM, and on a segmented-detector SEM such as the SU9000II, BF plus
+each HAADF segment plus SE plus LA-BSE plus HA-BSE, all from the same
+pass. Simultaneity is what a scanned instrument *is*; serial channels are
+the special case, and the API only had the special case. It cost dose
+(*k* channels, *k* passes over the specimen), time and drift, and
+correctness: DPC, iDPC and centre-of-mass take differences between
+segments **at the same probe position**, so segments from different
+passes are not merely noisier but invalid, with nothing in the recording
+saying so.
+
+`Scanner.scan_frames(parameters, channels)` is the fix, and the shape of
+it is the part worth recording. Each returned frame carries
+`scan_pass_id` — an opaque id for the one traversal of the specimen they
+came from — and `simultaneous_channels`, the siblings that shared it.
+**The identity is produced by that call and by nothing else**:
+`scan_frame` attaches neither key, so a bare id asserting an acquisition
+that did not happen is not reachable, which is what the old refusal was
+right to protect against (`probe_position`, again). It is not this
+project's invention either: Nion's own `scan_base.ScanAcquisitionTask`
+mints a `uuid4` per frame and stamps it on every simultaneously-read
+channel as `stem.scan.scan_id`.
+
+The Nion adapter drives the vendor's real mechanism rather than looping —
+`set_channel_enabled` for each requested channel, one `start_frame`, and
+`read_partial` until complete, which is how `ScanAcquisitionTask` itself
+runs and which returns one data element per enabled channel. It then
+checks what the device actually did (no bad frame, the frame number did
+not move, every requested channel reported) before stamping a shared id
+on anything. On the transport, a pass crosses as **one stacked block** in
+the source's existing shared segment: the reused-segment design allows
+exactly one publish per request/response cycle, so N publishes would
+overwrite each other and N segments would duplicate the ownership rules.
+Storage needed no change at all — `NexusWriter` already persists each
+frame's metadata whole — so a recorded multi-channel series says which
+frames shared a pass without a new NeXus layout being invented for it.
+
+What is still missing after this is the **cross-device** pass: a scan
+sharing probe positions with a camera or an X-ray detector. That is one
+concept, not three (see
+[spectrum detectors](adapters/spectrum-detectors.md)), and `scan_frames`
+deliberately does not pretend to cover it.
+
 ## What is still the wrong shape
 
 Two, neither fixed, both estimated below rather than pre-emptively built.
@@ -474,47 +525,6 @@ per-instrument value someone has to measure.
 This is cheap to handle and expensive to get wrong, so the note belongs
 here: a second adapter converts *into* this convention and records what it
 converted from in the frame metadata.
-
-### `scan_frame` cannot express a simultaneous multi-channel scan
-
-**This is the most consequential wrong shape on this page, and unlike the
-others it is not waiting on a second vendor — it is wrong for the
-instrument this project already drives.**
-
-`scan_frame(parameters, channel)` returns one channel per call, and
-`Frame`'s docstring declines a `scan_id` on the grounds that "a second
-channel is a second pass of the beam". **That premise is false, and not
-as an edge case: a scanned instrument gives you one or more signals
-simultaneously, always.** One pass of the probe, every detector reading
-out at once — HAADF and MAADF together on a Nion UltraSTEM, and on a
-segmented-detector SEM such as the SU9000II, BF plus each HAADF segment
-plus SE plus LA-BSE plus HA-BSE, all from the same pass. Simultaneity is
-what a scanned instrument *is*; serial channels are the special case, and
-this API only has the special case.
-
-Three consequences, in increasing order of severity:
-
-- **Dose.** Asking for *k* channels costs *k* passes over the specimen
-  instead of one. On beam-sensitive material that is the difference
-  between a measurement and a hole.
-- **Time and drift.** *k* passes take *k* times as long, and the
-  specimen moves between them.
-- **Correctness.** DPC, iDPC and centre-of-mass take differences between
-  segments **at the same probe position**. Segments from different passes
-  differ by drift, so those analyses are not merely noisier — they are
-  invalid, and nothing in the recorded data says so.
-
-The fix is a multi-channel call returning frames that share a scan
-identity **only when the device really acquired them together**. A
-`scan_id` alone would be worse than nothing: it would assert a shared
-acquisition that did not happen, which is precisely the fiction the
-`Frame` docstring was right to refuse. 3–5 d.
-
-Sizing note: this was found while researching a vendor that does not have
-an adapter yet, and was first written down as that vendor's problem. It
-is not. It applies to the Nion path in production today, so it should be
-scheduled on its own merits rather than bundled with whichever adapter
-happens to surface it again.
 
 ## Task estimates
 
@@ -623,8 +633,10 @@ constant supplies and that changes with working distance and kV.
 | Files only — TIFF plus `.txt` sidecar | 3–5 d | No. Ingest, not a device |
 
 All four need the common second-vendor block, and three of them need a
-**simultaneous multi-channel scan call** (3–5 d) that does not exist yet
-— see "What is still the wrong shape" above.
+**simultaneous multi-channel scan call** — which now exists
+(`Scanner.scan_frames`, see "What was the wrong shape, and is now fixed"
+above), so what an SU9000II adapter owes is the vendor half of it rather
+than the design.
 
 ### Bruker ESPRIT / Oxford AZtec — the protocol now exists
 

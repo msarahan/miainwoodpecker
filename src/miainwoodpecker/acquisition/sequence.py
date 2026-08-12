@@ -70,6 +70,61 @@ def scan_series(
         yield scanner.scan_frame(parameters, channel)
 
 
+def multichannel_scan_series(
+    scanner: Scanner,
+    parameters: ScanParameters,
+    count: int,
+    *,
+    channels: typing.Sequence[int],
+) -> Iterator[Frame]:
+    """
+    Yield ``count`` simultaneous passes, each read out on several channels.
+
+    The multi-channel sibling of :func:`scan_series`, and a separate
+    generator rather than a ``channels=`` parameter on it because the
+    yield shape differs in a way a caller must not discover at runtime:
+    this yields ``count * len(channels)`` frames, grouped by pass —
+    channels in request order within each pass — where ``scan_series``
+    yields exactly ``count``.
+
+    Each pass is **one** :meth:`~miainwoodpecker.devices.interface.Scanner.scan_frames`
+    call, so the device sees ``count`` scans however many channels read
+    out — one pass of dose per step, no drift between the channels of a
+    step — and every yielded frame carries the ``scan_pass_id`` and
+    ``simultaneous_channels`` metadata that call establishes. Composed
+    with :func:`record`, that identity lands verbatim in the NeXus file's
+    per-frame metadata, so a stored series says which frames shared a
+    pass rather than leaving a reader to guess from timestamps.
+
+    Parameters
+    ----------
+    scanner : Scanner
+        The scan device to drive.
+    parameters : ScanParameters
+        Scan geometry and timing, applied to every pass in the series.
+    count : int
+        Number of passes to acquire.
+    channels : typing.Sequence[int]
+        Detector channel indices to read out during each pass.
+
+    Yields
+    ------
+    Frame
+        Each pass's frames in channel-request order, passes in
+        acquisition order.
+
+    Raises
+    ------
+    ValueError
+        If ``count`` is negative.
+    """
+    if count < 0:
+        msg = f"count must be non-negative, got {count}"
+        raise ValueError(msg)
+    for _ in range(count):
+        yield from scanner.scan_frames(parameters, channels)
+
+
 def camera_series(camera: Camera, count: int) -> Iterator[Frame]:
     """
     Yield ``count`` camera frames, starting and stopping the camera.

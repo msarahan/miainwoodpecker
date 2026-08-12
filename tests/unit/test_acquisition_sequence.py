@@ -2,8 +2,10 @@
 
 import datetime
 import itertools
+import json
 import typing
 
+import h5py
 import numpy as np
 import pytest
 
@@ -11,6 +13,7 @@ from miainwoodpecker.acquisition import (
     camera_series,
     energy_offset_series,
     focal_series,
+    multichannel_scan_series,
     record,
     scan_series,
 )
@@ -31,6 +34,7 @@ class _RecordingScanner:
 
     def __init__(self) -> None:
         self.calls: list[tuple[ScanParameters, int]] = []
+        self.pass_calls: list[tuple[ScanParameters, tuple[int, ...]]] = []
 
     @property
     def scanner_id(self) -> str:
@@ -50,6 +54,46 @@ class _RecordingScanner:
             timestamp=datetime.datetime.now(tz=datetime.UTC),
             metadata={"fov_nm": parameters.fov_nm, "channel_index": channel},
         )
+
+    def scan_frames(
+        self,
+        parameters: ScanParameters,
+        channels: typing.Sequence[int],
+    ) -> list[Frame]:
+        """
+        Record one pass and return its frames, sharing a per-pass identity.
+
+        The identity is the pass's ordinal in this fake — stable, unique
+        per call, and visibly not per frame, which is what the series
+        tests need to tell one pass's frames from the next's.
+
+        Parameters
+        ----------
+        parameters : ScanParameters
+            Scan geometry, shared by every returned frame.
+        channels : typing.Sequence[int]
+            Channel indices to read out during the fake pass.
+
+        Returns
+        -------
+        list[Frame]
+            One frame per requested channel, in request order.
+        """
+        self.pass_calls.append((parameters, tuple(channels)))
+        pass_id = f"pass-{len(self.pass_calls)}"
+        timestamp = datetime.datetime.now(tz=datetime.UTC)
+        return [
+            Frame(
+                data=np.full(parameters.shape, len(self.pass_calls), dtype=np.float32),
+                timestamp=timestamp,
+                metadata={
+                    "channel_index": channel,
+                    "scan_pass_id": pass_id,
+                    "simultaneous_channels": list(channels),
+                },
+            )
+            for channel in channels
+        ]
 
     def close(self) -> None:
         """Release nothing; the fake owns no resources."""
@@ -210,6 +254,103 @@ def test_scan_series_is_lazy():
     assert scanner.calls == []
     next(series)
     assert len(scanner.calls) == 1
+
+
+def test_multichannel_series_asks_the_scanner_once_per_pass():
+    """
+    The dose accounting the multi-channel call exists for, at this layer.
+
+    Two channels over three passes must be three ``scan_frames`` calls
+    and zero ``scan_frame`` calls — a series that quietly looped the
+    single-channel call would double the dose and break the shared
+    identity while yielding the same number of frames, which is exactly
+    the failure mode that must not be reachable by accident.
+    """
+    scanner = _RecordingScanner()
+    frames = list(
+        multichannel_scan_series(scanner, _PARAMETERS, 3, channels=(0, 1)),
+    )
+    expected_frames = 6  # 3 passes x 2 channels
+    expected_passes = 3
+    assert len(frames) == expected_frames
+    assert len(scanner.pass_calls) == expected_passes
+    assert scanner.calls == []  # never the single-channel path
+    assert all(channels == (0, 1) for _, channels in scanner.pass_calls)
+
+
+def test_multichannel_series_frames_group_by_pass_identity():
+    """
+    Consecutive frames pair up under one pass id; the next pass gets a new one.
+
+    The yield order is the storage order, so this grouping is what a
+    recorded file will say about which frames shared a pass.
+    """
+    frames = list(
+        multichannel_scan_series(_RecordingScanner(), _PARAMETERS, 2, channels=(0, 1)),
+    )
+    ids = [frame.metadata["scan_pass_id"] for frame in frames]
+    assert ids[0] == ids[1]
+    assert ids[2] == ids[3]
+    assert ids[0] != ids[2]
+    assert [frame.metadata["channel_index"] for frame in frames] == [0, 1, 0, 1]
+
+
+def test_multichannel_series_is_lazy():
+    """Nothing is acquired until the generator is consumed, like scan_series."""
+    scanner = _RecordingScanner()
+    series = multichannel_scan_series(scanner, _PARAMETERS, 100, channels=(0, 1))
+    assert scanner.pass_calls == []
+    next(series)
+    assert len(scanner.pass_calls) == 1
+
+
+def test_multichannel_series_rejects_a_negative_count():
+    """A negative count is a programming error, matching the other series."""
+    with pytest.raises(ValueError, match="non-negative"):
+        list(
+            multichannel_scan_series(
+                _RecordingScanner(),
+                _PARAMETERS,
+                -1,
+                channels=(0, 1),
+            ),
+        )
+
+
+def test_recording_a_multichannel_series_stores_the_pass_identity(tmp_path):
+    """
+    The shared identity survives the trip to disk, per frame.
+
+    ``record`` streams into ``NexusWriter``, which keeps every frame's
+    whole metadata mapping as JSON — so nothing multi-channel-specific
+    was added to the storage layer, and this test is what proves nothing
+    needed to be: a reader of the file can reconstruct which frames
+    shared a pass, which channels they were, and in what order, from the
+    per-frame metadata alone.
+    """
+    path = tmp_path / "multichannel.nxs"
+    written = record(
+        multichannel_scan_series(
+            _RecordingScanner(),
+            _PARAMETERS,
+            2,
+            channels=(0, 1),
+        ),
+        path,
+        title="simultaneous pair",
+    )
+    expected = 4
+    assert written == expected
+    with h5py.File(path, "r") as handle:
+        stored = [
+            json.loads(entry)
+            for entry in handle["entry/metadata/frame_metadata_json"][()]
+        ]
+    assert [item["channel_index"] for item in stored] == [0, 1, 0, 1]
+    assert stored[0]["scan_pass_id"] == stored[1]["scan_pass_id"]
+    assert stored[2]["scan_pass_id"] == stored[3]["scan_pass_id"]
+    assert stored[0]["scan_pass_id"] != stored[2]["scan_pass_id"]
+    assert all(item["simultaneous_channels"] == [0, 1] for item in stored)
 
 
 def test_camera_series_starts_and_always_stops():

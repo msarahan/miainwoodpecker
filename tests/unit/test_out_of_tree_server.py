@@ -44,6 +44,9 @@ _FRAME_VALUE = 7.0
 _STARTUP_FAILURE_CEILING_S = 5.0
 # An exposure the fake server did not start with, so a round trip is visible.
 _CONFIGURED_EXPOSURE_MS = 9.0
+# The fake vendor's scan unit has two detectors, SE and BSE, and reads
+# both out of one pass - the ordinary case on a scanned instrument.
+_CHANNEL_COUNT = 2
 
 _SERVER_SOURCE = '''
 """A minimal out-of-tree device server, standing in for a vendor adapter."""
@@ -54,6 +57,7 @@ import argparse
 import datetime
 import os
 import threading
+import uuid
 from multiprocessing.connection import Listener
 
 from miainwoodpecker.devices.interface import CameraParameters, Frame
@@ -123,6 +127,33 @@ class FakeScanner:
             timestamp=datetime.datetime.now(tz=datetime.UTC),
             metadata={{"device_id": VENDOR_SCANNER_ID, "channel_index": channel}},
         )
+
+    def scan_frames(self, parameters, channels):
+        # One pass, several detectors: the identity is minted here,
+        # inside the call that establishes it, and every sibling gets the
+        # same one. A vendor adapter whose hardware cannot read several
+        # channels out of one pass raises here instead.
+        import numpy as np
+
+        pass_id = str(uuid.uuid4())
+        timestamp = datetime.datetime.now(tz=datetime.UTC)
+        return [
+            Frame(
+                # Distinguishable per channel, so a caller can tell which
+                # frame is which rather than trusting the order.
+                data=np.full(
+                    parameters.shape, FRAME_VALUE + channel, dtype=np.float32,
+                ),
+                timestamp=timestamp,
+                metadata={{
+                    "device_id": VENDOR_SCANNER_ID,
+                    "channel_index": channel,
+                    "scan_pass_id": pass_id,
+                    "simultaneous_channels": list(channels),
+                }},
+            )
+            for channel in channels
+        ]
 
     def close(self):
         pass
@@ -306,6 +337,40 @@ def test_a_third_party_server_module_can_be_driven_end_to_end(
         scanned = microscope.scanner.scan_frame(parameters, channel=1)
         assert scanned.data.shape == parameters.shape
         assert scanned.metadata["channel_index"] == 1
+
+
+def test_a_vendor_scanner_can_return_a_whole_simultaneous_pass(
+    vendor_server_module,
+):
+    """
+    A third-party adapter's multi-channel pass reaches the client intact.
+
+    ``scan_frames`` is part of the ``Scanner`` protocol, so this is now
+    part of what an out-of-tree adapter has to implement — and the twenty
+    lines above are the whole of what it costs, since the transport,
+    the client handle, and the metadata rules are the project's. What is
+    exercised here is the client half of the multi-frame path with no
+    vendor software present at all: the request crosses as one call (not
+    one per channel, which is the behaviour the whole feature exists to
+    remove), and the frames come back in request order with the pass
+    identity the adapter minted.
+    """
+    with remote_instrument(server_module=vendor_server_module) as microscope:
+        parameters = ScanParameters(
+            height=16, width=24, pixel_time_us=1.0, fov_nm=100.0,
+        )
+        frames = microscope.scanner.scan_frames(parameters, (0, 1))
+
+        assert len(frames) == _CHANNEL_COUNT
+        assert [frame.metadata["channel_index"] for frame in frames] == [0, 1]
+        assert frames[0].metadata["scan_pass_id"] == frames[1].metadata["scan_pass_id"]
+        assert all(
+            frame.metadata["simultaneous_channels"] == [0, 1] for frame in frames
+        )
+        # Each frame is its own channel's data rather than the first one
+        # twice, which is what a set arriving mis-ordered would look like.
+        assert float(np.mean(frames[0].data)) == pytest.approx(_FRAME_VALUE)
+        assert float(np.mean(frames[1].data)) == pytest.approx(_FRAME_VALUE + 1)
 
 
 def test_a_vendor_serving_fewer_targets_is_handled(vendor_server_module):
