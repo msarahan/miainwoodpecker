@@ -137,6 +137,7 @@ from miainwoodpecker.devices.rpc import (
 from miainwoodpecker.devices.shared_frame import (
     SharedFrameReader,
     SharedFrameRef,
+    SharedFrameSetRef,
     SharedSpectrumRef,
 )
 
@@ -969,6 +970,38 @@ class _RemoteDevice:
                 return self._reader.read(result)
             return typing.cast("Frame", result)
 
+    def _frame_set(self, method: str, *args: object) -> list[Frame]:
+        """
+        Make a call that returns several frames, following a stacked reference.
+
+        The multi-frame sibling of :meth:`_frame`, holding the same lock
+        for the same reason: the call and the copy-out are one critical
+        section, or a second thread's request overwrites the segment this
+        one is still reading. The frames of one pass arrive as **one**
+        stacked block (see
+        :class:`~miainwoodpecker.devices.shared_frame.SharedFrameSetRef`)
+        when they clear the shared-memory threshold together, and as a
+        plain pickled sequence when they do not.
+
+        Parameters
+        ----------
+        method : str
+            Method name on the remote target.
+        *args : object
+            Positional arguments.
+
+        Returns
+        -------
+        list[Frame]
+            The frames, in the order the server produced them, each with
+            its own private array.
+        """
+        with self._frame_lock:
+            result = self._call(method, *args)
+            if isinstance(result, SharedFrameSetRef):
+                return self._reader.read_frames(result)
+            return list(typing.cast("Sequence[Frame]", result))
+
     def _spectrum(self, method: str, *args: object) -> Spectrum:
         """
         Make a call that returns a spectrum, following a shared-memory reference.
@@ -1081,6 +1114,38 @@ class RemoteScanner(_RemoteDevice):
     def scan_frame(self, parameters: ScanParameters, channel: int = 0) -> Frame:
         """Scan and return a single frame from the remote device."""
         return self._frame("scan_frame", parameters, channel)
+
+    def scan_frames(
+        self,
+        parameters: ScanParameters,
+        channels: Sequence[int],
+    ) -> list[Frame]:
+        """
+        Scan once on the remote device and return one frame per channel.
+
+        One RPC call, because the request is one acquisition: the server
+        runs a single pass with every requested channel enabled and
+        returns the frames together, stamped with the shared
+        ``scan_pass_id`` the device-side adapter minted (see
+        :meth:`~miainwoodpecker.devices.interface.Scanner.scan_frames`
+        for the contract). Splitting this into per-channel calls would
+        reintroduce exactly the k-passes-for-k-channels behaviour the
+        call exists to remove.
+
+        Parameters
+        ----------
+        parameters : ScanParameters
+            Scan geometry and timing, shared by every returned frame.
+        channels : Sequence[int]
+            Detector channel indices to read out during the pass.
+
+        Returns
+        -------
+        list[Frame]
+            One frame per requested channel, in request order, all from
+            the same pass.
+        """
+        return self._frame_set("scan_frames", parameters, tuple(channels))
 
 
 class RemoteSpectrumDetector(_RemoteDevice):

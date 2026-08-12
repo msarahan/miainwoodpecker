@@ -50,6 +50,7 @@ from miainwoodpecker.devices.nion_server import (
     SIMULATED_BACKEND,
     HardwareNotAvailableError,
     NionCamera,
+    NionScanner,
     _axis_calibration_spec,
     _instrument_state,
     _parse_args,
@@ -123,6 +124,287 @@ def test_scanner_honors_non_square_shape_and_reports_channel():
         assert frame.data.shape == parameters.shape
         assert frame.metadata["channel_name"] == "HAADF"
         assert frame.metadata["fov_nm"] == parameters.fov_nm
+
+
+# --------------------------------------- the simultaneous multi-channel scan
+#
+# One pass of the probe, every enabled detector reading out at once, is
+# what a scanned instrument *is* (docs/vendor-support.md). These tests are
+# against the vendor device itself rather than a stand-in, because the
+# whole claim ``scan_frames`` makes is about what the *device* was asked
+# to do: a shared ``scan_pass_id`` that some emulation layer could have
+# minted around two separate scans would be exactly the fiction the
+# ``Frame`` docstring spent three phases refusing.
+
+# Small enough that the scan-box simulator's per-pixel timing keeps these
+# tests to milliseconds; non-square so the (height, width) convention is
+# under test here too.
+_PASS_PARAMETERS = ScanParameters(
+    height=16,
+    width=24,
+    pixel_time_us=1.0,
+    fov_nm=40.0,
+)
+_TWO_CHANNELS = 2
+
+
+class _CountingScanDevice:
+    """
+    A pass-through around Nion's scan device that counts what it was asked.
+
+    Everything is delegated to the real ``nion.device_kit.ScanDevice``,
+    so the adapter under test drives the genuine vendor object; the only
+    additions are counters on the two entry points that mean "acquire".
+    ``start_frame`` is the one that matters for dose — it is what begins
+    a traversal of the specimen — and its return value is the device's
+    own frame number, which is the device saying, in its own bookkeeping,
+    how many frames it thinks it has run.
+
+    Parameters
+    ----------
+    device : object
+        The vendor scan device to wrap.
+    """
+
+    def __init__(self, device: object) -> None:
+        self._device = device
+        self.started_frames: list[int] = []
+        self.generated_scans = 0
+
+    def __getattr__(self, name: str) -> object:
+        """
+        Delegate everything not overridden to the wrapped vendor device.
+
+        Parameters
+        ----------
+        name : str
+            Attribute being looked up.
+
+        Returns
+        -------
+        object
+            The vendor device's attribute.
+        """
+        return getattr(self._device, name)
+
+    def start_frame(self, is_continuous: bool) -> int:  # noqa: FBT001 - vendor signature
+        """
+        Begin one frame, recording the frame number the device gives back.
+
+        Parameters
+        ----------
+        is_continuous : bool
+            The vendor's continuous-acquisition flag.
+
+        Returns
+        -------
+        int
+            The device's frame number for the frame just started.
+        """
+        number = self._device.start_frame(is_continuous)
+        self.started_frames.append(int(number))
+        return number
+
+    def get_scan_data(self, frame_parameters: object, channel: object) -> np.ndarray:
+        """
+        Synthesise one channel's data, counting the call.
+
+        Parameters
+        ----------
+        frame_parameters : object
+            The vendor scan parameters.
+        channel : object
+            Channel index or channel object.
+
+        Returns
+        -------
+        np.ndarray
+            The simulated frame.
+        """
+        self.generated_scans += 1
+        return self._device.get_scan_data(frame_parameters, channel)
+
+
+def test_a_two_channel_pass_asks_the_device_for_exactly_one_scan():
+    """
+    The dose accounting, asserted against the device's own frame counter.
+
+    This is the entire point of the call: two channels must cost *one*
+    pass over the specimen, not two. Two independent witnesses are used
+    because a single call count could be satisfied by an adapter that
+    scanned twice and reported once — the device is asked to begin a
+    frame exactly once, and its own frame number (which it hands back
+    from ``start_frame``) advances by one per two-channel pass rather
+    than by one per channel.
+
+    The single-channel path is counted alongside as the contrast: it
+    reaches the vendor through ``get_scan_data``, which is one
+    synthesised traversal per call, so the naive way of getting two
+    channels really is two of them.
+    """
+    with simulated_instrument() as microscope:
+        device = _CountingScanDevice(microscope.scanner._device)  # noqa: SLF001
+        scanner = NionScanner(device, None)
+
+        first = scanner.scan_frames(_PASS_PARAMETERS, [0, 1])
+        second = scanner.scan_frames(_PASS_PARAMETERS, [0, 1])
+
+        assert len(first) == _TWO_CHANNELS
+        assert len(second) == _TWO_CHANNELS
+        assert len(device.started_frames) == _TWO_CHANNELS  # two passes, not four
+        assert device.started_frames[1] == device.started_frames[0] + 1
+        assert device.generated_scans == 0  # the pass path never goes there
+
+        scanner.scan_frame(_PASS_PARAMETERS, channel=0)
+        scanner.scan_frame(_PASS_PARAMETERS, channel=1)
+        assert device.generated_scans == _TWO_CHANNELS
+
+
+def test_two_channels_of_one_pass_share_an_identity_and_agree_on_geometry():
+    """
+    What the shared pass id has to mean for DPC or iDPC to be valid.
+
+    Both halves matter. The *identity* says these two frames came from
+    one traversal, so a difference taken between them is a difference at
+    the same probe position. The *geometry* is what makes that difference
+    computable at all: same shape, same field of view, same rotation and
+    centre, so pixel (i, j) of one names the same place as pixel (i, j)
+    of the other. A pair agreeing on one but not the other would be
+    quietly useless.
+
+    The arrays themselves must be separate objects, since a downstream
+    subtraction that turned out to be a frame minus itself would produce
+    a perfectly plausible field of zeros.
+    """
+    with simulated_instrument() as microscope:
+        frames = microscope.scanner.scan_frames(_PASS_PARAMETERS, [0, 1])
+
+        assert len(frames) == _TWO_CHANNELS
+        haadf, maadf = frames
+        assert haadf.metadata["scan_pass_id"] == maadf.metadata["scan_pass_id"]
+        assert haadf.metadata["scan_pass_id"]  # a real value, not an empty string
+        assert haadf.metadata["simultaneous_channels"] == [0, 1]
+        assert maadf.metadata["simultaneous_channels"] == [0, 1]
+        # Requested order, and each frame still says which channel it is.
+        assert haadf.metadata["channel_index"] == 0
+        assert maadf.metadata["channel_index"] == 1
+        assert haadf.metadata["channel_name"] == "HAADF"
+        assert maadf.metadata["channel_name"] == "MAADF"
+        # One pass, one clock.
+        assert haadf.timestamp == maadf.timestamp
+        for key in ("fov_nm", "fov_size_nm", "pixel_time_us", "rotation_rad",
+                    "center_nm", "line_time_us", "frame_time_s"):
+            assert haadf.metadata[key] == maadf.metadata[key]
+        assert haadf.data.shape == _PASS_PARAMETERS.shape
+        assert maadf.data.shape == _PASS_PARAMETERS.shape
+        assert haadf.data is not maadf.data
+
+
+def test_a_second_pass_is_a_second_identity():
+    """
+    Two calls are two traversals, so they must not share an id.
+
+    The failure this rules out is the one that would be least visible: a
+    pass id minted once per device or per session would group every frame
+    ever acquired, and every difference computed across two of them would
+    silently be a difference across drift.
+    """
+    with simulated_instrument() as microscope:
+        scanner = microscope.scanner
+        first = scanner.scan_frames(_PASS_PARAMETERS, [0, 1])
+        second = scanner.scan_frames(_PASS_PARAMETERS, [0, 1])
+        assert (
+            first[0].metadata["scan_pass_id"] != second[0].metadata["scan_pass_id"]
+        )
+
+
+def test_a_single_channel_scan_carries_no_pass_identity():
+    """
+    ``scan_frame`` fabricates nothing, and a pass of one is still honest.
+
+    The rule the ``Frame`` docstring now states: the identity exists
+    where a call established it and nowhere else. A ``scan_frame`` frame
+    has no siblings, so it carries neither key — a reader finding a pass
+    id on it would have to conclude some other frame shares its probe
+    positions, and none does.
+
+    A one-channel ``scan_frames`` is the interesting boundary: that
+    genuinely *was* a pass, so it does carry the identity, and its
+    sibling list names only itself. Nothing is claimed that did not
+    happen either way.
+    """
+    with simulated_instrument() as microscope:
+        scanner = microscope.scanner
+        single = scanner.scan_frame(_PASS_PARAMETERS, channel=0)
+        assert "scan_pass_id" not in single.metadata
+        assert "simultaneous_channels" not in single.metadata
+
+        (alone,) = scanner.scan_frames(_PASS_PARAMETERS, [0])
+        assert alone.metadata["scan_pass_id"]
+        assert alone.metadata["simultaneous_channels"] == [0]
+
+
+def test_a_pass_rejects_channels_the_scanner_does_not_have():
+    """
+    An impossible request fails, and the device is fine afterwards.
+
+    ``IndexError`` deliberately, because that is what the single-channel
+    path already raises for the same operator mistake (a bad channel
+    index reaching Nion's own channel list), so an adapter-conformance
+    suite or a caller branching on the error kind sees one vocabulary
+    rather than two. The message names the range, since "99 is not a
+    channel" is not actionable if the caller cannot see what is.
+
+    The recovery half is not decoration: this call enables and disables
+    detector channels on the device, so a request that dies partway
+    through must not leave the scan unit configured for a scan nobody
+    asked for.
+    """
+    with simulated_instrument() as microscope:
+        scanner = microscope.scanner
+        before = tuple(microscope.scanner._device.channels_enabled)  # noqa: SLF001
+
+        with pytest.raises(IndexError, match=r"channels 0\.\.3"):
+            scanner.scan_frames(_PASS_PARAMETERS, [0, 99])
+
+        assert tuple(microscope.scanner._device.channels_enabled) == before  # noqa: SLF001
+        recovered = scanner.scan_frames(_PASS_PARAMETERS, [0, 1])
+        assert len(recovered) == _TWO_CHANNELS
+
+
+def test_a_pass_rejects_a_request_no_scanner_could_honour():
+    """
+    No channels, or the same channel twice, is a caller bug rather than a scan.
+
+    ``ValueError`` rather than ``IndexError`` because these are not about
+    which channels exist: zero channels asks for no readout at all, and a
+    detector cannot be read out twice during one traversal — a duplicate
+    would have to be answered with two copies of one frame, which is a
+    claim about dose that nothing in the device supports.
+    """
+    with simulated_instrument() as microscope:
+        scanner = microscope.scanner
+        with pytest.raises(ValueError, match="at least one channel"):
+            scanner.scan_frames(_PASS_PARAMETERS, [])
+        with pytest.raises(ValueError, match="duplicate channels"):
+            scanner.scan_frames(_PASS_PARAMETERS, [1, 1])
+
+
+def test_a_pass_restores_the_channels_the_device_had_enabled():
+    """
+    Enabling channels for a pass is borrowed, not taken.
+
+    The device's enabled-channel set is instrument state that outlives
+    this call: it is what a subsequent vendor-level operation (Nion
+    Swift's own live view, on a shared instrument PC) would scan. A
+    ``scan_frames`` that left its own selection behind would silently
+    change what someone else's next acquisition recorded.
+    """
+    with simulated_instrument() as microscope:
+        device = microscope.scanner._device  # noqa: SLF001
+        before = tuple(device.channels_enabled)
+        microscope.scanner.scan_frames(_PASS_PARAMETERS, [1, 2])
+        assert tuple(device.channels_enabled) == before
 
 
 def _mean_abs_diff(first: np.ndarray, second: np.ndarray) -> float:

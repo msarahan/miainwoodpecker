@@ -17,8 +17,11 @@ import numpy as np
 import pytest
 
 from miainwoodpecker.devices.interface import Frame
+from miainwoodpecker.devices.rpc import Call
+from miainwoodpecker.devices.serving import invoke
 from miainwoodpecker.devices.shared_frame import (
     SharedFrameReader,
+    SharedFrameSetRef,
     SharedFrameWriter,
 )
 
@@ -189,6 +192,213 @@ def test_closing_the_writer_twice_is_harmless(writer):
     writer.publish(_frame(1.0))
     writer.close()
     writer.close()
+
+
+# ------------------------------------------- frame sets (one pass, N frames)
+#
+# The frames of a simultaneous multi-channel scan cross the boundary as
+# ONE stacked block in the same reused segment, because the transport
+# allows exactly one publish per request/response cycle - N sequential
+# publishes would each overwrite the last, and N segments per source
+# would multiply the ownership rules this module is careful about.
+
+
+def test_a_frame_set_round_trips_with_per_frame_identity(writer, reader):
+    """
+    Each frame of a published set keeps its own data, metadata, and timestamp.
+
+    The set travels as one block, but what the reader hands back must be
+    indistinguishable from frames published one at a time - the stacking
+    is transport, not semantics, and a swapped or shared metadata mapping
+    would silently relabel which channel a frame came from.
+    """
+    originals = [
+        _frame(1.0, dtype=np.float32),
+        _frame(2.0, dtype=np.float32),
+        _frame(3.0, dtype=np.float32),
+    ]
+    received = reader.read_frames(writer.publish_frames(originals))
+    assert len(received) == len(originals)
+    for original, copy in zip(originals, received, strict=True):
+        assert np.array_equal(copy.data, original.data)
+        assert copy.timestamp == original.timestamp
+        assert copy.metadata == original.metadata
+
+
+def test_frame_set_readers_own_their_copies(writer, reader):
+    """
+    Frames read from a set survive the writer's next publish untouched.
+
+    The same frame-identity contract single frames have: the client
+    copies out before the server may overwrite, so a held sibling must
+    not change when the next pass lands in the reused segment.
+    """
+    received = reader.read_frames(
+        writer.publish_frames([_frame(1.0), _frame(2.0)]),
+    )
+    writer.publish_frames([_frame(8.0), _frame(9.0)])
+    assert np.array_equal(received[0].data, np.full((4, 8), 1.0))
+    assert np.array_equal(received[1].data, np.full((4, 8), 2.0))
+
+
+def test_a_frame_set_reuses_the_single_frame_segment(writer):
+    """
+    Sets and single frames share one segment per source, not one each.
+
+    The set path exists so a pass costs one publish; giving it its own
+    segment would silently double every source's /dev/shm footprint.
+    """
+    single_name = writer.publish(_frame(1.0)).shm_name
+    set_name = writer.publish_frames([_frame(2.0), _frame(3.0)]).shm_name
+    # The two-frame block needs more room than the single frame, so the
+    # segment may legitimately have been replaced - what must hold is
+    # that a following single frame lands in the set's segment rather
+    # than creating a third.
+    assert writer.publish(_frame(4.0)).shm_name == set_name
+    assert single_name  # the first publish worked at all
+
+
+def test_an_empty_frame_set_is_refused(writer):
+    """Zero frames is a programming error, not an empty block."""
+    with pytest.raises(ValueError, match="at least one frame"):
+        writer.publish_frames([])
+
+
+def test_a_mismatched_frame_set_is_refused(writer):
+    """
+    Frames that disagree on shape cannot be stacked, and say so.
+
+    No scanned pass produces such a set - every channel shares the scan
+    geometry - so this is diagnosis of a broken adapter rather than a
+    path to support.
+    """
+    with pytest.raises(ValueError, match="shape and dtype"):
+        writer.publish_frames([_frame(1.0, shape=(4, 8)), _frame(2.0, shape=(8, 4))])
+
+
+# ------------------------------------ which transport a returned value takes
+#
+# The routing decision lives in serving.invoke, but it is tested here
+# because it is inseparable from the story above: it is what decides
+# whether a pass becomes a stacked block at all, and getting it wrong in
+# either direction is a transport bug (a heterogeneous list published as a
+# block, or a 40MB pass squeezed through pickle). Driven directly rather
+# than through a subprocess, so it needs no device extra and no server.
+
+# One 128x128 float64 frame is 128KB, so a single one already clears the
+# 64KB threshold and a pair certainly does.
+_BIG = (128, 128)
+
+
+class _PassScanner:
+    """A target returning whatever set of frames a test hands it."""
+
+    def __init__(self, frames: list[Frame]) -> None:
+        self._frames = frames
+
+    def scan_frames(self, count: int) -> list[Frame]:
+        """
+        Return the prepared frames, ignoring everything about the request.
+
+        Parameters
+        ----------
+        count : int
+            How many of the prepared frames to return.
+
+        Returns
+        -------
+        list[Frame]
+            The first ``count`` prepared frames.
+        """
+        return self._frames[:count]
+
+    @property
+    def channel_names(self) -> list[str]:
+        """Return names, i.e. a list result that is emphatically not frames."""
+        return ["HAADF", "MAADF"]
+
+
+def _invoke(
+    target: object,
+    method: str,
+    *args: object,
+    writer: SharedFrameWriter | None = None,
+) -> object:
+    """
+    Dispatch one call the way the device server's connection loop does.
+
+    Parameters
+    ----------
+    target : object
+        The object to dispatch against.
+    method : str
+        Method or property name.
+    *args : object
+        Positional arguments.
+    writer : SharedFrameWriter | None
+        The target's shared-memory writer, or ``None``.
+
+    Returns
+    -------
+    object
+        The ``Result``'s value.
+    """
+    result = invoke(target, Call("scanner", method, args), writer, "scanner")
+    assert result.error is None
+    return result.value
+
+
+def test_a_large_pass_is_routed_into_one_stacked_block(writer, reader):
+    """
+    Several big frames from one call cross as a block, not as N pickles.
+
+    This is the branch that makes the multi-channel call affordable: two
+    18MB frames through pickle is the +168ms-per-frame regime the
+    benchmarks rejected, and the reused segment cannot be published into
+    twice for one reply. What the caller must not be able to tell is that
+    any of this happened, so the frames are read back and compared.
+    """
+    frames = [
+        _frame(1.0, shape=_BIG, dtype=np.float32),
+        _frame(2.0, shape=_BIG, dtype=np.float32),
+    ]
+    reference = _invoke(_PassScanner(frames), "scan_frames", 2, writer=writer)
+
+    assert isinstance(reference, SharedFrameSetRef)
+    assert reference.shape == (2, *_BIG)
+    received = reader.read_frames(reference)
+    for original, copy in zip(frames, received, strict=True):
+        assert np.array_equal(copy.data, original.data)
+        assert copy.metadata == original.metadata
+
+
+def test_a_small_pass_stays_on_the_pickle_path(writer):
+    """
+    A pass too small to be worth a segment is returned as an ordinary list.
+
+    The same rule single frames follow, applied to the combined size: the
+    threshold decides, and below it plain pickling is measurably no worse
+    while being simpler and immune to segment lifetime questions
+    entirely.
+    """
+    frames = [_frame(1.0), _frame(2.0)]  # 4x8 float64, 256 bytes each
+    value = _invoke(_PassScanner(frames), "scan_frames", 2, writer=writer)
+
+    assert value == frames
+
+
+def test_a_list_that_is_not_frames_is_left_alone(writer):
+    """
+    Routing looks at what the value *is*, not at how many things it holds.
+
+    ``channel_names`` returns a list too, and a rule that published any
+    sequence would have turned a property read into a shared-memory
+    reference the client would not know how to follow.
+    """
+    assert _invoke(_PassScanner([]), "channel_names", writer=writer) == [
+        "HAADF",
+        "MAADF",
+    ]
 
 
 def test_the_reader_never_unlinks_what_it_reads(writer, reader):

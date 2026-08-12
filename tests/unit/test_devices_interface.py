@@ -2,6 +2,7 @@
 
 import datetime
 import typing
+import uuid
 
 import numpy as np
 import pytest
@@ -101,6 +102,46 @@ class _FakeScanner:
             timestamp=datetime.datetime.now(tz=datetime.UTC),
             metadata={"channel_index": channel},
         )
+
+    def scan_frames(
+        self,
+        parameters: ScanParameters,
+        channels: typing.Sequence[int],
+    ) -> list[Frame]:
+        """
+        Return one frame per channel, sharing the identity of one fake pass.
+
+        The reference shape of the contract: the pass identity is minted
+        *inside* this call, every sibling carries it plus the channel
+        list, and the single-channel ``scan_frame`` above attaches
+        neither — which is what makes the identity mean something.
+
+        Parameters
+        ----------
+        parameters : ScanParameters
+            Scan geometry, shared by every returned frame.
+        channels : typing.Sequence[int]
+            Channel indices to read out during the fake pass.
+
+        Returns
+        -------
+        list[Frame]
+            One frame per requested channel, in request order.
+        """
+        pass_id = str(uuid.uuid4())
+        timestamp = datetime.datetime.now(tz=datetime.UTC)
+        return [
+            Frame(
+                data=np.zeros(parameters.shape, dtype=np.float32),
+                timestamp=timestamp,
+                metadata={
+                    "channel_index": channel,
+                    "scan_pass_id": pass_id,
+                    "simultaneous_channels": list(channels),
+                },
+            )
+            for channel in channels
+        ]
 
     def close(self) -> None:
         """Release nothing; the fake owns no resources."""
@@ -232,6 +273,38 @@ def test_the_full_controller_is_not_a_runtime_check():
     """
     with pytest.raises(TypeError, match="runtime_checkable"):
         isinstance(_FakeInstrument(), InstrumentController)
+
+
+def test_scan_frames_share_a_pass_identity_that_scan_frame_never_carries():
+    """
+    The pass identity exists exactly where a pass exists.
+
+    This is the contract the interface docstrings promise: frames of one
+    ``scan_frames`` call all name the same ``scan_pass_id`` and the same
+    sibling channels, two *calls* never share one (each is its own pass
+    of the beam), and the single-channel ``scan_frame`` attaches neither
+    key — an identifier nothing establishes would be a claim, which is
+    what the earlier no-``scan_id`` rule was rightly protecting against.
+    """
+    scanner = _FakeScanner()
+    parameters = ScanParameters(height=8, width=16, pixel_time_us=1.0, fov_nm=50.0)
+    first_pass = scanner.scan_frames(parameters, [0, 1])
+    second_pass = scanner.scan_frames(parameters, [0, 1])
+    expected = 2
+    assert len(first_pass) == expected
+    pass_ids = {frame.metadata["scan_pass_id"] for frame in first_pass}
+    assert len(pass_ids) == 1
+    assert all(
+        frame.metadata["simultaneous_channels"] == [0, 1] for frame in first_pass
+    )
+    # A second call is a second pass, so its identity must be fresh.
+    assert (
+        second_pass[0].metadata["scan_pass_id"]
+        != first_pass[0].metadata["scan_pass_id"]
+    )
+    single = scanner.scan_frame(parameters, channel=0)
+    assert "scan_pass_id" not in single.metadata
+    assert "simultaneous_channels" not in single.metadata
 
 
 def test_stage_position_is_y_then_x_like_scan_parameters_shape():

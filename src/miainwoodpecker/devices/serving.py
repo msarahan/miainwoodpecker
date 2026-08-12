@@ -54,6 +54,49 @@ __all__ = ["accept_loop", "invoke", "serve_connection"]
 _LOGGER = logging.getLogger("miainwoodpecker.devices.serving")
 
 
+def _stackable_frames(value: object) -> list[Frame] | None:
+    """
+    Return the frames of a multi-frame result worth the shared-memory path.
+
+    A simultaneous multi-channel scan returns several frames from one
+    pass, and the reused-segment transport allows exactly one publish per
+    request/response cycle — so a qualifying set crosses as **one stacked
+    block** (:class:`~miainwoodpecker.devices.shared_frame.SharedFrameSetRef`)
+    rather than as N publishes that would overwrite each other. Qualifying
+    means: a non-empty list or tuple of nothing but frames, agreeing on
+    shape and dtype (true by construction for one pass, and required for
+    stacking), whose combined size clears the same threshold single
+    frames use. Anything else — a small set, or a heterogeneous one from
+    some future adapter — stays on the pickle path, which is correct for
+    every size and merely slower for large ones.
+
+    Parameters
+    ----------
+    value : object
+        A call's return value.
+
+    Returns
+    -------
+    list[Frame] | None
+        The frames to publish as one block, or ``None`` to leave the
+        value on the pickle path.
+    """
+    if not isinstance(value, (list, tuple)) or not value:
+        return None
+    if not all(isinstance(item, Frame) for item in value):
+        return None
+    frames = typing.cast("list[Frame]", list(value))
+    first = frames[0].data
+    if any(
+        frame.data.shape != first.shape or frame.data.dtype != first.dtype
+        for frame in frames[1:]
+    ):
+        return None
+    if sum(frame.data.nbytes for frame in frames) < SHARED_MEMORY_THRESHOLD_BYTES:
+        return None
+    return frames
+
+
 def invoke(
     target: object,
     call: Call,
@@ -112,6 +155,10 @@ def invoke(
                 if isinstance(value, Frame)
                 else writer.publish_spectrum(value)
             )
+        elif writer is not None and (frames := _stackable_frames(value)) is not None:
+            # The frames of one simultaneous scan, as one stacked block:
+            # see _stackable_frames for why one publish rather than N.
+            value = writer.publish_frames(frames)
         # The device's own close() just stopped its acquisition
         # thread; retire its shared-memory segment too, or it leaks
         # in /dev/shm - named segments aren't reclaimed when a

@@ -4,6 +4,48 @@
 
 ### Added
 
+- **The simultaneous multi-channel scan**, which is what a scanned
+  instrument actually does: one pass of the probe, every enabled
+  detector reading out at once.
+  `Scanner.scan_frames(parameters, channels)` returns one frame per
+  requested channel from **one** pass, so two channels cost one pass of
+  dose rather than two, nothing drifts between them, and DPC / iDPC /
+  centre-of-mass differences are taken between segments at the same
+  probe position. `scan_frame` is untouched; the new call is additive,
+  and `acquisition.multichannel_scan_series` is its series form.
+  Frames of a pass carry `scan_pass_id` (the identity of that one
+  traversal) and `simultaneous_channels` (the siblings that shared it).
+  **The identity is produced by `scan_frames` and by nothing else** —
+  `scan_frame` attaches neither key, so the id can never claim an
+  acquisition that did not happen, which is exactly why a bare `scan_id`
+  was refused before (this project having been bitten by
+  `probe_position`, an identifier nothing established). The old
+  `Frame` docstring premise that "a second channel is a second pass of
+  the beam" was false on real hardware and is now corrected there.
+  The Nion adapter uses the vendor's own mechanism rather than an
+  emulation — `set_channel_enabled`, one `start_frame`, `read_partial`
+  until complete, which is the loop `scan_base.ScanAcquisitionTask`
+  runs, and which returns one data element per enabled channel — and
+  verifies what the device did (no bad frame, the frame number did not
+  move, every requested channel reported) before stamping a shared id.
+  Nion mints a per-frame `uuid4` for the same purpose one layer up
+  (`stem.scan.scan_id`), so the concept is the vendor's; the rule that a
+  call must establish it is this project's.
+  Across the device-server boundary a pass crosses as **one stacked
+  block** in the source's existing shared-memory segment
+  (`SharedFrameSetRef`): the reused-segment design allows exactly one
+  publish per request/response cycle, so N publishes would overwrite
+  each other, N segments would double every source's `/dev/shm`
+  footprint, and N sequential replies would make the server hold a
+  finished pass between calls. Below the shared-memory threshold a pass
+  stays on the pickle path as an ordinary list. Storage needed no
+  change: `NexusWriter` persists each frame's metadata whole, so a
+  recorded series says which frames shared a pass with no new NeXus
+  layout invented for it.
+  `scan_frames` is part of the `Scanner` protocol rather than an
+  optional extra, so an out-of-tree adapter written before it no longer
+  satisfies `isinstance` and must add it — twenty lines, as
+  `tests/unit/test_out_of_tree_server.py`'s example server shows.
 - Process isolation for the viewer's analysis buttons, **on by
   default** (opt out with `MIAINWOODPECKER_ANALYSIS_ISOLATION=inprocess`).
   HyperSpy, eXSpy, py4DSTEM and LiberTEM run in a lazily-spawned worker
