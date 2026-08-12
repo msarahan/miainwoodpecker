@@ -50,6 +50,9 @@ measurements included:
 - [Other vendors](vendor-support.md) — what Thermo Fisher, JEOL, Zeiss,
   Hitachi and Bruker actually expose, and what a second device adapter
   would cost.
+- [DECTRIS detectors](adapters/dectris.md) — whether the ELA is reachable
+  without Gatan's software, what SIMPLON exposes, and the adapter built
+  on it.
 - [Development docs](documentation/index.md) — environments, linting,
   publishing.
 
@@ -64,5 +67,6 @@ Architecture review <architecture-review>
 Hardware validation checklist <hardware-validation-checklist>
 Work before hardware <pre-hardware-work>
 Other vendors <vendor-support>
+DECTRIS detectors <adapters/dectris>
 Development <documentation/index>
 :::

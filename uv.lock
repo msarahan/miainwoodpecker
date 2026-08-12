@@ -1665,6 +1665,9 @@ camera = [
 compression = [
     { name = "hdf5plugin" },
 ]
+dectris = [
+    { name = "tifffile" },
+]
 dev = [
     { name = "pre-commit" },
     { name = "ruff" },
@@ -1727,8 +1730,9 @@ requires-dist = [
     { name = "sphinx-autobuild", marker = "extra == 'docs'", specifier = ">=2024.10.3" },
     { name = "sphinx-copybutton", marker = "extra == 'docs'", specifier = ">=0.5.2" },
     { name = "sphinx-design", marker = "extra == 'docs'", specifier = ">=0.6.1" },
+    { name = "tifffile", marker = "extra == 'dectris'", specifier = ">=2024.7.24" },
 ]
-provides-extras = ["analysis", "camera", "compression", "dev", "device", "docs", "libertem", "py4dstem", "tests", "viewer"]
+provides-extras = ["analysis", "camera", "compression", "dectris", "dev", "device", "docs", "libertem", "py4dstem", "tests", "viewer"]
 
 [[package]]
 name = "mistune"
