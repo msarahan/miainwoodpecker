@@ -89,23 +89,45 @@ time either grew an option. The EELS behaviour is unchanged — same
 flattening, same refusal when no single axis is energy — and a spectrum
 recording simply takes a shorter route to the same ``Signal1D``.
 
-:func:`load_as_eds_signal` then sits *on top of* that shared path rather
-than beside it: it loads the spectrum exactly as above and adds the EDS
-signal type and eXSpy's detector metadata. Anything that later wants
-``EELS`` typing for the camera path adds the same kind of thin layer and
-inherits the same loader.
+:func:`load_as_eds_signal` and :func:`load_as_eels_signal` then sit *on
+top of* that shared path rather than beside it: each loads the spectrum
+exactly as above and adds only the two things the shared loader cannot —
+the eXSpy signal type, and the metadata that spectroscopy's own
+quantification reads. They are twins by construction, and each refuses
+the *other* one's layout rather than typing it: both spectroscopies end
+as the same ``Signal1D``, so nothing downstream would catch an EELS
+recording wearing ``EDS_TEM`` (eXSpy would fit X-ray lines to electron
+energy losses) or an EDX one wearing ``EELS`` (it would fit ionisation
+edges to X-ray lines).
 
 Requires the ``analysis`` optional dependency group
 (``pip install miainwoodpecker[analysis]``).
-:func:`load_as_eds_signal` additionally needs ``exspy``, which is where
-HyperSpy 2.x keeps its EELS and EDS signal classes — measured: a bare
-HyperSpy 2.4 install knows *no* signal types at all
-(``hs.print_known_signal_types()`` returns an empty table), and
-``EDSTEMSpectrum`` lives in ``exspy.signals``.
+:func:`load_as_eds_signal` and :func:`load_as_eels_signal` additionally
+need ``exspy``, which is where HyperSpy 2.x keeps its EELS and EDS signal
+classes — measured: a bare HyperSpy 2.4 install knows *no* signal types
+at all (``hs.print_known_signal_types()`` returns an empty table), so
+``set_signal_type("EELS")`` silently leaves a plain ``Signal1D``, and
+both ``EDSTEMSpectrum`` and ``EELSSpectrum`` live in ``exspy.signals``.
+
+The one asymmetry between the two is the energy unit, and it is the
+reason :func:`load_as_eels_signal` normalizes the axis rather than
+trusting it. eXSpy's **EDS** side validates: ``_get_line_energy``
+(``exspy.signals.eds``) accepts ``"eV"`` and ``"keV"`` and raises for
+anything else. Its **EELS** side does not check the axis units anywhere —
+measured by reading ``exspy/signals/eels.py`` in full — while assuming eV
+throughout: the ionisation-edge table it matches against
+``axes_manager.signal_axes[0].axis`` is in eV
+(``onset_energy (eV)``), ``align_zero_loss_peak``'s subpixel window
+defaults to ``(-3.0, 3.0)``, and ``kramers_kronig_analysis`` works in eV.
+This project's energy vocabulary also admits ``meV`` and ``keV``
+(:mod:`miainwoodpecker.storage.calibration`), so a recording in either
+would be silently misread by every one of those. Hence the exact,
+within-kind conversion in :func:`load_as_eels_signal`.
 """
 
 from __future__ import annotations
 
+import json
 import typing
 
 import hyperspy.api as hs
@@ -137,10 +159,21 @@ passes ``source=`` to keep the filename in the message it always had.
 
 _EDS_TEM = "EDS_TEM"
 _EDS_SEM = "EDS_SEM"
+_EELS = "EELS"
 # The energy unit this project writes, and one eXSpy accepts natively -
 # measured in exspy.signals.eds._get_line_energy, which handles "eV" and
-# "keV" and raises for anything else.
+# "keV" and raises for anything else. It is also the unit eXSpy's EELS
+# side assumes without ever checking, which is why load_as_eels_signal
+# converts to it rather than asserting it.
 _ENERGY_UNITS = "eV"
+# Volts to eXSpy's keV, amps to its nA, milliseconds to its seconds.
+# Every unit gap between this project's operator units and eXSpy's, in
+# one place, so a factor cannot go loose in the metadata - which would
+# make every number computed from it wrong by exactly that factor with
+# nothing saying so. See docs/adapters/spectrum-detectors.md, section 4.
+_VOLTS_PER_KILOVOLT = 1000.0
+_NANOAMPS_PER_AMP = 1.0e9
+_MILLISECONDS_PER_SECOND = 1000.0
 
 
 def _frame_time_calibration(values: np.ndarray) -> tuple[float, float]:
@@ -521,32 +554,24 @@ def load_as_eds_signal(
     ValueError
         If the file is a frame recording rather than a spectrum
         recording — an EELS camera stack reaches ``Signal1D`` through
-        :func:`load_as_hyperspy_spectrum` and is not EDS data.
-    ImportError
-        If ``exspy`` is not installed, since HyperSpy 2.x keeps its EDS
-        signal classes there and without it ``set_signal_type`` silently
-        produces a plain ``Signal1D``.
+        :func:`load_as_eels_signal` and is not EDS data.
+
+    Notes
+    -----
+    Propagates ``ImportError`` from :func:`_require_exspy` when ``exspy``
+    is not installed, since HyperSpy 2.x keeps its EDS signal classes
+    there and without it ``set_signal_type`` silently produces a plain
+    ``Signal1D``.
     """
     if not _holds_spectra(path):
         msg = (
             f"{path} is a frame recording, not a spectrum recording, so it is "
-            f"not EDS data; load it with load_as_hyperspy_spectrum (an EELS "
-            f"camera stack) or load_as_hyperspy_signal (an image stack)"
+            f"not EDS data; load it with load_as_eels_signal (an EELS camera "
+            f"stack), load_as_hyperspy_spectrum (the same, untyped), or "
+            f"load_as_hyperspy_signal (an image stack)"
         )
         raise ValueError(msg)
-    try:
-        import exspy  # noqa: F401, PLC0415 - imported for its signal-type registration
-    except ImportError as error:
-        msg = (
-            "reading a recording as an EDS signal needs 'exspy', which is "
-            "where HyperSpy 2.x keeps its EELS and EDS signal classes - a "
-            "bare HyperSpy install knows no signal types at all, so "
-            "set_signal_type('EDS_TEM') would quietly leave you with a plain "
-            "Signal1D. Install this project's 'analysis' extra, or exspy "
-            "directly. load_as_hyperspy_spectrum needs none of this and "
-            "returns the same data with the same energy axis."
-        )
-        raise ImportError(msg) from error
+    _require_exspy("EDS", signal_type)
 
     signal = load_as_hyperspy_spectrum(path)
     signal.set_signal_type(signal_type)
@@ -581,28 +606,330 @@ def _apply_eds_metadata(
     column = "SEM" if signal_type == _EDS_SEM else "TEM"
     detector = f"Acquisition_instrument.{column}.Detector.EDS"
     items: list[tuple[str, object]] = []
-    voltage = metadata.get(HIGH_TENSION_V_KEY)
-    if isinstance(voltage, (int, float)) and not isinstance(voltage, bool):
+    for key, item, factor in (
         # eXSpy's beam_energy is in keV; ours is in volts, as everywhere
-        # else in this project. One division, in one place.
-        beam_energy_kev = float(voltage) / 1000.0
-        items.append(
-            (f"Acquisition_instrument.{column}.beam_energy", beam_energy_kev),
-        )
-    for key, item in (
-        ("live_time_s", f"{detector}.live_time"),
-        ("real_time_s", f"{detector}.real_time"),
-        ("azimuth_deg", f"{detector}.azimuth_angle"),
-        ("elevation_deg", f"{detector}.elevation_angle"),
-        ("solid_angle_sr", f"{detector}.solid_angle"),
-        ("energy_resolution_ev", f"{detector}.energy_resolution_MnKa"),
-        ("beam_current_a", f"Acquisition_instrument.{column}.beam_current"),
+        # else in this project.
+        (
+            HIGH_TENSION_V_KEY,
+            f"Acquisition_instrument.{column}.beam_energy",
+            1.0 / _VOLTS_PER_KILOVOLT,
+        ),
+        # And its beam_current is in **nanoamps**, measured in
+        # exspy.signals.eds_tem: the dose calculation behind
+        # quantification reads it as nA and multiplies by 1e-9 to reach
+        # coulombs ("1e-9 is included here because the beam_current is in
+        # nA"). This project records amps, so a 200 pA probe written
+        # straight through arrived as 2e-10 nA and made every dose a
+        # billion times too small - silently, since neither end range
+        # checks it.
+        (
+            "beam_current_a",
+            f"Acquisition_instrument.{column}.beam_current",
+            _NANOAMPS_PER_AMP,
+        ),
+        ("live_time_s", f"{detector}.live_time", 1.0),
+        ("real_time_s", f"{detector}.real_time", 1.0),
+        ("azimuth_deg", f"{detector}.azimuth_angle", 1.0),
+        ("elevation_deg", f"{detector}.elevation_angle", 1.0),
+        ("solid_angle_sr", f"{detector}.solid_angle", 1.0),
+        ("energy_resolution_ev", f"{detector}.energy_resolution_MnKa", 1.0),
     ):
-        value = metadata.get(key)
-        if isinstance(value, (int, float)) and not isinstance(value, bool):
-            items.append((item, float(value)))
+        value = _number(metadata.get(key))
+        if value is not None:
+            items.append((item, value * factor))
     detector_type = metadata.get("detector_type")
     if detector_type is not None:
         items.append((f"{detector}.EDS_det", str(detector_type)))
     for item, value in items:
         signal.metadata.set_item(item, value)
+
+
+def _number(value: object) -> float | None:
+    """
+    Return a recorded value as a float, or ``None`` if it is not a number.
+
+    The rule the whole metadata mapping runs on: only what the recording
+    actually reported is set, and an absent or non-numeric entry is left
+    absent rather than written as zero. ``bool`` is excluded deliberately
+    — it is an ``int`` in Python and a flag in every recording that
+    carries one, so ``True`` reaching a beam energy would be a fabricated
+    1 keV.
+
+    Parameters
+    ----------
+    value : object
+        A value read out of a recording's metadata mapping.
+
+    Returns
+    -------
+    float | None
+        The value as a float, or ``None`` if it is not a real number.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
+
+
+def _require_exspy(technique: str, signal_type: str) -> None:
+    """
+    Import eXSpy, or raise a message naming what to install.
+
+    Imported for its side effect: eXSpy registers its signal classes with
+    HyperSpy on import, and nothing here uses the module object. Doing it
+    lazily, inside the function, is what lets this module be imported
+    without the extra — the same rule every other analysis import in this
+    project follows.
+
+    Parameters
+    ----------
+    technique : str
+        ``"EDS"`` or ``"EELS"``, for the sentence an operator reads.
+    signal_type : str
+        The signal type that would have been silently ignored.
+
+    Raises
+    ------
+    ImportError
+        If ``exspy`` is not installed. Raised rather than returning
+        something that looks right, because a bare HyperSpy install knows
+        *no* signal types at all — measured:
+        ``hs.print_known_signal_types()`` returns an empty table — so
+        ``set_signal_type`` neither errors nor warns, it simply does
+        nothing.
+    """
+    try:
+        import exspy  # noqa: F401, PLC0415 - imported for its signal-type registration
+    except ImportError as error:
+        msg = (
+            f"reading a recording as an {technique} signal needs 'exspy', "
+            f"which is where HyperSpy 2.x keeps its EELS and EDS signal "
+            f"classes - a bare HyperSpy install knows no signal types at all, "
+            f"so set_signal_type({signal_type!r}) would quietly leave you with "
+            f"a plain Signal1D. Install this project's 'analysis' extra, or "
+            f"exspy directly. load_as_hyperspy_spectrum needs none of this and "
+            f"returns the same data with the same energy axis."
+        )
+        raise ImportError(msg) from error
+
+
+def load_as_eels_signal(path: os.PathLike[str] | str) -> hs.signals.Signal1D:
+    """
+    Read an EELS camera recording as an eXSpy ``EELSSpectrum``.
+
+    The exact counterpart of :func:`load_as_eds_signal`, and a thin layer
+    over :func:`load_as_hyperspy_spectrum` for the same reason: the
+    arrays, the flattening across the spectrometer slit, and the energy
+    axis all come from there, and what this adds is the signal type and
+    the instrument metadata eXSpy's EELS model reads.
+
+    **The energy axis is normalized to eV here, and that is not
+    cosmetic.** eXSpy's EDS side validates its axis unit
+    (``_get_line_energy`` accepts ``"eV"``/``"keV"`` and raises
+    otherwise); its EELS side never checks. It assumes eV everywhere
+    instead — the ionisation-edge onsets it matches against the axis are
+    tabulated in eV, ``align_zero_loss_peak``'s subpixel window defaults
+    to ±3 *eV*, and ``kramers_kronig_analysis`` works in eV. This
+    project's energy vocabulary also admits ``meV`` and ``keV``, so a
+    spectrometer recorded in either would be misread by all of them
+    without a word. The conversion is
+    :meth:`~miainwoodpecker.storage.calibration.AxisCalibration.converted_to`,
+    which is exact within a kind, so an eV recording (every one this
+    project's device layer produces today) is untouched.
+
+    **What eXSpy metadata this can and cannot fill in.** Set, from the
+    frame metadata the recording carries:
+
+    - ``Acquisition_instrument.TEM.beam_energy`` — from
+      ``high_tension_v``, **divided by 1000** because eXSpy holds it in
+      keV and this project holds accelerating voltage in volts.
+    - ``Acquisition_instrument.TEM.beam_current`` — from
+      ``beam_current_a``, **times 1e9** because eXSpy holds it in nA.
+    - ``Acquisition_instrument.TEM.Detector.EELS.exposure`` — from
+      ``exposure_ms``, in seconds, which is the unit RosettaSciIO's
+      DigitalMicrograph reader maps this item from.
+
+    **Left unset, deliberately**, because nothing this project records
+    carries them and a plausible-looking wrong angle poisons every
+    quantification computed from it:
+
+    - ``Acquisition_instrument.TEM.convergence_angle`` (convergence
+      semi-angle, mrad). The only place a convergence angle exists
+      anywhere in this stack is usim's ``"ConvergenceAngle"`` control,
+      which appears in *no* Nion package outside the simulator — reading
+      it would be encoding a simulator detail as an instrument
+      convention, which is the mistake this project's control-name list
+      is careful not to make.
+    - ``Acquisition_instrument.TEM.Detector.EELS.collection_angle``
+      (collection semi-angle, mrad). It is set by the spectrometer
+      entrance aperture and the camera length, neither of which any
+      device here reports.
+    - ``…Detector.EELS.spectrometer``, ``…aperture_size``,
+      ``…frame_number``. A recording knows the *camera*'s name, not the
+      spectrometer's model or its aperture; ``frame_number`` counts
+      readouts summed into one spectrum, which this project never
+      requests.
+
+    Leaving them out is not merely honest, it is *safe*: eXSpy checks for
+    exactly those three items (``_are_microscope_parameters_missing``)
+    and **refuses** the operations that need them — ``estimate_thickness``
+    with a ``density`` raises rather than applying an angular correction
+    from someone else's geometry. Supply them per session with eXSpy's
+    own ``signal.set_microscope_parameters(...)``, which is the
+    documented way in and the only one that puts the operator's knowledge
+    where it belongs.
+
+    Reads the file; there is no frames-taking twin because the metadata
+    this adds is read from the file, not from a
+    :class:`~miainwoodpecker.storage.nexus.FrameStack`.
+
+    Parameters
+    ----------
+    path : os.PathLike[str] | str
+        A frame recording written by
+        :class:`~miainwoodpecker.storage.nexus.NexusWriter` whose axis
+        calibration names one direction as energy — an EEL spectrometer
+        dispersing onto a camera. See
+        :meth:`miainwoodpecker.storage.calibration.FrameCalibration.spectrum`.
+
+    Returns
+    -------
+    hyperspy.signals.Signal1D
+        An ``exspy.signals.EELSSpectrum`` with an eV energy axis, frame
+        time in seconds as its navigation axis, and whatever of the
+        metadata above the recording carried.
+
+    Raises
+    ------
+    ValueError
+        If the file is a spectrum recording rather than a frame
+        recording — an EDX detector's counts are not electron energy
+        losses, and once loaded the two are indistinguishable, so this
+        refuses instead of typing it. Also propagated from
+        :func:`load_as_hyperspy_spectrum` when the recording has no
+        single energy-calibrated axis to flatten along.
+
+    Notes
+    -----
+    Propagates ``ImportError`` from :func:`_require_exspy` when ``exspy``
+    is not installed, since HyperSpy 2.x keeps its EELS signal classes
+    there and without it ``set_signal_type`` silently produces a plain
+    ``Signal1D``.
+    """
+    if _holds_spectra(path):
+        msg = (
+            f"{path} is a spectrum recording, not a frame recording, so it is "
+            f"not EELS data: this project's spectrum layout is written by "
+            f"SpectrumWriter for detectors that are natively 1D, of which an "
+            f"EDX detector is the case in hand. Load it with "
+            f"load_as_eds_signal, or with load_as_hyperspy_spectrum for an "
+            f"untyped Signal1D. An EEL spectrometer disperses onto a camera "
+            f"and is recorded as a frame stack"
+        )
+        raise ValueError(msg)
+    _require_exspy("EELS", _EELS)
+
+    signal = load_as_hyperspy_spectrum(path)
+    _to_electronvolts(signal.axes_manager.signal_axes[0])
+    signal.set_signal_type(_EELS)
+    _apply_eels_metadata(signal, _first_frame_metadata(path))
+    return signal
+
+
+def _to_electronvolts(axis: typing.Any) -> None:  # noqa: ANN401 - HyperSpy UniformDataAxis
+    """
+    Rescale one HyperSpy energy axis into electronvolts, in place.
+
+    Parameters
+    ----------
+    axis : typing.Any
+        A HyperSpy ``UniformDataAxis`` carrying an energy calibration in
+        one of this project's energy units.
+
+    Notes
+    -----
+    Propagates ``ValueError`` from
+    :class:`~miainwoodpecker.storage.calibration.AxisCalibration` if the
+    axis is not in an energy unit at all. Unreachable through
+    :func:`load_as_eels_signal`, which reaches here only for an axis the
+    calibration model already called
+    :attr:`~miainwoodpecker.storage.calibration.AxisKind.ENERGY`.
+    """
+    if axis.units == _ENERGY_UNITS:
+        return
+    converted = AxisCalibration(
+        AxisKind.ENERGY,
+        axis.scale,
+        axis.offset,
+        str(axis.units),
+    ).converted_to(_ENERGY_UNITS)
+    _apply(axis, str(axis.name), converted)
+
+
+def _first_frame_metadata(path: os.PathLike[str] | str) -> dict[str, object]:
+    """
+    Read a frame recording's first-frame metadata blob.
+
+    The frame-side twin of ``read_spectra(path).metadata[0]``, which is
+    where :func:`load_as_eds_signal` gets the same facts. The blob is the
+    first frame's metadata, written at ``close()``; a recording that was
+    never finalized simply has none, and an absent blob yields an empty
+    mapping rather than an error, because "nobody recorded the beam
+    energy" is not a reason to refuse to load the spectrum.
+
+    Parameters
+    ----------
+    path : os.PathLike[str] | str
+        A frame recording written by
+        :class:`~miainwoodpecker.storage.nexus.NexusWriter`.
+
+    Returns
+    -------
+    dict[str, object]
+        The first frame's metadata, or ``{}`` if the file carries none.
+    """
+    import h5py  # noqa: PLC0415 - a base dependency, imported where it is used
+
+    with h5py.File(path, "r") as handle:
+        dataset = handle.get(layout.VENDOR_METADATA)
+        raw = None if dataset is None else dataset[()]
+    if raw is None:
+        return {}
+    text = raw.decode("utf-8") if isinstance(raw, bytes) else str(raw)
+    stored = json.loads(text)
+    return stored if isinstance(stored, dict) else {}
+
+
+def _apply_eels_metadata(
+    signal: hs.signals.Signal1D,
+    metadata: dict[str, object],
+) -> None:
+    """
+    Copy a recording's instrument facts into eXSpy's EELS metadata tree.
+
+    Only what the recording actually reported is set, by exactly the rule
+    :func:`_apply_eds_metadata` follows: an absent key is left absent
+    rather than written as zero, so eXSpy's own behaviour for a missing
+    item stands and is visibly a default. See
+    :func:`load_as_eels_signal` for the three items this can fill and the
+    three it deliberately cannot.
+
+    Parameters
+    ----------
+    signal : hs.signals.Signal1D
+        The signal to annotate, already typed.
+    metadata : dict[str, object]
+        The recording's first-frame metadata.
+    """
+    tem = "Acquisition_instrument.TEM"
+    for key, item, factor in (
+        (HIGH_TENSION_V_KEY, f"{tem}.beam_energy", 1.0 / _VOLTS_PER_KILOVOLT),
+        ("beam_current_a", f"{tem}.beam_current", _NANOAMPS_PER_AMP),
+        (
+            "exposure_ms",
+            f"{tem}.Detector.EELS.exposure",
+            1.0 / _MILLISECONDS_PER_SECOND,
+        ),
+    ):
+        value = _number(metadata.get(key))
+        if value is not None:
+            signal.metadata.set_item(item, value * factor)

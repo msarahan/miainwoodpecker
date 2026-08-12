@@ -201,6 +201,62 @@
   have*, which is the clearest evidence yet that a fixed positional tuple
   is the wrong mechanism.
 
+- **An EELS analysis path: `analysis.hyperspy_bridge.load_as_eels_signal`.**
+  The project had none, on an instrument class where EELS is often the
+  reason the instrument exists — `docs/analysis-parity.md` found the
+  cause (HyperSpy 2.x contains no EELS classes; they moved to eXSpy at
+  the 2.0 split) and eXSpy was already in the `analysis` extra from the
+  EDX work. An EELS camera recording now reaches an
+  `exspy.signals.EELSSpectrum`, with the recording's own energy axis,
+  through the same shared `load_as_hyperspy_spectrum` loader an EDX
+  recording uses. Exactly the thin layer `load_as_eds_signal` is, and
+  the two now refuse each other's on-disk layout — once loaded a
+  spectrum is a spectrum, so nothing downstream would catch eXSpy
+  fitting X-ray lines to electron energy losses or ionisation edges to
+  X-ray lines.
+
+  **The energy axis is normalized to eV, and that is not cosmetic.**
+  eXSpy's EDS code validates its axis unit (`_get_line_energy` takes eV
+  or keV and raises otherwise); its EELS code checks nowhere while
+  assuming eV everywhere — tabulated edge onsets in eV,
+  `align_zero_loss_peak`'s ±3 eV subpixel window,
+  `kramers_kronig_analysis` in eV. This project's vocabulary also admits
+  meV (the natural unit for a monochromated vibrational spectrum), so the
+  exact within-kind conversion happens on this side or not at all.
+
+  **Two eXSpy items are deliberately left unset**: the convergence and
+  collection semi-angles. Nothing here records either — the collection
+  angle comes from the spectrometer entrance aperture and camera length,
+  which no device reports, and the only convergence angle in the whole
+  stack is a control that exists in usim and in no other Nion package,
+  so reading it would dress a simulator detail as an instrument
+  convention. Absent is also the safe state: eXSpy checks for exactly
+  these and *refuses* the operations that need them, where a plausible
+  wrong angle would have produced a number that looks like a result.
+  Set, from what the recordings do carry: `beam_energy` (volts→keV),
+  `beam_current` (amps→nA), and `Detector.EELS.exposure` (ms→s).
+
+  **The axis is proved end to end against the simulator, not against our
+  own array.** `tests/integration/test_eels_round_trip.py` sweeps the
+  spectrometer with `energy_offset_series` and asserts that eXSpy finds
+  the zero-loss peak at 0 eV in every step while the peak itself moves
+  160 channels across the detector. The zero-loss peak is at zero by
+  definition and the simulator plots it there independently; an adapter
+  that lost the offset would report +100/+60/+20 eV, one that halved the
+  dispersion would report −50/−30/−10 eV (verified by mutating the
+  adapter), and one that lost the calibration would report a channel
+  index. Only carrying both numbers through puts it at zero three times.
+
+  **No viewer button**, and that is a decision. The analysis buttons act
+  on the viewer's single camera, which `_choose_camera` resolves to the
+  **Ronchigram** camera wherever there is one — so the button would
+  refuse every click on the default configuration. And every EELS
+  operation past loading needs a parameter an operator must choose
+  (`estimate_thickness` raises without a threshold or a ZLP; background
+  removal needs a fit window; mapping needs edges), while the one with
+  usable defaults returns a recalibrated copy of the input rather than
+  anything to draw. Reasoning recorded in `docs/analysis-parity.md`.
+
 - **The spectrum server's playback is `--backend replay`, and
   `--backend hardware` refuses.** Playback was originally the `hardware`
   backend, honestly labelled — every spectrum carried `backend: "replay"`
@@ -447,6 +503,17 @@
   a shape would put a number on screen that no acquisition would produce.
 
 ### Fixed
+
+- **EDS beam current reached eXSpy a billion times too small.**
+  `load_as_eds_signal` wrote `beam_current_a` straight into
+  `Acquisition_instrument.TEM.beam_current`, which eXSpy reads as
+  **nanoamps** — `exspy/signals/eds_tem.py`'s dose calculation multiplies
+  it by 1e-9 to reach coulombs, and says so in a comment. A 200 pA probe
+  therefore arrived as 2e-10 nA, making every dose-based quantification
+  wrong by 1e9 with nothing saying so. Found while mapping the same
+  metadata tree for EELS. Now converted in the one place all the other
+  unit conversions live, and `docs/adapters/spectrum-detectors.md` §4's
+  units table gained the row that would have prevented it.
 
 - **Phase 2's napari-versus-`ndv` question is closed: keep napari.**
   Measured on an M2 Pro across a 16× range of frame sizes, display cost

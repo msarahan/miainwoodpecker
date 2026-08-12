@@ -117,6 +117,15 @@ class Frame:
         The vendor's own label for the detector (``"ronchigram"``,
         ``"eels"``), which is what an analysis tool needs to know what
         kind of data this is.
+    ``exposure_ms``, ``binning``
+        What the frame was taken with. Every camera adapter here attaches
+        both, and the EELS adapter
+        (:func:`~miainwoodpecker.analysis.hyperspy_bridge.load_as_eels_signal`)
+        maps the exposure onto eXSpy's own detector item — so it is part
+        of the vocabulary rather than a Nion detail, and listed here
+        where the rest of it is. The caveat ``nion_server`` records
+        applies: this is the *configured* exposure, which the frame
+        already in flight during a ``configure`` was not taken at.
     ``counts_per_electron``
         Detector gain, where the device publishes it.
     ``frame_number``, ``integration_count``
