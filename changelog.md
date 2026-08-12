@@ -4,8 +4,8 @@
 
 ### Added
 
-- Optional process isolation for the viewer's analysis buttons
-  (`MIAINWOODPECKER_ANALYSIS_ISOLATION=process`, **off by default**).
+- Process isolation for the viewer's analysis buttons, **on by
+  default** (opt out with `MIAINWOODPECKER_ANALYSIS_ISOLATION=inprocess`).
   HyperSpy, eXSpy, py4DSTEM and LiberTEM run in a lazily-spawned worker
   (`python -m miainwoodpecker.analysis.worker`) that reuses the device
   layer's `Call`/`Result` protocol, its dispatch loop, and its
@@ -18,8 +18,14 @@
   (ten call sites, one of which computes), a capability/licence table
   with permissive alternatives, and a precise statement of the licence
   question — including why isolation cannot answer it, since the
-  documented `load_as_*` API returns live library objects by design. Off
-  by default is deliberate: the decision is the project owner's.
+  documented `load_as_*` API returns live library objects by design. It
+  shipped off by default so the decision would be the project owner's,
+  and the owner made both calls: isolation on, for crash containment —
+  a segfault in a native analysis library used to take the session and
+  any in-flight recording, and now costs one result and a worker
+  restart — and the licensing posture left as it is, expressly not the
+  reason for the switch. The opt-out is the whole word `inprocess`, so
+  a typo cannot silently disable the protection.
 - `scripts/analysis_ipc_benchmark.py`, the analysis-side counterpart to
   `scripts/ipc_overhead_benchmark.py`. Interleaves the two transports
   call by call, because measuring them sequentially produced a

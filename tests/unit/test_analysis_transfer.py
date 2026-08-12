@@ -172,9 +172,22 @@ def test_every_target_names_an_extra_and_a_probe_module():
         assert target.eager_modules
 
 
-def test_isolation_is_off_unless_the_environment_says_otherwise(monkeypatch):
-    """The default is unchanged from before this layer existed."""
+def test_isolation_is_on_unless_the_environment_opts_out(monkeypatch):
+    """
+    The default is isolated, by the project owner's decision.
+
+    Isolation shipped off by default so that switching it on would be a
+    recorded choice rather than an agent answering the owner's question
+    for them; the owner then chose on, for crash containment — a segfault
+    in a native analysis library used to take the session and any
+    in-flight recording with it. Unset therefore means isolated, and the
+    opt-out is the explicit word ``inprocess``.
+    """
     monkeypatch.delenv(remote.ISOLATION_ENV_VAR, raising=False)
+    assert isolation_enabled() is True
+    assert isinstance(analysis_runner("hyperspy"), WorkerRunner)
+
+    monkeypatch.setenv(remote.ISOLATION_ENV_VAR, "inprocess")
     assert isolation_enabled() is False
     assert isinstance(analysis_runner("hyperspy"), InProcessRunner)
 
@@ -183,10 +196,20 @@ def test_isolation_is_off_unless_the_environment_says_otherwise(monkeypatch):
     assert isinstance(analysis_runner("hyperspy"), WorkerRunner)
 
 
-def test_an_unrecognised_isolation_setting_does_not_silently_isolate(monkeypatch):
-    """Only the documented value turns it on; a typo leaves the default."""
-    monkeypatch.setenv(remote.ISOLATION_ENV_VAR, "subprocess")
-    assert isolation_enabled() is False
+def test_a_typo_cannot_silently_disable_the_isolation(monkeypatch):
+    """
+    Only the exact word ``inprocess`` opts out.
+
+    The dangerous misconfiguration inverted with the default: it used to
+    be a typo that failed to *enable* isolation, which cost nothing but
+    the protection you thought you asked for; now it would be a typo that
+    silently *disabled* crash containment. So anything that is not the
+    documented opt-out keeps the safe default.
+    """
+    monkeypatch.setenv(remote.ISOLATION_ENV_VAR, "in-process")
+    assert isolation_enabled() is True
+    monkeypatch.setenv(remote.ISOLATION_ENV_VAR, "off")
+    assert isolation_enabled() is True
 
 
 def test_availability_is_answered_without_importing_anything():
@@ -230,7 +253,7 @@ def test_a_missing_extra_is_an_import_error_in_both_modes(monkeypatch):
             ("miainwoodpecker_nonesuch",),
         ),
     )
-    monkeypatch.delenv(remote.ISOLATION_ENV_VAR, raising=False)
+    monkeypatch.setenv(remote.ISOLATION_ENV_VAR, "inprocess")
     with pytest.raises(ImportError):
         open_runner("nonesuch")
 
