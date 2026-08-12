@@ -500,6 +500,23 @@ class SimplonClient:
     def __init__(self, address: str, *, timeout_s: float = _DEFAULT_TIMEOUT_S) -> None:
         self._address = _normalise_address(address)
         self._timeout_s = timeout_s
+        # Never through a proxy. urllib's default opener consults
+        # $HTTP_PROXY and, on macOS, the system proxy configuration - and
+        # a detector control unit is exactly the host you must not send
+        # through one. A DCU lives on a private instrument network, so a
+        # proxy either cannot route to it (the request hangs until the
+        # timeout, or fails with a confusing error attributed to the
+        # detector) or, worse, resolves the address to something else
+        # entirely. An explicit empty ProxyHandler is the documented way
+        # to say "direct".
+        #
+        # This is not hypothetical: the simulated backend talks to its own
+        # mock DCU on 127.0.0.1, and whether that works with the default
+        # opener depends on whether the machine happens to list 127.0.0.1
+        # in $no_proxy. CI is not a machine you control.
+        self._opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({}),
+        )
 
     @property
     def address(self) -> str:
@@ -689,7 +706,7 @@ class SimplonClient:
             headers={"Content-Type": "application/json"} if body else {},
         )
         try:
-            with urllib.request.urlopen(  # noqa: S310 - http:// only, built above
+            with self._opener.open(
                 request,
                 timeout=self._timeout_s,
             ) as response:

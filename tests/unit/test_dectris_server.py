@@ -62,6 +62,9 @@ _SHORTER_EXPOSURE_MS = 4.0
 _NOT_FOUND = 404
 
 
+_TWO_DIMENSIONS = 2
+
+
 @pytest.fixture
 def detector():
     """Open a camera against a mock control unit, in this process."""
@@ -410,21 +413,35 @@ def test_an_already_armed_detector_names_who_might_have_it():
         camera.close()
 
 
-def test_an_unreachable_control_unit_names_the_cause():
+def test_an_unreachable_control_unit_names_the_address_and_a_way_forward():
     """
-    "Nothing is listening" and "wrong box entirely" are different sentences.
+    A dead address produces a diagnosis, not a bare traceback.
 
-    A DCU commonly has two interfaces — a control network and a 10 GbE
-    data link — and SIMPLON is served by the control unit rather than by
-    the detector head, so a refused connection has a specific and
-    checkable meaning. Bound and immediately closed, so the port is
-    genuinely free rather than merely unlikely to be used.
+    Deliberately does *not* assert which transport branch fires. Whether
+    connecting to a free loopback port is refused or times out is the
+    platform's choice, not this adapter's: Linux sends an immediate RST
+    and produces ``ConnectionRefusedError``, while macOS and Windows were
+    both observed in CI taking the timeout path instead. Asserting
+    "Nothing is listening" here made a real cross-platform difference
+    look like a bug in the hint.
+
+    What is genuinely this adapter's contract, and is asserted: the
+    message names the address that failed, and tells the operator how to
+    proceed without a detector. Which sentence each transport cause gets
+    is pinned separately and platform-independently in
+    :func:`test_each_transport_failure_gets_its_own_sentence`, by handing
+    the hint function the causes directly rather than trying to provoke
+    them through a real socket.
     """
     with socket.socket() as probe:
         probe.bind(("127.0.0.1", 0))
-        address = f"127.0.0.1:{probe.getsockname()[1]}"
-    with pytest.raises(DetectorOpenError, match="Nothing is listening"):
+        port = probe.getsockname()[1]
+        address = f"127.0.0.1:{port}"
+    with pytest.raises(DetectorOpenError) as raised:
         DectrisCamera(address, timeout_s=2.0)
+    message = str(raised.value)
+    assert str(port) in message
+    assert "--backend simulated" in message
 
 
 def test_something_that_is_not_a_control_unit_names_the_api_version():
@@ -683,3 +700,42 @@ class _always_404_server:  # noqa: N801 - a context manager used as one
         self._server.shutdown()
         self._server.server_close()
         self._thread.join(timeout=5.0)
+
+
+def test_a_control_unit_is_reached_directly_rather_than_through_a_proxy(
+    monkeypatch,
+):
+    """
+    An HTTP proxy in the environment must not be used to reach a detector.
+
+    ``urllib``'s default opener consults ``$HTTP_PROXY`` and, on macOS,
+    the system proxy configuration. A DECTRIS control unit is precisely
+    the host that must never be reached that way: it sits on a private
+    instrument network, so a proxy either cannot route to it — the
+    request hangs until the timeout and the failure gets attributed to
+    the detector — or resolves the address to something else entirely.
+
+    This is not a hypothetical. Without an explicit empty
+    ``ProxyHandler``, whether the *simulated* backend works at all
+    depends on whether the machine happens to list ``127.0.0.1`` in
+    ``$no_proxy``, because it talks to its own mock DCU over real HTTP on
+    loopback. CI is not a machine you control: this was found when macOS
+    runners failed every test that spawns a device server, while Linux
+    passed, because the two disagreed about proxy defaults.
+
+    The proxy here points at port 9 (discard), so anything actually
+    routed through it fails rather than quietly succeeding.
+    """
+    for variable in ("HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"):
+        monkeypatch.setenv(variable, "http://127.0.0.1:9")
+    monkeypatch.setenv("no_proxy", "")
+    monkeypatch.setenv("NO_PROXY", "")
+
+    camera = open_camera(SIMULATED_BACKEND, "ignored")
+    try:
+        camera.start()
+        frame = camera.acquire_frame()
+    finally:
+        camera.close()
+    assert frame.data.ndim == _TWO_DIMENSIONS
+    assert frame.data.size > 0
