@@ -101,6 +101,8 @@ from miainwoodpecker.devices.interface import (
     BEAM_BLANKER_CONTROL,
     DEFOCUS_CONTROL,
     ENERGY_OFFSET_CONTROL,
+    IMAGE_READOUT,
+    PROJECTED_READOUT,
     STAGE_POSITION_CONTROL,
     CameraParameters,
     Frame,
@@ -230,6 +232,38 @@ _STAGE_POSITION_CONTROL_NAME = "stage_position_m"
 # usim, whose eels_x_offset calibration control tracks it exactly, so the
 # recorded energy axis follows the offset with no conversion between them.
 _ENERGY_OFFSET_CONTROL_NAME = "ZLPoffset"
+
+# Nion's name for the projected readout. What the interface's
+# PROJECTED_READOUT maps onto: CameraFrameParameters has no per-axis
+# binning anywhere, and "sum the whole non-dispersive direction to 1D" is
+# expressed as this processing mode.
+#
+# **A plain acquire does not honour it, and that is measured, not
+# inferred.** nionswift-usim 5.4.2's CameraDevice reads `processing` in
+# exactly three places - `_acquire_sequence` (lines 241, 254, 272) and
+# `CameraTask.start` (line 393) - all of them the sequence/SI paths.
+# `Camera.__acquire_image`, which `acquire_image()` and therefore this
+# server calls, never consults it and asserts the buffer is 2D
+# (`assert len(xdata_buffer.dimensional_shape) == 2`). Confirmed by
+# running it: with processing="sum_project" set and validated through
+# `validate_frame_parameters`, `acquire_image()` returns the full
+# (256, 1024) EELS frame while `_acquire_sequence(2)` returns (2, 1024).
+# Nion says as much itself, twice: CameraControl_test's
+# `test_eels_calibrations` notes '"sum_project" is for sequence/SI only'
+# and it is 'an error to run view mode with "sum_project" enabled', and
+# nionswift-instrumentation 23.6.2's CameraHardwareSource.__init__
+# (camera_base.py:2129-2134) clears `processing` off the view and record
+# frame parameters outright - 'it should never be enabled'.
+#
+# So the mode is still handed to the device, because a vendor camera that
+# *can* project in its readout should be allowed to; and when the device
+# hands back an image anyway, NionCamera.acquire_frame does the sum and
+# the frame's "projected_by" metadata says "server" rather than "sensor".
+# That distinction is about noise statistics, not bookkeeping: a sensor
+# that sums before readout pays one readout's noise, a server summing N
+# rows pays N of them, so a recording must not imply the first when it
+# got the second.
+_SUM_PROJECT_PROCESSING = "sum_project"
 
 _NM_PER_M = 1e9
 # Only a geometry hint for choosing a field of view. Nion's device_kit
@@ -371,6 +405,29 @@ def _instrument_state(
     return state
 
 
+def _readout_of(
+    frame_parameters: typing.Any,  # noqa: ANN401 - vendor CameraFrameParameters
+) -> str:
+    """
+    Translate a vendor frame-parameter set's processing into a readout mode.
+
+    Parameters
+    ----------
+    frame_parameters : typing.Any
+        A ``nion.instrumentation.camera_base.CameraFrameParameters``.
+
+    Returns
+    -------
+    str
+        ``PROJECTED_READOUT`` when its processing is Nion's
+        ``"sum_project"``, else ``IMAGE_READOUT``.
+    """
+    processing = getattr(frame_parameters, "processing", None)
+    if processing == _SUM_PROJECT_PROCESSING:
+        return PROJECTED_READOUT
+    return IMAGE_READOUT
+
+
 class NionCamera:
     """A ``Camera`` implementation wrapping a Nion device-kit camera device."""
 
@@ -391,6 +448,7 @@ class NionCamera:
         self._parameters = CameraParameters(
             exposure_ms=float(defaults.exposure_ms),
             binning=int(defaults.binning),
+            readout=_readout_of(defaults),
         )
 
     @property
@@ -433,13 +491,23 @@ class NionCamera:
         frame after ``start`` is already correct. So a caller who needs a
         frame taken at known settings should configure before starting,
         and one configuring live should expect a frame or two of overlap.
-        The frames themselves stay honest about binning either way, since
-        it is recovered from their shape.
+        The frames themselves stay honest about binning and readout
+        either way, since both are recovered from their shape.
+
+        **A projected readout maps onto Nion's**
+        ``processing = "sum_project"`` — the only per-axis reduction
+        Nion's camera API has (there is no per-axis binning anywhere in
+        ``CameraFrameParameters``). The device is handed the processing
+        mode so a camera that honours it in hardware may; measured
+        against usim, the device consults it only on the sequence/SI
+        paths and the plain acquire this server drives ignores it, so
+        :meth:`acquire_frame` sums server-side and says so in
+        ``projected_by``. See ``_SUM_PROJECT_PROCESSING``.
 
         Parameters
         ----------
         parameters : CameraParameters
-            The requested exposure and binning.
+            The requested exposure, binning, and readout mode.
 
         Returns
         -------
@@ -461,6 +529,11 @@ class NionCamera:
         frame_parameters = _camera_base.CameraFrameParameters(
             exposure_ms=parameters.exposure_ms,
             binning=parameters.binning,
+            processing=(
+                _SUM_PROJECT_PROCESSING
+                if parameters.readout == PROJECTED_READOUT
+                else None
+            ),
         )
         validate = getattr(self._device, "validate_frame_parameters", None)
         if callable(validate):
@@ -469,6 +542,7 @@ class NionCamera:
         self._parameters = CameraParameters(
             exposure_ms=float(frame_parameters.exposure_ms),
             binning=int(frame_parameters.binning),
+            readout=_readout_of(frame_parameters),
         )
         return self._parameters
 
@@ -546,15 +620,47 @@ class NionCamera:
         self._device.stop_live()
 
     def acquire_frame(self) -> Frame:
-        """Return the next available frame; requires ``start`` to have been called."""
+        """
+        Return the next available frame; requires ``start`` to have been called.
+
+        Under a projected readout the returned frame is **1D** — the
+        non-dispersive direction summed away, the surviving axis keeping
+        its calibration verbatim (:meth:`calibration_metadata` already
+        calibrates only ``x`` for a 1D shape, as Nion does). Who summed
+        is recorded rather than implied: ``projected_by`` is
+        ``"sensor"`` when the device delivered 1D data itself, and
+        ``"server"`` when this method summed a 2D image the sensor
+        delivered — measured against usim, the plain-acquire path always
+        lands on the second, because the device honours ``sum_project``
+        only for sequence/SI acquisition. The binning is recovered from
+        the sensor's shape *before* the projection, so an in-flight
+        frame stays correctly labelled.
+
+        Returns
+        -------
+        Frame
+            The next frame: 2D under an image readout, 1D under a
+            projected one.
+        """
         data_element = self._device.acquire_image()
         data = data_element["data"]
         metadata = dict(data_element.get("properties") or {})
+        # From the shape the sensor delivered, before any server-side
+        # projection collapses the evidence.
         binning = self._binning_of(data.shape)
+        projected_by: str | None = None
+        if data.ndim == 1:
+            # The device itself delivered a spectrum - a camera honouring
+            # sum_project in hardware, or one vertically binned to a
+            # single row (usim squeezes that case to 1D too).
+            projected_by = "sensor"
+        elif self._parameters.readout == PROJECTED_READOUT:
+            data = data.sum(axis=0)
+            projected_by = "server"
         calibration = self.calibration_metadata(data.shape, float(binning))
         if calibration is not None:
             metadata[_calibration.METADATA_KEY] = calibration
-        metadata.update(self._frame_metadata(binning))
+        metadata.update(self._frame_metadata(binning, projected_by))
         self._frame_index += 1
         return Frame(
             data=data,
@@ -578,10 +684,21 @@ class NionCamera:
         so a camera that bins asymmetrically is handled by its own rules
         rather than by dividing and hoping.
 
+        **A 1D shape is a projected frame**, and its recovery is defined
+        the way Nion defines the projection: ``sum_project`` drops the
+        leading (non-dispersive) dimension and keeps the trailing one
+        (``CameraTask.start`` uses ``get_expected_dimensions(binning)[1:]``),
+        so a 1D shape is matched against the *trailing* axes of each
+        supported factor's expected dimensions. The widths differ per
+        factor, so the match is as unambiguous as the 2D one. Server-side
+        projection never reaches this case — ``acquire_frame`` recovers
+        the binning from the sensor's 2D shape before summing — so it
+        exists for a device that projects in hardware.
+
         Parameters
         ----------
         shape : tuple[int, ...]
-            The acquired frame's shape.
+            The acquired frame's shape, 2D or 1D.
 
         Returns
         -------
@@ -590,14 +707,24 @@ class NionCamera:
             supported factor produces this shape.
         """
         expected = getattr(self._device, "get_expected_dimensions", None)
-        if callable(expected):
+        rank = len(shape)
+        if callable(expected) and rank > 0:
             for value in self.binning_values:
                 with contextlib.suppress(Exception):
-                    if tuple(expected(value)) == tuple(shape):
+                    dimensions = tuple(expected(value))
+                    # A suffix match, so a 2D shape compares whole (exactly
+                    # as before) and a 1D one against the trailing axis.
+                    # Guarded on rank, so a shape with *more* axes than the
+                    # device describes cannot match a slice of one.
+                    if rank <= len(dimensions) and dimensions[-rank:] == tuple(shape):
                         return value
         return self._parameters.binning
 
-    def _frame_metadata(self, binning: int) -> dict[str, object]:
+    def _frame_metadata(
+        self,
+        binning: int,
+        projected_by: str | None = None,
+    ) -> dict[str, object]:
         """
         Return the identity, instrument state, and detector labels for a frame.
 
@@ -605,6 +732,11 @@ class NionCamera:
         ----------
         binning : int
             The binning the frame was taken at, from :meth:`_binning_of`.
+        projected_by : str | None
+            ``"sensor"``/``"server"`` for a projected frame, ``None`` for
+            an image. From :meth:`acquire_frame`, which recovered it from
+            the data's rank — so the recorded readout mode, like the
+            binning, describes the frame in hand rather than the request.
 
         Returns
         -------
@@ -616,6 +748,9 @@ class NionCamera:
             "device_id": self.camera_id,
             "frame_index": self._frame_index,
             "binning": binning,
+            "readout": (
+                IMAGE_READOUT if projected_by is None else PROJECTED_READOUT
+            ),
             # The configured exposure, which the frame in flight during a
             # `configure` was *not* taken at. Unlike binning that leaves
             # no trace in the data to recover it from, so a caller who
@@ -623,6 +758,8 @@ class NionCamera:
             # `configure`.
             "exposure_ms": self._parameters.exposure_ms,
         }
+        if projected_by is not None:
+            metadata["projected_by"] = projected_by
         for key, attribute in (
             ("camera_name", "camera_name"),
             ("camera_type", "camera_type"),

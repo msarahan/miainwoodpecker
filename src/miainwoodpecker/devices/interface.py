@@ -126,6 +126,16 @@ class Frame:
         where the rest of it is. The caveat ``nion_server`` records
         applies: this is the *configured* exposure, which the frame
         already in flight during a ``configure`` was not taken at.
+    ``readout``, ``projected_by``
+        Which readout mode the frame was actually taken with — recovered
+        from the data's rank, not echoed from the request, for the same
+        in-flight reason as ``binning``. ``projected_by`` is present only
+        on a projected frame and says **who summed**: ``"sensor"`` when
+        the detector itself projected (accumulating before readout, so
+        one readout's noise), ``"server"`` when the device server summed
+        an image the sensor delivered (N rows' readout noise). The noise
+        statistics differ, so the distinction is recorded rather than
+        implied.
     ``counts_per_electron``
         Detector gain, where the device publishes it.
     ``frame_number``, ``integration_count``
@@ -151,22 +161,22 @@ class Frame:
         **natively** 1D, of which an EDX silicon drift detector is the
         case in hand; it is not a second home for EELS.
 
-        **The 1D case is real but still unstored.** This said "may be 1D
-        for binned spectra", and Nion's own device layer can produce
-        one: ``CameraFrameParameters.processing = "sum_project"`` makes
-        the camera sum the whole non-dispersive direction and return a
-        spectrum (``nion.usim_device.CameraDevice``, measured — and
-        Nion's own ``CameraControl_test`` notes it is "for sequence/SI
-        only", not live view). This project never requests it,
-        ``nion_server``'s ``calibration_metadata`` already handles the
-        shape if it ever arrives, and
-        :class:`~miainwoodpecker.storage.nexus.NexusWriter` names exactly
-        two frame axes and raises on any other rank
+        **The 1D case is real and now stored.** A camera configured with
+        :data:`PROJECTED_READOUT` produces a 1D frame whose one axis is
+        the dispersive one, calibration kept verbatim.
+        :class:`~miainwoodpecker.storage.nexus.NexusWriter` still names
+        exactly two frame axes and raises on any other rank
         (docs/architecture-review.md, §1.6: "a layout decision, not a
-        shape guess"). The layout now exists —
-        :class:`~miainwoodpecker.storage.spectra.SpectrumWriter` — so
-        that decision is reachable; wiring a projected readout to it is
-        the follow-up docs/adapters/spectrum-detectors.md specifies.
+        shape guess") — a projected frame is routed by the recording path
+        into :class:`~miainwoodpecker.storage.spectra.SpectrumWriter`
+        instead, landing in the same ``NXspectrum`` layout as EDX
+        (:func:`miainwoodpecker.acquisition.sequence.record` is the
+        seam). On the Nion side the mode maps onto
+        ``CameraFrameParameters.processing = "sum_project"`` — which the
+        device honours only for sequence/SI acquisition, measured, so on
+        the plain-acquire path this project drives the server sums and
+        the frame's ``projected_by`` metadata says so; see
+        docs/adapters/spectrum-detectors.md §6.
 
         **Deliberately not 3D**, which a colour sensor would need. A
         camera with a colour filter array should deliver its raw Bayer
@@ -248,16 +258,46 @@ class ScanParameters:
         return (self.height * pixel_nm, self.width * pixel_nm)
 
 
+IMAGE_READOUT = "image"
+"""
+Camera readout mode: the sensor's 2D image, unchanged. The default.
+"""
+
+PROJECTED_READOUT = "projected"
+"""
+Camera readout mode: the whole non-dispersive direction summed to 1D.
+
+The operation an EELS operator asks for when trading dynamic range
+against SNR — vertical binning taken to its limit — and deliberately a
+*readout mode* rather than a per-axis binning factor, because that is
+what the only adapter behind this interface can honour: Nion's
+``CameraFrameParameters`` has no per-axis binning anywhere, and what it
+offers is ``processing = "sum_project"``, a full projection to 1D. See
+docs/adapters/spectrum-detectors.md §6 for the measurement behind the
+decision, and for when a per-axis tuple would earn its place (a second
+camera adapter that can honour one).
+
+A projected readout produces a **1D** :class:`Frame` whose surviving
+axis keeps the dispersive calibration verbatim; the summed axis is gone,
+not merged. Cameras that cannot project refuse in ``configure`` with a
+sentence, rather than silently imaging.
+"""
+
+READOUT_MODES = (IMAGE_READOUT, PROJECTED_READOUT)
+"""Every readout mode a :class:`CameraParameters` may request."""
+
+
 @dataclass(frozen=True)
 class CameraParameters:
     """
     Settings for a camera acquisition, in vendor-neutral units.
 
     The camera's counterpart to :class:`ScanParameters`, and a value
-    object for the same reason: a camera has two settings that must change
+    object for the same reason: a camera has settings that must change
     together to stay coherent, since binning changes both the frame shape
-    and the calibration scale. Setting them one at a time leaves a window
-    in which the two disagree.
+    and the calibration scale, and the readout mode changes the frame's
+    very rank. Setting them one at a time leaves a window in which they
+    disagree.
 
     Attributes
     ----------
@@ -268,10 +308,17 @@ class CameraParameters:
         direction. A binned pixel spans proportionally more of the axis,
         so this multiplies the calibration scale — which is why the two
         are one type. Must be one of the camera's ``binning_values``.
+    readout : str
+        One of :data:`READOUT_MODES`. :data:`IMAGE_READOUT` (the
+        default) delivers the sensor's 2D image exactly as before;
+        :data:`PROJECTED_READOUT` sums the whole non-dispersive
+        direction and delivers a 1D spectrum. A camera that cannot
+        project refuses in ``configure`` rather than silently imaging.
     """
 
     exposure_ms: float
     binning: int = 1
+    readout: str = IMAGE_READOUT
 
     def __post_init__(self) -> None:
         """Reject values no camera could act on."""
@@ -280,6 +327,11 @@ class CameraParameters:
             raise ValueError(msg)
         if self.binning < 1:
             msg = f"binning must be at least 1, got {self.binning!r}"
+            raise ValueError(msg)
+        if self.readout not in READOUT_MODES:
+            msg = (
+                f"readout must be one of {READOUT_MODES}, got {self.readout!r}"
+            )
             raise ValueError(msg)
 
 

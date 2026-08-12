@@ -58,6 +58,39 @@ def make_frame(value: float = 1.0, size: int = 4) -> Frame:
     )
 
 
+def make_projected_frame(index: int = 0) -> Frame:
+    """
+    Return the 1D frame a camera's projected readout produces.
+
+    Parameters
+    ----------
+    index : int
+        Which frame in the series this is.
+
+    Returns
+    -------
+    Frame
+        A 1D frame carrying an energy calibration on its one axis.
+    """
+    return Frame(
+        data=np.full(8, float(index), dtype=np.float32),
+        timestamp=datetime.datetime.now(tz=datetime.UTC),
+        metadata={
+            "device_id": "eels_camera",
+            "camera_type": "eels",
+            "frame_index": index,
+            "calibration": {
+                "x": {
+                    "kind": "energy",
+                    "scale": 0.5,
+                    "offset": -100.0,
+                    "units": "eV",
+                },
+            },
+        },
+    )
+
+
 def abandon_a_writer(path, frame_count: int = 3) -> None:
     """
     Leave the file an abandoned-but-cleanly-exited writer leaves.
@@ -351,6 +384,33 @@ def test_an_empty_acquisition_produces_a_readable_but_frameless_file(tmp_path):
     assert recording.readable
     assert recording.frame_count == 0
     assert read_session_context(recording.path) == {}
+
+
+def test_a_projected_recording_is_listed_and_counted_like_any_other(tmp_path):
+    """
+    A session that recorded spectra can still say how much it recorded.
+
+    ``Session`` mints the name, streams through the same ``record``, and
+    describes what landed — and describing means counting, which reads
+    the frame dataset. A spectrum recording has no such dataset, so
+    without this the session's own listing would report every projected
+    EELS acquisition of a shift as empty and an operator would have no
+    way to tell a real one from a failed one.
+    """
+    session = Session(tmp_path / "s", sample="graphene")
+    frames = [make_projected_frame(index) for index in range(3)]
+
+    recording = session.record(frames, label="eels projected")
+
+    assert recording.readable
+    expected_count = 3
+    assert recording.frame_count == expected_count
+    assert session.recordings() == [recording]
+    # The session context reaches the spectrum writer's groups too, which
+    # is what makes the two recording kinds interchangeable to an
+    # operator rather than only to the type checker.
+    with h5py.File(recording.path, "r") as handle:
+        assert handle["entry/sample/name"][()].decode() == "graphene"
 
 
 def test_a_reserved_but_unwritten_name_is_reported_as_unreadable(tmp_path):

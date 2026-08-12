@@ -21,9 +21,12 @@ from miainwoodpecker.devices import (
     Frame,
     ScanParameters,
 )
-from miainwoodpecker.storage import read_series
+from miainwoodpecker.storage import read_series, read_spectra
 
 _PARAMETERS = ScanParameters(height=4, width=4, pixel_time_us=1.0, fov_nm=10.0)
+_CHANNELS = 16
+_DISPERSION_EV = 0.5
+_ZERO_LOSS_OFFSET_EV = -100.0
 
 
 class _RecordingScanner:
@@ -332,6 +335,111 @@ def test_record_streams_a_series_to_disk(tmp_path):
     assert len(recovered) == expected
     # Frames arrive in acquisition order: pixel value equals sequence number.
     assert [int(data.flat[0]) for data, _ in recovered] == [1, 2, 3, 4]
+
+
+def _projected_frame(index: int) -> Frame:
+    """
+    Build one 1D frame of the kind a projected camera readout produces.
+
+    Parameters
+    ----------
+    index : int
+        Which frame in the series this is, written into the counts so the
+        recording's order is checkable.
+
+    Returns
+    -------
+    Frame
+        A 1D frame with an energy calibration on its surviving axis.
+    """
+    return Frame(
+        data=np.full(_CHANNELS, index, dtype="float32"),
+        timestamp=datetime.datetime.now(tz=datetime.UTC),
+        metadata={
+            "device_id": "eels_camera",
+            "camera_type": "eels",
+            "frame_index": index,
+            "calibration": {
+                "x": {
+                    "kind": "energy",
+                    "scale": _DISPERSION_EV,
+                    "offset": _ZERO_LOSS_OFFSET_EV,
+                    "units": "eV",
+                },
+            },
+        },
+    )
+
+
+def test_record_routes_projected_frames_into_the_spectrum_layout(tmp_path):
+    """
+    A 1D series lands in ``NXspectrum``, the same file shape EDX lands in.
+
+    The seam this change exists to establish: ``NexusWriter`` refuses any
+    rank but 2 by design, so a projected readout would otherwise have
+    nowhere to go — and routing it into ``SpectrumWriter`` rather than
+    teaching the frame writer a second layout is what lets it reach
+    ``load_as_hyperspy_spectrum`` with no flattening.
+    """
+    path = tmp_path / "projected.nxs"
+    written = record((_projected_frame(index) for index in range(3)), path)
+
+    expected = 3
+    assert written == expected
+    recording = read_spectra(path)
+    assert recording.data.shape == (expected, _CHANNELS)
+    assert recording.energy_scale_ev == pytest.approx(_DISPERSION_EV)
+    assert recording.energy_offset_ev == pytest.approx(_ZERO_LOSS_OFFSET_EV)
+    # Acquisition order survives, so the dispatch did not reorder or
+    # collapse anything on its way through the generator.
+    assert [int(row[0]) for row in recording.data] == [0, 1, 2]
+
+
+def test_record_still_writes_image_frames_the_way_it_always_did(tmp_path):
+    """
+    The dispatch is invisible to a 2D series, which is the compatibility claim.
+
+    Asserted beside the projected case rather than trusted: the branch
+    reads the first frame before opening any file, so this is what pins
+    that an image series still reaches ``NexusWriter`` unchanged.
+    """
+    path = tmp_path / "images.nxs"
+    written = record(scan_series(_RecordingScanner(), _PARAMETERS, 2), path)
+
+    expected = 2
+    assert written == expected
+    assert len(list(read_series(path))) == expected
+
+
+def test_recording_nothing_still_writes_the_empty_frame_file(tmp_path):
+    """
+    An empty series cannot say what it is, so it stays what it always was.
+
+    A cancelled recording yields no frames, and the rank it *would* have
+    produced is not knowable from an empty iterator — so this keeps the
+    existing behaviour (a readable, frameless frame recording) rather
+    than guessing a layout from the camera's configuration.
+    """
+    path = tmp_path / "empty.nxs"
+    assert record([], path) == 0
+    assert list(read_series(path)) == []
+
+
+def test_a_projected_frame_with_no_energy_axis_is_refused_by_the_recorder(tmp_path):
+    """
+    A 1D frame that cannot say what its axis is does not get stored as a guess.
+
+    The refusal comes from ``spectrum_from_projected_frame`` and reaches
+    the caller unchanged, because "record it as something else" is the
+    only alternative and every option is a fabricated axis.
+    """
+    frame = Frame(
+        data=np.zeros(_CHANNELS, dtype="float32"),
+        timestamp=datetime.datetime.now(tz=datetime.UTC),
+        metadata={"device_id": "eels_camera"},
+    )
+    with pytest.raises(ValueError, match="cannot exist without its energy axis"):
+        record([frame], tmp_path / "unstorable.nxs")
 
 
 def test_energy_offset_series_steps_the_offset_and_records_the_read_back():

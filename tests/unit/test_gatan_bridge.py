@@ -30,7 +30,11 @@ from miainwoodpecker.devices.gatan_bridge import (
     SimulatedSpectrometer,
     _build_targets,
 )
-from miainwoodpecker.devices.interface import CameraParameters
+from miainwoodpecker.devices.interface import (
+    IMAGE_READOUT,
+    PROJECTED_READOUT,
+    CameraParameters,
+)
 
 _DISPERSION_EV = 0.5
 _BINNING = 4
@@ -211,3 +215,21 @@ def test_shutdown_releases_the_devices_without_claiming_to_stop_the_host():
     # adapter has no blanker.
     assert report["beam_blanked"] is False
     assert stop.is_set()
+
+
+def test_the_gatan_bridge_refuses_a_projected_readout_rather_than_imaging():
+    """
+    A camera that cannot project says so; it does not quietly send a picture.
+
+    This bridge stands in for DM's front-image path, which delivers
+    whatever DigitalMicrograph is already showing — so a projection is
+    DM's to perform in its own spectrum modes, and accepting the request
+    here would answer an operator asking for a spectrum with an image
+    whose metadata claimed to be one.
+    """
+    camera = SimulatedEELSCamera(SimulatedSpectrometer(_DISPERSION_EV))
+    with pytest.raises(ValueError, match="is not supported by"):
+        camera.configure(
+            CameraParameters(exposure_ms=10.0, readout=PROJECTED_READOUT),
+        )
+    assert camera.parameters().readout == IMAGE_READOUT

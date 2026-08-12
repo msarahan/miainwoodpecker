@@ -101,12 +101,14 @@ import typing
 import h5py
 import numpy as np
 
-from miainwoodpecker.devices.interface import HIGH_TENSION_V_KEY
+from miainwoodpecker.devices.interface import HIGH_TENSION_V_KEY, Spectrum
 from miainwoodpecker.storage import layout
 from miainwoodpecker.storage.calibration import (
+    METADATA_KEY,
     AxisCalibration,
     AxisKind,
     FrameCalibration,
+    resolve_axis_calibration,
 )
 
 if typing.TYPE_CHECKING:
@@ -115,7 +117,7 @@ if typing.TYPE_CHECKING:
 
     import numpy.typing as npt
 
-    from miainwoodpecker.devices.interface import Spectrum
+    from miainwoodpecker.devices.interface import Frame
 
 _PROGRAM_NAME = "miainwoodpecker"
 _DEFAULT_COMPRESSION = "gzip"
@@ -145,6 +147,28 @@ MAP_LAYOUT = "spectrum_2d"
 # is the same arrangement `fov_nm`/`fov_size_nm`/`calibration` already have
 # in storage.calibration - the alternative was a constant per key in
 # interface.py, each with exactly one use.
+TECHNIQUE_KEY = "technique"
+"""
+Spectrum-metadata key naming the kind of spectroscopy, e.g. ``"eds"``.
+
+Named here, unlike the rest of the vocabulary, because two layers now
+read it *by name* rather than persisting it whole: this module stamps it
+onto a projected camera readout, and
+:mod:`miainwoodpecker.analysis.hyperspy_bridge` keys its EELS/EDS
+refusals on it. It is written into ``NXdetector``'s ``description``.
+"""
+
+EELS_TECHNIQUE = "eels"
+"""
+The :data:`TECHNIQUE_KEY` value for electron energy-loss spectroscopy.
+
+The one value with a constant, for the same reason: once a camera's
+projected readout lands in the same ``NXspectrum`` layout as EDX, this
+string is the *only* thing distinguishing the two on disk, and the
+writer and the loader agreeing on it letter for letter is what keeps
+eXSpy from fitting X-ray lines to electron energy losses.
+"""
+
 _DETECTOR_FIELDS: tuple[tuple[str, str, str | None], ...] = (
     ("live_time_s", "count_time", "s"),
     ("real_time_s", "real_time", "s"),
@@ -152,7 +176,7 @@ _DETECTOR_FIELDS: tuple[tuple[str, str, str | None], ...] = (
     ("elevation_deg", "polar_angle", "deg"),
     ("solid_angle_sr", "solid_angle", "sr"),
     ("detector_type", "type", None),
-    ("technique", "description", None),
+    (TECHNIQUE_KEY, "description", None),
 )
 
 _ENERGY_UNITS = "eV"
@@ -815,6 +839,113 @@ def write_spectra(
             if flush_every > 0 and writer.spectrum_count % flush_every == 0:
                 writer.flush()
         return writer.spectrum_count
+
+
+def spectrum_from_projected_frame(frame: Frame) -> Spectrum:
+    """
+    Turn a projected (1D) camera frame into a :class:`Spectrum`.
+
+    The bridge between the two device shapes: an EEL spectrometer camera
+    under a projected readout
+    (:data:`~miainwoodpecker.devices.interface.PROJECTED_READOUT`)
+    produces a 1D :class:`~miainwoodpecker.devices.interface.Frame` whose
+    surviving axis is the dispersive one, and this is what routes it into
+    :class:`SpectrumWriter`'s ``NXspectrum`` layout — the same file shape
+    EDX lands in, reaching
+    :func:`~miainwoodpecker.analysis.hyperspy_bridge.load_as_hyperspy_spectrum`
+    with no flattening. The §5 convergence of
+    docs/adapters/spectrum-detectors.md, moved one layer down.
+
+    The energy axis is taken **verbatim** from the frame's own
+    ``metadata["calibration"]["x"]`` — the dispersive axis's calibration,
+    which the projection keeps; the summed axis is gone — converted
+    exactly within the energy kind to this layout's canonical eV. A frame
+    whose surviving axis is not energy-calibrated is refused, because a
+    :class:`~miainwoodpecker.devices.interface.Spectrum` cannot exist
+    without its energy axis and inventing one here would put a fabricated
+    axis on stored data.
+
+    ``technique`` is stamped ``"eels"`` when the frame says it came from
+    an EELS camera (``camera_type``), which is what lets
+    :func:`~miainwoodpecker.analysis.hyperspy_bridge.load_as_eels_signal`
+    recognise the recording — and
+    :func:`~miainwoodpecker.analysis.hyperspy_bridge.load_as_eds_signal`
+    refuse it — from what the file *says it is* rather than from its
+    shape, which by then is identical to EDX's.
+
+    Parameters
+    ----------
+    frame : Frame
+        A 1D frame from a camera's projected readout, carrying an
+        energy calibration for its surviving axis.
+
+    Returns
+    -------
+    Spectrum
+        The same counts and timestamp, with the energy axis as
+        constructor arguments and the frame's metadata carried whole
+        (plus ``technique`` where recoverable).
+
+    Raises
+    ------
+    ValueError
+        If the frame is not 1D, carries no ``calibration`` metadata for
+        its axis, or its axis is calibrated as something other than
+        energy.
+
+    Notes
+    -----
+    Also propagates ``ValueError`` from
+    :class:`~miainwoodpecker.devices.interface.Spectrum` when the
+    dispersive axis's scale is negative — a spectrometer that disperses
+    high-energy-first is a real arrangement, and reversing the counts to
+    fit this layout would be a transformation of the data that this
+    layer has no business performing silently.
+    """
+    if frame.data.ndim != 1:
+        msg = (
+            f"spectrum_from_projected_frame takes the 1D frame a projected "
+            f"camera readout produces; got a {frame.data.ndim}D frame of "
+            f"shape {frame.data.shape}, which belongs to NexusWriter"
+        )
+        raise ValueError(msg)
+    calibration = frame.metadata.get(METADATA_KEY)
+    axis_spec: object | None = None
+    if isinstance(calibration, FrameCalibration):
+        axis_spec = calibration.x
+    elif isinstance(calibration, typing.Mapping):
+        axis_spec = calibration.get("x")
+    if axis_spec is None:
+        msg = (
+            f"a projected frame carries no energy calibration "
+            f"(metadata[{METADATA_KEY!r}] names no 'x' axis), and a spectrum "
+            f"cannot exist without its energy axis; record what the device "
+            f"reported rather than assuming a dispersion"
+        )
+        raise ValueError(msg)
+    axis = resolve_axis_calibration(axis_spec, int(frame.data.shape[0]), "x")
+    if axis.kind is not AxisKind.ENERGY:
+        msg = (
+            f"a projected frame's surviving axis is calibrated as "
+            f"{axis.kind.value!r} ({axis.units!r}), not energy, so its counts "
+            f"are not a spectrum; only an energy-dispersive camera's "
+            f"projected readout can be stored in the NXspectrum layout"
+        )
+        raise ValueError(msg)
+    axis_ev = axis.converted_to(_ENERGY_UNITS)
+    metadata = dict(frame.metadata)
+    if str(metadata.get("camera_type", "")).lower() == EELS_TECHNIQUE:
+        # What lets the analysis layer tell this recording from EDX once
+        # both wear the same 1D shape. setdefault, so an adapter that
+        # already said what it is is not overruled.
+        metadata.setdefault(TECHNIQUE_KEY, EELS_TECHNIQUE)
+    return Spectrum(
+        data=frame.data,
+        timestamp=frame.timestamp,
+        energy_offset_ev=axis_ev.offset,
+        energy_scale_ev=axis_ev.scale,
+        metadata=metadata,
+    )
 
 
 class SpectrumRecording(typing.NamedTuple):

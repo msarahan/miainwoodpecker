@@ -32,10 +32,12 @@ import pytest
 pytest.importorskip("hyperspy", reason="needs the 'analysis' extra")
 
 from miainwoodpecker.analysis.hyperspy_bridge import (
+    load_as_eds_signal,
     load_as_eels_signal,
     load_as_hyperspy_spectrum,
 )
 from miainwoodpecker.devices.interface import (
+    PROJECTED_READOUT,
     Frame,
     Spectrum,
     SpectrumParameters,
@@ -43,7 +45,10 @@ from miainwoodpecker.devices.interface import (
 from miainwoodpecker.devices.spectrum_server import SimulatedSpectrumDetector
 from miainwoodpecker.storage.calibration import FrameCalibration
 from miainwoodpecker.storage.nexus import write_frames
-from miainwoodpecker.storage.spectra import write_spectra
+from miainwoodpecker.storage.spectra import (
+    spectrum_from_projected_frame,
+    write_spectra,
+)
 
 # A 64x512 frame is the shape of the thing: one direction across the
 # spectrometer slit, one dispersive. usim's real EELS camera is 256x1024
@@ -97,6 +102,47 @@ def _dispersed_frame(index: int) -> Frame:
             "exposure_ms": _EXPOSURE_MS,
             "high_tension_v": _HIGH_TENSION_V,
             "beam_current_a": _BEAM_CURRENT_A,
+        },
+    )
+
+
+def _projected_eels_frame(index: int = 0) -> Frame:
+    """
+    Build the 1D frame the same camera produces under a projected readout.
+
+    The slit direction summed away — which is what
+    :data:`~miainwoodpecker.devices.interface.PROJECTED_READOUT` means —
+    so the counts, the calibration and the instrument state are
+    :func:`_dispersed_frame`'s, and the only difference is the rank and
+    the calibration living on the frame itself rather than on the
+    recording.
+
+    Parameters
+    ----------
+    index : int
+        Which frame of the series this is.
+
+    Returns
+    -------
+    Frame
+        A ``(_CHANNELS,)`` frame with an energy-calibrated ``x`` axis.
+    """
+    dispersed = _dispersed_frame(index)
+    return Frame(
+        data=dispersed.data.sum(axis=0),
+        timestamp=dispersed.timestamp,
+        metadata={
+            **dispersed.metadata,
+            "readout": PROJECTED_READOUT,
+            "projected_by": "server",
+            "calibration": {
+                "x": {
+                    "kind": "energy",
+                    "scale": _DISPERSION_EV,
+                    "offset": _OFFSET_EV,
+                    "units": "eV",
+                },
+            },
         },
     )
 
@@ -285,10 +331,15 @@ def test_an_edx_recording_is_refused_as_eels_rather_than_mislabelled(tmp_path):
     Both spectroscopies end as the same ``Signal1D``, so once loaded
     nothing downstream can tell them apart: an EDX recording typed
     ``EELS`` would have eXSpy fitting ionisation edges to X-ray lines,
-    quietly and plausibly. The two loaders therefore each refuse the
-    other's on-disk layout, which is a question the file can answer —
-    a spectrum recording's signal dataset is ``intensity`` and a frame
-    recording's is ``data``.
+    quietly and plausibly. So each loader refuses the other's.
+
+    **What it keys on changed, and had to.** The layout used to answer
+    the question by itself — ``intensity`` for a spectrum recording,
+    ``data`` for a frame one — but a camera's projected readout now
+    lands EELS in the *spectrum* layout, so the shape no longer
+    distinguishes them. The evidence is what the recording says it is
+    (``technique``, written into ``NXdetector``'s description), which is
+    the check ``docs/adapters/spectrum-detectors.md`` §5 named in advance.
     """
     pytest.importorskip("exspy", reason="needs exspy for EELS signal types")
     detector = SimulatedSpectrumDetector()
@@ -301,8 +352,56 @@ def test_an_edx_recording_is_refused_as_eels_rather_than_mislabelled(tmp_path):
     path = tmp_path / "eds.nxs"
     write_spectra(path, spectra)
 
-    with pytest.raises(ValueError, match="not EELS data"):
+    with pytest.raises(ValueError, match="does not say it is EELS"):
         load_as_eels_signal(path)
+
+
+def test_a_projected_eels_readout_loads_as_eels_from_the_edx_layout(tmp_path):
+    """
+    An EELS recording wearing the EDX shape is still recognised as EELS.
+
+    The other half of the refusal above, and the reason the check is on
+    the recording rather than the shape: a camera's projected readout
+    goes through ``SpectrumWriter`` into the same ``NXspectrum`` layout
+    an EDX detector uses, so keying on the layout would refuse a
+    perfectly good EELS recording — the exact opposite failure.
+    """
+    exspy = pytest.importorskip("exspy", reason="needs exspy for EELS signal types")
+    path = tmp_path / "projected.nxs"
+    write_spectra(path, [spectrum_from_projected_frame(_projected_eels_frame())])
+
+    signal = load_as_eels_signal(path)
+
+    assert isinstance(signal, exspy.signals.EELSSpectrum)
+    energy = signal.axes_manager.signal_axes[0]
+    assert energy.units == "eV"
+    assert energy.scale == pytest.approx(_DISPERSION_EV)
+    assert energy.offset == pytest.approx(_OFFSET_EV)
+    # The peak was put at calibrated zero, so a lost or rescaled axis
+    # would move it - the same assertion the frame-stack path makes.
+    assert float(signal.axes_manager.signal_axes[0].axis[int(signal.data.argmax())]) == (
+        pytest.approx(0.0, abs=_DISPERSION_EV)
+    )
+    tem = signal.metadata.Acquisition_instrument.TEM
+    assert tem.beam_energy == pytest.approx(_HIGH_TENSION_V / 1000.0)
+
+
+def test_a_projected_eels_readout_is_refused_as_eds(tmp_path):
+    """
+    And the EDS loader will not take it, which is the refusal that costs most.
+
+    An EELS recording typed ``EDS_TEM`` has eXSpy fitting X-ray lines to
+    electron energy losses — plausible output, wrong physics, nothing
+    downstream to catch it. Once projection put EELS into this layout,
+    the EDS loader could no longer treat "it is a spectrum recording" as
+    proof, and this is what pins that it stopped.
+    """
+    pytest.importorskip("exspy", reason="needs exspy for EDS signal types")
+    path = tmp_path / "projected.nxs"
+    write_spectra(path, [spectrum_from_projected_frame(_projected_eels_frame())])
+
+    with pytest.raises(ValueError, match="is an EELS spectrum recording"):
+        load_as_eds_signal(path)
 
 
 def test_a_camera_recording_with_no_energy_axis_is_refused(tmp_path):

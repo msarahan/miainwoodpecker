@@ -131,6 +131,10 @@ _SIDECAR_SCHEMA = "miainwoodpecker-session/1"
 _SUFFIX = ".nxs"
 _STAMP_FORMAT = "%Y%m%dT%H%M%SZ"
 _INDEX_DIGITS = 4
+# A spectrum image's intensity is (j, i, n_energy); a series' is
+# (n_spc, n_energy). The rank is how _inspect tells one acquisition
+# (a map) from many (a stack) - the same rule read_spectra applies.
+_SPECTRUM_MAP_RANK = 3
 _CONTEXT_PREFIX = "session_"
 # Nion's own documented session vocabulary, from its scripting guide:
 # stem.session.{instrument, microscopist, sample, sample_area, site, task}.
@@ -184,8 +188,11 @@ class Recording:
     started_at : datetime.datetime
         When the name was minted, parsed back from the filename (UTC).
     frame_count : int
-        Frames actually present in the file. ``0`` for an acquisition
-        that produced nothing, and for a file too damaged to open.
+        Acquisitions actually present in the file: frames for a frame
+        recording, spectra for a spectrum recording (which is what a
+        projected EELS readout records; a spectrum image counts as one).
+        ``0`` for an acquisition that produced nothing, and for a file
+        too damaged to open.
     readable : bool
         Whether the file opens as HDF5 at all. ``False`` means the write
         was interrupted hard enough to lose the container — see
@@ -1553,7 +1560,22 @@ def _inspect(path: Path) -> tuple[int, bool, bool]:
     try:
         with h5py.File(path, "r") as handle:
             dataset = handle.get(layout.DETECTOR_DATA)
-            count = 0 if dataset is None else int(dataset.shape[0])
+            if dataset is None:
+                # Not a frame recording; it may be a spectrum recording
+                # (SpectrumWriter's layout, which a projected EELS readout
+                # recorded through Session.record produces). Its signal is
+                # (n_spc, n_energy) for a series and (j, i, n_energy) for
+                # one map, so the acquisition count is the leading axis
+                # for a stack and one for a map.
+                intensity = handle.get(layout.SPECTRUM_INTENSITY)
+                if intensity is None:
+                    count = 0
+                elif intensity.ndim == _SPECTRUM_MAP_RANK:
+                    count = 1
+                else:
+                    count = int(intensity.shape[0])
+            else:
+                count = int(dataset.shape[0])
             return count, True, layout.NXDATA_GROUP in handle
     except FileNotFoundError:
         # Vanished between the listing and the open.

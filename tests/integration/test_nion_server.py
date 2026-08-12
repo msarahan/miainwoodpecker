@@ -38,6 +38,8 @@ from miainwoodpecker.devices import (
     BEAM_BLANKER_CONTROL,
     DEFOCUS_CONTROL,
     ENERGY_OFFSET_CONTROL,
+    IMAGE_READOUT,
+    PROJECTED_READOUT,
     STAGE_POSITION_CONTROL,
     Camera,
     CameraParameters,
@@ -51,8 +53,10 @@ from miainwoodpecker.devices.nion_server import (
     HardwareNotAvailableError,
     NionCamera,
     _axis_calibration_spec,
+    _camera_base,
     _instrument_state,
     _parse_args,
+    _SUM_PROJECT_PROCESSING,
     hardware_instrument,
     open_instrument,
     simulated_instrument,
@@ -696,6 +700,10 @@ def test_an_instrument_that_reports_nothing_contributes_no_keys():
 # integer factor on every binned frame.
 
 _UNSUPPORTED_BINNING = 3
+_IMAGE_RANK = 2
+# The projection is a float32 sum either way; only the order of the
+# additions differs between numpy's reduction and the assertion's.
+_PROJECTION_RTOL = 1e-5
 # A supported factor big enough that a wrongly-scaled axis is unmistakable.
 _TEST_BINNING = 4
 
@@ -805,3 +813,272 @@ def test_an_unsupported_binning_is_refused_rather_than_rounded():
             )
         # And the camera is unchanged, not left half-configured.
         assert camera.parameters().binning == 1
+
+
+def test_the_plain_acquire_path_does_not_honour_nions_sum_project():
+    """
+    Measured, not assumed: this is why the server projects and says it did.
+
+    ``processing = "sum_project"`` is the only per-axis reduction Nion's
+    camera API has, and the mapping is right — but the device consults it
+    only on the sequence/SI paths (``_acquire_sequence``,
+    ``CameraTask.start``). ``acquire_image``, which is the whole of what
+    this project drives, never reads it and asserts a 2D buffer. Nion's
+    own tests say the same in prose ('"sum_project" is for sequence/SI
+    only'), and ``camera_base.CameraHardwareSource.__init__`` clears the
+    field off view parameters outright.
+
+    This asserts it against the installed simulator rather than trusting
+    that prose, because the whole honesty of ``projected_by`` rests on
+    it: if a future usim *did* honour it here, the frames would arrive 1D
+    and be labelled ``"sensor"``, and this test failing is how anyone
+    would find out.
+    """
+    with simulated_instrument() as microscope:
+        device = microscope.eels_camera._device  # noqa: SLF001
+        frame_parameters = _camera_base.CameraFrameParameters(
+            exposure_ms=10.0,
+            binning=1,
+            processing=_SUM_PROJECT_PROCESSING,
+        )
+        validated = device.validate_frame_parameters(frame_parameters)
+        # The device keeps the mode - it is not rejected or dropped...
+        assert validated.processing == _SUM_PROJECT_PROCESSING
+        device.set_frame_parameters(validated)
+        device.start_live()
+        try:
+            element = device.acquire_image()
+        finally:
+            device.stop_live()
+        # ...and then ignores it on this path, returning the full sensor.
+        expected_2d = 2
+        assert element["data"].ndim == expected_2d
+        assert element["data"].shape == device.get_expected_dimensions(1)
+
+
+def test_a_projected_readout_is_configured_and_reported_back():
+    """
+    ``configure`` says what the device took, readout included.
+
+    The standing contract, extended to the new field: a caller that needs
+    to know what the next frame will be must be able to read it back
+    rather than assume the request was honoured — which matters more here
+    than for exposure, because this one changes the frame's *rank* and so
+    which writer the recording path will use.
+    """
+    with simulated_instrument() as microscope:
+        camera = microscope.eels_camera
+        took = camera.configure(
+            CameraParameters(exposure_ms=10.0, readout=PROJECTED_READOUT),
+        )
+        assert took.readout == PROJECTED_READOUT
+        assert camera.parameters() == took
+        # And back again, so the mode is a setting rather than a latch.
+        assert camera.configure(CameraParameters(exposure_ms=10.0)).readout == (
+            IMAGE_READOUT
+        )
+
+
+def test_a_projected_readout_produces_a_1d_frame_that_says_who_summed_it():
+    """
+    The frame is 1D, and its metadata does not claim the sensor did it.
+
+    ``projected_by`` is the whole point of recording this rather than
+    just ``readout``: a sensor that sums before readout pays one
+    readout's noise and a server summing N rows pays N of them, so a
+    recording that implied the first while getting the second would
+    misstate its own noise statistics — invisibly, and in exactly the
+    direction that flatters the data.
+    """
+    with simulated_instrument() as microscope:
+        camera = microscope.eels_camera
+        camera.configure(CameraParameters(exposure_ms=10.0, readout=PROJECTED_READOUT))
+        camera.start()
+        try:
+            frame = camera.acquire_frame()
+        finally:
+            camera.stop()
+
+    assert frame.data.ndim == 1
+    assert frame.data.shape == (camera._device.get_expected_dimensions(1)[1],)  # noqa: SLF001
+    assert frame.metadata["readout"] == PROJECTED_READOUT
+    assert frame.metadata["projected_by"] == "server"
+    assert frame.metadata["binning"] == 1
+
+
+def test_a_projected_frame_keeps_the_dispersive_axis_the_image_frame_had():
+    """
+    Verbatim: same dispersion, same offset, same units. The summed axis is gone.
+
+    The correctness claim the storage route depends on. The projection
+    removes the non-dispersive direction and nothing else, so an energy
+    axis that shifted or rescaled between the two readouts would mean the
+    projection had silently reinterpreted the detector — and every eV in
+    every projected recording would be wrong with the file still
+    perfectly readable.
+    """
+    with simulated_instrument() as microscope:
+        camera = microscope.eels_camera
+        camera.configure(CameraParameters(exposure_ms=10.0))
+        camera.start()
+        try:
+            imaged = camera.acquire_frame()
+            camera.configure(
+                CameraParameters(exposure_ms=10.0, readout=PROJECTED_READOUT),
+            )
+            # One frame of overlap, as for any other reconfigure.
+            camera.acquire_frame()
+            projected = camera.acquire_frame()
+        finally:
+            camera.stop()
+
+    assert imaged.data.ndim == _IMAGE_RANK
+    assert projected.data.ndim == 1
+    assert projected.metadata["calibration"]["x"] == imaged.metadata["calibration"]["x"]
+    # The other axis is not merged into the survivor: it is absent.
+    assert "y" not in projected.metadata["calibration"]
+
+
+class _FixedFrameCamera:
+    """A camera device returning one known array, so the sum is checkable."""
+
+    camera_id = "fixed"
+    camera_type = "eels"
+    binning_values = (1,)
+    calibration_controls = {}
+
+    def __init__(self, data) -> None:
+        self._data = data
+        self.processing = None
+
+    def get_expected_dimensions(self, binning: int) -> tuple[int, int]:
+        """
+        Return the shape this device produces at the given binning.
+
+        Parameters
+        ----------
+        binning : int
+            The binning factor.
+
+        Returns
+        -------
+        tuple[int, int]
+            The unbinned shape divided by the factor.
+        """
+        rows, columns = self._data.shape
+        return (rows // binning, columns // binning)
+
+    def set_frame_parameters(self, frame_parameters) -> None:
+        """
+        Record what was asked for, as a real device would.
+
+        Parameters
+        ----------
+        frame_parameters : object
+            A vendor ``CameraFrameParameters``.
+        """
+        self.processing = frame_parameters.processing
+
+    def acquire_image(self) -> dict:
+        """
+        Return the fixed array, ignoring ``processing`` exactly as usim does.
+
+        Returns
+        -------
+        dict
+            A Nion data element wrapping the fixed array.
+        """
+        return {"data": self._data, "properties": {}}
+
+    def close(self) -> None:
+        """Release nothing; this device owns no threads."""
+
+
+def test_the_server_side_projection_is_a_sum_along_the_non_dispersive_axis():
+    """
+    Which axis is summed is Nion's own definition, checked arithmetically.
+
+    ``sum_project`` sums axis 0 and keeps the trailing one — that is what
+    ``Core.function_sum(..., 0)`` does in ``_acquire_sequence`` and what
+    ``CameraTask.start``'s ``[1:]`` slice of the expected dimensions
+    agrees with. Following that definition rather than inventing one is
+    what makes the surviving axis the same ``x`` the device calibrates.
+
+    Against a fixed array rather than the simulator, because the
+    simulator's counts change frame to frame: comparing a projected frame
+    to a *different* image frame's column sums would test nothing except
+    that both are noisy.
+    """
+    data = np.arange(24, dtype="float32").reshape(4, 6)
+    camera = NionCamera(_FixedFrameCamera(data))
+    camera.configure(CameraParameters(exposure_ms=1.0, readout=PROJECTED_READOUT))
+
+    frame = camera.acquire_frame()
+
+    np.testing.assert_allclose(frame.data, data.sum(axis=0), rtol=_PROJECTION_RTOL)
+    assert frame.metadata["projected_by"] == "server"
+    # The mode still reached the device, so a camera that can project in
+    # its own readout gets the chance to.
+    assert camera._device.processing == _SUM_PROJECT_PROCESSING  # noqa: SLF001
+
+
+def test_a_device_that_projects_in_hardware_is_credited_rather_than_re_summed():
+    """
+    A 1D frame from the device is labelled ``"sensor"``, and is not summed again.
+
+    Unreachable through usim, and that is exactly why it is pinned here:
+    the branch exists for a vendor camera that honours the mode in its
+    own readout, and a bug in it would either double-sum a spectrum or
+    quietly credit the sensor for the server's arithmetic — the second
+    being the misstatement about noise this metadata exists to prevent.
+    """
+    spectrum = np.arange(6, dtype="float32")
+    camera = NionCamera(_FixedFrameCamera(spectrum))
+    camera.configure(CameraParameters(exposure_ms=1.0, readout=PROJECTED_READOUT))
+
+    frame = camera.acquire_frame()
+
+    np.testing.assert_array_equal(frame.data, spectrum)
+    assert frame.metadata["projected_by"] == "sensor"
+    assert frame.metadata["readout"] == PROJECTED_READOUT
+
+
+def test_a_1d_frames_binning_is_recovered_from_its_shape_like_any_other():
+    """
+    Shape recovery survives the rank change, which keeps in-flight frames honest.
+
+    ``_binning_of`` exists because a camera reconfigured while running
+    finishes the frame already in flight at the old settings, and
+    labelling that frame with the new binning puts an axis on stored data
+    wrong by the whole factor. A device that projects in its own readout
+    delivers 1D frames, and the recovery has to keep working for them —
+    matched against the *trailing* axis of ``get_expected_dimensions``,
+    which is the dimension Nion's own ``sum_project`` keeps
+    (``CameraTask.start`` slices ``[1:]``).
+
+    Driven against the real device's dimensions rather than a stub, so
+    the widths being distinct per factor — which is what makes the match
+    unambiguous — is a fact about the camera and not about the test.
+    """
+    with simulated_instrument() as microscope:
+        camera = microscope.eels_camera
+        for value in camera.binning_values:
+            rows, columns = camera._device.get_expected_dimensions(value)  # noqa: SLF001
+            assert camera._binning_of((rows, columns)) == value  # noqa: SLF001
+            assert camera._binning_of((columns,)) == value  # noqa: SLF001
+
+
+def test_a_shape_no_binning_explains_falls_back_to_the_configured_one():
+    """
+    An unrecognisable shape yields the setting, which is the documented answer.
+
+    The fallback matters because it is what a vendor camera with a
+    cropped readout area would hit: guessing a factor by division would
+    put a confidently wrong number in the metadata, where reporting the
+    configured one is at least the thing that was asked for.
+    """
+    with simulated_instrument() as microscope:
+        camera = microscope.eels_camera
+        camera.configure(CameraParameters(exposure_ms=10.0, binning=_TEST_BINNING))
+        assert camera._binning_of((7, 13)) == _TEST_BINNING  # noqa: SLF001
+        assert camera._binning_of((13,)) == _TEST_BINNING  # noqa: SLF001
