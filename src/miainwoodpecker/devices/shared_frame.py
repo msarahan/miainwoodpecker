@@ -68,10 +68,12 @@ from multiprocessing import shared_memory
 
 import numpy as np
 
-from miainwoodpecker.devices.interface import Frame
+from miainwoodpecker.devices.interface import Frame, Spectrum
 
 if typing.TYPE_CHECKING:
     import datetime
+
+    import numpy.typing as npt
 
 # Every SharedMemory handle - created or attached by name - auto-registers
 # with *this process's* resource_tracker, which tries to unlink it again at
@@ -120,6 +122,53 @@ class SharedFrameRef:
     metadata: typing.Mapping[str, typing.Any]
 
 
+@dataclass(frozen=True)
+class SharedSpectrumRef:
+    """
+    A reference to a spectrum's array living in a (possibly reused) segment.
+
+    The spectrum-side counterpart to :class:`SharedFrameRef`, and a
+    separate type rather than a widened one because the two carry
+    different things: a spectrum's energy calibration is part of the
+    value, not part of its metadata, so it has to travel here or the
+    reader cannot reconstruct the
+    :class:`~miainwoodpecker.devices.interface.Spectrum` at all.
+
+    A spot spectrum never reaches this path in practice — 4096 uint32
+    channels is 16KB against the 64KB of
+    :data:`~miainwoodpecker.devices.rpc.SHARED_MEMORY_THRESHOLD_BYTES` —
+    and that is fine; the threshold is there to decide, not to be hit.
+    What this exists for is the map: a 256x256 scan of 4096-channel
+    spectra is 1GB, which is not a size to push through pickle and a
+    socket buffer.
+
+    Attributes
+    ----------
+    shm_name : str
+        Name of the shared memory segment holding the array.
+    shape : tuple[int, ...]
+        Array shape, energy last.
+    dtype : str
+        Array dtype, as a string (``np.dtype(dtype)`` reconstructs it).
+    timestamp : datetime.datetime
+        The original spectrum's timestamp.
+    energy_offset_ev : float
+        Energy at channel 0, in electronvolts.
+    energy_scale_ev : float
+        Energy per channel, in electronvolts.
+    metadata : typing.Mapping[str, typing.Any]
+        The original spectrum's metadata.
+    """
+
+    shm_name: str
+    shape: tuple[int, ...]
+    dtype: str
+    timestamp: datetime.datetime
+    energy_offset_ev: float
+    energy_scale_ev: float
+    metadata: typing.Mapping[str, typing.Any]
+
+
 class SharedFrameWriter:
     """
     Server-side: publish frames into one reused, resized-on-demand segment.
@@ -163,7 +212,68 @@ class SharedFrameWriter:
             ``shm_name`` is stable across calls until a frame too large
             for the current segment forces a new one.
         """
-        data = np.ascontiguousarray(frame.data)
+        shm_name, data = self._store(frame.data)
+        return SharedFrameRef(
+            shm_name=shm_name,
+            shape=data.shape,
+            dtype=str(data.dtype),
+            timestamp=frame.timestamp,
+            metadata=frame.metadata,
+        )
+
+    def publish_spectrum(self, spectrum: Spectrum) -> SharedSpectrumRef:
+        """
+        Copy a spectrum's array into the reused segment, growing it if needed.
+
+        The same segment, the same reuse rule, and the same one-in-flight
+        invariant as :meth:`publish`; only the reference type differs,
+        because a spectrum's energy calibration has to cross with it.
+        Sharing the segment is deliberate rather than incidental: a
+        target serves exactly one device, so a spectrum detector's writer
+        will only ever hold spectra.
+
+        Parameters
+        ----------
+        spectrum : Spectrum
+            The spectrum to publish.
+
+        Returns
+        -------
+        SharedSpectrumRef
+            A reference the reader can use to retrieve the array.
+        """
+        shm_name, data = self._store(spectrum.data)
+        return SharedSpectrumRef(
+            shm_name=shm_name,
+            shape=data.shape,
+            dtype=str(data.dtype),
+            timestamp=spectrum.timestamp,
+            energy_offset_ev=spectrum.energy_offset_ev,
+            energy_scale_ev=spectrum.energy_scale_ev,
+            metadata=spectrum.metadata,
+        )
+
+    def _store(
+        self,
+        array: npt.NDArray[typing.Any],
+    ) -> tuple[str, npt.NDArray[typing.Any]]:
+        """
+        Copy one array into the reused segment and return its name and the copy.
+
+        Parameters
+        ----------
+        array : npt.NDArray[typing.Any]
+            The array to publish, contiguous or not.
+
+        Returns
+        -------
+        tuple[str, npt.NDArray[typing.Any]]
+            The segment's name, and the contiguous array that was
+            written — the caller reads ``shape``/``dtype`` off the
+            latter rather than off its own input, since
+            ``ascontiguousarray`` is what the reader will reconstruct.
+        """
+        data = np.ascontiguousarray(array)
         with self._lock:
             if self._segment is None or data.nbytes > self._segment.size:
                 self._replace_segment(data.nbytes)
@@ -173,13 +283,7 @@ class SharedFrameWriter:
             )
             destination[:] = data
             shm_name = self._segment.name
-        return SharedFrameRef(
-            shm_name=shm_name,
-            shape=data.shape,
-            dtype=str(data.dtype),
-            timestamp=frame.timestamp,
-            metadata=frame.metadata,
-        )
+        return shm_name, data
 
     def _replace_segment(self, size: int) -> None:
         """Destroy the current segment, if any, and create a right-sized one."""
@@ -226,6 +330,54 @@ class SharedFrameReader:
         Frame
             The frame, with its own private copy of the array.
         """
+        return Frame(
+            data=self._copy_out(reference),
+            timestamp=reference.timestamp,
+            metadata=reference.metadata,
+        )
+
+    def read_spectrum(self, reference: SharedSpectrumRef) -> Spectrum:
+        """
+        Copy a referenced spectrum's array out of the writer's shared segment.
+
+        Parameters
+        ----------
+        reference : SharedSpectrumRef
+            A reference returned by
+            :meth:`SharedFrameWriter.publish_spectrum`.
+
+        Returns
+        -------
+        Spectrum
+            The spectrum, with its own private copy of the array and the
+            energy calibration the writer acquired it with.
+        """
+        return Spectrum(
+            data=self._copy_out(reference),
+            timestamp=reference.timestamp,
+            energy_offset_ev=reference.energy_offset_ev,
+            energy_scale_ev=reference.energy_scale_ev,
+            metadata=reference.metadata,
+        )
+
+    def _copy_out(
+        self,
+        reference: SharedFrameRef | SharedSpectrumRef,
+    ) -> npt.NDArray[typing.Any]:
+        """
+        Attach if needed and return a private copy of the referenced array.
+
+        Parameters
+        ----------
+        reference : SharedFrameRef | SharedSpectrumRef
+            Any reference naming a segment, a shape, and a dtype.
+
+        Returns
+        -------
+        npt.NDArray[typing.Any]
+            A copy the caller owns, so nothing downstream reads a buffer
+            the writer may overwrite on the next call.
+        """
         if self._segment is None or self._segment.name != reference.shm_name:
             if self._segment is not None:
                 self._segment.close()  # detach only: the writer owns unlink()
@@ -236,12 +388,7 @@ class SharedFrameReader:
             dtype=np.dtype(reference.dtype),
             buffer=self._segment.buf,
         )
-        owned = view.copy()
-        return Frame(
-            data=owned,
-            timestamp=reference.timestamp,
-            metadata=reference.metadata,
-        )
+        return view.copy()
 
     def close(self) -> None:
         """Detach from the current segment, if any. Never unlinks it."""

@@ -103,8 +103,19 @@ viewer = [
 # describes, just judged unlikely to bite for this dependency. Revisit
 # with an exact pin if a hatch env build ever actually resolves a HyperSpy
 # release that breaks this adapter.
+# eXSpy joins HyperSpy here rather than getting its own extra, because it
+# is not an alternative to HyperSpy - it is where HyperSpy 2.x *moved* the
+# EELS and EDS signal classes when it split its domain code out. Measured:
+# a bare `hyperspy 2.4` install answers `hs.print_known_signal_types()`
+# with an empty table, so `set_signal_type("EDS_TEM")` silently leaves a
+# plain Signal1D and `EDSTEMSpectrum` does not exist. Since the whole
+# point of this project's spectrum path is that a recording is loadable as
+# an EDS signal, an extra that could not do that would be claiming
+# something false. It is also cheap next to HyperSpy itself - one package
+# plus a couple of pure-Python dependencies against HyperSpy's ~35.
 analysis = [
     "hyperspy>=2.0",
+    "exspy>=0.3",
 ]
 # LiberTEM: kept as its own extra, not folded into "analysis" above.
 # Measured (docs/migration-plan.md section 5): `pip install libertem` alone

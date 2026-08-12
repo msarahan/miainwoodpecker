@@ -64,5 +64,6 @@ Architecture review <architecture-review>
 Hardware validation checklist <hardware-validation-checklist>
 Work before hardware <pre-hardware-work>
 Other vendors <vendor-support>
+Spectrum detectors <adapters/spectrum-detectors>
 Development <documentation/index>
 :::

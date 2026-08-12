@@ -115,9 +115,16 @@ from miainwoodpecker.devices.rpc import (
     CAMERA_TARGET_NAMES as _CAMERA_TARGET_NAMES,
 )
 from miainwoodpecker.devices.rpc import (
+    SPECTRUM_TARGET_NAMES as _SPECTRUM_TARGET_NAMES,
+)
+from miainwoodpecker.devices.rpc import (
     TARGET_NAMES as _TARGET_NAMES,
 )
-from miainwoodpecker.devices.shared_frame import SharedFrameReader, SharedFrameRef
+from miainwoodpecker.devices.shared_frame import (
+    SharedFrameReader,
+    SharedFrameRef,
+    SharedSpectrumRef,
+)
 
 # The one server-side constant the client must agree on beyond the wire
 # protocol: which exit status means "retry with different ports".
@@ -162,6 +169,8 @@ if typing.TYPE_CHECKING:
         CameraParameters,
         Frame,
         ScanParameters,
+        Spectrum,
+        SpectrumParameters,
     )
 
 # Re-exported from rpc.py so callers of this client keep importing the
@@ -180,6 +189,7 @@ __all__ = [
     "RemoteInstrument",
     "RemoteInstrumentDevices",
     "RemoteScanner",
+    "RemoteSpectrumDetector",
     "ServerHealth",
     "remote_instrument",
     "remote_simulated_instrument",
@@ -606,6 +616,23 @@ class _RemoteDevice:
                 return self._reader.read(result)
             return typing.cast("Frame", result)
 
+    def _spectrum(self, method: str, *args: object) -> Spectrum:
+        """
+        Make a call that returns a spectrum, following a shared-memory reference.
+
+        The spectrum-side twin of :meth:`_frame`, holding the same lock
+        for the same reason: the call and the copy-out are one critical
+        section, or a second thread's request overwrites the segment
+        this one is still reading. A spot spectrum usually arrives
+        whole (it is under the threshold), and a spectrum image
+        usually does not.
+        """
+        with self._frame_lock:
+            result = self._call(method, *args)
+            if isinstance(result, SharedSpectrumRef):
+                return self._reader.read_spectrum(result)
+            return typing.cast("Spectrum", result)
+
     def detach(self) -> None:
         """
         Detach from the server's shared segment without unlinking it.
@@ -701,6 +728,96 @@ class RemoteScanner(_RemoteDevice):
     def scan_frame(self, parameters: ScanParameters, channel: int = 0) -> Frame:
         """Scan and return a single frame from the remote device."""
         return self._frame("scan_frame", parameters, channel)
+
+
+class RemoteSpectrumDetector(_RemoteDevice):
+    """
+    A ``SpectrumDetector`` implementation that delegates over IPC to a server.
+
+    Thin, like its two siblings, and for the same reason: transport is
+    not the adapter's problem. Worth measuring one thing that is *not*
+    thin, though, because it is the question a simultaneous EDX, EELS and
+    imaging workflow asks of this transport.
+
+    **Concurrency composes; correlation does not.** This handle owns its
+    own connection, and the server gives every connection its own handler
+    thread (``serving.accept_loop``), so a caller genuinely may drive
+    this detector from one thread while another drives the scanner —
+    neither call queues behind the other, and the detector really can be
+    integrating while the scan runs. That much of the brief's question
+    has a positive answer, and it is worth stating because the protocol
+    being "strictly synchronous" makes it sound as though it does not.
+
+    What the transport gives no part of is a shared trigger, a shared
+    clock, or an identifier tying two results to one pass of the probe.
+    So what two overlapping calls produce is two acquisitions that
+    overlapped in *wall-clock time*, which is not the same claim as
+    sharing probe positions, and on a scanned instrument sharing probe
+    positions is the whole point. Adding a trigger here would not fix it
+    either: the correlation is established in hardware at the detector,
+    and what is missing above this layer is a unit of acquisition that
+    represents one pass with several outputs. See
+    :meth:`~miainwoodpecker.devices.interface.SpectrumDetector.acquire_map`
+    and docs/adapters/spectrum-detectors.md.
+    """
+
+    @property
+    def detector_id(self) -> str:
+        """Return the remote device's detector id."""
+        return typing.cast("str", self._call("detector_id"))
+
+    @property
+    def acquisition_modes(self) -> Sequence[str]:
+        """Return the acquisition modes the remote device supports."""
+        return typing.cast("Sequence[str]", self._call("acquisition_modes"))
+
+    def parameters(self) -> SpectrumParameters:
+        """Return the settings the remote device's next spectrum will use."""
+        return typing.cast("SpectrumParameters", self._call("parameters"))
+
+    def configure(self, parameters: SpectrumParameters) -> SpectrumParameters:
+        """
+        Apply settings to the remote device and return what it accepted.
+
+        Parameters
+        ----------
+        parameters : SpectrumParameters
+            The requested live time, channel count, and energy calibration.
+
+        Returns
+        -------
+        SpectrumParameters
+            What the device took, which is not necessarily what was asked.
+        """
+        return typing.cast("SpectrumParameters", self._call("configure", parameters))
+
+    def start(self) -> None:
+        """Begin acquisition on the remote device."""
+        self._call("start")
+
+    def stop(self) -> None:
+        """Pause acquisition on the remote device."""
+        self._call("stop")
+
+    def acquire_spectrum(self) -> Spectrum:
+        """Return one spot spectrum from the remote device."""
+        return self._spectrum("acquire_spectrum")
+
+    def acquire_map(self, parameters: ScanParameters) -> Spectrum:
+        """
+        Return a spectrum image from the remote device.
+
+        Parameters
+        ----------
+        parameters : ScanParameters
+            The scan geometry to map over.
+
+        Returns
+        -------
+        Spectrum
+            One spectrum per probe position, energy on the last axis.
+        """
+        return self._spectrum("acquire_map", parameters)
 
 
 class RemoteInstrument:
@@ -1078,6 +1195,16 @@ class RemoteInstrumentDevices:
     stage_size_nm : float
         The stage extent, useful for choosing a sensible
         ``ScanParameters.fov_nm``.
+    spectrum_detector : RemoteSpectrumDetector | None
+        A detector that produces energy spectra rather than frames — an
+        EDX silicon drift detector is the case in hand. ``None`` unless
+        the server serves the ``spectrum_detector`` target.
+
+        Last, and with a default, deliberately: this dataclass is frozen
+        and its fields are positional, so anything constructing one by
+        position — a test, a script, an out-of-tree tool — keeps working
+        untouched. An EELS spectrometer is **not** here; it disperses
+        onto a camera and is served as one.
     """
 
     ronchigram_camera: RemoteCamera | None
@@ -1086,6 +1213,31 @@ class RemoteInstrumentDevices:
     scanner: RemoteScanner | None
     instrument: RemoteInstrument
     stage_size_nm: float
+    spectrum_detector: RemoteSpectrumDetector | None = None
+
+    def spectrum_detectors(self) -> dict[str, RemoteSpectrumDetector]:
+        """
+        Return every spectrum detector this instrument serves, by target name.
+
+        The counterpart to :meth:`cameras`, and there for the same
+        reason: an instrument with both an EDX and a WDS spectrometer is
+        ordinary, and a caller should be able to ask what is there
+        rather than about named slots.
+
+        Returns
+        -------
+        dict[str, RemoteSpectrumDetector]
+            Target name to detector, omitting those this server lacks.
+        """
+        return {
+            name: detector
+            for name, detector in zip(
+                _SPECTRUM_TARGET_NAMES,
+                (self.spectrum_detector,),
+                strict=True,
+            )
+            if detector is not None
+        }
 
     def cameras(self) -> dict[str, RemoteCamera]:
         """
@@ -1454,9 +1606,19 @@ def remote_instrument(
             if "scanner" in connections
             else None
         )
+        # Optional in exactly the way the cameras and the scanner are:
+        # what a server serves is what describe() says. Most instruments
+        # have no X-ray detector, and the ones that do may have it on a
+        # separate analyser entirely.
+        spectrum_detectors = {
+            name: RemoteSpectrumDetector(connections[name], name, process)
+            for name in _SPECTRUM_TARGET_NAMES
+            if name in connections
+        }
         devices: list[_RemoteDevice] = [
             *cameras.values(),
             *([scanner] if scanner is not None else []),
+            *spectrum_detectors.values(),
         ]
         try:
             yield RemoteInstrumentDevices(
@@ -1468,6 +1630,7 @@ def remote_instrument(
                 stage_size_nm=float(
                     typing.cast("float", description["stage_size_nm"]),
                 ),
+                spectrum_detector=spectrum_detectors.get("spectrum_detector"),
             )
         finally:
             _shut_down_server(instrument, devices, process)

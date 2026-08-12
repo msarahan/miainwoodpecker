@@ -55,6 +55,20 @@ What it checks, and why each check exists
    emitted before, on the same ``NXdata`` ``AXISNAME`` fields NXem
    validates. This proves the new axis kinds cost nothing schema-side, so
    the appdef claim from check 2 survives them.
+6. **Spectrum-detector recordings are valid NXem, and the placement that
+   is *not* valid still is not.** ``storage/spectra.py`` writes a
+   different layout — ``NXspectrum``'s ``intensity``/``axis_energy``
+   vocabulary plus an ``NXdetector`` carrying the EDS geometry — and the
+   question of *where* that layout may live was settled by measurement
+   rather than by reading. ``NXem`` documents ``NXspectrum`` only under
+   ``measurement/eventID*/spectrumID*``, and putting an ``NXspectrum``
+   group directly in the ``NXentry`` makes the file stop validating,
+   exactly as this project already found for ``NXebeam_column``. So the
+   data goes in the ``NXdata`` at ``entry/data`` that ``NXem`` *does*
+   document, spelled in ``NXspectrum``'s field names. This check asserts
+   both halves — that what the writer produces validates, and that the
+   tempting alternative does not — so the second cannot silently become
+   allowed and leave the writer looking arbitrary.
 
 Exits non-zero if any check fails, which is the point: ``pynx validate``
 itself exits 0 even when it prints "is NOT valid", so a CI step built on
@@ -75,8 +89,8 @@ import numpy as np
 from pynxtools.dataconverter.validation import validate_hdf_group_against
 from pynxtools.units import NXUnitSet
 
-from miainwoodpecker.devices.interface import HIGH_TENSION_V_KEY, Frame
-from miainwoodpecker.storage import FrameCalibration, NexusWriter
+from miainwoodpecker.devices.interface import HIGH_TENSION_V_KEY, Frame, Spectrum
+from miainwoodpecker.storage import FrameCalibration, NexusWriter, SpectrumWriter
 from miainwoodpecker.storage.calibration import (
     NEXUS_UNIT_CATEGORIES,
     PIXEL_UNITS,
@@ -327,6 +341,94 @@ def _check_calibrated_recordings_are_still_valid(directory: Path) -> str | None:
     return None
 
 
+def _spectra() -> list[Frame]:
+    """
+    Return synthetic spectra to write, standing in for an EDX acquisition.
+
+    Returns
+    -------
+    list[Frame]
+        Two spot spectra with the full detector-metadata vocabulary, so
+        the ``NXdetector`` fields the spectrum writer emits are part of
+        what gets validated rather than only the ``NXdata``.
+    """
+    rng = np.random.default_rng(1)
+    return [
+        Spectrum(
+            data=rng.poisson(200.0, 512).astype("uint32"),
+            timestamp=datetime.datetime(2026, 1, 1, tzinfo=datetime.UTC)
+            + datetime.timedelta(seconds=index),
+            energy_offset_ev=-480.0,
+            energy_scale_ev=10.0,
+            metadata={
+                "device_id": "synthetic_sdd",
+                "spectrum_index": index,
+                "live_time_s": 10.0,
+                "real_time_s": 12.5,
+                "azimuth_deg": 45.0,
+                "elevation_deg": 18.0,
+                "solid_angle_sr": 0.7,
+                "energy_resolution_ev": 129.0,
+                "detector_type": "sdd",
+                "technique": "eds",
+                HIGH_TENSION_V_KEY: 100000.0,
+            },
+        )
+        for index in range(2)
+    ]
+
+
+def _check_spectrum_recording_is_valid(directory: Path) -> str | None:
+    """
+    Check a spectrum recording validates as NXem, and the rejected layout does not.
+
+    Parameters
+    ----------
+    directory : Path
+        Scratch directory to write into.
+
+    Returns
+    -------
+    str | None
+        A failure description, or None if the check passed.
+    """
+    path = directory / "spectra.nxs"
+    with SpectrumWriter(
+        path,
+        title="EDS recording",
+        definition=_APPDEF,
+        sample=_SYNTHETIC_SAMPLE,
+        instrument=_SYNTHETIC_INSTRUMENT,
+    ) as writer:
+        for spectrum in _spectra():
+            writer.append(spectrum)
+    if not _is_valid(path):
+        return (
+            f"a spectrum recording claiming {_APPDEF!r} with full specimen "
+            f"metadata does not validate; see the reported problems above"
+        )
+
+    # And the negative half: the same NXdata, moved into an NXspectrum
+    # group at entry level, must still be rejected. If a pynxtools upgrade
+    # ever started allowing it, the layout above would be an arbitrary
+    # choice rather than the only validating one, and this is where that
+    # would be noticed.
+    rejected = directory / "spectra-in-nxspectrum.nxs"
+    with h5py.File(path, "r") as source, h5py.File(rejected, "w") as target:
+        source.copy("entry", target)
+        target.attrs["NX_class"] = "NXroot"
+        target.attrs["default"] = "entry"
+        group = target["entry"].create_group("spectra")
+        group.attrs["NX_class"] = "NXspectrum"
+    if _is_valid(rejected):
+        return (
+            "an NXspectrum group placed directly in the NXentry now validates "
+            "against NXem; storage/spectra.py writes its NXdata at entry/data "
+            "specifically because it did not, so that decision needs revisiting"
+        )
+    return None
+
+
 def main() -> int:
     """
     Run every schema check and report.
@@ -346,6 +448,8 @@ def main() -> int:
          _check_calibration_units_match_their_categories),
         (f"calibrated camera recordings are still valid {_APPDEF}",
          _check_calibrated_recordings_are_still_valid),
+        (f"spectrum recordings are valid {_APPDEF}, and NXspectrum-at-entry is not",
+         _check_spectrum_recording_is_valid),
     )
     failures = []
     with tempfile.TemporaryDirectory() as scratch:

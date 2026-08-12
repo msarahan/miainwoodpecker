@@ -12,9 +12,12 @@ the main application.
 """
 
 from miainwoodpecker.devices.interface import (
+    ACQUISITION_MODES,
     BEAM_BLANKER_CONTROL,
     DEFOCUS_CONTROL,
     ENERGY_OFFSET_CONTROL,
+    MAP_MODE,
+    SPOT_MODE,
     STAGE_POSITION_CONTROL,
     Camera,
     CameraParameters,
@@ -22,12 +25,18 @@ from miainwoodpecker.devices.interface import (
     InstrumentController,
     ScanParameters,
     Scanner,
+    Spectrum,
+    SpectrumDetector,
+    SpectrumParameters,
 )
 
 __all__ = [
+    "ACQUISITION_MODES",
     "BEAM_BLANKER_CONTROL",
     "DEFOCUS_CONTROL",
     "ENERGY_OFFSET_CONTROL",
+    "MAP_MODE",
+    "SPOT_MODE",
     "STAGE_POSITION_CONTROL",
     "Camera",
     "CameraParameters",
@@ -35,4 +44,7 @@ __all__ = [
     "InstrumentController",
     "ScanParameters",
     "Scanner",
+    "Spectrum",
+    "SpectrumDetector",
+    "SpectrumParameters",
 ]

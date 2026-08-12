@@ -35,6 +35,7 @@ TARGET_NAMES = (
     "eels_camera",
     "camera",
     "scanner",
+    "spectrum_detector",
     "instrument",
 )
 """
@@ -47,10 +48,56 @@ declare their own copy, so reordering one silently bound the scanner's
 port to the EELS camera — a mismatch ``strict=True`` cannot catch,
 because the *count* still agrees. One definition, on the side of the
 boundary that has no vendor dependency, removes the possibility.
+
+**This tuple is append-only, and ``spectrum_detector`` is the first
+thing appended to it.** New names go immediately before ``instrument``,
+which stays last (pinned by ``tests/unit/test_rpc.py``), so every
+existing name keeps its argv position and a server needs no change
+beyond agreeing on this tuple — which every server in this tree does by
+reading it at run time (``nargs=len(TARGET_NAMES)``), never by counting
+for itself. The client allocates one port per name whether or not the
+server serves it, and ``describe()`` decides which are connected, so the
+cost of a name nobody serves is one unused localhost port.
+
+docs/vendor-support.md proposes replacing this whole mechanism — bind
+one well-known port for ``instrument``, let the server choose and report
+the rest — and says the redesign should land *with* a second column
+adapter, against a real device list. Adding a name here rather than
+doing that redesign now is deliberate: an X-ray detector is not a second
+column, and settling a protocol change in the same commit as a new
+device shape would make both harder to review. It does make the case for
+the redesign stronger, since the tuple is now Nion's device list plus a
+detector class Nion does not have.
 """
 
-DEVICE_TARGET_NAMES = ("ronchigram_camera", "eels_camera", "camera", "scanner")
+DEVICE_TARGET_NAMES = (
+    "ronchigram_camera",
+    "eels_camera",
+    "camera",
+    "scanner",
+    "spectrum_detector",
+)
 """The targets that are devices, i.e. everything but ``instrument``."""
+
+SPECTRUM_TARGET_NAMES = ("spectrum_detector",)
+"""
+The targets that produce spectra rather than frames.
+
+One name, and neutral rather than ``eds``: the protocol behind it
+(:class:`~miainwoodpecker.devices.interface.SpectrumDetector`) fits a
+WDS spectrometer, a micro-XRF head, or a cathodoluminescence
+spectrometer as well as an EDX silicon drift detector, and putting the
+*technique* in the target name would be the same fiction as serving a
+USB microscope on ``ronchigram_camera``. Which technique it is belongs
+in the spectrum metadata, where ``camera_type`` already lives for
+frames.
+
+A tuple rather than a bare string for the reason
+:data:`CAMERA_TARGET_NAMES` is one: the client iterates it to build
+handles, and a second spectrum target (an instrument with both an EDX
+and a WDS spectrometer is ordinary) then costs a name here rather than a
+new code path.
+"""
 
 CAMERA_TARGET_NAMES = ("ronchigram_camera", "eels_camera", "camera")
 """
