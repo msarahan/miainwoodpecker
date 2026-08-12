@@ -37,6 +37,12 @@ plan's Phase 3 interruption table measured are reported in words rather
 than discovered as a traceback — an unfinalized recording displays but
 will not analyze, and a hard-killed one does neither.
 
+Analyzing an opened file reads it once, not twice. The load that displayed
+it already decompressed every frame, so those frames — with the axis
+calibration they were recorded with — are handed to the adapter directly
+instead of the adapter being pointed at the path. At 2048x2048 that is the
+difference between one 16.8MB-per-frame read and two.
+
 Importing this module requires the ``viewer`` optional dependency group.
 The camera group's "Analyze in HyperSpy", "Sum in LiberTEM", and "Fit
 central disk (py4DSTEM)" buttons additionally need the ``analysis``,
@@ -80,6 +86,7 @@ if typing.TYPE_CHECKING:
     import napari
 
     from miainwoodpecker.devices.interface import Camera, Frame, Scanner
+    from miainwoodpecker.storage.nexus import FrameStack
     from miainwoodpecker.storage.session import LoadedRecording, Recording
 
 _DEFAULT_DISPLAY_INTERVAL_MS = 33
@@ -118,11 +125,20 @@ class _AnalysisInput:
     origin : str
         Where it came from, in words, so the status line distinguishes a
         result computed from a fresh burst from one computed from a file.
+    frames : FrameStack | None
+        The same frames already in memory, when the operator is analyzing a
+        recording this widget has just opened and displayed — in which case
+        the adapters take these and the file is read once for the whole
+        operation instead of twice. ``None`` means the adapter reads
+        ``path`` itself, which is the fresh-burst case and any case where
+        the in-memory copy is not demonstrably the whole file (see
+        :meth:`_analysis_input`).
     """
 
     path: Path
     frame_count: int
     origin: str
+    frames: FrameStack | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -286,6 +302,11 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         self._analysis_status: QtWidgets.QLabel | None = None
         self._analysis_display: Callable[[object, _AnalysisInput], str] | None = None
         self._opened_file: Path | None = None
+        # The frames of _opened_file, kept from the load that displayed
+        # them so an analysis of that file does not read it again. Set and
+        # read on the GUI thread only, and handed to the worker as plain
+        # data by _start_analysis, exactly as _opened_file already is.
+        self._opened_frames: FrameStack | None = None
         self._scan_request: tuple[ScanParameters, int, str] = (
             ScanParameters(
                 height=_SCAN_SIZES[_DEFAULT_SCAN_SIZE_INDEX],
@@ -1131,6 +1152,11 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         """
         recording = loaded.recording
         self._opened_file = recording.path
+        # Kept alongside the path, from the same load: this is what the
+        # analysis buttons hand the adapters instead of making them read
+        # the file a second time. None when these frames are not the whole
+        # recording - LoadedRecording.frames decides that, not this widget.
+        self._opened_frames = loaded.frames
         data = loaded.data[0] if loaded.data.shape[0] == 1 else loaded.data
         name = f"File: {recording.path.name}"
         if name in self._viewer.layers:
@@ -1144,11 +1170,25 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
             )
         self._load_status.setText(f"{recording.path.name}: {' - '.join(parts)}")
 
-    def _analysis_file(self) -> Path | None:
-        """Return the on-disk file the analysis buttons should use, if any."""
+    def _analysis_source(self) -> tuple[Path | None, FrameStack | None]:
+        """
+        Return the opened file the analysis buttons should use, and its frames.
+
+        Both halves are read here, on the GUI thread, and passed into the
+        worker as plain data — the checkbox because it is a widget, and the
+        frames because they belong to whichever load last succeeded and
+        must not be picked up mid-flight from another thread.
+
+        Returns
+        -------
+        tuple[Path | None, FrameStack | None]
+            The file to analyze (``None`` to acquire a fresh burst
+            instead), and the frames already read from it, if they are the
+            whole recording.
+        """
         if not self._analyze_from_file_check.isChecked():
-            return None
-        return self._opened_file
+            return None, None
+        return self._opened_file, self._opened_frames
 
     @contextlib.contextmanager
     def _analysis_input(  # noqa: PLR0913 - keyword-only inputs, not a call signature
@@ -1159,6 +1199,7 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         title: str,
         filename: str,
         existing: Path | None,
+        existing_frames: FrameStack | None,
         note: str | None,
     ) -> Iterator[_AnalysisInput]:
         """
@@ -1184,6 +1225,33 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         frame is present and readable, only the finalization is missing. So
         that case is refused here with a sentence saying so.
 
+        Case 1 is also where the file gets read *once* rather than twice.
+        Opening it already read every frame to display them, so those
+        frames are passed on to the adapter rather than the adapter being
+        pointed at the path and decompressing the same tens of megabytes
+        again. Two conditions have to hold, and both are checked rather
+        than assumed:
+
+        - :attr:`~miainwoodpecker.storage.session.LoadedRecording.frames`
+          has to have offered them at all, which it declines to do for a
+          truncated read or a file that states no calibration;
+        - the file's own frame count, read here, has to match how many are
+          in hand — if the recording on disk has grown since it was opened,
+          the in-memory copy is stale and the file is the authority on what
+          it contains.
+
+        Either way the analysis is the same analysis; the fallback costs
+        the second read this exists to avoid, and nothing else.
+
+        The fresh-burst cases (2 and 3) deliberately keep reading the file
+        they just wrote. The frames are in memory there too, but their
+        calibration is only resolved when ``NexusWriter`` writes them (from
+        the frame metadata, by
+        :func:`~miainwoodpecker.storage.calibration.resolve_frame_calibration`),
+        so short-circuiting the read would mean re-deriving that here — a
+        second implementation of the rule that decides what a recording's
+        axes are, to save one read of a file this app just created.
+
         Parameters
         ----------
         frame_count : int
@@ -1201,6 +1269,10 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
             :class:`~miainwoodpecker.viewer.jobs.AnalysisJob`), and reading
             a widget off the GUI thread is exactly what that split exists to
             prevent. :meth:`_start_analysis` resolves it beforehand.
+        existing_frames : FrameStack | None
+            That file's frames, if the load that displayed them kept them.
+            Resolved on the GUI thread with ``existing``, for the same
+            reason, and used only when the checks above pass.
         note : str | None
             Per-recording note for a fresh burst into a session, resolved on
             the GUI thread for the same reason.
@@ -1221,10 +1293,17 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
             refusal = _analysis_refusal(described)
             if refusal is not None:
                 raise RecordingReadError(refusal)
+            in_hand = (
+                existing_frames
+                if existing_frames is not None
+                and len(existing_frames.data) == described.frame_count
+                else None
+            )
             yield _AnalysisInput(
                 path=existing,
                 frame_count=described.frame_count,
                 origin=existing.name,
+                frames=in_hand,
             )
             return
 
@@ -1274,7 +1353,12 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         happens on this side of the call — resolving the operator's
         Recordings checkbox and note field *before* the thread starts, and
         deferring every layer and label update to :meth:`_poll_analysis`.
-        Only ``compute`` crosses over, and it is handed plain data.
+        Only ``compute`` crosses over, and it is handed plain data. The
+        frames of an already-opened recording are resolved here for the
+        same reason and travel the same way: arrays and a calibration are
+        plain data, so handing them to the worker changes nothing about the
+        contract — what would break it is the worker reaching back for
+        ``self._opened_frames`` itself.
 
         One analysis at a time: a second click while one is running is
         refused rather than queued, because all three share the camera and
@@ -1315,7 +1399,7 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
             status.setText(_CAMERA_BUSY_MESSAGE)
             return
 
-        existing = self._analysis_file()
+        existing, existing_frames = self._analysis_source()
         note = self._note_for_next_recording()
 
         def work() -> _AnalysisOutcome:
@@ -1325,6 +1409,7 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
                 title=title,
                 filename=filename,
                 existing=existing,
+                existing_frames=existing_frames,
                 note=note,
             ) as source:
                 return _AnalysisOutcome(payload=compute(source), source=source)
@@ -1367,7 +1452,8 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         drive the same device at once), get a NeXus file to analyze from
         :meth:`_analysis_input` — a fresh burst, or a recording already on
         disk if the operator opened one and ticked the Recordings
-        checkbox — read it back as a HyperSpy signal with
+        checkbox, whose frames are then handed over directly rather than
+        read again — read it back as a HyperSpy signal with
         :func:`~miainwoodpecker.analysis.hyperspy_bridge.load_as_hyperspy_signal`,
         run one real HyperSpy operation
         (:meth:`hyperspy.signals.Signal2D.mean` over the frame axis), and
@@ -1379,6 +1465,7 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
             return
         try:
             from miainwoodpecker.analysis.hyperspy_bridge import (  # noqa: PLC0415
+                hyperspy_signal_from_frames,
                 load_as_hyperspy_signal,
             )
         except ImportError:
@@ -1386,7 +1473,11 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
             return
 
         def compute(source: _AnalysisInput) -> object:
-            signal = load_as_hyperspy_signal(source.path)
+            signal = (
+                load_as_hyperspy_signal(source.path)
+                if source.frames is None
+                else hyperspy_signal_from_frames(source.frames)
+            )
             return signal.mean(axis=signal.axes_manager.navigation_axes[0]).data
 
         def display(payload: object, source: _AnalysisInput) -> str:
@@ -1415,7 +1506,9 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         live camera loop if running, get a NeXus file to analyze from
         :meth:`_analysis_input` (a fresh burst, or a recording already on
         disk if the operator opened one and ticked the Recordings
-        checkbox), read it back as a LiberTEM ``DataSet`` with
+        checkbox, in which case its frames go straight into a
+        ``MemoryDataSet`` rather than being read off disk again), read it
+        back as a LiberTEM ``DataSet`` with
         :func:`~miainwoodpecker.analysis.libertem_bridge.load_as_libertem_dataset`,
         run one real LiberTEM UDF (``libertem.udf.sum.SumUDF``, summing
         across the frame/navigation axis) on the thread-bounded inline
@@ -1432,6 +1525,7 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
 
             from miainwoodpecker.analysis.libertem_bridge import (  # noqa: PLC0415
                 analysis_context,
+                libertem_dataset_from_frames,
                 load_as_libertem_dataset,
             )
         except ImportError:
@@ -1439,14 +1533,28 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
             return
 
         def compute(source: _AnalysisInput) -> object:
-            # An inline executor, sized to leave cores for this thread's
-            # own event loop: one UDF over one small, already-in-memory
-            # burst is not the large-dataset workload LiberTEM's default
-            # dask executor is built for, and an unbounded inline
-            # executor still asks for every physical core underneath
-            # itself. See analysis/threads.py for the measurement.
+            # Inline executor: this is a single UDF run over one small,
+            # already-in-memory burst, not the large-dataset workload
+            # LiberTEM's default dask executor is built for - spinning
+            # up a local cluster per button click would be pure overhead
+            # here. It is also what makes the in-memory MemoryDataSet
+            # below the right dataset rather than a testing convenience:
+            # there is no worker to ship the array to (see the adapter's
+            # module docstring).
+            #
+            # Sized rather than left at LiberTEM's default, which is
+            # every physical core: an unbounded inline executor sets the
+            # thread count around *every* partition, so it starves this
+            # thread's own event loop even though it spawns no cluster.
+            # See analysis/threads.py for the measurement.
             with analysis_context() as ctx:
-                dataset = load_as_libertem_dataset(ctx, source.path)
+                dataset = (
+                    load_as_libertem_dataset(ctx, source.path)
+                    if source.frames is None
+                    else libertem_dataset_from_frames(
+                        ctx, source.frames, source=source.origin
+                    )
+                )
                 result = ctx.run_udf(dataset=dataset, udf=SumUDF())
                 return result["intensity"].data
 
@@ -1476,7 +1584,8 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         §5) end to end: stop the live camera loop if running, get a NeXus
         file from :meth:`_analysis_input` — one freshly acquired frame, or
         a recording already on disk if the operator opened one and ticked
-        the Recordings checkbox — read it back
+        the Recordings checkbox, in which case the frames already read to
+        display it are used rather than read again — read it back
         as a py4DSTEM ``DiffractionSlice`` with
         :func:`~miainwoodpecker.analysis.py4dstem_bridge.load_as_diffraction_slice`,
         run one real py4DSTEM operation on that single diffraction pattern
@@ -1499,6 +1608,7 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
             from py4DSTEM.process.calibration import get_probe_size  # noqa: PLC0415
 
             from miainwoodpecker.analysis.py4dstem_bridge import (  # noqa: PLC0415
+                diffraction_slice_from_frames,
                 load_as_diffraction_slice,
             )
         except ImportError:
@@ -1506,7 +1616,11 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
             return
 
         def compute(source: _AnalysisInput) -> object:
-            diffraction_slice = load_as_diffraction_slice(source.path)
+            diffraction_slice = (
+                load_as_diffraction_slice(source.path)
+                if source.frames is None
+                else diffraction_slice_from_frames(source.frames, source=source.origin)
+            )
             stack = diffraction_slice.data
             pattern = stack if stack.ndim == _SINGLE_PATTERN_NDIM else stack[0]
             return (pattern, *get_probe_size(pattern))

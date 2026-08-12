@@ -110,6 +110,18 @@ is no single-pattern home for it, and ``get_probe_size`` measures the
 centre from the data anyway, so the offset stays in the file rather than
 being forced into a field that means something else.
 
+Reading a file, and not reading one
+-----------------------------------
+:func:`load_as_diffraction_slice` reads the recording;
+:func:`diffraction_slice_from_frames` takes frames a caller already holds
+(a :class:`~miainwoodpecker.storage.nexus.FrameStack`) and reads nothing.
+The first is one call to the second, so the unit conversion above has one
+implementation and cannot drift between the two. Two names rather than one
+union-typed parameter, for the reason given in
+:mod:`miainwoodpecker.analysis.hyperspy_bridge`: whether a call reads a
+2048x2048 file is exactly the thing the caller is choosing, so it belongs
+in the name.
+
 Requires the ``py4dstem`` optional dependency group
 (``pip install miainwoodpecker[py4dstem]``) - kept separate from the
 ``analysis`` extra HyperSpy uses; see pyproject.toml for the measured
@@ -127,6 +139,10 @@ from miainwoodpecker.storage.nexus import read_frames
 
 if typing.TYPE_CHECKING:
     import os
+
+    from miainwoodpecker.storage.nexus import FrameStack
+
+_UNNAMED_SOURCE = "this recording"
 
 # Which of our axis kinds py4DSTEM's diffraction-plane calibration can
 # express, as (the unit we must convert the axis to, py4DSTEM's own label
@@ -160,6 +176,9 @@ def load_as_diffraction_slice(path: os.PathLike[str] | str) -> DiffractionSlice:
     :func:`~miainwoodpecker.analysis.hyperspy_bridge.load_as_hyperspy_signal`
     delegates to HyperSpy's ``AxesManager``.
 
+    Reads the file; :func:`diffraction_slice_from_frames` is the same
+    construction from frames a caller already holds.
+
     Parameters
     ----------
     path : os.PathLike[str] | str
@@ -170,24 +189,67 @@ def load_as_diffraction_slice(path: os.PathLike[str] | str) -> DiffractionSlice:
     py4DSTEM.data.DiffractionSlice
         The frame(s), calibrated on the diffraction-plane (``Q``) axis.
 
+    Notes
+    -----
+    Raises ``ValueError`` if the file was written by an acquisition that
+    produced no frames, so it has no ``/entry/data`` group to read (from
+    :func:`~miainwoodpecker.storage.nexus.read_frames`); if its axes are
+    not both the same kind of quantity at the same scale, since
+    ``Q_pixel_size`` is a single isotropic number; or if that kind is not
+    one a diffraction plane can hold - real-space nanometres, from a
+    *scan* recording, and an energy axis, from a spectrum image, are both
+    refused rather than mislabelled as a diffraction-plane quantity. The
+    last two checks live in :func:`diffraction_slice_from_frames`.
+    """
+    return diffraction_slice_from_frames(read_frames(path), source=str(path))
+
+
+def diffraction_slice_from_frames(
+    frames: FrameStack,
+    *,
+    source: str = _UNNAMED_SOURCE,
+) -> DiffractionSlice:
+    """
+    Build a py4DSTEM ``DiffractionSlice`` from frames already in memory.
+
+    The disk-free half of :func:`load_as_diffraction_slice`, including the
+    factor-of-ten unit conversion that function's docstring and this
+    module's are about - it lives here, and the path-taking form is one
+    call to this, so there is no second copy of it to get wrong.
+
+    Parameters
+    ----------
+    frames : FrameStack
+        The frames to wrap, with the calibration they were recorded with.
+        The calibration is what decides whether these frames can become a
+        ``DiffractionSlice`` at all, so it is required rather than
+        optional.
+    source : str
+        What to call these frames in an error message. The arrays carry no
+        provenance of their own; the file-reading form passes its path so
+        the refusals below still name the file.
+
+    Returns
+    -------
+    py4DSTEM.data.DiffractionSlice
+        The frame(s), calibrated on the diffraction-plane (``Q``) axis.
+
     Raises
     ------
     ValueError
-        If the file was written by an acquisition that produced no
-        frames (so it has no ``/entry/data`` group to read); if its axes
-        are not both the same kind of quantity at the same scale, since
-        ``Q_pixel_size`` is a single isotropic number; or if that kind is
-        not one a diffraction plane can hold - real-space nanometres, from
-        a *scan* recording, and an energy axis, from a spectrum image, are
-        both refused rather than mislabelled as a diffraction-plane
-        quantity.
+        If the axes are not both the same kind of quantity at the same
+        scale, since ``Q_pixel_size`` is a single isotropic number; or if
+        that kind is not one a diffraction plane can hold - real-space
+        nanometres, from a *scan* recording, and an energy axis, from a
+        spectrum image, are both refused rather than mislabelled as a
+        diffraction-plane quantity.
     """
-    data, _frame_time, frame_calibration = read_frames(path)
+    data, _frame_time, frame_calibration = frames
     y_axis, x_axis = frame_calibration.y, frame_calibration.x
 
     if y_axis.kind is not x_axis.kind or y_axis.kind not in _Q_PIXEL_UNITS:
         msg = (
-            f"{path}'s axes are calibrated as y={y_axis.scale!r} "
+            f"{source}'s axes are calibrated as y={y_axis.scale!r} "
             f"{y_axis.units!r}, x={x_axis.scale!r} {x_axis.units!r}; "
             f"py4DSTEM.data.Calibration.Q_pixel_size/Q_pixel_units model a "
             f"single isotropic diffraction-plane scale in 'pixels', 'A^-1', "
@@ -201,7 +263,7 @@ def load_as_diffraction_slice(path: os.PathLike[str] | str) -> DiffractionSlice:
     x_converted = x_axis.converted_to(nexus_units)
     if y_converted.scale != x_converted.scale:
         msg = (
-            f"{path}'s diffraction axes are anisotropic "
+            f"{source}'s diffraction axes are anisotropic "
             f"({y_converted.scale!r} vs {x_converted.scale!r} "
             f"{nexus_units}); py4DSTEM.data.Calibration models one "
             f"Q_pixel_size for both, so this cannot be expressed without "

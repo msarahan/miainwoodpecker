@@ -27,7 +27,8 @@ import pytest
 
 from miainwoodpecker.devices import Frame
 from miainwoodpecker.storage import layout
-from miainwoodpecker.storage.nexus import NexusWriter, read_series
+from miainwoodpecker.storage.calibration import AxisKind
+from miainwoodpecker.storage.nexus import FrameStack, NexusWriter, read_series
 from miainwoodpecker.storage.session import (
     LoadJob,
     RecordingJob,
@@ -546,6 +547,79 @@ def test_load_recording_always_reads_at_least_one_frame(tmp_path):
 
     assert loaded.truncated
     assert loaded.data.shape[0] == 1
+
+
+def test_a_loaded_recording_carries_the_axis_calibration_from_the_file(tmp_path):
+    """
+    Loading reads the axes as well as the frames, which is what makes it analyzable.
+
+    The point is not the field itself but what it removes: an analysis of
+    an opened recording can now be handed the frames already in memory
+    instead of making an adapter read the same file again. Without the
+    calibration travelling with them that hand-off would produce a signal
+    claiming bare pixel axes — a silently wrong answer traded for a saved
+    read, which is a bad trade.
+    """
+    session = Session(tmp_path / "s")
+    # make_frame writes fov_nm=10.0 on a 4x4 frame, so the file records a
+    # real-space axis at 2.5 nm per pixel rather than the pixel fallback.
+    recording = session.record([make_frame(), make_frame()], label="scan")
+
+    loaded = load_recording(recording.path)
+
+    assert loaded.calibration is not None
+    assert loaded.calibration.x.kind is AxisKind.REAL_SPACE
+    assert loaded.calibration.x.units == "nm"
+    assert loaded.calibration.x.scale == pytest.approx(2.5)
+    # ...and the same values come back through the adapters' own carrier,
+    # alongside the arrays, so neither can be passed without the other.
+    frames = loaded.frames
+    assert isinstance(frames, FrameStack)
+    assert frames.calibration == loaded.calibration
+    assert np.array_equal(frames.data, loaded.data)
+    assert frames.frame_time.tolist() == list(loaded.frame_times)
+
+
+def test_an_unfinalized_recording_offers_frames_to_display_but_not_to_analyze(tmp_path):
+    """
+    An abandoned writer never wrote the axes, so there is no calibration to carry.
+
+    ``None`` here is not "uncalibrated" — an uncalibrated recording says so
+    in ``"pixel"`` units — it is "this file never got that far", and the
+    difference decides whether the frames may stand in for the recording.
+    They may not: an adapter handed them would produce axes the file never
+    asserted.
+    """
+    session = Session(tmp_path / "s")
+    target = session.reserve_path("scan")
+    abandon_a_writer(target)
+
+    loaded = load_recording(target)
+
+    expected_shape = (3, 4, 4)
+    assert loaded.data.shape == expected_shape  # still displays
+    assert loaded.calibration is None
+    assert loaded.frames is None
+
+
+def test_a_truncated_load_offers_no_frames_to_analyze(tmp_path):
+    """
+    Part of a recording is not the recording, however calibrated it is.
+
+    The budget stopped the read early, so "the mean of this recording"
+    computed from what is in hand would be the mean of something else with
+    nothing saying so. The file is still there and the adapter can read it;
+    only the shortcut is refused.
+    """
+    session = Session(tmp_path / "s")
+    recording = session.record([make_frame(float(i)) for i in range(5)], label="scan")
+    one_frame_bytes = 4 * 4 * 4
+
+    loaded = load_recording(recording.path, budget_bytes=2 * one_frame_bytes)
+
+    assert loaded.truncated
+    assert loaded.calibration is not None  # the axes were read fine
+    assert loaded.frames is None
 
 
 def test_load_recording_refuses_an_empty_recording_with_a_reason(tmp_path):

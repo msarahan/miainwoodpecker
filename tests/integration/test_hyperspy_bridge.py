@@ -6,6 +6,7 @@ Skipped unless the ``analysis`` optional dependency group is installed
 """
 
 import datetime
+import re
 
 import numpy as np
 import pytest
@@ -15,11 +16,20 @@ pytest.importorskip("hyperspy", reason="requires the 'analysis' extra")
 import hyperspy.api as hs
 
 from miainwoodpecker.analysis.hyperspy_bridge import (
+    hyperspy_signal_from_frames,
+    hyperspy_spectrum_from_frames,
     load_as_hyperspy_signal,
     load_as_hyperspy_spectrum,
 )
 from miainwoodpecker.devices import Frame
-from miainwoodpecker.storage import FrameCalibration, write_frames
+from miainwoodpecker.storage import (
+    AxisCalibration,
+    AxisKind,
+    FrameCalibration,
+    FrameStack,
+    read_frames,
+    write_frames,
+)
 
 _FRAME_COUNT = 3
 _HEIGHT, _WIDTH = 4, 6
@@ -199,6 +209,163 @@ def test_a_dispersive_y_axis_flattens_along_the_other_direction(tmp_path):
 
     assert spectrum.data.shape == (1, _HEIGHT)
     assert np.allclose(spectrum.data[0], _WIDTH)  # summed across x
+
+
+def _axes(signal) -> list[tuple[str, str, float, float]]:
+    """Return every axis of a signal as (name, units, scale, offset) tuples."""
+    return [
+        (axis.name, axis.units, axis.scale, axis.offset)
+        for axis in signal.axes_manager._axes  # noqa: SLF001 - nav + signal, in order
+    ]
+
+
+def test_frames_in_memory_produce_the_same_signal_as_reading_the_file(tmp_path):
+    """
+    The two entry points are one implementation, so they cannot disagree.
+
+    This is what makes the viewer's read-once path safe: analyzing a
+    recording it has already read must give the answer analyzing the file
+    would, or the saved read has been paid for in a different result.
+    Compared on data *and* every axis, because a mismatch in the axes is
+    exactly the failure that would otherwise pass unnoticed.
+    """
+    path = tmp_path / "diffraction.nxs"
+    write_frames(
+        path,
+        [_frame(i) for i in range(_FRAME_COUNT)],
+        calibration=FrameCalibration.diffraction(0.05, shape=(_HEIGHT, _WIDTH)),
+    )
+
+    from_file = load_as_hyperspy_signal(path)
+    from_memory = hyperspy_signal_from_frames(read_frames(path))
+
+    assert np.array_equal(from_memory.data, from_file.data)
+    assert from_memory.data.dtype == from_file.data.dtype
+    assert _axes(from_memory) == _axes(from_file)
+
+
+def test_frames_in_memory_need_no_file_at_all(tmp_path):
+    """
+    Nothing is read here, which is the whole point, so assert it structurally.
+
+    The frames are built in memory and never written, so if this function
+    reached for a file there would be nothing to reach for. That is a
+    stronger statement than counting opens: there is no path to open.
+    ``tmp_path`` is taken only to keep the signature uniform with its
+    neighbours.
+    """
+    assert tmp_path.exists()
+    data = np.arange(_FRAME_COUNT * _HEIGHT * _WIDTH, dtype=np.float32).reshape(
+        _FRAME_COUNT, _HEIGHT, _WIDTH
+    )
+    dispersion, zero_loss = 0.5, -20.0
+    frames = FrameStack(
+        data=data,
+        frame_time=np.array([0.0, 2.0, 4.0]),
+        calibration=FrameCalibration.spectrum(dispersion, offset=zero_loss),
+    )
+
+    signal = hyperspy_signal_from_frames(frames)
+
+    assert np.array_equal(signal.data, data)
+    x_axis, y_axis = signal.axes_manager.signal_axes
+    assert x_axis.units == "eV"
+    assert x_axis.scale == pytest.approx(dispersion)
+    assert x_axis.offset == pytest.approx(zero_loss)
+    assert y_axis.units == "pixel"
+    nav_axis = signal.axes_manager.navigation_axes[0]
+    assert nav_axis.units == "s"
+    assert nav_axis.scale == pytest.approx(2.0)  # two seconds between frames
+
+
+def test_an_uncalibrated_stack_stays_uncalibrated_rather_than_borrowing_axes(tmp_path):
+    """
+    Frames without a calibration produce the honest pixel axes, not silence.
+
+    The in-memory form cannot invent axes from a file it never opened, so
+    the ``FrameStack`` has to carry them — this asserts the fallback is the
+    same admitted "pixel" the file-reading form produces, rather than
+    something that merely looks calibrated.
+    """
+    path = tmp_path / "uncalibrated.nxs"
+    write_frames(path, [_frame(0)])
+
+    from_memory = hyperspy_signal_from_frames(read_frames(path))
+    from_file = load_as_hyperspy_signal(path)
+
+    assert _axes(from_memory) == _axes(from_file)
+    for axis in from_memory.axes_manager.signal_axes:
+        assert axis.units == "pixel"
+        assert axis.scale == pytest.approx(1.0)
+
+
+def test_the_spectrum_flattening_matches_between_the_two_entry_points(tmp_path):
+    """
+    The Signal1D path is shared the same way, energy axis included.
+
+    Flattening depends entirely on the calibration saying which direction
+    disperses, so this is the case where dropping the calibration on the
+    way to memory would be loudest — and it is asserted rather than assumed.
+    """
+    path = tmp_path / "eels.nxs"
+    dispersion, zero_loss = 0.5, -20.0
+    write_frames(
+        path,
+        [_frame(index) for index in range(_FRAME_COUNT)],
+        calibration=FrameCalibration.spectrum(dispersion, offset=zero_loss),
+    )
+
+    from_file = load_as_hyperspy_spectrum(path)
+    from_memory = hyperspy_spectrum_from_frames(read_frames(path))
+
+    assert isinstance(from_memory, hs.signals.Signal1D)
+    assert np.array_equal(from_memory.data, from_file.data)
+    assert _axes(from_memory) == _axes(from_file)
+
+
+def test_frames_with_no_energy_axis_are_refused_and_named_by_the_caller(tmp_path):
+    """
+    The refusal survives the move off disk, and can still say which file it was.
+
+    An array has no provenance of its own, so ``source=`` is how the
+    file-reading form keeps the filename in a message an operator reads in
+    a status label — with a neutral phrase when nobody supplies one.
+    """
+    path = tmp_path / "uncalibrated.nxs"
+    write_frames(path, [_frame(0)])
+    frames = read_frames(path)
+
+    with pytest.raises(ValueError, match="this recording has no single energy"):
+        hyperspy_spectrum_from_frames(frames)
+    with pytest.raises(ValueError, match=re.escape("0007-camera.nxs has no")):
+        hyperspy_spectrum_from_frames(frames, source="0007-camera.nxs")
+    with pytest.raises(ValueError, match=re.escape(str(path))):
+        load_as_hyperspy_spectrum(path)
+
+
+def test_a_hand_built_frame_stack_calibrates_its_two_axes_independently(tmp_path):
+    """
+    The per-axis model survives the in-memory route, which is where it could rot.
+
+    A frame with one energy axis and one real-space axis is the case a
+    single scale per signal cannot express; a carrier that flattened the
+    two would lose it quietly rather than fail.
+    """
+    assert tmp_path.exists()
+    frames = FrameStack(
+        data=np.ones((1, _HEIGHT, _WIDTH), dtype=np.float32),
+        frame_time=np.array([0.0]),
+        calibration=FrameCalibration(
+            y=AxisCalibration(AxisKind.REAL_SPACE, 1.5, units="nm"),
+            x=AxisCalibration(AxisKind.ENERGY, 0.25, -10.0, "eV"),
+        ),
+    )
+
+    signal = hyperspy_signal_from_frames(frames)
+
+    x_axis, y_axis = signal.axes_manager.signal_axes
+    assert (x_axis.units, x_axis.scale, x_axis.offset) == ("eV", 0.25, -10.0)
+    assert (y_axis.units, y_axis.scale, y_axis.offset) == ("nm", 1.5, 0.0)
 
 
 def test_empty_recording_is_rejected_with_a_clear_error(tmp_path):

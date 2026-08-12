@@ -783,9 +783,45 @@ def _axis_calibration_from_values(
     return AxisCalibration(kind, scale, offset, units)
 
 
-def read_frames(
-    path: os.PathLike[str] | str,
-) -> tuple[np.ndarray, np.ndarray, FrameCalibration]:
+class FrameStack(typing.NamedTuple):
+    """
+    A recording's frames, their times, and their axis calibration, together.
+
+    What :func:`read_frames` has always returned, given a name so it can be
+    *passed on* rather than only unpacked. The Phase 4 analysis adapters
+    take one of these as their in-memory input (see
+    :func:`miainwoodpecker.analysis.hyperspy_bridge.hyperspy_signal_from_frames`
+    and its siblings), which is what lets the viewer analyze frames it has
+    already read instead of making the adapter read the file a second time.
+
+    A :class:`typing.NamedTuple` rather than a dataclass for one reason:
+    ``data, frame_time, calibration = read_frames(path)`` is how every
+    existing caller and test uses that function, and a named tuple keeps
+    all of them working unchanged while giving the triple a type the rest
+    of the codebase can name in a signature.
+
+    The three fields travel together because *separating* them is the bug
+    this exists to prevent: an array without its calibration produces a
+    signal whose axes silently claim bare pixels, which is worse than the
+    duplicated read it was meant to avoid.
+
+    Attributes
+    ----------
+    data : np.ndarray
+        The ``(frames, height, width)`` stack.
+    frame_time : np.ndarray
+        Each frame's elapsed time in seconds, in acquisition order.
+    calibration : FrameCalibration
+        The ``y``/``x`` axis calibration, kind recovered from the units the
+        file records.
+    """
+
+    data: np.ndarray
+    frame_time: np.ndarray
+    calibration: FrameCalibration
+
+
+def read_frames(path: os.PathLike[str] | str) -> FrameStack:
     """
     Read a whole recording — stack, times, and calibration — in one open.
 
@@ -811,9 +847,10 @@ def read_frames(
 
     Returns
     -------
-    tuple[np.ndarray, np.ndarray, FrameCalibration]
+    FrameStack
         The ``(frames, height, width)`` stack, the per-frame elapsed
-        times in seconds, and the ``y``/``x`` calibration.
+        times in seconds, and the ``y``/``x`` calibration. Unpacks as the
+        plain triple it has always been.
 
     Raises
     ------
@@ -836,7 +873,7 @@ def read_frames(
                 for name in AXIS_NAMES
             },
         )
-    return data, frame_time, calibration
+    return FrameStack(data, frame_time, calibration)
 
 
 def require_frames(path: os.PathLike[str] | str) -> None:
