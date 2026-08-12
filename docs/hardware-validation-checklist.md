@@ -257,3 +257,43 @@ and sources: [adapters/dectris.md](adapters/dectris.md).
       It documents ARINA and QUADRO and does not name the ELA; whether
       that is a documentation gap or a real one decides whether the
       streaming half needs an upstream fix.
+
+## Gatan spectrometer — and the one check that may make it moot
+
+Full reasoning and sources: [adapters/gatan.md](adapters/gatan.md).
+
+- [ ] **Settle the Nion question first — this is cheap and may close the
+      whole case.** On SuperSTEM 2's control computer, run the existing
+      Nion server with `--backend hardware` and record what `describe()`
+      reports. If `eels_camera` and `energy_offset` are there, the UHV
+      Enfina is already supported through Nion with no Gatan code, and
+      every item below becomes unnecessary for that instrument. Nion
+      publishes `ZLPoffset` — the spectrometer drift-tube offset — which
+      it would not do for a spectrometer it does not drive.
+
+- [ ] If it is *not* there: identify what does read the Enfina — GMS, a
+      Gatan controller with its own interface, or something site-specific.
+
+- [ ] Confirm GMS's embedded Python version (`import sys; sys.version` in
+      DM's Python window) and whether `pip install miainwoodpecker` is
+      possible inside `GMS_VENV_PYTHON`. The pickle cap assumes 3.7; if
+      GMS has moved on, the cap is unnecessary but harmless.
+
+- [ ] Run the bridge's `simulated` backend *inside GMS* against a client
+      on the same network. This exercises the transport, the pickle
+      protocol cap and the authkey handshake across the real interpreter
+      pair, with no hardware at risk. Do this before anything touches a
+      detector.
+
+- [ ] Find the real imaging-filter DM-Script commands for this
+      spectrometer and record them, then replace the placeholder snippets.
+      They are constructor parameters precisely because they could not be
+      verified without the vendor's documentation.
+
+- [ ] Confirm `DM.GetFrontImage()` returns the live spectrum image while a
+      live view runs, and that `GetNumArray()` gives the expected shape
+      and dtype.
+
+- [ ] Measure the pickle-only frame cost at this detector's real frame
+      size. Attached links deliberately do not use shared memory, because
+      the peer may be on another machine.

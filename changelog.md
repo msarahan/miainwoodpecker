@@ -143,6 +143,68 @@
   that `hyperspy` and `py4dstem` are themselves GPL-3.0 and imported
   in-process, which §6 does not currently speak to.
 
+- **`remote.attached_instrument()`: drive a device server this client did
+  not launch.** The subprocess rule has one structural exception — an
+  adapter whose SDK exists only inside another running application cannot
+  be spawned by us. Gatan is the first case (GMS 3's Python cannot be
+  executed from outside DigitalMicrograph); anything living on a vendor's
+  own control PC is the general one. Both socket directions are supported
+  (`ACCEPT_TRANSPORT`, we listen; `CONNECT_TRANSPORT`, the bridge
+  listens and the recommended default, since GMS outlives many client
+  runs), sharing the whole existing protocol, authkey handshake, device
+  contracts and `RemoteInstrumentDevices` shape. `AttachInvitation`
+  publishes the rendezvous as a `0600` JSON file plus printed operator
+  instructions, with the authkey only in the file.
+
+  Liveness is deliberately *weaker* rather than faked: there is no
+  `Popen`, so a new `SERVER_DISCONNECTED` health state reports what is
+  actually known instead of reusing `SERVER_EXITED`, and attached errors
+  name the bridge's origin and point at its log rather than inventing an
+  exit status. Teardown is graceful with a per-device fallback and no
+  forced terminate — killing the peer would kill DigitalMicrograph
+  mid-acquisition. Shared memory is not used on attached links, because
+  the peer may be on another machine. All process knowledge moved behind
+  `_ServerLifecycle`; the spawn path's behaviour, messages and states are
+  unchanged.
+
+- **`rpc.COMPATIBLE_PICKLE_PROTOCOL`** caps outgoing calls on attached
+  links at pickle protocol 4. `multiprocessing.Connection.send` pickles
+  with the *sender's* default protocol — 5 since Python 3.8 — while GMS's
+  embedded interpreter is Python 3.7, whose `HIGHEST_PROTOCOL` is 4. Every
+  `Call` would have been unreadable and every `Result` fine, which
+  presents as a broken server rather than a version mismatch. Found by
+  reading CPython's source rather than by running it, since the failure
+  needs the vendor's interpreter to appear at all. The authkey handshake
+  is already cross-version safe: `_create_response` keeps the legacy MD5
+  path for an unprefixed challenge.
+
+- **`devices/gatan_bridge.py`** — a device server that runs *inside*
+  Gatan Microscopy Suite, with a `simulated` backend that needs no Gatan
+  software and is what CI exercises. DM-Script command names are
+  constructor parameters with placeholders rather than hard-coded
+  constants, because the imaging-filter energy-offset commands could not
+  be verified from this environment and guessing them into the source
+  would look like knowledge.
+
+- **`docs/adapters/gatan.md`**, and a correction to this project's own
+  recorded reasoning. `vendor-support.md` said a Gatan adapter "inverts
+  the topology … a bridge running inside DM that connects *out*". Only
+  half of that holds: what inverts is *ownership*, not direction.
+  DM-Script has both `TCPSocketBind` and `TCPSocketConnect`, SerialEM's
+  plug-in has listened inside DM for twenty years, and a published
+  DM-SDK/ZeroMQ bridge already exists (Lei, Weber, Clausen & Wilbrink,
+  *M&M* 30(S1), 2024). Direction is a firewall question.
+
+  The document also leads with the finding that matters most to the
+  facility that prompted it: **a Gatan spectrometer on a Nion column is
+  probably already supported.** Nion's instrumentation kit models an
+  optional `eels_camera` on the STEM controller, which `nion_server.py`
+  already reads, and already maps `energy_offset_ev` onto Nion's
+  `ZLPoffset` — the spectrometer drift-tube offset. Nion would not
+  publish that control for a spectrometer it does not drive. So the
+  SuperSTEM 2 case (UltraSTEM 100 + UHV Enfina) may need no Gatan code at
+  all, and settling it costs one `describe()` call on the instrument PC.
+
 - **A DECTRIS device server** (`miainwoodpecker.devices.dectris_server`),
   MIT and in-tree, driving ARINA/ELA/QUADRO/SINGLA-class detectors over
   the SIMPLON REST API — the third adapter, and the first *scientific
@@ -215,6 +277,16 @@
   with what would settle it, and the central one (whether `MfExtCont` is
   on an SU9000II rather than an SU7000) is settled by looking at the
   instrument PC rather than by a negotiation.
+
+- **`InstrumentController` is all-or-nothing to `isinstance`.**
+  `available_controls()` exists so an instrument can serve some controls
+  and not others, but the protocol is `runtime_checkable`, and that check
+  demands every method regardless of what the instrument says it
+  supports. Two adapters now fail it while working perfectly
+  (`camera_server.ServerInstrument`, `gatan_bridge.BridgeInstrument`), so
+  the check tests for Nion-shapedness rather than conformance. Found
+  independently by two adapters, which is the signal that it is the
+  abstraction rather than the adapters. Recorded, not yet fixed.
 
 - **A protocol gap in the instrument we already drive.** `Scanner`
   produces one channel per `scan_frame` call, on the stated premise that

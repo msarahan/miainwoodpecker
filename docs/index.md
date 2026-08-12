@@ -56,6 +56,9 @@ measurements included:
 - [DECTRIS detectors](adapters/dectris.md) — whether the ELA is reachable
   without Gatan's software, what SIMPLON exposes, and the adapter built
   on it.
+- [Gatan](adapters/gatan.md) — the one adapter that cannot be a
+  subprocess, the inbound transport built for it, and why the facility
+  that prompted it probably does not need it.
 - [Development docs](documentation/index.md) — environments, linting,
   publishing.
 
@@ -73,5 +76,6 @@ Other vendors <vendor-support>
 Analysis parity <analysis-parity>
 Hitachi SU9000II <adapters/hitachi>
 DECTRIS detectors <adapters/dectris>
+Gatan <adapters/gatan>
 Development <documentation/index>
 :::

@@ -87,12 +87,24 @@ in-process anything. **Direct Electron** ships a pip-installable Python
 client. **Hamamatsu** is a C SDK, but it is free, has an official Linux
 build, and has several maintained Python wrappers.
 
-**Gatan is the exception, and it inverts the topology.** GMS 3's Python
-integration runs *inside* DigitalMicrograph and, in Gatan's own words,
-cannot be executed from outside the application. A Gatan adapter is
-therefore not a subprocess this client launches — it is a bridge running
-inside DM that connects *out*. Same wire protocol, opposite direction,
-and the one detector case the current design does not fit.
+**Gatan is the exception, but it inverts *ownership*, not direction.**
+GMS 3's Python runs inside DigitalMicrograph and, in Gatan's own words,
+cannot be executed from outside it — so a Gatan adapter cannot be a
+subprocess we launch. It does *not* follow that it must connect out, as
+an earlier draft of this page asserted: `gms-socket-plugin` exposes both
+`TCPSocketBind` and `TCPSocketConnect` to DM-Script, SerialEM's DM
+plug-in has listened inside DM for two decades, and a published
+DM-SDK/ZeroMQ bridge already exists (Lei, Weber, Clausen & Wilbrink,
+*M&M* **30**(S1), 2024). Direction is a firewall question.
+`remote.attached_instrument()` supports both, and
+[`devices/gatan_bridge.py`](../src/miainwoodpecker/devices/gatan_bridge.py)
+is the reference implementation. See [Gatan](adapters/gatan.md).
+
+**And check Nion first.** A Gatan spectrometer on a Nion column is very
+likely reached as Nion's `eels_camera`, which this project already serves
+along with the `ZLPoffset` energy offset — supported today, with no Gatan
+code at all. That is the SuperSTEM 2 case (UltraSTEM 100 + UHV Enfina),
+unverified pending one `describe()` call on the instrument PC.
 
 #### Do not re-plumb high-rate streaming
 
@@ -182,7 +194,7 @@ What such an adapter would still have to work around, honestly:
 | **Direct Electron** | 4–6 d | `deapi` is pip-installable; needs Mission Control running and a detector to test against |
 | **Hamamatsu ORCA** | 5–8 d | C SDK via a Python wrapper; Linux build exists; add ROI and gain mode |
 | **Merlin / ASI** | 2–4 d each | Wrap LiberTEM-live's existing connection behind `Camera` |
-| **Gatan** | 5–8 d | Different topology: a bridge inside DM connecting out, plus a design decision about who owns the detector |
+| **Gatan** | transport **done** (2 d); DM-side 3–5 d | The transport is built (`attached_instrument()`, both socket directions). The remaining vendor work starts by settling whether a Nion column already serves the spectrometer, which would make it zero |
 | **ROI / gain / trigger on `CameraParameters`** | 2–3 d | Shared prerequisite for the three direct vendors |
 | **LiberTEM-live streaming handoff + ownership interlock** | 3–5 d | The design question above, settled once for all detectors |
 
@@ -401,6 +413,19 @@ Everything beyond that in a real adapter is vendor work.
 ## What is still the wrong shape
 
 Two, neither fixed, both estimated below rather than pre-emptively built.
+
+### `InstrumentController` is all-or-nothing to `isinstance`
+
+`available_controls()` exists precisely so an instrument can serve some
+controls and not others — a webcam has no defocus, a detector-only server
+has no stage. But `InstrumentController` is `runtime_checkable`, and a
+`runtime_checkable` Protocol's `isinstance` check is all-or-nothing: it
+demands every method regardless of what the instrument says it supports.
+Two adapters now fail that check while working perfectly
+(`camera_server.ServerInstrument` and `gatan_bridge.BridgeInstrument`),
+which means the check is testing for Nion-shapedness rather than for
+protocol conformance. Found twice, by two independent adapters, which is
+the signal that it is the abstraction and not the adapters.
 
 ### The target names are a fixed tuple
 
