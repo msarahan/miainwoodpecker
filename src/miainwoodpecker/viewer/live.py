@@ -37,6 +37,12 @@ plan's Phase 3 interruption table measured are reported in words rather
 than discovered as a traceback — an unfinalized recording displays but
 will not analyze, and a hard-killed one does neither.
 
+Analyzing an opened file reads it once, not twice. The load that displayed
+it already decompressed every frame, so those frames — with the axis
+calibration they were recorded with — are handed to the adapter directly
+instead of the adapter being pointed at the path. At 2048x2048 that is the
+difference between one 16.8MB-per-frame read and two.
+
 Importing this module requires the ``viewer`` optional dependency group.
 The camera group's "Analyze in HyperSpy", "Sum in LiberTEM", and "Fit
 central disk (py4DSTEM)" buttons additionally need the ``analysis``,
@@ -79,7 +85,10 @@ if typing.TYPE_CHECKING:
 
     import napari
 
+    from miainwoodpecker.analysis.operations import AnalysisInput
+    from miainwoodpecker.analysis.remote import AnalysisRunner
     from miainwoodpecker.devices.interface import Camera, Frame, Scanner
+    from miainwoodpecker.storage.nexus import FrameStack
     from miainwoodpecker.storage.session import LoadedRecording, Recording
 
 _DEFAULT_DISPLAY_INTERVAL_MS = 33
@@ -101,7 +110,6 @@ _NOTES_HEIGHT_PX = 64
 # that an operator who types and immediately clicks Record has their note.
 _CONTEXT_SAVE_DELAY_MS = 750
 _NEXUS_FILE_FILTER = "NeXus recordings (*.nxs *.h5 *.hdf5);;All files (*)"
-_SINGLE_PATTERN_NDIM = 2
 
 
 @dataclasses.dataclass(frozen=True)
@@ -118,11 +126,20 @@ class _AnalysisInput:
     origin : str
         Where it came from, in words, so the status line distinguishes a
         result computed from a fresh burst from one computed from a file.
+    frames : FrameStack | None
+        The same frames already in memory, when the operator is analyzing a
+        recording this widget has just opened and displayed — in which case
+        the adapters take these and the file is read once for the whole
+        operation instead of twice. ``None`` means the adapter reads
+        ``path`` itself, which is the fresh-burst case and any case where
+        the in-memory copy is not demonstrably the whole file (see
+        :meth:`_analysis_input`).
     """
 
     path: Path
     frame_count: int
     origin: str
+    frames: FrameStack | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -143,6 +160,36 @@ class _AnalysisOutcome:
 
     payload: object
     source: _AnalysisInput
+
+
+def _analysis_job_input(source: _AnalysisInput) -> AnalysisInput:
+    """
+    Restate what this widget resolved as what an analysis runner takes.
+
+    A three-field copy rather than a shared type, because the two
+    dataclasses answer different questions: ``_AnalysisInput`` also
+    carries the frame count the *status line* needs, which is a display
+    concern with no business crossing a process boundary. The conversion
+    is one line and it is here rather than in each button so the three
+    cannot drift.
+
+    Parameters
+    ----------
+    source : _AnalysisInput
+        What :meth:`LiveInstrumentWidget._analysis_input` produced.
+
+    Returns
+    -------
+    AnalysisInput
+        The same file-or-frames pair, plus the name a refusal should use.
+    """
+    from miainwoodpecker.analysis.operations import AnalysisInput  # noqa: PLC0415
+
+    return AnalysisInput(
+        path=str(source.path),
+        frames=source.frames,
+        origin=source.origin,
+    )
 
 
 def _condition(recording: Recording) -> str:
@@ -207,7 +254,7 @@ def _analysis_refusal(recording: Recording) -> str | None:
 
 class LiveInstrumentWidget(QtWidgets.QWidget):
     """
-    Dock widget with live scan (and optionally camera) view controls.
+    Dock widget with live scan and/or camera view controls.
 
     A session is attached with :meth:`set_session` rather than passed
     here: where data goes is operator-editable state that can change
@@ -216,29 +263,54 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
     widget still works as a live display, and the recording controls say
     so instead of pretending to save anything.
 
+    **Both devices are optional, and at least one is required.** A
+    detector-only device server — a Direct Electron, DECTRIS or Hamamatsu
+    camera driven through its own SDK, or the commodity USB camera server
+    — has no scan unit, and a scan-only server has no camera. The Scan
+    group is built only when there is a scanner to drive, so the absent
+    device is missing from the window rather than present and broken.
+    Everything downstream of the two groups (session, recordings,
+    analysis) is shared and unconditional, because none of it is
+    scan-specific: the analysis buttons already acquire from the camera.
+
     Parameters
     ----------
     viewer : napari.Viewer
         The napari viewer whose layers display the live frames.
-    scanner : Scanner
-        The scan device to drive.
+    scanner : Scanner | None
+        The scan device to drive, or None for a detector-only instrument.
     camera : Camera | None
-        An optional camera to offer a live view for (e.g. Ronchigram).
+        An optional camera to offer a live view for (e.g. Ronchigram, or
+        a commodity USB camera).
     display_interval_ms : int
         How often the display polls for new frames.
     parent : QtWidgets.QWidget | None
         Optional Qt parent widget.
+
+    Raises
+    ------
+    ValueError
+        If neither a scanner nor a camera is given. There would be
+        nothing to show and nothing to record, and every control would
+        be disabled — a window worth refusing to build rather than
+        opening empty.
     """
 
     def __init__(
         self,
         viewer: napari.Viewer,
-        scanner: Scanner,
+        scanner: Scanner | None,
         *,
         camera: Camera | None = None,
         display_interval_ms: int = _DEFAULT_DISPLAY_INTERVAL_MS,
         parent: QtWidgets.QWidget | None = None,
     ) -> None:
+        if scanner is None and camera is None:
+            msg = (
+                "LiveInstrumentWidget needs a scanner, a camera, or both - "
+                "an instrument with neither has nothing to display"
+            )
+            raise ValueError(msg)
         super().__init__(parent)
         self._viewer = viewer
         self._scanner = scanner
@@ -259,10 +331,19 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         # status label and layers. One job at a time is enforced in
         # _start_analysis; all three buttons share the device.
         self._analysis_status: QtWidgets.QLabel | None = None
-        self._analysis_display: (
-            Callable[[object, _AnalysisInput], str] | None
-        ) = None
+        self._analysis_display: Callable[[object, _AnalysisInput], str] | None = None
+        # One runner per analysis target, kept for the life of the widget.
+        # Only the isolated runner has anything to keep - a worker process
+        # whose 2.6-5.2s library import must not be paid per click - but
+        # both are cached the same way so the two paths differ in nothing
+        # but transport. Closed in shutdown().
+        self._analysis_runners: dict[str, AnalysisRunner] = {}
         self._opened_file: Path | None = None
+        # The frames of _opened_file, kept from the load that displayed
+        # them so an analysis of that file does not read it again. Set and
+        # read on the GUI thread only, and handed to the worker as plain
+        # data by _start_analysis, exactly as _opened_file already is.
+        self._opened_frames: FrameStack | None = None
         self._scan_request: tuple[ScanParameters, int, str] = (
             ScanParameters(
                 height=_SCAN_SIZES[_DEFAULT_SCAN_SIZE_INDEX],
@@ -271,10 +352,11 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
                 fov_nm=_DEFAULT_FOV_NM,
             ),
             0,
-            scanner.channel_names[0],
+            scanner.channel_names[0] if scanner is not None else "",
         )
         self._build_ui()
-        self._on_scan_settings_changed()
+        if scanner is not None:
+            self._on_scan_settings_changed()
         self._timer = QtCore.QTimer(self)
         self._timer.setInterval(display_interval_ms)
         self._timer.timeout.connect(self.refresh_display)
@@ -283,7 +365,8 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         layout = QtWidgets.QVBoxLayout(self)
         layout.addWidget(self._build_session_group())
         layout.addWidget(self._build_recordings_group())
-        layout.addWidget(self._build_scan_group())
+        if self._scanner is not None:
+            layout.addWidget(self._build_scan_group())
         if self._camera is not None:
             layout.addWidget(self._build_camera_group())
         layout.addStretch(1)
@@ -420,10 +503,17 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         self._notes_edit.textChanged.connect(self._context_save_timer.start)
 
     def _build_scan_group(self) -> QtWidgets.QGroupBox:
+        # Only reached when there is a scanner: _build_ui skips this group
+        # entirely for a detector-only instrument, so the widgets it
+        # creates (_channel_combo, _scan_count_spin, _scan_status, ...) do
+        # not exist in that case. Every method that touches them checks
+        # _scanner rather than hasattr, because the scanner is the reason
+        # they exist and is the honest thing to ask about.
+        scanner = typing.cast("Scanner", self._scanner)
         scan_group = QtWidgets.QGroupBox("Scan", self)
         scan_form = QtWidgets.QFormLayout(scan_group)
         self._channel_combo = QtWidgets.QComboBox(scan_group)
-        self._channel_combo.addItems(list(self._scanner.channel_names))
+        self._channel_combo.addItems(list(scanner.channel_names))
         scan_form.addRow("Channel", self._channel_combo)
         self._size_combo = QtWidgets.QComboBox(scan_group)
         self._size_combo.addItems([str(size) for size in _SCAN_SIZES])
@@ -546,7 +636,8 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
     def _grab_scan(self) -> Frame:
         # Runs on the worker thread: reads the request tuple, never Qt state.
         parameters, channel_index, _ = self._scan_request
-        return self._scanner.scan_frame(parameters, channel_index)
+        scanner = typing.cast("Scanner", self._scanner)
+        return scanner.scan_frame(parameters, channel_index)
 
     def _toggle_scan(self) -> None:
         if self._scan_loop is not None and self._scan_loop.is_running:
@@ -561,7 +652,9 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
             self.start_camera()
 
     def start_scan(self) -> None:
-        """Start the live scan loop and the display timer."""
+        """Start the live scan loop and the display timer. No-op with no scanner."""
+        if self._scanner is None:
+            return
         if self._scan_loop is not None and self._scan_loop.is_running:
             return
         self._scan_loop = LiveAcquisition(self._grab_scan)
@@ -579,8 +672,12 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         bool
             True if the worker actually finished. False means a grab is
             still in flight and the scanner is still in use — callers
-            about to drive the scanner themselves must not proceed.
+            about to drive the scanner themselves must not proceed. True
+            with no scanner at all: nothing is holding the device, which
+            is what the callers are asking about.
         """
+        if self._scanner is None:
+            return True
         stopped = True
         if self._scan_loop is not None:
             stopped = self._scan_loop.stop()
@@ -827,21 +924,58 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
             self._space_label.setText("")
             return
         free = free_space(self._session.root)
-        frames = self._scan_count_spin.value()
-        planned = estimate_size(self._scan_request[0].shape, frames)
         text = f"{format_bytes(free)} free"
-        if free and planned > free:
-            # An upper bound compared against the real number: erring high
-            # here means warning slightly early, which is the right way to
-            # be wrong about running out of disk mid-acquisition.
-            text += (
-                f" - warning: {frames} scan frames need up to "
-                f"{format_bytes(planned)}"
-            )
+        plan = self._planned_recording_size()
+        if free and plan is not None:
+            frames, planned, source = plan
+            if planned > free:
+                # An upper bound compared against the real number: erring
+                # high here means warning slightly early, which is the
+                # right way to be wrong about running out of disk
+                # mid-acquisition.
+                text += (
+                    f" - warning: {frames} {source} frames need up to "
+                    f"{format_bytes(planned)}"
+                )
         self._space_label.setText(text)
+
+    def _planned_recording_size(self) -> tuple[int, int, str] | None:
+        """
+        Estimate the largest recording the current controls would write.
+
+        Returns
+        -------
+        tuple[int, int, str] | None
+            Frame count, upper-bound byte size, and what to call the
+            source, or None when no size can be estimated honestly.
+
+        Notes
+        -----
+        A scan's size is known before anything is acquired, because the
+        operator sets it: the Size combo *is* the frame shape. A camera's
+        is not — the sensor decides, and a commodity USB camera's
+        resolution is whatever the driver negotiated. So with no scanner
+        the estimate waits for a frame to arrive and then uses its real
+        shape, and stays silent until then. Inventing a shape to warn
+        about would put a number on screen that no acquisition would
+        produce, which is worse than saying nothing: the free-space
+        figure beside it is still true.
+        """
+        if self._scanner is not None:
+            frames = self._scan_count_spin.value()
+            return frames, estimate_size(self._scan_request[0].shape, frames), "scan"
+        if self._camera is None:  # pragma: no cover - one device is required
+            return None
+        frame = self._camera_loop.latest() if self._camera_loop is not None else None
+        if frame is None:
+            return None
+        frames = self._camera_count_spin.value()
+        return frames, estimate_size(frame.data.shape, frames), "camera"
 
     def save_scan_frame(self) -> None:
         """Save the scan frame currently on screen into the session."""
+        if self._scanner is None:
+            return
         label = f"scan-{self._scan_request[2]}-frame"
         self._save_displayed_frame(self._scan_loop, label)
 
@@ -867,6 +1001,8 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
 
     def record_scan_frames(self) -> None:
         """Record the requested number of scan frames into the session."""
+        if self._scanner is None:
+            return
         if self._session is None:
             self._recording_status.setText(_NO_SESSION_MESSAGE)
             return
@@ -883,7 +1019,7 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         parameters, channel_index, channel_name = self._scan_request
         self._start_recording(
             scan_series(
-                self._scanner,
+                typing.cast("Scanner", self._scanner),
                 parameters,
                 self._scan_count_spin.value(),
                 channel=channel_index,
@@ -1053,6 +1189,11 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         """
         recording = loaded.recording
         self._opened_file = recording.path
+        # Kept alongside the path, from the same load: this is what the
+        # analysis buttons hand the adapters instead of making them read
+        # the file a second time. None when these frames are not the whole
+        # recording - LoadedRecording.frames decides that, not this widget.
+        self._opened_frames = loaded.frames
         data = loaded.data[0] if loaded.data.shape[0] == 1 else loaded.data
         name = f"File: {recording.path.name}"
         if name in self._viewer.layers:
@@ -1066,11 +1207,25 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
             )
         self._load_status.setText(f"{recording.path.name}: {' - '.join(parts)}")
 
-    def _analysis_file(self) -> Path | None:
-        """Return the on-disk file the analysis buttons should use, if any."""
+    def _analysis_source(self) -> tuple[Path | None, FrameStack | None]:
+        """
+        Return the opened file the analysis buttons should use, and its frames.
+
+        Both halves are read here, on the GUI thread, and passed into the
+        worker as plain data — the checkbox because it is a widget, and the
+        frames because they belong to whichever load last succeeded and
+        must not be picked up mid-flight from another thread.
+
+        Returns
+        -------
+        tuple[Path | None, FrameStack | None]
+            The file to analyze (``None`` to acquire a fresh burst
+            instead), and the frames already read from it, if they are the
+            whole recording.
+        """
         if not self._analyze_from_file_check.isChecked():
-            return None
-        return self._opened_file
+            return None, None
+        return self._opened_file, self._opened_frames
 
     @contextlib.contextmanager
     def _analysis_input(  # noqa: PLR0913 - keyword-only inputs, not a call signature
@@ -1081,6 +1236,7 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         title: str,
         filename: str,
         existing: Path | None,
+        existing_frames: FrameStack | None,
         note: str | None,
     ) -> Iterator[_AnalysisInput]:
         """
@@ -1106,6 +1262,33 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         frame is present and readable, only the finalization is missing. So
         that case is refused here with a sentence saying so.
 
+        Case 1 is also where the file gets read *once* rather than twice.
+        Opening it already read every frame to display them, so those
+        frames are passed on to the adapter rather than the adapter being
+        pointed at the path and decompressing the same tens of megabytes
+        again. Two conditions have to hold, and both are checked rather
+        than assumed:
+
+        - :attr:`~miainwoodpecker.storage.session.LoadedRecording.frames`
+          has to have offered them at all, which it declines to do for a
+          truncated read or a file that states no calibration;
+        - the file's own frame count, read here, has to match how many are
+          in hand — if the recording on disk has grown since it was opened,
+          the in-memory copy is stale and the file is the authority on what
+          it contains.
+
+        Either way the analysis is the same analysis; the fallback costs
+        the second read this exists to avoid, and nothing else.
+
+        The fresh-burst cases (2 and 3) deliberately keep reading the file
+        they just wrote. The frames are in memory there too, but their
+        calibration is only resolved when ``NexusWriter`` writes them (from
+        the frame metadata, by
+        :func:`~miainwoodpecker.storage.calibration.resolve_frame_calibration`),
+        so short-circuiting the read would mean re-deriving that here — a
+        second implementation of the rule that decides what a recording's
+        axes are, to save one read of a file this app just created.
+
         Parameters
         ----------
         frame_count : int
@@ -1123,6 +1306,10 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
             :class:`~miainwoodpecker.viewer.jobs.AnalysisJob`), and reading
             a widget off the GUI thread is exactly what that split exists to
             prevent. :meth:`_start_analysis` resolves it beforehand.
+        existing_frames : FrameStack | None
+            That file's frames, if the load that displayed them kept them.
+            Resolved on the GUI thread with ``existing``, for the same
+            reason, and used only when the checks above pass.
         note : str | None
             Per-recording note for a fresh burst into a session, resolved on
             the GUI thread for the same reason.
@@ -1143,10 +1330,17 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
             refusal = _analysis_refusal(described)
             if refusal is not None:
                 raise RecordingReadError(refusal)
+            in_hand = (
+                existing_frames
+                if existing_frames is not None
+                and len(existing_frames.data) == described.frame_count
+                else None
+            )
             yield _AnalysisInput(
                 path=existing,
                 frame_count=described.frame_count,
                 origin=existing.name,
+                frames=in_hand,
             )
             return
 
@@ -1196,7 +1390,12 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         happens on this side of the call — resolving the operator's
         Recordings checkbox and note field *before* the thread starts, and
         deferring every layer and label update to :meth:`_poll_analysis`.
-        Only ``compute`` crosses over, and it is handed plain data.
+        Only ``compute`` crosses over, and it is handed plain data. The
+        frames of an already-opened recording are resolved here for the
+        same reason and travel the same way: arrays and a calibration are
+        plain data, so handing them to the worker changes nothing about the
+        contract — what would break it is the worker reaching back for
+        ``self._opened_frames`` itself.
 
         One analysis at a time: a second click while one is running is
         refused rather than queued, because all three share the camera and
@@ -1237,7 +1436,7 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
             status.setText(_CAMERA_BUSY_MESSAGE)
             return
 
-        existing = self._analysis_file()
+        existing, existing_frames = self._analysis_source()
         note = self._note_for_next_recording()
 
         def work() -> _AnalysisOutcome:
@@ -1247,6 +1446,7 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
                 title=title,
                 filename=filename,
                 existing=existing,
+                existing_frames=existing_frames,
                 note=note,
             ) as source:
                 return _AnalysisOutcome(payload=compute(source), source=source)
@@ -1280,6 +1480,62 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         self._refresh_session_labels()
         self._maybe_stop_timer()
 
+    def _analysis_runner(self, name: str) -> AnalysisRunner:
+        """
+        Return this widget's runner for one analysis target, making it once.
+
+        Cached for the widget's lifetime because an isolated runner owns a
+        worker process whose library import costs seconds, and paying that
+        per click would turn a demonstrated capability into an annoyance.
+        The in-process runner has nothing to cache and is cached anyway,
+        so the two paths differ in transport and in nothing else.
+
+        Called on the GUI thread, before the analysis job starts, for the
+        same reason every other pre-flight check is: it can raise, and it
+        can talk to a status label.
+
+        Parameters
+        ----------
+        name : str
+            The analysis target, as
+            :data:`~miainwoodpecker.analysis.transfer.ANALYSIS_TARGETS`
+            names it.
+
+        Returns
+        -------
+        AnalysisRunner
+            The runner to hand to the button's ``compute`` closure.
+
+        Notes
+        -----
+        Propagates ``ImportError`` from
+        :func:`~miainwoodpecker.analysis.remote.open_runner` when the
+        target's optional extra is not installed — which each caller turns
+        into its own status message, exactly as the handler's own
+        ``try``/``except`` did before.
+        """
+        existing = self._analysis_runners.get(name)
+        if existing is not None:
+            return existing
+        from miainwoodpecker.analysis.remote import open_runner  # noqa: PLC0415
+
+        runner = open_runner(name)
+        self._analysis_runners[name] = runner
+        return runner
+
+    def _close_analysis_runners(self) -> None:
+        """
+        Shut down every analysis worker this widget started.
+
+        Guarded individually: a worker that has already died should not
+        stop the next one being reaped, and an application on its way out
+        has nothing to gain from a traceback here.
+        """
+        for runner in self._analysis_runners.values():
+            with contextlib.suppress(Exception):
+                runner.close()
+        self._analysis_runners.clear()
+
     def _analyze_camera_in_hyperspy(self) -> None:
         """
         Round-trip a short camera burst through the HyperSpy adapter.
@@ -1289,27 +1545,31 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         drive the same device at once), get a NeXus file to analyze from
         :meth:`_analysis_input` — a fresh burst, or a recording already on
         disk if the operator opened one and ticked the Recordings
-        checkbox — read it back as a HyperSpy signal with
+        checkbox, whose frames are then handed over directly rather than
+        read again — read it back as a HyperSpy signal with
         :func:`~miainwoodpecker.analysis.hyperspy_bridge.load_as_hyperspy_signal`,
         run one real HyperSpy operation
         (:meth:`hyperspy.signals.Signal2D.mean` over the frame axis), and
         push the result into napari as a new image layer. Requires the
         ``analysis`` optional dependency group; reports that in the
         status label rather than crashing the widget if it is missing.
+
+        Whether the HyperSpy call happens in this process or in an
+        isolated worker is
+        :func:`~miainwoodpecker.analysis.remote.analysis_runner`'s
+        decision, not this handler's, and in-process remains the default.
+        See docs/analysis-isolation.md.
         """
         if self._camera is None:
             return
         try:
-            from miainwoodpecker.analysis.hyperspy_bridge import (  # noqa: PLC0415
-                load_as_hyperspy_signal,
-            )
+            runner = self._analysis_runner("hyperspy")
         except ImportError:
             self._analyze_status.setText("install the 'analysis' extra")
             return
 
         def compute(source: _AnalysisInput) -> object:
-            signal = load_as_hyperspy_signal(source.path)
-            return signal.mean(axis=signal.axes_manager.navigation_axes[0]).data
+            return runner.run("mean_projection", _analysis_job_input(source))
 
         def display(payload: object, source: _AnalysisInput) -> str:
             self._viewer.add_image(
@@ -1337,37 +1597,33 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         live camera loop if running, get a NeXus file to analyze from
         :meth:`_analysis_input` (a fresh burst, or a recording already on
         disk if the operator opened one and ticked the Recordings
-        checkbox), read it back as a LiberTEM ``DataSet`` with
+        checkbox, in which case its frames go straight into a
+        ``MemoryDataSet`` rather than being read off disk again), read it
+        back as a LiberTEM ``DataSet`` with
         :func:`~miainwoodpecker.analysis.libertem_bridge.load_as_libertem_dataset`,
         run one real LiberTEM UDF (``libertem.udf.sum.SumUDF``, summing
-        across the frame/navigation axis) with an inline ``Context``, and
-        push the result into napari as a new image layer. Requires the
+        across the frame/navigation axis) on the thread-bounded inline
+        ``Context`` from
+        :func:`~miainwoodpecker.analysis.libertem_bridge.analysis_context`,
+        and push the result into napari as a new image layer. Requires the
         ``libertem`` optional dependency group; reports that in the status
         label rather than crashing the widget if it is missing.
+
+        The executor stays inline and thread-bounded, unchanged — see
+        :func:`~miainwoodpecker.analysis.operations.sum_projection`, which
+        is where that closure's body now lives so the isolated worker can
+        run the same code rather than a copy of it.
         """
         if self._camera is None:
             return
         try:
-            from libertem.api import Context  # noqa: PLC0415
-            from libertem.udf.sum import SumUDF  # noqa: PLC0415
-
-            from miainwoodpecker.analysis.libertem_bridge import (  # noqa: PLC0415
-                load_as_libertem_dataset,
-            )
+            runner = self._analysis_runner("libertem")
         except ImportError:
             self._libertem_status.setText("install the 'libertem' extra")
             return
 
         def compute(source: _AnalysisInput) -> object:
-            # Inline executor: this is a single UDF run over one small,
-            # already-in-memory burst, not the large-dataset workload
-            # LiberTEM's default dask executor is built for - spinning
-            # up a local cluster per button click would be pure
-            # overhead here.
-            with Context.make_with("inline") as ctx:
-                dataset = load_as_libertem_dataset(ctx, source.path)
-                result = ctx.run_udf(dataset=dataset, udf=SumUDF())
-                return result["intensity"].data
+            return runner.run("sum_projection", _analysis_job_input(source))
 
         def display(payload: object, source: _AnalysisInput) -> str:
             self._viewer.add_image(
@@ -1395,7 +1651,8 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         §5) end to end: stop the live camera loop if running, get a NeXus
         file from :meth:`_analysis_input` — one freshly acquired frame, or
         a recording already on disk if the operator opened one and ticked
-        the Recordings checkbox — read it back
+        the Recordings checkbox, in which case the frames already read to
+        display it are used rather than read again — read it back
         as a py4DSTEM ``DiffractionSlice`` with
         :func:`~miainwoodpecker.analysis.py4dstem_bridge.load_as_diffraction_slice`,
         run one real py4DSTEM operation on that single diffraction pattern
@@ -1415,20 +1672,13 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         if self._camera is None:
             return
         try:
-            from py4DSTEM.process.calibration import get_probe_size  # noqa: PLC0415
-
-            from miainwoodpecker.analysis.py4dstem_bridge import (  # noqa: PLC0415
-                load_as_diffraction_slice,
-            )
+            runner = self._analysis_runner("py4dstem")
         except ImportError:
             self._py4dstem_status.setText("install the 'py4dstem' extra")
             return
 
         def compute(source: _AnalysisInput) -> object:
-            diffraction_slice = load_as_diffraction_slice(source.path)
-            stack = diffraction_slice.data
-            pattern = stack if stack.ndim == _SINGLE_PATTERN_NDIM else stack[0]
-            return (pattern, *get_probe_size(pattern))
+            return runner.run("fit_central_disk", _analysis_job_input(source))
 
         def display(payload: object, source: _AnalysisInput) -> str:
             pattern, radius, x0, y0 = typing.cast(
@@ -1468,9 +1718,7 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
 
     def _maybe_stop_timer(self) -> None:
         scan_running = self._scan_loop is not None and self._scan_loop.is_running
-        camera_running = (
-            self._camera_loop is not None and self._camera_loop.is_running
-        )
+        camera_running = self._camera_loop is not None and self._camera_loop.is_running
         recording = self._recording_job is not None and self._recording_job.is_running
         loading = self._load_job is not None and self._load_job.is_running
         analyzing = self._analysis_job is not None
@@ -1584,6 +1832,11 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
             job.join()
         self.stop_scan()
         self.stop_camera()
+        # After the devices, and deliberately: a worker holds no hardware,
+        # so nothing about the column depends on it going first, while
+        # stopping the camera can take an exposure's worth of time and an
+        # idle worker costs nothing to leave running for it.
+        self._close_analysis_runners()
 
     def closeEvent(self, event: typing.Any) -> None:  # noqa: N802, ANN401 - Qt override
         """Shut down cleanly when the widget is closed."""

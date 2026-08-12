@@ -31,12 +31,20 @@ and only the pure compute is handed over. See
 ``LiveInstrumentWidget._start_analysis``, which reads the operator's
 choices *before* starting a job and defers every layer and label update to
 ``_poll_analysis``.
+
+Off the GUI thread is necessary and not sufficient, which is the second
+thing this module does. One job on one worker thread still starves the
+GUI if the libraries inside it each fan out to every core — measured, at
+a four-second freeze (docs/migration-plan.md, Phase 2) — so the work runs
+inside :func:`~miainwoodpecker.analysis.threads.limit_analysis_threads`.
+That module holds the policy and the evidence for it.
 """
 
 from __future__ import annotations
 
 import typing
 
+from miainwoodpecker.analysis.threads import limit_analysis_threads
 from miainwoodpecker.jobs import BackgroundJob
 
 if typing.TYPE_CHECKING:
@@ -67,11 +75,20 @@ class AnalysisJob(BackgroundJob):
 
     def _work(self) -> object:
         """
-        Run the caller's analysis on the worker thread.
+        Run the caller's analysis on the worker thread, with bounded threads.
+
+        The cap covers the whole callable rather than only the library
+        call inside it. The acquisition and the NeXus write that an
+        analysis button does first are not what the benchmark caught
+        taking the machine — a grab is IPC and gzip is single-threaded —
+        so including them costs nothing and means there is one place where
+        the limit goes on and comes off, rather than three buttons each
+        remembering to ask for it.
 
         Returns
         -------
         object
             Whatever the analysis produced, for the GUI thread to draw.
         """
-        return self._callable()
+        with limit_analysis_threads():
+            return self._callable()

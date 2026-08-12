@@ -380,13 +380,48 @@ problem — read their source and docs before designing our own adapters:
   4 seconds. **So this is not a second argument for changing viewer; it
   is a scheduling constraint on our own code.**
 
-  **The actionable form: cap analysis parallelism below the core count.**
-  `viewer/jobs.py` already runs one analysis at a time on one worker
-  thread, so our own fan-out is not the problem — the numpy/BLAS and
-  LiberTEM executor threads *inside* that one job are, and they default
-  to every core. Whatever runs analysis should leave at least two cores
-  for the GUI thread (`OMP_NUM_THREADS`, LiberTEM's executor worker
-  count), which the `--load 4` row says costs the live view nothing.
+  **The actionable form, now implemented rather than recommended:
+  analysis parallelism is capped below the core count.**
+  [`src/miainwoodpecker/analysis/threads.py`](../src/miainwoodpecker/analysis/threads.py)
+  holds the whole policy as one number — `os.cpu_count()` minus two,
+  floored at one — and two places apply it. `AnalysisJob` runs every
+  analysis inside `limit_analysis_threads()`, which caps the
+  OpenBLAS/MKL/OpenMP pools with `threadpoolctl` and restores them
+  afterwards; the LiberTEM button builds its `Context` from
+  `analysis_context()`, which hands the same number to
+  `InlineJobExecutor(inline_threads=...)`. The second is not redundant
+  with the first: **"inline" bounds the executor, not the numerics under
+  it** — an `InlineJobExecutor` with no `inline_threads` asks for
+  `psutil.cpu_count(logical=False)` fine-grained threads and applies that
+  to numba (which `threadpoolctl` cannot reach), pyfftw and the BLAS
+  pools around every partition it processes. `viewer/jobs.py` already ran
+  one analysis at a time on one worker thread, so our own fan-out never
+  was the problem; the library threads inside that one job were. The
+  target is the `--load 4` row — two cores left free — which that row
+  says costs the live view nothing.
+
+  **The floor is not a detail.** On one or two cores the subtraction is
+  zero or negative, and both consumers read that badly: a BLAS pool takes
+  zero as "decide for yourself" and goes back to every core, and LiberTEM
+  passes the number to `numba.set_num_threads`, which refuses anything
+  below one. So the smallest machines would have been the ones where the
+  cap either did nothing or crashed. One thread means a slow analysis
+  that still shares the machine.
+
+  **`OMP_NUM_THREADS` and friends are deliberately not used**, and would
+  not have worked: those are read when the native library loads — for
+  numpy, at `import numpy` — so setting them from inside a running Qt
+  application is a no-op that looks like a fix. `threadpoolctl` calls each
+  library's own runtime setter instead, which is the same thing LiberTEM
+  reaches for internally. The honest limitation is scope: those setters
+  are process-global, so the cap is bounded in *time* (lifted when the job
+  finishes) rather than confined to the worker thread. That costs nothing
+  here, since the GUI thread's own work is Qt repaints and napari
+  bookkeeping rather than BLAS calls, but it is a real difference from
+  "the analysis thread is limited". A second known gap: `os.cpu_count()`
+  reports the machine, not a container's CPU quota — `os.process_cpu_count()`
+  is the correct call and needs Python 3.13, above this package's 3.11
+  floor.
 
   **Camera live views measured at half the scan path, as predicted from
   the code.** 5.6 ms median here against the scan loop's 11–12 ms above,
@@ -442,7 +477,8 @@ problem — read their source and docs before designing our own adapters:
   OpenGL): the condition set here for moving to `ndv` — display still
   dominating once hardware-accelerated — is not met at any scan size, and
   the one regime where the fixed cost would bite is already routed to
-  LiberTEM-live. Keep napari; keep the analysis threads bounded.
+  LiberTEM-live. Keep napari — and the analysis threads are bounded, in
+  `analysis/threads.py`, rather than left as advice.
 
 **Phase 3 — Acquisition and storage**
 - [x] Acquisition sequences —
@@ -1048,12 +1084,43 @@ problem — read their source and docs before designing our own adapters:
     — heavier than HyperSpy's ~35 and close to the ~70 the Phase 3 notes
     measured for `pynxtools-em` — so installing one analysis library
     doesn't tax someone who only wanted the other.
-- [ ] Port Swift-specific analyses not already covered upstream, as small
-  adapter functions. **Deferred, not attempted**: this PoC's scope was
-  proving the wiring shape (adapter + one real menu action) works end to
-  end, not auditing Swift's analysis feature set for gaps HyperSpy/
-  py4DSTEM/LiberTEM don't already cover. That audit is real work for a
-  follow-up, not a checkbox to wave through here.
+- [x] Port Swift-specific analyses not already covered upstream, as small
+  adapter functions. **Audited, and the audit changed the shape of the
+  answer** — [`docs/analysis-parity.md`](analysis-parity.md) enumerates
+  roughly ninety operator-reachable operations across `nionswift`,
+  `nionswift-eels-analysis`, `nionswift-experimental` and the
+  instrumentation kit, maps each onto HyperSpy/LiberTEM/py4DSTEM (or
+  admits it doesn't map), and costs what's left. Three findings are worth
+  repeating here because they move Phase 4's premise:
+  - **"Port as small adapter functions" is the wrong verb for the core
+    menu.** All 56 Processing-menu operations are thin expressions over
+    one `nion.data.xdata_1_0` call, and `niondata` is **Apache-2.0**, not
+    GPL-3.0 — checked in three places, including the installed metadata
+    of the 15.9.1 this project already pins in the `device` extra. It
+    installs into a bare venv in four packages (against HyperSpy's ~35,
+    py4DSTEM's 65, LiberTEM's ~102) and runs standalone on plain NumPy
+    arrays with no Swift and no GUI, verified rather than assumed. So the
+    core menu is a dependency declaration on the MIT side plus a
+    calibration conversion, not fifty reimplementations.
+  - **This project has no EELS capability at all today, and that was
+    invisible.** HyperSpy 2.x does not contain EELS — verified by
+    introspecting the installed 2.4.0, whose `hs.signals` has no
+    `EELSSpectrum` — because EELS and EDS moved to `exspy` at the 2.0
+    split. The `analysis` extra is `hyperspy>=2.0`, so it covers none of
+    Swift's EELS menu. That is the largest real gap the audit found, and
+    it is ours rather than Swift's.
+  - **Only five gaps are genuinely Swift-specific and worth porting**, at
+    9–15 days total: thermometry (2–3 d), Fourier-filter mask shapes
+    (2–4 d), Double Gaussian (1 d), radial power spectrum (1–2 d), and
+    a two-area EELS background (1–2 d, on request only). Everything else
+    is either covered, subsumed by a better upstream implementation
+    (Swift's quantification is K-shell hydrogenic only, against eXSpy's
+    tabulated DFT/Dirac databases), display-only, or acquisition-time
+    work belonging to the synchronized-acquisition item rather than here.
+  - The audit also surfaces, without resolving, that `hyperspy` and
+    `py4dstem` are themselves GPL-3.0 and are imported in-process by
+    `viewer/live.py` — the shape §6 avoided for the device layer. §6
+    should say explicitly whether its boundary covers analysis extras.
 
 **Phase 5 — Parity and cutover**
 - Audit which Swift features the team actually uses day to day (not the
@@ -1109,15 +1176,52 @@ problem — read their source and docs before designing our own adapters:
     real ratio depends on data that does not exist yet. What is still not
     done is tracking cumulative usage across a shift, or doing anything
     about it beyond saying so.
-  - **A large file is read twice on the analyze-from-disk path** — once by
-    the load job for display, once by the adapter — because the adapters take
-    a path rather than an array. Harmless at pilot scale, wasteful at
-    2048×2048. **Still open, and deliberately**: fixing it means changing
-    what `load_as_hyperspy_signal`, `load_as_libertem_dataset`, and
-    `load_as_diffraction_slice` accept, which is a Phase 4 adapter API
-    change rather than the Phase 5 wiring the rest of this list is. Each has
-    an in-memory constructor to target (`Signal2D`, `MemoryDataSet`,
-    `DiffractionSlice`), so the shape is known; it is scoped, not blocked.
+  - ~~**A large file is read twice on the analyze-from-disk path**~~ —
+    **done**. It was read once by the load job for display and once by the
+    adapter, because the adapters took a path rather than an array;
+    harmless at pilot scale, 16.8MB per frame paid twice at 2048×2048.
+    Each adapter now has an in-memory entry point beside its file-reading
+    one — `hyperspy_signal_from_frames`, `hyperspy_spectrum_from_frames`,
+    `libertem_dataset_from_frames`, `diffraction_slice_from_frames`,
+    targeting exactly the `Signal2D`/`MemoryDataSet`/`DiffractionSlice`
+    constructors this note predicted — and the viewer hands over the
+    frames it already read. The path-taking forms are unchanged and are
+    now one call to their in-memory half, so there is one implementation
+    and the documented scripting API did not move.
+    - **Separate names, not a union-typed parameter.** Whether a call
+      decompresses a large recording is the thing the caller is choosing;
+      an `isinstance` check at the bottom of the stack would hide it,
+      while a name states it at the call site.
+    - **The calibration is what made this an adapter API change rather
+      than wiring**, exactly as this item said. Frames handed over without
+      their axes produce a signal silently claiming bare pixels — worse
+      than the duplicated read, because nothing downstream says so. So the
+      carrier is `FrameStack`: the `(data, frame_time, calibration)`
+      triple `read_frames` already returned, made a named tuple so every
+      existing unpacking still works, rather than a new type. `LoadJob`'s
+      `LoadedRecording` now carries the file's calibration too, and its
+      `frames` property declines to offer them when they are not the whole
+      recording — a truncated read, or an unfinalized file that never
+      wrote its axes — so a saved read can never quietly become a
+      different answer.
+    - **LiberTEM's constraints were measured, not assumed.**
+      `ctx.load("memory", data=stack, sig_dims=2)` infers the same
+      navigation `(n_frames,)` and signal `(height, width)` shapes its
+      HDF5 reader infers from the same file. `sig_dims` is explicit
+      because the same call on a *2D* array builds a dataset with no
+      frames to navigate instead of raising, so a flat single frame is
+      refused here with a sentence. `MemoryDataSet`'s own "not recommended
+      with a distributed executor" is a reason to keep the file-reading
+      form for that case, not to avoid this one — the viewer's executor is
+      inline, where there is no worker to ship an array to.
+    - **The fresh-burst path still reads the file it just wrote**, on
+      purpose: a burst's calibration is only resolved when `NexusWriter`
+      writes it, so short-circuiting that read would mean a second
+      implementation of the rule deciding what a recording's axes are, to
+      save one read of a file this app created moments earlier.
+    - Asserted by counting reads (`tests/integration/test_live_widget.py`
+      instruments both frame readers), because the result is identical
+      either way — nothing about the *answer* can show which happened.
   - ~~**The analysis buttons still block the GUI thread**~~ — **done**. All
     three now hand off to
     [`AnalysisJob`](../src/miainwoodpecker/viewer/jobs.py), which has

@@ -35,7 +35,7 @@ import logging
 import threading
 import typing
 
-from miainwoodpecker.devices.interface import Frame
+from miainwoodpecker.devices.interface import Frame, Spectrum
 from miainwoodpecker.devices.rpc import (
     SHARED_MEMORY_THRESHOLD_BYTES,
     Call,
@@ -96,15 +96,22 @@ def invoke(
         value = (
             attribute(*call.args, **call.kwargs) if callable(attribute) else attribute
         )
-        # Only frames worth the round trip are routed around the
+        # Only arrays worth the round trip are routed around the
         # pickle-over-socket channel; everything else returned here
-        # is small (a string, a list of names, None).
+        # is small (a string, a list of names, None). A spot spectrum is
+        # normally under the threshold and stays on the pickle path; a
+        # spectrum image is the case this branch exists for, since a
+        # 256x256 map of 4096 channels is a gigabyte.
         if (
             writer is not None
-            and isinstance(value, Frame)
+            and isinstance(value, (Frame, Spectrum))
             and value.data.nbytes >= SHARED_MEMORY_THRESHOLD_BYTES
         ):
-            value = writer.publish(value)
+            value = (
+                writer.publish(value)
+                if isinstance(value, Frame)
+                else writer.publish_spectrum(value)
+            )
         # The device's own close() just stopped its acquisition
         # thread; retire its shared-memory segment too, or it leaks
         # in /dev/shm - named segments aren't reclaimed when a

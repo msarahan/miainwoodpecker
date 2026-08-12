@@ -50,6 +50,19 @@ measurements included:
 - [Other vendors](vendor-support.md) — what Thermo Fisher, JEOL, Zeiss,
   Hitachi and Bruker actually expose, and what a second device adapter
   would cost.
+- [Analysis parity](analysis-parity.md) — every analysis Nion Swift
+  offers, which ones HyperSpy/LiberTEM/py4DSTEM already cover, and a
+  costed list of the ones they do not.
+- [Analysis isolation](analysis-isolation.md) — what HyperSpy actually
+  buys this project, what the GPL-3.0 analysis extras do and do not
+  imply, and the measured worker-process boundary built for the viewer's
+  analysis buttons.
+- [DECTRIS detectors](adapters/dectris.md) — whether the ELA is reachable
+  without Gatan's software, what SIMPLON exposes, and the adapter built
+  on it.
+- [Gatan](adapters/gatan.md) — the one adapter that cannot be a
+  subprocess, the inbound transport built for it, and why the facility
+  that prompted it probably does not need it.
 - [Development docs](documentation/index.md) — environments, linting,
   publishing.
 
@@ -64,5 +77,11 @@ Architecture review <architecture-review>
 Hardware validation checklist <hardware-validation-checklist>
 Work before hardware <pre-hardware-work>
 Other vendors <vendor-support>
+Analysis parity <analysis-parity>
+Analysis isolation <analysis-isolation>
+Hitachi SU9000II <adapters/hitachi>
+DECTRIS detectors <adapters/dectris>
+Gatan <adapters/gatan>
+Spectrum detectors <adapters/spectrum-detectors>
 Development <documentation/index>
 :::

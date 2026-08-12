@@ -6,6 +6,7 @@ Skipped unless the ``py4dstem`` optional dependency group is installed
 """
 
 import datetime
+import re
 
 import numpy as np
 import pytest
@@ -15,12 +16,17 @@ pytest.importorskip("py4DSTEM", reason="requires the 'py4dstem' extra")
 from py4DSTEM.data import DiffractionSlice
 from py4DSTEM.process.calibration import get_probe_size
 
-from miainwoodpecker.analysis.py4dstem_bridge import load_as_diffraction_slice
+from miainwoodpecker.analysis.py4dstem_bridge import (
+    diffraction_slice_from_frames,
+    load_as_diffraction_slice,
+)
 from miainwoodpecker.devices import Frame
 from miainwoodpecker.storage import (
     AxisCalibration,
     AxisKind,
     FrameCalibration,
+    FrameStack,
+    read_frames,
     write_frames,
 )
 
@@ -243,6 +249,79 @@ def test_mixed_axis_kinds_are_refused(tmp_path):
         ),
     )
 
+    with pytest.raises(ValueError, match="diffraction-plane"):
+        load_as_diffraction_slice(path)
+
+
+def test_frames_in_memory_produce_the_same_slice_as_reading_the_file(tmp_path):
+    """
+    Same data, same Q calibration, whichever entry point produced it.
+
+    The conversion this adapter is most careful about is a factor of ten
+    (1 A^-1 is 10 nm^-1), so "the two paths agree" is worth asserting on
+    the calibration and not only on the pixels: a second implementation
+    that skipped the conversion would still return the right array.
+    """
+    path = tmp_path / "reciprocal.nxs"
+    scale_per_nm = 0.05
+    write_frames(
+        path,
+        [_frame(1), _frame(2)],
+        calibration=FrameCalibration.diffraction(scale_per_nm),
+    )
+
+    from_file = load_as_diffraction_slice(path)
+    from_memory = diffraction_slice_from_frames(read_frames(path))
+
+    assert np.array_equal(from_memory.data, from_file.data)
+    assert from_memory.slicelabels == from_file.slicelabels
+    assert from_memory.calibration.Q_pixel_units == "A^-1"
+    assert from_memory.calibration.Q_pixel_size == pytest.approx(
+        from_file.calibration.Q_pixel_size
+    )
+    assert from_memory.calibration.Q_pixel_size == pytest.approx(scale_per_nm / 10.0)
+
+
+def test_the_factor_of_ten_is_applied_to_frames_that_never_touched_a_file(tmp_path):
+    """
+    The conversion lives in the in-memory half, so it cannot be skipped by it.
+
+    Built by hand, written nowhere: if the unit translation had stayed in
+    the file-reading wrapper, this would come back labelled 'A^-1' while
+    carrying an nm^-1 magnitude — every downstream number wrong by exactly
+    ten, with nothing saying so.
+    """
+    assert tmp_path.exists()
+    frames = FrameStack(
+        data=np.full((1, _HEIGHT, _WIDTH), 4.0, dtype=np.float32),
+        frame_time=np.array([0.0]),
+        calibration=FrameCalibration.diffraction(0.05),
+    )
+
+    diffraction_slice = diffraction_slice_from_frames(frames)
+
+    assert diffraction_slice.data.shape == (_HEIGHT, _WIDTH)
+    assert diffraction_slice.calibration.Q_pixel_units == "A^-1"
+    assert diffraction_slice.calibration.Q_pixel_size == pytest.approx(0.005)
+
+
+def test_a_scan_recording_in_memory_is_refused_and_can_still_name_its_file(tmp_path):
+    """
+    The refusals move with the conversion, and keep the filename when given one.
+
+    A real-space recording has no diffraction-plane scale to express, in
+    memory as much as on disk. Arrays carry no provenance, so ``source=``
+    is how the message an operator sees still says which file it was —
+    with a neutral phrase when nobody supplies one.
+    """
+    path = tmp_path / "scan.nxs"
+    write_frames(path, [_frame(0, fov_nm=24.0)])
+    frames = read_frames(path)
+
+    with pytest.raises(ValueError, match="this recording's axes are calibrated"):
+        diffraction_slice_from_frames(frames)
+    with pytest.raises(ValueError, match=re.escape("0007-scan.nxs's axes")):
+        diffraction_slice_from_frames(frames, source="0007-scan.nxs")
     with pytest.raises(ValueError, match="diffraction-plane"):
         load_as_diffraction_slice(path)
 

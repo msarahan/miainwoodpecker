@@ -246,6 +246,57 @@ from miainwoodpecker.analysis.py4dstem_bridge import load_as_diffraction_slice
 pattern = load_as_diffraction_slice("camera.nxs")  # calibrated DiffractionSlice
 ```
 
+Spectroscopy has its own two, which add the signal type and the metadata
+the quantification models read — an EELS camera recording and an EDX
+detector recording, each refusing the other's layout:
+
+```python
+from miainwoodpecker.analysis.hyperspy_bridge import (
+    load_as_eds_signal,
+    load_as_eels_signal,
+)
+
+eels = load_as_eels_signal("energy-series.nxs")  # exspy EELSSpectrum, eV axis
+eels.estimate_zero_loss_peak_centre()            # where the ZLP actually is
+eels.align_zero_loss_peak()                      # and line the series up on it
+
+eds = load_as_eds_signal("eds.nxs")              # exspy EDSTEMSpectrum
+```
+
+Both need the `analysis` extra, and say which one if it is missing.
+Two things eXSpy wants for EELS quantification are **not** filled in,
+because nothing this project records carries them — the convergence and
+collection semi-angles. Supply them yourself for the session:
+
+```python
+eels.set_microscope_parameters(convergence_angle=30.0, collection_angle=44.0)
+```
+
+Leaving them out is not a silent default: eXSpy refuses the operations
+that need them (`estimate_thickness(density=...)` raises) rather than
+using someone else's geometry. See
+[analysis parity](analysis-parity.md) for the full mapping.
+
+Each of those reads the file. If you already have the frames — because
+you read them yourself, or the viewer opened the recording — pass them
+instead and nothing is read again:
+
+```python
+from miainwoodpecker.analysis.hyperspy_bridge import hyperspy_signal_from_frames
+from miainwoodpecker.storage import read_frames
+
+frames = read_frames("series.nxs")      # data, frame_time, calibration
+signal = hyperspy_signal_from_frames(frames)
+```
+
+`hyperspy_spectrum_from_frames`, `libertem_dataset_from_frames(ctx,
+frames)`, and `diffraction_slice_from_frames` are the same for the other
+three. They take a `FrameStack` rather than a bare array on purpose: the
+calibration travels with the data, so a signal cannot end up silently
+claiming pixel axes because the axes were left behind. The two names are
+separate rather than one function accepting either, so it is visible at
+the call site whether a large file is about to be read.
+
 And because the files are plain NeXus HDF5, tools this project has
 never heard of can read them too — that is the point of not having a
 private format.

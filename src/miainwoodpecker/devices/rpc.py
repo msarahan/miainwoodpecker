@@ -22,6 +22,7 @@ one result shape, dispatch by looking up ``target`` then ``getattr`` for
 from __future__ import annotations
 
 import contextlib
+import pickle
 import socket
 import typing
 from dataclasses import dataclass, field
@@ -35,6 +36,7 @@ TARGET_NAMES = (
     "eels_camera",
     "camera",
     "scanner",
+    "spectrum_detector",
     "instrument",
 )
 """
@@ -47,10 +49,56 @@ declare their own copy, so reordering one silently bound the scanner's
 port to the EELS camera — a mismatch ``strict=True`` cannot catch,
 because the *count* still agrees. One definition, on the side of the
 boundary that has no vendor dependency, removes the possibility.
+
+**This tuple is append-only, and ``spectrum_detector`` is the first
+thing appended to it.** New names go immediately before ``instrument``,
+which stays last (pinned by ``tests/unit/test_rpc.py``), so every
+existing name keeps its argv position and a server needs no change
+beyond agreeing on this tuple — which every server in this tree does by
+reading it at run time (``nargs=len(TARGET_NAMES)``), never by counting
+for itself. The client allocates one port per name whether or not the
+server serves it, and ``describe()`` decides which are connected, so the
+cost of a name nobody serves is one unused localhost port.
+
+docs/vendor-support.md proposes replacing this whole mechanism — bind
+one well-known port for ``instrument``, let the server choose and report
+the rest — and says the redesign should land *with* a second column
+adapter, against a real device list. Adding a name here rather than
+doing that redesign now is deliberate: an X-ray detector is not a second
+column, and settling a protocol change in the same commit as a new
+device shape would make both harder to review. It does make the case for
+the redesign stronger, since the tuple is now Nion's device list plus a
+detector class Nion does not have.
 """
 
-DEVICE_TARGET_NAMES = ("ronchigram_camera", "eels_camera", "camera", "scanner")
+DEVICE_TARGET_NAMES = (
+    "ronchigram_camera",
+    "eels_camera",
+    "camera",
+    "scanner",
+    "spectrum_detector",
+)
 """The targets that are devices, i.e. everything but ``instrument``."""
+
+SPECTRUM_TARGET_NAMES = ("spectrum_detector",)
+"""
+The targets that produce spectra rather than frames.
+
+One name, and neutral rather than ``eds``: the protocol behind it
+(:class:`~miainwoodpecker.devices.interface.SpectrumDetector`) fits a
+WDS spectrometer, a micro-XRF head, or a cathodoluminescence
+spectrometer as well as an EDX silicon drift detector, and putting the
+*technique* in the target name would be the same fiction as serving a
+USB microscope on ``ronchigram_camera``. Which technique it is belongs
+in the spectrum metadata, where ``camera_type`` already lives for
+frames.
+
+A tuple rather than a bare string for the reason
+:data:`CAMERA_TARGET_NAMES` is one: the client iterates it to build
+handles, and a second spectrum target (an instrument with both an EDX
+and a WDS spectrometer is ordinary) then costs a name here rather than a
+new code path.
+"""
 
 CAMERA_TARGET_NAMES = ("ronchigram_camera", "eels_camera", "camera")
 """
@@ -76,6 +124,22 @@ HARDWARE_BACKEND = "hardware"
 BACKENDS = (SIMULATED_BACKEND, HARDWARE_BACKEND)
 """Every backend name the server accepts on its command line."""
 
+REPLAY_BACKEND = "replay"
+"""
+Backend name selecting a recording played back as if it were a device.
+
+Its own name rather than a flavour of :data:`HARDWARE_BACKEND`, because
+``hardware`` carries a promise. ``viewer/app.py`` states the two failures
+its backend selector exists to prevent: driving a microscope you meant to
+simulate, and *believing you are on hardware when you are not*. A backend
+called ``hardware`` that opens a file is the second one. Frame metadata
+saying ``replay`` does not undo a command line saying ``hardware`` — by
+the time anyone reads the metadata the session has already happened.
+
+Only servers that actually offer playback advertise this; it is not in
+:data:`BACKENDS`, which stays the two names every server understands.
+"""
+
 # Below this, a Frame result travels as plain pickle over the socket
 # instead of through shared memory. This is a *protocol* decision - it
 # determines whether the client receives a Frame or a SharedFrameRef - so
@@ -92,6 +156,36 @@ BACKENDS = (SIMULATED_BACKEND, HARDWARE_BACKEND)
 # size. 64KB sits inside the band measured as "doesn't matter much either
 # way", so it is kept rather than tuned further.
 SHARED_MEMORY_THRESHOLD_BYTES = 64 * 1024
+
+COMPATIBLE_PICKLE_PROTOCOL = 4
+"""
+The highest pickle protocol an older embedded interpreter can still read.
+
+Only relevant when the two ends of this protocol are **different
+interpreters**, which the spawn path never produces (it launches
+``sys.executable``) and an attached device server routinely does. The
+motivating case is Gatan's: GMS embeds its own Miniconda environment, and
+Gatan's own FAQ names Python 3.7.2 for it, while this project requires
+3.11 or newer.
+
+That combination breaks silently in one direction, which is why the
+number is pinned here rather than left to chance.
+``multiprocessing.connection.Connection.send`` serialises with
+``_ForkingPickler.dumps(obj)`` — no protocol argument, so the *sender's*
+``pickle.DEFAULT_PROTOCOL``. On 3.8 and later that is 5; Python 3.7's
+``pickle.HIGHEST_PROTOCOL`` is 4, so it cannot read a protocol-5 stream at
+all. Every ``Call`` this client sent would arrive as an unpickling error,
+while every ``Result`` coming back (written by the older end at protocol 3
+or 4) would decode perfectly — a failure that looks like a broken server
+rather than a version mismatch.
+
+Protocol 4 is readable by every Python 3.4 and later, and costs nothing:
+protocol 5's addition is out-of-band buffers, which a plain
+``pickle.dumps`` without a ``buffer_callback`` never emits anyway.
+
+The *reply* direction needs no such cap. An older peer writes protocol 3
+or 4 by default, and a newer interpreter reads both.
+"""
 
 
 def disable_nagle(connection: Connection) -> None:
@@ -288,6 +382,7 @@ def send_call(
     call: Call,
     *,
     timeout_s: float | None = None,
+    pickle_protocol: int | None = None,
 ) -> object:
     """
     Send a call and return its result, raising on a server-side error.
@@ -308,6 +403,15 @@ def send_call(
         wrong guess would abort a good exposure — and wrong only for
         calls whose whole purpose is to not hang the application, which
         is why this is opt-in per call rather than a global setting.
+    pickle_protocol : int | None
+        Cap the pickle protocol this call is serialised with, or ``None``
+        (the default) to use the sending interpreter's own default. Set
+        it when the peer is a *different, older* interpreter — see
+        :data:`COMPATIBLE_PICKLE_PROTOCOL`. The bytes on the wire are
+        otherwise identical: ``Connection.send`` is
+        ``send_bytes(pickle.dumps(...))`` with the framing this reuses,
+        so a capped call is indistinguishable from an ordinary one except
+        in its protocol byte.
 
     Returns
     -------
@@ -327,7 +431,10 @@ def send_call(
     """
     with lock:
         try:
-            connection.send(call)
+            if pickle_protocol is None:
+                connection.send(call)
+            else:
+                connection.send_bytes(pickle.dumps(call, protocol=pickle_protocol))
             if timeout_s is not None and not connection.poll(timeout_s):
                 msg = (
                     f"remote call {call.target}.{call.method}() did not reply "

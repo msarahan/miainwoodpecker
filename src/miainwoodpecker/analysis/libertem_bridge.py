@@ -67,6 +67,39 @@ adapter — and
 LiberTEM ever grows a per-axis calibration field the test fails and this
 adapter can start using it instead of this paragraph aging quietly.
 
+Reading a file, and not reading one
+-----------------------------------
+:func:`load_as_libertem_dataset` points LiberTEM's own HDF5 reader at the
+file. :func:`libertem_dataset_from_frames` is for the caller who already
+holds the frames — the viewer, which read them to display them — and wraps
+them with ``ctx.load("memory", ...)``, LiberTEM's ``MemoryDataSet``, so a
+2048x2048 recording is not decompressed twice to draw it once and analyze
+it once.
+
+These are two genuinely different datasets rather than one with two
+constructors, and the difference is worth stating rather than hiding
+behind a union-typed parameter. ``MemoryDataSet``'s own docstring says it
+"is not recommended for production use since it performs poorly with a
+distributed executor" — which is a statement about *where the array lives*,
+not a defect: with a dask executor each worker can open the file itself,
+while an in-memory dataset has to ship the array to them. Under the inline
+executor the viewer uses (one small burst, one UDF run) there is nothing to
+ship and nothing to lose, so the choice between the two entry points is the
+same question as the choice of executor, and the caller is the one holding
+both answers.
+
+Measured against LiberTEM 0.16 rather than assumed, because the shape
+rules are not obvious: ``ctx.load("memory", data=stack, sig_dims=2)`` on a
+``(n_frames, height, width)`` array infers navigation shape
+``(n_frames,)`` and signal shape ``(height, width)`` — byte for byte the
+shape ``H5DataSet`` infers from the same recording, which is what makes the
+two entry points interchangeable. ``sig_dims=2`` is passed explicitly
+because the same call on a *2D* array silently yields an empty navigation
+shape with the frame itself as signal; a single frame handed over as
+``(height, width)`` would therefore become a dataset with no frames to
+navigate rather than an error, so this adapter requires the 3D stack a
+recording always is.
+
 **Also investigated and found not to apply here**: a stronger
 demonstration would run LiberTEM against a real, published 4D-STEM
 dataset (genuine 2D navigation) rather than this app's 1D-navigation
@@ -93,6 +126,7 @@ from __future__ import annotations
 
 import typing
 
+from miainwoodpecker.analysis.threads import analysis_thread_count
 from miainwoodpecker.storage import layout
 from miainwoodpecker.storage.nexus import require_frames
 
@@ -102,7 +136,59 @@ if typing.TYPE_CHECKING:
     from libertem.api import Context
     from libertem.io.dataset.base import DataSet
 
+    from miainwoodpecker.storage.nexus import FrameStack
+
 _DATASET_PATH = layout.ABSOLUTE_NXDATA_DATA
+# A frame stack is (n_frames, height, width): one navigation dimension and
+# two signal ones. Stated as a constant because both numbers are load
+# bearing - see the module docstring for what a 2D array does instead.
+_STACK_RANK = 3
+_SIGNAL_DIMENSIONS = 2
+_UNNAMED_SOURCE = "these frames"
+
+
+def analysis_context(cpu_count: int | None = None) -> Context:
+    """
+    Return a ``Context`` whose threads leave room for the GUI thread.
+
+    The executor choice is unchanged and deliberate: an inline executor,
+    because a button click here is one UDF over one small, already
+    in-memory burst, and standing up a local dask cluster per click would
+    be pure overhead. What changes is the number under it. **"Inline"
+    bounds the executor, not the numerics**: ``InlineJobExecutor`` with no
+    ``inline_threads`` asks for ``psutil.cpu_count(logical=False)``
+    fine-grained threads and applies that to numba, pyfftw and the BLAS
+    pools around every partition it processes
+    (``libertem.common.threading.set_num_threads``), which on an idle
+    machine is every physical core — the thing
+    :mod:`miainwoodpecker.analysis.threads` exists to stop.
+
+    This is LiberTEM's own knob rather than an environment variable, which
+    is why the LiberTEM path gets a factory of its own instead of relying
+    on the process-wide limit
+    :func:`~miainwoodpecker.analysis.threads.limit_analysis_threads`
+    applies: numba's pool is not one ``threadpoolctl`` can reach, and
+    LiberTEM already sets it correctly when told a worker count.
+
+    Parameters
+    ----------
+    cpu_count : int | None
+        Cores to size the cap against; defaults to the machine's. See
+        :func:`~miainwoodpecker.analysis.threads.analysis_thread_count`.
+
+    Returns
+    -------
+    Context
+        A LiberTEM ``Context``, ready for :func:`load_as_libertem_dataset`
+        and :meth:`Context.run_udf`. It is a context manager and owns an
+        executor, so close it (``with analysis_context() as ctx:``).
+    """
+    from libertem.api import Context  # noqa: PLC0415
+    from libertem.executor.inline import InlineJobExecutor  # noqa: PLC0415
+
+    return Context(
+        executor=InlineJobExecutor(inline_threads=analysis_thread_count(cpu_count))
+    )
 
 
 def load_as_libertem_dataset(
@@ -123,7 +209,9 @@ def load_as_libertem_dataset(
         An existing LiberTEM ``Context`` (owns the executor the
         ``DataSet`` will run UDFs on). Not created here: a ``Context``'s
         lifecycle — inline vs. dask executor, one per app run vs. one
-        per call — is a caller concern, not a file-reading one.
+        per call — is a caller concern, not a file-reading one. This
+        app's own callers use :func:`analysis_context`, which makes the
+        one this project's GUI can afford to share a machine with.
     path : os.PathLike[str] | str
         An HDF5 file written by :class:`~miainwoodpecker.storage.nexus.NexusWriter`.
 
@@ -139,6 +227,75 @@ def load_as_libertem_dataset(
     :func:`~miainwoodpecker.storage.nexus.require_frames`) when the file
     recorded no frames. Checked here rather than left to LiberTEM, whose
     own "unable to infer dataset" message does not say what is wrong.
+
+    Reads the file, through LiberTEM's own reader rather than this
+    adapter's. :func:`libertem_dataset_from_frames` is the entry point for
+    a caller that already holds the frames.
     """
     require_frames(path)
     return ctx.load("hdf5", path=str(path), ds_path=_DATASET_PATH)
+
+
+def libertem_dataset_from_frames(
+    ctx: Context,
+    frames: FrameStack,
+    *,
+    source: str = _UNNAMED_SOURCE,
+) -> DataSet:
+    """
+    Wrap frames already in memory as a LiberTEM ``DataSet``.
+
+    ``ctx.load("memory", ...)``, i.e. LiberTEM's own ``MemoryDataSet``,
+    with the navigation/signal split stated explicitly rather than
+    inferred. The resulting shape is the same one
+    :func:`load_as_libertem_dataset` gets from the same recording, so a UDF
+    cannot tell which entry point produced its input — see the module
+    docstring for the measurement, and for when the file-reading form is
+    still the right one (a distributed executor).
+
+    The calibration in ``frames`` is ignored here, and that is not an
+    oversight: LiberTEM models no per-axis calibration at all, which the
+    module docstring documents and
+    ``tests/integration/test_libertem_bridge.py`` asserts as a canary. It
+    is still carried in the parameter rather than stripped at the call
+    site, so this adapter takes the same input as its two siblings and a
+    caller who reads the calibration out of ``frames`` for its own use has
+    it to hand.
+
+    Parameters
+    ----------
+    ctx : Context
+        An existing LiberTEM ``Context``, as for
+        :func:`load_as_libertem_dataset` — the executor's lifecycle is a
+        caller concern.
+    frames : FrameStack
+        The frames to wrap, ``(n_frames, height, width)``.
+    source : str
+        What to call these frames in an error message; the file-reading
+        callers pass their path, since the arrays carry no provenance.
+
+    Returns
+    -------
+    DataSet
+        The frame stack as a LiberTEM ``DataSet``, ready for
+        :meth:`Context.run_udf`.
+
+    Raises
+    ------
+    ValueError
+        If the stack is not three-dimensional. LiberTEM would not refuse a
+        2D array here — it would build a dataset with an empty navigation
+        shape — so a single frame passed as ``(height, width)`` is caught
+        with a sentence rather than analyzed as something it is not.
+    """
+    data = frames.data
+    if data.ndim != _STACK_RANK:
+        msg = (
+            f"{source} is a {data.ndim}D array of shape {data.shape}; a "
+            f"LiberTEM DataSet is built here from the "
+            f"(n_frames, height, width) stack a recording always is. Pass a "
+            f"single frame as data[np.newaxis] rather than on its own, which "
+            f"LiberTEM would accept as a dataset with no frames to navigate."
+        )
+        raise ValueError(msg)
+    return ctx.load("memory", data=data, sig_dims=_SIGNAL_DIMENSIONS)

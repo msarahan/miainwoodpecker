@@ -24,6 +24,14 @@ proxying all of them would be a vendor API in vendor-neutral clothing.
 Adding a control here should be driven by a caller that needs it — which
 is how the energy offset arrived, with ``energy_offset_series`` and not
 before it.
+
+:class:`SpectrumDetector` is the fourth kind, and the first one that is
+not a picture. An energy-dispersive X-ray detector produces a *histogram
+of photon energies* — one spectrum in spot mode, one spectrum per probe
+position when mapping — which is neither a scanned frame nor a camera
+frame. See docs/adapters/spectrum-detectors.md for the design argument,
+including why :class:`Spectrum` is its own type rather than a
+:class:`Frame` with a 1D array.
 """
 
 from __future__ import annotations
@@ -109,6 +117,15 @@ class Frame:
         The vendor's own label for the detector (``"ronchigram"``,
         ``"eels"``), which is what an analysis tool needs to know what
         kind of data this is.
+    ``exposure_ms``, ``binning``
+        What the frame was taken with. Every camera adapter here attaches
+        both, and the EELS adapter
+        (:func:`~miainwoodpecker.analysis.hyperspy_bridge.load_as_eels_signal`)
+        maps the exposure onto eXSpy's own detector item — so it is part
+        of the vocabulary rather than a Nion detail, and listed here
+        where the rest of it is. The caveat ``nion_server`` records
+        applies: this is the *configured* exposure, which the frame
+        already in flight during a ``configure`` was not taken at.
     ``counts_per_electron``
         Detector gain, where the device publishes it.
     ``frame_number``, ``integration_count``
@@ -122,7 +139,34 @@ class Frame:
     Attributes
     ----------
     data : npt.NDArray[typing.Any]
-        The acquired array. 2D for images; may be 1D for binned spectra.
+        The acquired array. 2D for images.
+
+        **An EELS frame is a ``Frame``, and stays one.** A spectrometer
+        disperses onto a 2D detector, so what the device produces is an
+        image in which one direction is energy and the other is not —
+        exactly what this type plus a per-axis calibration describes
+        (:meth:`~miainwoodpecker.storage.calibration.FrameCalibration.spectrum`,
+        and the adapter reads *which* direction from the device rather
+        than assuming). :class:`Spectrum` is for detectors that are
+        **natively** 1D, of which an EDX silicon drift detector is the
+        case in hand; it is not a second home for EELS.
+
+        **The 1D case is real but still unstored.** This said "may be 1D
+        for binned spectra", and Nion's own device layer can produce
+        one: ``CameraFrameParameters.processing = "sum_project"`` makes
+        the camera sum the whole non-dispersive direction and return a
+        spectrum (``nion.usim_device.CameraDevice``, measured — and
+        Nion's own ``CameraControl_test`` notes it is "for sequence/SI
+        only", not live view). This project never requests it,
+        ``nion_server``'s ``calibration_metadata`` already handles the
+        shape if it ever arrives, and
+        :class:`~miainwoodpecker.storage.nexus.NexusWriter` names exactly
+        two frame axes and raises on any other rank
+        (docs/architecture-review.md, §1.6: "a layout decision, not a
+        shape guess"). The layout now exists —
+        :class:`~miainwoodpecker.storage.spectra.SpectrumWriter` — so
+        that decision is reachable; wiring a projected readout to it is
+        the follow-up docs/adapters/spectrum-detectors.md specifies.
 
         **Deliberately not 3D**, which a colour sensor would need. A
         camera with a colour filter array should deliver its raw Bayer
@@ -334,6 +378,444 @@ class Scanner(typing.Protocol):
     def close(self) -> None:
         """Release the device."""
         ...
+
+
+SPOT_MODE = "spot"
+"""
+Acquisition mode: one spectrum from wherever the beam is standing.
+
+The mode every spectrum detector has, because it needs nothing from the
+scan unit — an accumulating counter and a clock. Named rather than
+implied because :attr:`SpectrumDetector.acquisition_modes` reports which
+of these a device can actually do, and a detector that cannot be
+scan-synchronised should say so instead of failing on the first map.
+"""
+
+MAP_MODE = "map"
+"""
+Acquisition mode: one spectrum per probe position over a scanned region.
+
+A *spectrum image*. Reported separately from :data:`SPOT_MODE` because it
+requires something spot mode does not: a hardware synchronisation between
+the scan and the detector's per-pixel binning. A benchtop XRF head or an
+unsynchronised analyser has :data:`SPOT_MODE` and not this one, and the
+distinction is not cosmetic — see
+:meth:`SpectrumDetector.acquire_map` for what this interface can and
+cannot promise about that synchronisation.
+"""
+
+ACQUISITION_MODES = (SPOT_MODE, MAP_MODE)
+"""Every acquisition mode a :class:`SpectrumDetector` may report."""
+
+
+@dataclass(frozen=True)
+class SpectrumParameters:
+    """
+    Settings for a spectrum acquisition, in vendor-neutral units.
+
+    The spectrum detector's counterpart to :class:`CameraParameters`, and
+    a value object for the same reason: the channel count and the energy
+    calibration must change together to stay coherent, since a detector
+    reconfigured from 2048 to 4096 channels at a fixed dispersion covers
+    a different energy range. Setting them one at a time leaves a window
+    in which a caller's idea of the energy axis and the device's disagree.
+
+    Energies are in electronvolts throughout, which is this project's
+    canonical energy unit
+    (:mod:`miainwoodpecker.storage.calibration`,
+    :meth:`InstrumentController.energy_offset_ev`) — **not** the
+    kiloelectronvolts every EDX vendor uses on screen and in its files.
+    RosettaSciIO's Bruker reader builds its energy axis in ``keV``
+    (``rsciio.bruker._api``, ``"units": "keV"``), and eXSpy accepts either
+    but converts internally, so an adapter converts once, here, rather
+    than leaving a factor of a thousand loose in the metadata.
+
+    Attributes
+    ----------
+    live_time_s : float
+        Preset acquisition time in *live* seconds — clock time minus the
+        time the pulse processor spent busy. EDX presets are specified in
+        live time rather than real time precisely because that is what
+        makes two spectra comparable at different count rates; the
+        acquired spectrum reports both (see :class:`Spectrum`). Must be
+        positive.
+
+        In :data:`MAP_MODE` this is the *per-pixel* preset, and a device
+        is free to ignore it in favour of the scan's own dwell time —
+        which is why ``configure`` returns what the device took.
+    channel_count : int
+        Number of energy channels in the spectrum. Must be at least one.
+    energy_scale_ev : float
+        Energy per channel, in electronvolts — the detector's dispersion,
+        typically 5-20 eV/channel on a silicon drift detector. Must be
+        positive.
+    energy_offset_ev : float
+        Energy at channel 0, in electronvolts. Not always zero: vendors
+        commonly digitise a little below zero so the noise peak is
+        visible and the zero-strobe can be fitted.
+    """
+
+    live_time_s: float
+    channel_count: int = 4096
+    energy_scale_ev: float = 10.0
+    energy_offset_ev: float = 0.0
+
+    def __post_init__(self) -> None:
+        """Reject values no spectrum detector could act on."""
+        if not self.live_time_s > 0:
+            msg = f"live_time_s must be positive, got {self.live_time_s!r}"
+            raise ValueError(msg)
+        if self.channel_count < 1:
+            msg = f"channel_count must be at least 1, got {self.channel_count!r}"
+            raise ValueError(msg)
+        if not self.energy_scale_ev > 0:
+            msg = f"energy_scale_ev must be positive, got {self.energy_scale_ev!r}"
+            raise ValueError(msg)
+
+
+@dataclass(frozen=True)
+class Spectrum:
+    """
+    Acquired photon counts against energy, and the acquisition's metadata.
+
+    The spectrum-side counterpart to :class:`Frame`, and deliberately a
+    *separate* type rather than a ``Frame`` carrying a 1D array. Three
+    things forced that, and the full argument is in
+    docs/adapters/spectrum-detectors.md:
+
+    - **A spectrum cannot exist without its energy axis.** A ``Frame``
+      may carry a calibration in ``metadata["calibration"]``, and
+      routinely does not — an uncalibrated frame is still an image. An
+      array of counts with no dispersion is not a spectrum; it is a
+      histogram of nothing. So the energy axis is a constructor argument
+      here, not an optional key.
+    - **A spectrum image is rank 3**, and ``Frame`` forbids that
+      explicitly (see :attr:`Frame.data`).
+    - **The calibration model does not fit.**
+      :class:`~miainwoodpecker.storage.calibration.FrameCalibration` is
+      exactly two axes named ``y`` and ``x``. A spot spectrum has one
+      axis and a spectrum image has three, so either case would have to
+      lie about one of the two.
+
+    **The energy axis is always the last one**, whatever the rank. That
+    is not this project's convention: it is NeXus's
+    (``NXspectrum``'s ``n_energy`` symbol reads "Number of energy bins
+    (**always the fastest dimension**)"), RosettaSciIO's, whose Bruker
+    HyperMap reader emits ``(height, width, Energy)``, and HyperSpy's,
+    where the signal axis is last and the navigation axes precede it. One
+    invariant, agreed by the format, the reader, and the analysis library
+    this data has to reach.
+
+    **The metadata vocabulary.** As on :class:`Frame`, every adapter
+    attaches what it can and omits what the instrument does not report
+    rather than substituting a default.
+
+    This set is **not** this project's invention, and that is the point:
+    it is the EMSA/MAS Standard File Format's spectral header, which both
+    vendors on the target instrument already export and which HyperSpy
+    already consumes. Read off RosettaSciIO's ``msa`` reader, whose
+    keyword table maps ``XPERCHAN``/``OFFSET`` (dispersion and channel
+    zero), ``LIVETIME``/``REALTIME``, ``AZIMANGLE``/``ELEVANGLE``/
+    ``SOLIDANGLE``, ``FWHMMNKA`` and ``EDSDET`` onto exactly the eXSpy
+    ``Acquisition_instrument.TEM.Detector.EDS.*`` items. Every name below
+    is one of those, spelled in this project's own conventions, and every
+    one also has a home in a NeXus base class — see
+    docs/adapters/spectrum-detectors.md for the three-column table.
+
+    Units are the operator's throughout, as everywhere else here, and two
+    are worth naming because the vendors disagree with each other:
+    energies are in **eV** (Oxford's H5OINA writes ``Channel Width`` and
+    ``Start Channel`` in electronvolts; Bruker's ``bcf``/``spx`` reader
+    builds its axis in keV), and detector angles are in **degrees**
+    (EMSA's ``#AZIMANGLE-dg:`` and eXSpy both use degrees; H5OINA stores
+    ``Detector Elevation``/``Detector Azimuth`` in radians). An adapter
+    converts once, here, so a factor of a thousand and a factor of 57.3
+    are not left loose in the metadata.
+
+    Every spectrum detector:
+
+    ``device_id``
+        The detector's stable id.
+    ``spectrum_index``
+        Spectra produced by this device since it was opened, from 0.
+        Monotonic and gapless, for the same reason
+        ``Frame.frame_index`` is.
+    ``live_time_s``, ``real_time_s``
+        The live (counting) and real (clock) durations this spectrum
+        integrated for. Both, not one: their ratio is the dead-time
+        fraction, and a quantification that assumes real time at a high
+        count rate is wrong by it. eXSpy wants both
+        (``Acquisition_instrument.TEM.Detector.EDS.live_time`` and
+        ``.real_time``) and RosettaSciIO's Bruker reader fills both from
+        ``LifeTime``/``RealTime``.
+    ``azimuth_deg``, ``elevation_deg``
+        Where the detector sits relative to the specimen and the beam.
+        Required by any absorption correction, so a quantification
+        against a spectrum lacking them is using eXSpy's *defaults*
+        rather than this instrument's geometry.
+    ``solid_angle_sr``
+        The solid angle the detector subtends at the specimen, in
+        steradians — what turns counts into a collection efficiency.
+    ``energy_resolution_ev``
+        Detector resolution as the FWHM of the Mn Ka line, in eV. The one
+        number every EDX vendor quotes, and what eXSpy's peak model uses.
+    ``detector_type``, ``technique``
+        What kind of detector this is (``"sdd"``, ``"sili"``) and what
+        kind of spectroscopy it is doing (``"eds"``, ``"wds"``,
+        ``"xrf"``). The technique is metadata rather than a target name
+        for the same reason ``Frame.camera_type`` is.
+    ``high_tension_v``, ``beam_current_a``
+        Instrument state at acquisition time, in the same units and under
+        the same key as :class:`Frame` uses — the accelerating voltage
+        matters more here than anywhere else, because it sets which X-ray
+        lines can be excited at all.
+
+    Spectrum images additionally:
+
+    ``fov_size_nm``, ``pixel_time_us``, ``rotation_rad``, ``center_nm``
+        The scan geometry the map was collected over, in exactly the
+        vocabulary a scanned :class:`Frame` uses, so storage calibrates
+        the navigation axes through the same path
+        (:meth:`~miainwoodpecker.storage.calibration.FrameCalibration.from_field_size`)
+        rather than a second one.
+    ``scan_sync``
+        **Which device was the master.** Free text naming how the scan
+        and the detector were synchronised — ``"detector"`` when the
+        analyser drove the column's external scan input, ``"scanner"``
+        when the column drove and the analyser followed a pixel-advance
+        line, ``"none"`` when nothing did and the correspondence between
+        pixel and spectrum is an assumption. This interface cannot
+        *enforce* synchronisation (see
+        :meth:`SpectrumDetector.acquire_map`), so the least it can do is
+        make a recording say which it had — and the difference matters,
+        because everything computed per pixel from an unsynchronised map
+        is computed against the wrong position.
+    ``simultaneous_with``
+        **What else came from the same pass**, when anything did: a list
+        of the device ids whose signals share this acquisition's probe
+        positions. Empty or absent means nothing is claimed, which is the
+        honest answer today, because nothing in this project can yet
+        establish it. It is in the vocabulary now rather than later so
+        that an adapter which *does* know — a vendor map job that
+        collects its own image channels alongside the spectra — has
+        somewhere truthful to say so, and so that a recording made before
+        the acquisition layer grows a pass concept is not silently
+        indistinguishable from one made after.
+
+    Attributes
+    ----------
+    data : npt.NDArray[typing.Any]
+        Counts per channel, with energy on the **last** axis. Rank 1 is a
+        spot spectrum, rank 2 a line, rank 3 a spectrum image over a 2D
+        scan — matching ``NXspectrum``'s ``spectrum_0d``/``_1d``/``_2d``.
+        Ranks above 3 are refused rather than stored ambiguously.
+    timestamp : datetime.datetime
+        Acquisition time. Always timezone-aware (UTC), as on
+        :class:`Frame`.
+    energy_offset_ev : float
+        Energy at channel 0, in electronvolts, as actually acquired —
+        which need not equal what was requested, exactly as a camera may
+        round an exposure.
+    energy_scale_ev : float
+        Energy per channel, in electronvolts, as actually acquired. Must
+        be positive: a zero or negative dispersion describes no axis, and
+        a spectrum whose axis cannot be built is not a spectrum.
+    metadata : typing.Mapping[str, typing.Any]
+        Acquisition properties, in the vocabulary above plus whatever
+        else the vendor reported.
+    """
+
+    data: npt.NDArray[typing.Any]
+    timestamp: datetime.datetime
+    energy_offset_ev: float
+    energy_scale_ev: float
+    metadata: typing.Mapping[str, typing.Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        """Reject arrays and dispersions that describe no spectrum."""
+        if not 1 <= self.data.ndim <= _MAX_SPECTRUM_RANK:
+            msg = (
+                f"a Spectrum is counts against energy with up to "
+                f"{_MAX_SPECTRUM_RANK - 1} navigation axes (NXspectrum's "
+                f"spectrum_0d, _1d, _2d); got a {self.data.ndim}D array of "
+                f"shape {self.data.shape}"
+            )
+            raise ValueError(msg)
+        if not self.energy_scale_ev > 0:
+            msg = (
+                f"energy_scale_ev must be positive to describe an energy "
+                f"axis, got {self.energy_scale_ev!r}"
+            )
+            raise ValueError(msg)
+
+    @property
+    def channel_count(self) -> int:
+        """Return the number of energy channels, i.e. the last axis's length."""
+        return int(self.data.shape[-1])
+
+    @property
+    def navigation_shape(self) -> tuple[int, ...]:
+        """
+        Return the scanned shape, ``()`` for a spot spectrum.
+
+        Every axis but the last, in the same slow-to-fast order the
+        ``(height, width)`` scan convention pins — so a spectrum image
+        acquired over a :class:`ScanParameters` has this equal to that
+        parameter set's :attr:`~ScanParameters.shape`.
+        """
+        return tuple(int(size) for size in self.data.shape[:-1])
+
+
+@typing.runtime_checkable
+class SpectrumDetector(typing.Protocol):
+    """
+    A detector that produces energy spectra rather than images.
+
+    An EDX silicon drift detector is the case this was built for, but
+    nothing here is EDX-specific: a WDS spectrometer, a micro-XRF head,
+    or a cathodoluminescence spectrometer produce the same shape of data
+    and want the same calls.
+
+    Contract: call ``start`` before acquiring; ``stop`` pauses
+    acquisition and ``start`` may be called again afterwards; call
+    ``close`` exactly once when the device will not be used again. The
+    same lifecycle :class:`Camera` has, deliberately — an adapter author
+    who has written one has written this.
+
+    **Which modes exist is asked, not assumed.** A detector reports
+    :attr:`acquisition_modes`, and a caller consults it before driving
+    one, exactly as it consults
+    :meth:`InstrumentController.available_controls` before driving a
+    control. This project has been bitten before by treating "the setter
+    returned" as "the control works" (docs/migration-plan.md, §7), and a
+    map on an unsynchronised detector is the same trap with a much more
+    expensive failure: it returns a plausible cube in which pixel and
+    spectrum have no relationship.
+    """
+
+    @property
+    def detector_id(self) -> str:
+        """Return the stable identifier for this detector."""
+        ...
+
+    @property
+    def acquisition_modes(self) -> typing.Sequence[str]:
+        """Return the modes this detector supports, from :data:`ACQUISITION_MODES`."""
+        ...
+
+    def parameters(self) -> SpectrumParameters:
+        """Return the settings the next spectrum will be acquired with."""
+        ...
+
+    def configure(self, parameters: SpectrumParameters) -> SpectrumParameters:
+        """
+        Apply new settings and return the ones the device actually took.
+
+        Returned rather than assumed, for the reason
+        :meth:`Camera.configure` gives and one more that is specific to
+        this class of device: analysers commonly quantise the channel
+        count to a power of two and the dispersion to a small set of
+        hardware gain steps, so "asked for 7 eV/channel, got 10" is the
+        normal outcome. A caller that assumed its request took would
+        record an energy axis the detector never used, which shifts every
+        identified line.
+        """
+        ...
+
+    def start(self) -> None:
+        """
+        Begin acquisition.
+
+        Returns as soon as the device has been told to start; it does
+        **not** wait for a spectrum, matching :meth:`Camera.start`.
+        """
+        ...
+
+    def stop(self) -> None:
+        """Pause acquisition."""
+        ...
+
+    def acquire_spectrum(self) -> Spectrum:
+        """
+        Return one spot spectrum; requires ``start`` to have been called.
+
+        Blocks for the configured live time. Whether successive calls
+        return independent spectra or a single accumulating one is the
+        device's business, and the contract is only that each reports the
+        ``live_time_s`` and ``real_time_s`` it actually covers — so a
+        caller can tell the two apart from the data rather than from
+        documentation.
+        """
+        ...
+
+    def acquire_map(self, parameters: ScanParameters) -> Spectrum:
+        """
+        Return a spectrum image over a scanned region.
+
+        Only meaningful when :attr:`acquisition_modes` includes
+        :data:`MAP_MODE`; a detector without it should raise rather than
+        return something map-shaped.
+
+        Takes :class:`ScanParameters` — the same type the scanner takes —
+        because the geometry is the scan's, and because storage then
+        calibrates the navigation axes through exactly the path a scanned
+        frame uses. The returned :class:`Spectrum` has
+        :attr:`Spectrum.navigation_shape` equal to
+        :attr:`ScanParameters.shape`.
+
+        **What this call cannot promise, stated plainly.** On real
+        hardware a spectrum image is synchronised in *hardware*: either
+        the analyser drives the column's external scan input, or the
+        column drives and the analyser advances on a pixel-clock line.
+        Nothing in this interface establishes either. This method assumes
+        the adapter has arranged one of them out of band — through the
+        vendor's own map job, which is how Bruker's ESPRIT and Oxford's
+        AZtec do it — and requires it to record which, in
+        ``metadata["scan_sync"]``.
+
+        **This models the vendor-owned map job, and only that.** It is a
+        real and common case: ESPRIT and AZtec both accept "map this
+        region" as one instruction to the analyser, and hand back a cube.
+        What it is *not* is the general answer, because a scanned
+        instrument does not acquire one signal at a time. One pass of the
+        probe reads out every detector at once — HAADF and MAADF
+        together on the Nion columns this project already drives, and on
+        an instrument with an EDX detector fitted, the X-ray spectra
+        alongside them. Serial acquisition is the special case, not
+        simultaneity.
+
+        Nothing in this project can currently express that: :class:`Scanner`
+        returns one channel per call, so a second channel costs a second
+        pass of dose and lets the specimen drift between them; and the
+        transport gives each target its own connection with no shared
+        trigger, so two overlapping calls overlap in *wall-clock time*
+        rather than sharing a probe position. (:class:`Frame`'s note
+        declining a ``scan_id`` reasons from the premise that "a second
+        channel is a second pass of the beam", which is false on real
+        hardware; that note is superseded and belongs with the
+        ``Scanner`` change rather than with this one.)
+
+        So this method is deliberately the *device-level* primitive and
+        not the acquisition-level answer. The acquisition-level answer is
+        a pass that yields a set of correlated outputs, and it is the
+        same missing concept that blocks multi-channel scanning,
+        simultaneous EELS, and 4D-STEM — one change, not four. See
+        docs/adapters/spectrum-detectors.md for the options and the
+        recommendation.
+        """
+        ...
+
+    def close(self) -> None:
+        """Release the device and any background threads it owns."""
+        ...
+
+
+# NXspectrum defines spectrum_0d, _1d and _2d - a spot spectrum, a line, and a
+# map - so up to two navigation axes plus energy. spectrum_3d exists there for
+# a 3D ROI, which is a serial-sectioning result rather than something a
+# detector hands back in one acquisition, so it is refused here rather than
+# accepted and then not storable.
+_MAX_SPECTRUM_RANK = 3
 
 
 # Neutral names for the controls an InstrumentController may report through

@@ -32,7 +32,7 @@ first; `Camera` faces the other two.
 | **Thermo Fisher** (SEM/DualBeam) | [AutoScript 4](https://www.thermofisher.com/us/en/home/electron-microscopy/products/software-em-3d-vis/autoscript-4-software.html) | Python | Paid add-on | Yes |
 | **JEOL** | [PyJEM](https://www.jeolusa.com/PRODUCTS/Transmission-Electron-Microscopes-TEM/Analytical-Data-Optimization/PyJEM) over TEM_External/TEMCenter | Python | On the TEM PC; [docs are public](https://github.com/PyJEM/PyJEM), package is not on PyPI | Yes |
 | **Zeiss** | [SmartSEM Remote API](https://www.zeiss.com/microscopy/en/products/software/zeiss-smartsem.html) (`CZEMApi.ocx`) | ActiveX/COM | **Requires an agreement with Zeiss** to develop against | Yes, on Windows |
-| **Hitachi** | None published | — | EM Wizard / EM Flow Creator are GUI automation, not an API | Unknown — ask the vendor |
+| **Hitachi** | Undocumented Python external control (`MfExtCont`), evidenced on an SU7000 FE-SEM | Python | Not published; on the instrument PC, apparently with sample scripts | Presumed yes — unverified |
 | **Bruker** | ESPRIT scripting | In-app | Analyzer software (EDS/EBSD/µXRF), **not a column API** | No |
 
 Three things fall out of that table.
@@ -54,10 +54,13 @@ its own protocol, and the honest first question is whether
 [RosettaSciIO's `bcf` reader](https://github.com/hyperspy/rosettasciio)
 covers the need by reading the files ESPRIT already writes.
 
-**Hitachi publishes nothing.** No documented API surfaced for SU-series
-SEMs or the TEMs; the automation products are workflow recorders. That is
-a finding, not a gap in the search: an adapter would start with a
-conversation with Hitachi, and until then it cannot be estimated.
+**Hitachi publishes nothing, which is not the same as having nothing.**
+No manual, no package, no documented surface — but third parties do
+drive Hitachi FE-SEMs from Python using modules that arrive on the
+instrument, and on a SEM the scan is separately purchasable through the
+external scan connector. So the honest description is "undocumented and
+probably obtainable", not "absent". See
+[adapters/hitachi.md](adapters/hitachi.md).
 
 ### Detector SDKs — the `Camera` side
 
@@ -71,7 +74,7 @@ Talking to the detector directly is frequently *less* work, not more.
 | Detector | Interface | Language | How you get it |
 |---|---|---|---|
 | **Direct Electron** (DE-16, Apollo, Celeritas) | [`deapi`](https://github.com/directelectron/deapi) against DE Mission Control / DE-Server | Python | On PyPI and conda; needs Mission Control and a DE detector |
-| **DECTRIS** (ARINA, QUADRO, EIGER2) | SIMPLON REST API (HTTP/JSON control, ZeroMQ stream) | any | Published; on the detector control unit itself |
+| **DECTRIS** (ARINA, **ELA**, QUADRO, SINGLA — all EIGER2-chip-based) | SIMPLON REST API (HTTP/JSON control, ZeroMQ stream) | any | Published; on the detector control unit itself. **Note the ELA specifically**: it is also sold through Gatan Microscopy Suite as the *Stela* camera, which makes it look like a GMS peripheral. It is not — it speaks SIMPLON directly, and GMS is a second front end. See [DECTRIS](adapters/dectris.md). |
 | **Hamamatsu** (ORCA) | [DCAM-API / DCAM-SDK4](https://www.hamamatsu.com/us/en/product/cameras/software/driver-software/dcam-sdk4.html) | C, Windows **and Linux** | Free SDK registration; Python via [`pyDCAM`](https://pypi.org/project/pyDCAM), `pylablib`, or Micro-Manager |
 | **Quantum Detectors** (Merlin) | TCP control + data | any | Documented; already wrapped by LiberTEM-live |
 | **ASI** (TPX3) | Socket to the ASI software | any | Already wrapped by LiberTEM-live |
@@ -84,12 +87,24 @@ in-process anything. **Direct Electron** ships a pip-installable Python
 client. **Hamamatsu** is a C SDK, but it is free, has an official Linux
 build, and has several maintained Python wrappers.
 
-**Gatan is the exception, and it inverts the topology.** GMS 3's Python
-integration runs *inside* DigitalMicrograph and, in Gatan's own words,
-cannot be executed from outside the application. A Gatan adapter is
-therefore not a subprocess this client launches — it is a bridge running
-inside DM that connects *out*. Same wire protocol, opposite direction,
-and the one detector case the current design does not fit.
+**Gatan is the exception, but it inverts *ownership*, not direction.**
+GMS 3's Python runs inside DigitalMicrograph and, in Gatan's own words,
+cannot be executed from outside it — so a Gatan adapter cannot be a
+subprocess we launch. It does *not* follow that it must connect out, as
+an earlier draft of this page asserted: `gms-socket-plugin` exposes both
+`TCPSocketBind` and `TCPSocketConnect` to DM-Script, SerialEM's DM
+plug-in has listened inside DM for two decades, and a published
+DM-SDK/ZeroMQ bridge already exists (Lei, Weber, Clausen & Wilbrink,
+*M&M* **30**(S1), 2024). Direction is a firewall question.
+`remote.attached_instrument()` supports both, and
+[`devices/gatan_bridge.py`](../src/miainwoodpecker/devices/gatan_bridge.py)
+is the reference implementation. See [Gatan](adapters/gatan.md).
+
+**And check Nion first.** A Gatan spectrometer on a Nion column is very
+likely reached as Nion's `eels_camera`, which this project already serves
+along with the `ZLPoffset` energy offset — supported today, with no Gatan
+code at all. That is the SuperSTEM 2 case (UltraSTEM 100 + UHV Enfina),
+unverified pending one `describe()` call on the instrument PC.
 
 #### Do not re-plumb high-rate streaming
 
@@ -103,6 +118,20 @@ that exists:
 supports Merlin, DECTRIS EIGER2, and ASI TPX3, with Gatan K2 IS and
 others in progress — and this project already depends on LiberTEM for
 analysis.
+
+**Settled, for DECTRIS, and the API drew the line itself.** SIMPLON
+publishes two ways to get images out and they are not the same thing: the
+**stream** subsystem pushes every frame of a series over ZeroMQ as an
+`lz4`/`bslz4` blob and is the recording path (which LiberTEM-live's Rust
+receiver already consumes), while the **monitor** subsystem serves the
+latest image as a TIFF over HTTP and is explicitly a preview channel that
+drops frames by design. The second is pull-per-frame already, so
+[`dectris_server`](adapters/dectris.md) is built on it and touches the
+stream not at all. An ELA runs to 2250 fps full-frame and past 10 kHz on
+a narrow readout; that path is tens of fps and says so in its docstring.
+This is not a compromise — configuring a spectrometer while watching the
+zero-loss peak is exactly what LiberTEM-live does not do, and a spectrum
+image is exactly what a `Camera` should not.
 
 The split is also where the *viewer's* limit lands, measured rather than
 assumed: napari's per-update cost is a fixed ~11 ms on an M2 Pro,
@@ -161,11 +190,11 @@ What such an adapter would still have to work around, honestly:
 
 | Detector | Size | Notes |
 |---|---|---|
-| **DECTRIS** | 3–5 d | REST + JSON, no vendor library, no OS constraint. The reference implementation to write first. |
+| ~~**DECTRIS**~~ | **done** | [`devices/dectris_server.py`](../src/miainwoodpecker/devices/dectris_server.py), both backends; the 3–5 d estimate held. ROI/gain/trigger on `CameraParameters` is the outstanding piece — `roi_mode` is where a DECTRIS detector's readout reduction lives, and it is recorded in the metadata but not settable. |
 | **Direct Electron** | 4–6 d | `deapi` is pip-installable; needs Mission Control running and a detector to test against |
 | **Hamamatsu ORCA** | 5–8 d | C SDK via a Python wrapper; Linux build exists; add ROI and gain mode |
 | **Merlin / ASI** | 2–4 d each | Wrap LiberTEM-live's existing connection behind `Camera` |
-| **Gatan** | 5–8 d | Different topology: a bridge inside DM connecting out, plus a design decision about who owns the detector |
+| **Gatan** | transport **done** (2 d); DM-side 3–5 d | The transport is built (`attached_instrument()`, both socket directions). The remaining vendor work starts by settling whether a Nion column already serves the spectrometer, which would make it zero |
 | **ROI / gain / trigger on `CameraParameters`** | 2–3 d | Shared prerequisite for the three direct vendors |
 | **LiberTEM-live streaming handoff + ownership interlock** | 3–5 d | The design question above, settled once for all detectors |
 
@@ -385,6 +414,35 @@ Everything beyond that in a real adapter is vendor work.
 
 Two, neither fixed, both estimated below rather than pre-emptively built.
 
+### `CameraParameters.binning` is scalar, and EELS is not
+
+EELS is run with vertical binning — bin along the non-dispersive
+direction to trade dynamic range against SNR, leaving the energy axis at
+full resolution. A single `int` cannot say that. But the fix is *not* a
+`(y, x)` tuple: Nion's `CameraFrameParameters` has no per-axis binning at
+all, and what it offers for "bin vertically" is
+`processing = "sum_project"`, a full projection to 1D. A tuple would
+therefore be a field the only adapter behind it must refuse — the exact
+"vendor-neutral in name only" failure `ScanParameters.fov_nm` warns about
+— and it would break the shape-recovery trick that keeps an in-flight
+frame correctly labelled. Model the *readout mode* instead, and route a
+projected readout into `SpectrumWriter` so it lands in the same
+`NXspectrum` layout as EDX. 2–4 days; specification in
+[spectrum detectors](adapters/spectrum-detectors.md) §6.
+
+### `InstrumentController` is all-or-nothing to `isinstance`
+
+`available_controls()` exists precisely so an instrument can serve some
+controls and not others — a webcam has no defocus, a detector-only server
+has no stage. But `InstrumentController` is `runtime_checkable`, and a
+`runtime_checkable` Protocol's `isinstance` check is all-or-nothing: it
+demands every method regardless of what the instrument says it supports.
+Two adapters now fail that check while working perfectly
+(`camera_server.ServerInstrument` and `gatan_bridge.BridgeInstrument`),
+which means the check is testing for Nion-shapedness rather than for
+protocol conformance. Found twice, by two independent adapters, which is
+the signal that it is the abstraction and not the adapters.
+
 ### The target names are a fixed tuple
 
 `rpc.TARGET_NAMES = ("ronchigram_camera", "eels_camera", "scanner",
@@ -416,6 +474,47 @@ per-instrument value someone has to measure.
 This is cheap to handle and expensive to get wrong, so the note belongs
 here: a second adapter converts *into* this convention and records what it
 converted from in the frame metadata.
+
+### `scan_frame` cannot express a simultaneous multi-channel scan
+
+**This is the most consequential wrong shape on this page, and unlike the
+others it is not waiting on a second vendor — it is wrong for the
+instrument this project already drives.**
+
+`scan_frame(parameters, channel)` returns one channel per call, and
+`Frame`'s docstring declines a `scan_id` on the grounds that "a second
+channel is a second pass of the beam". **That premise is false, and not
+as an edge case: a scanned instrument gives you one or more signals
+simultaneously, always.** One pass of the probe, every detector reading
+out at once — HAADF and MAADF together on a Nion UltraSTEM, and on a
+segmented-detector SEM such as the SU9000II, BF plus each HAADF segment
+plus SE plus LA-BSE plus HA-BSE, all from the same pass. Simultaneity is
+what a scanned instrument *is*; serial channels are the special case, and
+this API only has the special case.
+
+Three consequences, in increasing order of severity:
+
+- **Dose.** Asking for *k* channels costs *k* passes over the specimen
+  instead of one. On beam-sensitive material that is the difference
+  between a measurement and a hole.
+- **Time and drift.** *k* passes take *k* times as long, and the
+  specimen moves between them.
+- **Correctness.** DPC, iDPC and centre-of-mass take differences between
+  segments **at the same probe position**. Segments from different passes
+  differ by drift, so those analyses are not merely noisier — they are
+  invalid, and nothing in the recorded data says so.
+
+The fix is a multi-channel call returning frames that share a scan
+identity **only when the device really acquired them together**. A
+`scan_id` alone would be worse than nothing: it would assert a shared
+acquisition that did not happen, which is precisely the fiction the
+`Frame` docstring was right to refuse. 3–5 d.
+
+Sizing note: this was found while researching a vendor that does not have
+an adapter yet, and was first written down as that vendor's problem. It
+is not. It applies to the Nion path in production today, so it should be
+scheduled on its own merits rather than bundled with whichever adapter
+happens to surface it again.
 
 ## Task estimates
 
@@ -486,11 +585,59 @@ The 8-bit remote mode is worth flagging early: it would silently halve
 the dynamic range of everything recorded. An adapter should refuse remote
 mode for recording, or record what mode it used.
 
-### Hitachi — not estimable
+### Hitachi (SU9000II) — 12–18 days, or 10–16, or 3–5
 
-No public API. Step one is a vendor conversation. If the answer is "no
-API", the honest options are file-watching whatever EM Flow Creator
-writes, or nothing.
+Estimable now, in four scenarios, because the placeholder here was
+written without a search and the search found something. Full working:
+[adapters/hitachi.md](adapters/hitachi.md).
+
+**There is very likely an API, and it is undocumented.** Public code
+drives a Hitachi SU7000 FE-SEM from Python through modules named
+`MfExtCont`, `MfKeyMouse` and `MfCommon` — `EXT.SetHv()`,
+`EXT.GetStagePosition()`, `EXT.RunStageMove()`, `EXT.RunAutoAfc()`,
+`EXT.RunScan()` — which is `InstrumentController` and `Scanner` in
+everything but spelling. Nothing about it is published: no manual, no
+PyPI package, three files across all of GitHub. Whether it is on an
+SU9000II is the question, and it is answered by looking at the
+instrument PC, not by a negotiation.
+
+**EM Flow Creator is not that.** It is a recipe engine that "can execute
+scripts written in Python" — the instrument owns the loop and calls your
+block. That is the Gatan topology, a bridge running inside the vendor's
+application connecting out, and it cannot give an interactive session at
+all.
+
+**On a SEM the scan is purchasable.** The external scan connector, there
+since EDS mapping systems needed it, takes third-party scan generators;
+point electronic's DISS6 digitises 4 analog and 12 digital inputs
+simultaneously and ships an SDK. So unlike every other column vendor
+here, a flat refusal still leaves a route to a scanned image — at the
+cost of a measured volts-to-nanometres calibration that no vendor
+constant supplies and that changes with working distance and kV.
+
+| Scenario | Size | Drives the microscope? |
+|---|---|---|
+| Callable control library on the instrument PC | 12–18 d | Yes |
+| EM Flow Creator Python blocks only | 10–16 d | Batch, not interactive |
+| External scan generator, no vendor cooperation | 10–16 d + hardware | Scan and detectors; not optics or stage |
+| Files only — TIFF plus `.txt` sidecar | 3–5 d | No. Ingest, not a device |
+
+All four need the common second-vendor block, and three of them need a
+**simultaneous multi-channel scan call** (3–5 d) that does not exist yet
+— see "What is still the wrong shape" above.
+
+### Bruker ESPRIT / Oxford AZtec — the protocol now exists
+
+The deferral below ("a new protocol — spectra and maps, not frames") is
+discharged: `SpectrumDetector`, `Spectrum` and `NXspectrum`-shaped
+storage ship, with a simulated server and a verified HyperSpy EDS round
+trip ([spectrum detectors](adapters/spectrum-detectors.md)). Neither
+vendor's control library is redistributable, so a *live* adapter is
+out-of-tree — and the offline answer is still the right first question.
+RosettaSciIO reads Bruker `bcf`/`spx` and the EMSA `msa` both vendors
+export. Note that RosettaSciIO 0.14 has **no** Oxford/H5OINA reader, so
+that answer is weaker for AZtec than for ESPRIT: SuperSTEM 2's Bruker is
+covered, SuperSTEM 4's Oxford needs AZtec asked for `.msa` export.
 
 ### Bruker ESPRIT — 3–5 days, and probably the wrong question
 
@@ -507,12 +654,12 @@ a different job from a column adapter and is likely to come first.
 
 ## The short version
 
-**Start with a detector or a camera, not a column.** DECTRIS is the
-smallest real adapter in this document — a documented REST API, no vendor
-library, no OS constraint — and a detector-only server now works end to
-end, so it would prove the whole out-of-tree path at a fraction of the
-cost of any column vendor. Direct Electron is a close second and
-pip-installable.
+**Start with a detector or a camera, not a column — and it did.** DECTRIS
+was the smallest real adapter in this document — a documented REST API,
+no vendor library, no OS constraint — and it is now built
+([adapters/dectris.md](adapters/dectris.md)), proving the whole
+detector-only path end to end at a fraction of the cost of any column
+vendor. Direct Electron is the obvious next one and pip-installable.
 
 **The best coverage per day of work is pymmcore.** One device server
 backed by Micro-Manager's core reaches every UVC microscope plus much of
@@ -522,7 +669,8 @@ and wrapping it is adopting that work rather than admiring it.
 
 Among column vendors, Thermo Fisher first — permissive wrapper, offline
 dummy, best class-map fit. JEOL second. Zeiss only if a site already has
-the agreement. Hitachi needs a phone call. Bruker is a file-reading
+the agreement. Hitachi needs someone to look at the instrument PC
+first, and *then* a phone call. Bruker is a file-reading
 question wearing a device-adapter costume.
 
 Two pieces of shared groundwork belong before, or with, the first

@@ -52,9 +52,26 @@ that case — the reader remembers the names it attached to and can unlink
 them once the writer's process is confirmed dead — and its docstring is
 explicit about the narrow window even that cannot reach.
 
-MIT, no ``nion.*`` import — used by both
-:mod:`miainwoodpecker.devices.nion_server` and
-:mod:`miainwoodpecker.devices.remote`.
+A third user arrived after the device layer:
+:mod:`miainwoodpecker.analysis.transfer` moves analysis payloads through
+the same segments (see docs/analysis-isolation.md). It needs one thing the
+device path never did — a **bare array**, with no ``Frame`` or ``Spectrum``
+around it — because a frame stack's array and an analysis result are
+arrays and nothing else. :class:`SharedArrayRef`,
+:meth:`SharedFrameWriter.publish_array` and
+:meth:`SharedFrameReader.read_array` are that, and they are three lines
+each because ``_store``/``_copy_out`` were already the array-shaped core
+that :meth:`SharedFrameWriter.publish` and
+:meth:`SharedFrameWriter.publish_spectrum` were both wrappers around.
+Nothing about the reuse rule, the ownership rule, or the
+one-in-flight invariant changes: the analysis protocol is synchronous
+request/response for the same reason
+:mod:`miainwoodpecker.devices.rpc` is.
+
+MIT, no ``nion.*`` import — used by
+:mod:`miainwoodpecker.devices.nion_server`,
+:mod:`miainwoodpecker.devices.remote`, and
+:mod:`miainwoodpecker.analysis.transfer`.
 """
 
 from __future__ import annotations
@@ -68,10 +85,12 @@ from multiprocessing import shared_memory
 
 import numpy as np
 
-from miainwoodpecker.devices.interface import Frame
+from miainwoodpecker.devices.interface import Frame, Spectrum
 
 if typing.TYPE_CHECKING:
     import datetime
+
+    import numpy.typing as npt
 
 # Every SharedMemory handle - created or attached by name - auto-registers
 # with *this process's* resource_tracker, which tries to unlink it again at
@@ -120,6 +139,113 @@ class SharedFrameRef:
     metadata: typing.Mapping[str, typing.Any]
 
 
+def _stop_tracking(name: str) -> None:
+    """
+    Tell this process's ``resource_tracker`` to forget an attached segment.
+
+    Only ever called by a :class:`SharedFrameReader` constructed with
+    ``stop_tracking=True``, and only for a segment that reader has just
+    attached to by name — see that class for why the analysis layer needs
+    it and the device layer does not.
+
+    The leading slash is what ``multiprocessing.shared_memory`` registers
+    internally (its public ``name`` strips it), so it has to be put back
+    or the unregister names a segment the daemon has never heard of.
+
+    Parameters
+    ----------
+    name : str
+        The segment's public name, without the leading slash.
+    """
+    try:
+        from multiprocessing import resource_tracker  # noqa: PLC0415
+
+        resource_tracker.unregister(f"/{name}", "shared_memory")
+    except Exception:  # noqa: BLE001, S110 - see below
+        # Best-effort by design. On Windows there is no tracker to talk to
+        # and nothing was registered; on POSIX a failure here costs a
+        # spurious unlink attempt at exit, which is the behaviour this
+        # module already had. Neither is worth failing a frame over.
+        pass
+
+
+@dataclass(frozen=True)
+class SharedArrayRef:
+    """
+    A reference to a bare array living in a (possibly reused) segment.
+
+    The same three fields :class:`SharedFrameRef` needs to reconstruct an
+    array, and none of the ones it needs to reconstruct a *frame*. It
+    exists for :mod:`miainwoodpecker.analysis.transfer`, whose payloads —
+    a frame stack's ``(n, h, w)`` block, a mean projection, a fitted
+    diffraction pattern — are arrays with no timestamp and no device
+    metadata. Inventing a timestamp to reuse :class:`SharedFrameRef` would
+    put a fiction in the wire format; carrying an empty metadata mapping
+    would say the acquisition recorded nothing rather than that this is not
+    an acquisition.
+
+    Attributes
+    ----------
+    shm_name : str
+        Name of the shared memory segment holding the array.
+    shape : tuple[int, ...]
+        Array shape.
+    dtype : str
+        Array dtype, as a string (``np.dtype(dtype)`` reconstructs it).
+    """
+
+    shm_name: str
+    shape: tuple[int, ...]
+    dtype: str
+
+
+@dataclass(frozen=True)
+class SharedSpectrumRef:
+    """
+    A reference to a spectrum's array living in a (possibly reused) segment.
+
+    The spectrum-side counterpart to :class:`SharedFrameRef`, and a
+    separate type rather than a widened one because the two carry
+    different things: a spectrum's energy calibration is part of the
+    value, not part of its metadata, so it has to travel here or the
+    reader cannot reconstruct the
+    :class:`~miainwoodpecker.devices.interface.Spectrum` at all.
+
+    A spot spectrum never reaches this path in practice — 4096 uint32
+    channels is 16KB against the 64KB of
+    :data:`~miainwoodpecker.devices.rpc.SHARED_MEMORY_THRESHOLD_BYTES` —
+    and that is fine; the threshold is there to decide, not to be hit.
+    What this exists for is the map: a 256x256 scan of 4096-channel
+    spectra is 1GB, which is not a size to push through pickle and a
+    socket buffer.
+
+    Attributes
+    ----------
+    shm_name : str
+        Name of the shared memory segment holding the array.
+    shape : tuple[int, ...]
+        Array shape, energy last.
+    dtype : str
+        Array dtype, as a string (``np.dtype(dtype)`` reconstructs it).
+    timestamp : datetime.datetime
+        The original spectrum's timestamp.
+    energy_offset_ev : float
+        Energy at channel 0, in electronvolts.
+    energy_scale_ev : float
+        Energy per channel, in electronvolts.
+    metadata : typing.Mapping[str, typing.Any]
+        The original spectrum's metadata.
+    """
+
+    shm_name: str
+    shape: tuple[int, ...]
+    dtype: str
+    timestamp: datetime.datetime
+    energy_offset_ev: float
+    energy_scale_ev: float
+    metadata: typing.Mapping[str, typing.Any]
+
+
 class SharedFrameWriter:
     """
     Server-side: publish frames into one reused, resized-on-demand segment.
@@ -163,7 +289,101 @@ class SharedFrameWriter:
             ``shm_name`` is stable across calls until a frame too large
             for the current segment forces a new one.
         """
-        data = np.ascontiguousarray(frame.data)
+        shm_name, data = self._store(frame.data)
+        return SharedFrameRef(
+            shm_name=shm_name,
+            shape=data.shape,
+            dtype=str(data.dtype),
+            timestamp=frame.timestamp,
+            metadata=frame.metadata,
+        )
+
+    def publish_spectrum(self, spectrum: Spectrum) -> SharedSpectrumRef:
+        """
+        Copy a spectrum's array into the reused segment, growing it if needed.
+
+        The same segment, the same reuse rule, and the same one-in-flight
+        invariant as :meth:`publish`; only the reference type differs,
+        because a spectrum's energy calibration has to cross with it.
+        Sharing the segment is deliberate rather than incidental: a
+        target serves exactly one device, so a spectrum detector's writer
+        will only ever hold spectra.
+
+        Parameters
+        ----------
+        spectrum : Spectrum
+            The spectrum to publish.
+
+        Returns
+        -------
+        SharedSpectrumRef
+            A reference the reader can use to retrieve the array.
+        """
+        shm_name, data = self._store(spectrum.data)
+        return SharedSpectrumRef(
+            shm_name=shm_name,
+            shape=data.shape,
+            dtype=str(data.dtype),
+            timestamp=spectrum.timestamp,
+            energy_offset_ev=spectrum.energy_offset_ev,
+            energy_scale_ev=spectrum.energy_scale_ev,
+            metadata=spectrum.metadata,
+        )
+
+    def publish_array(
+        self,
+        array: npt.NDArray[typing.Any],
+    ) -> SharedArrayRef:
+        """
+        Copy a bare array into the reused segment, growing it if needed.
+
+        The same segment, the same reuse rule, and the same one-in-flight
+        invariant as :meth:`publish`. Used by
+        :mod:`miainwoodpecker.analysis.transfer` in **both** directions —
+        an analysis client publishes its request's frame stack and an
+        analysis worker publishes its result — which is the one structural
+        difference from the device path, where only the server ever writes.
+        Each side owns its own writer, so the ownership rule is unchanged:
+        whoever created a segment is who unlinks it.
+
+        Parameters
+        ----------
+        array : npt.NDArray[typing.Any]
+            The array to publish, contiguous or not.
+
+        Returns
+        -------
+        SharedArrayRef
+            A reference the reader can use to retrieve the array.
+        """
+        shm_name, data = self._store(array)
+        return SharedArrayRef(
+            shm_name=shm_name,
+            shape=data.shape,
+            dtype=str(data.dtype),
+        )
+
+    def _store(
+        self,
+        array: npt.NDArray[typing.Any],
+    ) -> tuple[str, npt.NDArray[typing.Any]]:
+        """
+        Copy one array into the reused segment and return its name and the copy.
+
+        Parameters
+        ----------
+        array : npt.NDArray[typing.Any]
+            The array to publish, contiguous or not.
+
+        Returns
+        -------
+        tuple[str, npt.NDArray[typing.Any]]
+            The segment's name, and the contiguous array that was
+            written — the caller reads ``shape``/``dtype`` off the
+            latter rather than off its own input, since
+            ``ascontiguousarray`` is what the reader will reconstruct.
+        """
+        data = np.ascontiguousarray(array)
         with self._lock:
             if self._segment is None or data.nbytes > self._segment.size:
                 self._replace_segment(data.nbytes)
@@ -173,13 +393,7 @@ class SharedFrameWriter:
             )
             destination[:] = data
             shm_name = self._segment.name
-        return SharedFrameRef(
-            shm_name=shm_name,
-            shape=data.shape,
-            dtype=str(data.dtype),
-            timestamp=frame.timestamp,
-            metadata=frame.metadata,
-        )
+        return shm_name, data
 
     def _replace_segment(self, size: int) -> None:
         """Destroy the current segment, if any, and create a right-sized one."""
@@ -206,11 +420,50 @@ class SharedFrameReader:
     thing that makes :meth:`unlink_orphan` possible after the writer's
     process has been hard-killed. See that method for the ownership
     exception it represents.
+
+    Parameters
+    ----------
+    stop_tracking : bool
+        Unregister each attached segment from *this* process's
+        ``resource_tracker``, so that this process exiting cannot unlink a
+        segment it does not own. Default ``False``, which is the device
+        layer's behaviour unchanged.
+
+        It exists because the analysis layer inverted a lifetime the
+        device layer never had to think about. There, the reader is the
+        long-lived application and the writer is the subprocess, so the
+        reader's tracker gets its chance to misbehave only as the whole
+        session ends, by which point the writer has already unlinked and
+        the tracker finds nothing — the harmless "warns once per segment"
+        wart this module's header describes. In an analysis worker the
+        roles are reversed: the *reader* is the subprocess, it attaches to
+        a segment the long-lived client owns, and when the worker exits
+        its tracker cheerfully unlinks the client's live segment out from
+        under it. Measured, not predicted — the first end-to-end run of
+        the isolated path failed on exactly this, with the client's own
+        ``close()`` raising ``FileNotFoundError`` for a segment it had
+        created and never released.
+
+        ``resource_tracker.unregister`` is the documented fix, and the
+        reason this module's header records it as having *made things
+        worse* does not apply here. That attempt unregistered a name from
+        a daemon that had never registered it — writer and reader being
+        independent ``Popen`` processes with a tracker each — and landed a
+        ``KeyError`` in the wrong daemon's main loop. This unregisters, in
+        the attaching process's own daemon, a name that same daemon
+        registered a line earlier. Same call, opposite side of the
+        boundary.
+
+        Opt-in rather than always-on because the device layer's tests pin
+        its current behaviour and a reader that never unlinks is correct
+        either way; there is no reason to move a measured thing to fix a
+        problem it does not have.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, stop_tracking: bool = False) -> None:
         self._segment: shared_memory.SharedMemory | None = None
         self._last_name: str | None = None
+        self._stop_tracking = stop_tracking
 
     def read(self, reference: SharedFrameRef) -> Frame:
         """
@@ -226,22 +479,83 @@ class SharedFrameReader:
         Frame
             The frame, with its own private copy of the array.
         """
+        return Frame(
+            data=self._copy_out(reference),
+            timestamp=reference.timestamp,
+            metadata=reference.metadata,
+        )
+
+    def read_spectrum(self, reference: SharedSpectrumRef) -> Spectrum:
+        """
+        Copy a referenced spectrum's array out of the writer's shared segment.
+
+        Parameters
+        ----------
+        reference : SharedSpectrumRef
+            A reference returned by
+            :meth:`SharedFrameWriter.publish_spectrum`.
+
+        Returns
+        -------
+        Spectrum
+            The spectrum, with its own private copy of the array and the
+            energy calibration the writer acquired it with.
+        """
+        return Spectrum(
+            data=self._copy_out(reference),
+            timestamp=reference.timestamp,
+            energy_offset_ev=reference.energy_offset_ev,
+            energy_scale_ev=reference.energy_scale_ev,
+            metadata=reference.metadata,
+        )
+
+    def read_array(self, reference: SharedArrayRef) -> npt.NDArray[typing.Any]:
+        """
+        Copy a referenced bare array out of the writer's shared segment.
+
+        Parameters
+        ----------
+        reference : SharedArrayRef
+            A reference returned by :meth:`SharedFrameWriter.publish_array`.
+
+        Returns
+        -------
+        npt.NDArray[typing.Any]
+            The array, as a copy the caller owns.
+        """
+        return self._copy_out(reference)
+
+    def _copy_out(
+        self,
+        reference: SharedFrameRef | SharedSpectrumRef | SharedArrayRef,
+    ) -> npt.NDArray[typing.Any]:
+        """
+        Attach if needed and return a private copy of the referenced array.
+
+        Parameters
+        ----------
+        reference : SharedFrameRef | SharedSpectrumRef | SharedArrayRef
+            Any reference naming a segment, a shape, and a dtype.
+
+        Returns
+        -------
+        npt.NDArray[typing.Any]
+            A copy the caller owns, so nothing downstream reads a buffer
+            the writer may overwrite on the next call.
+        """
         if self._segment is None or self._segment.name != reference.shm_name:
             if self._segment is not None:
                 self._segment.close()  # detach only: the writer owns unlink()
             self._segment = shared_memory.SharedMemory(name=reference.shm_name)
             self._last_name = reference.shm_name
+            if self._stop_tracking:
+                _stop_tracking(reference.shm_name)
         view = np.ndarray(
             reference.shape,
             dtype=np.dtype(reference.dtype),
             buffer=self._segment.buf,
         )
-        owned = view.copy()
-        return Frame(
-            data=owned,
-            timestamp=reference.timestamp,
-            metadata=reference.metadata,
-        )
+        return view.copy()
 
     def close(self) -> None:
         """Detach from the current segment, if any. Never unlinks it."""

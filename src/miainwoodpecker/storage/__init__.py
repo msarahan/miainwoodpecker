@@ -18,10 +18,17 @@ from miainwoodpecker.storage.calibration import (
     FrameCalibration,
 )
 from miainwoodpecker.storage.nexus import (
+    FrameStack,
     NexusWriter,
     read_calibration,
+    read_frames,
     read_series,
     write_frames,
+)
+from miainwoodpecker.storage.spectra import (
+    SpectrumWriter,
+    read_spectra,
+    write_spectra,
 )
 
 __all__ = [
@@ -29,8 +36,13 @@ __all__ = [
     "AxisCalibration",
     "AxisKind",
     "FrameCalibration",
+    "FrameStack",
     "NexusWriter",
+    "SpectrumWriter",
     "read_calibration",
+    "read_frames",
     "read_series",
+    "read_spectra",
     "write_frames",
+    "write_spectra",
 ]

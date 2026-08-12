@@ -103,8 +103,29 @@ viewer = [
 # describes, just judged unlikely to bite for this dependency. Revisit
 # with an exact pin if a hatch env build ever actually resolves a HyperSpy
 # release that breaks this adapter.
+# threadpoolctl is here for src/miainwoodpecker/analysis/threads.py, which
+# caps the BLAS thread pools underneath an analysis so the GUI thread keeps
+# a core (measured: docs/migration-plan.md, Phase 2 - eight competing
+# workers froze the viewer for four seconds). It is checked, not assumed,
+# to be new weight only here: uv.lock has libertem and py4dstem both
+# depending on it directly, and scikit-learn (which both pull in) as well,
+# so the other two analysis extras already ship it. Bare "analysis" did
+# not - hyperspy's own tree stops at dask/scipy/rosettasciio - and neither
+# does napari's. One pure-Python wheel with no dependencies of its own.
+# eXSpy joins HyperSpy here rather than getting its own extra, because it
+# is not an alternative to HyperSpy - it is where HyperSpy 2.x *moved* the
+# EELS and EDS signal classes when it split its domain code out. Measured:
+# a bare `hyperspy 2.4` install answers `hs.print_known_signal_types()`
+# with an empty table, so `set_signal_type("EDS_TEM")` silently leaves a
+# plain Signal1D and `EDSTEMSpectrum` does not exist. Since the whole
+# point of this project's spectrum path is that a recording is loadable as
+# an EDS signal, an extra that could not do that would be claiming
+# something false. It is also cheap next to HyperSpy itself - one package
+# plus a couple of pure-Python dependencies against HyperSpy's ~35.
 analysis = [
     "hyperspy>=2.0",
+    "exspy>=0.3",
+    "threadpoolctl>=3",
 ]
 # LiberTEM: kept as its own extra, not folded into "analysis" above.
 # Measured (docs/migration-plan.md section 5): `pip install libertem` alone
@@ -165,6 +186,19 @@ compression = [
 # and give two toolkits in one process tree for no benefit.
 camera = [
     "opencv-python-headless>=4.9",
+]
+# DECTRIS hybrid-pixel detectors (ARINA, ELA, QUADRO, SINGLA) through
+# miainwoodpecker.devices.dectris_server. Deliberately small, because
+# SIMPLON needs no vendor library at all: control is HTTP and JSON from
+# the standard library, and the *only* thing this buys is decoding the
+# monitor images the control unit returns. Those are TIFFs, and a DCU is
+# free to send any baseline variant it likes - a compression or byte order
+# the module's own narrow reader would have to refuse rather than guess
+# at, since guessing wrong silently reinterprets counts. The simulated
+# backend writes plain uncompressed strips and needs none of this, which
+# is what keeps the whole path runnable in CI.
+dectris = [
+    "tifffile>=2024.7.24",
 ]
 docs = [
     "sphinx>=8.2.3",
