@@ -84,6 +84,17 @@ touch it — :attr:`Recording.finalized` is that distinction, and callers
 are expected to report it rather than discover it as a ``ValueError``.
 :class:`LoadJob` runs the load on a worker thread for the same reason
 :class:`RecordingJob` writes on one.
+
+What comes back is enough to analyze, not only to display
+----------------------------------------------------------
+:class:`LoadedRecording` carries the file's axis calibration alongside its
+frames, and :attr:`LoadedRecording.frames` hands both to the Phase 4
+adapters in one object. That closes a genuinely wasteful path the migration
+plan's Phase 5 list carried as open: analyzing a recording opened in the
+viewer used to read it twice — once here to draw it, once in the adapter,
+which took a path. The calibration is the reason it could not simply be an
+array: an adapter handed frames without it produces a signal whose axes
+silently claim bare pixels, which is a worse bug than the duplicated read.
 """
 
 from __future__ import annotations
@@ -105,7 +116,7 @@ import numpy as np
 from miainwoodpecker.acquisition.sequence import record as record_frames
 from miainwoodpecker.jobs import BackgroundJob
 from miainwoodpecker.storage import layout
-from miainwoodpecker.storage.nexus import read_series
+from miainwoodpecker.storage.nexus import FrameStack, read_calibration, read_series
 
 if typing.TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Iterator
@@ -113,6 +124,7 @@ if typing.TYPE_CHECKING:
     import numpy.typing as npt
 
     from miainwoodpecker.devices.interface import Frame
+    from miainwoodpecker.storage.calibration import FrameCalibration
 
 _SIDECAR_NAME = "session.json"
 _SIDECAR_SCHEMA = "miainwoodpecker-session/1"
@@ -217,12 +229,61 @@ class LoadedRecording:
     truncated : bool
         Whether the byte budget stopped the read early, so ``data`` holds
         fewer frames than :attr:`Recording.frame_count`.
+    calibration : FrameCalibration | None
+        The per-axis calibration the file records, or ``None`` when it
+        states none. ``None`` is not "uncalibrated" — an uncalibrated
+        recording says so, in ``"pixel"`` units — it is "this file never
+        got as far as writing its axes", which is the abandoned-writer case
+        from the Phase 3 interruption table: the axis datasets live in
+        ``/entry/data``, which ``NexusWriter.close()`` creates. Kept
+        distinct because the two are answered differently: the first can be
+        analyzed, the second cannot.
     """
 
     recording: Recording
     data: np.ndarray
     frame_times: tuple[float, ...]
     truncated: bool
+    calibration: FrameCalibration | None = None
+
+    @property
+    def frames(self) -> FrameStack | None:
+        """
+        Return these frames in the form the analysis adapters take, if they qualify.
+
+        The point of the whole read-once path: the viewer hands this
+        straight to
+        :func:`~miainwoodpecker.analysis.hyperspy_bridge.hyperspy_signal_from_frames`
+        and its siblings instead of handing them the path and paying for a
+        second decompression of the same tens of megabytes.
+
+        ``None`` in the two cases where these frames are not the recording:
+
+        - **No calibration**, i.e. an unfinalized file. Its frames display
+          fine, but a signal built from them would claim pixel axes the
+          file never asserted.
+        - **Truncated**, i.e. the byte budget stopped the read early. The
+          frames present are real, but "the mean of this recording"
+          computed from the first few of them is not what it says it is,
+          and the adapter reading the file itself is the honest answer.
+
+        Both are silent narrowings if they were not checked here, which is
+        why they are checked here — one place — rather than at each of the
+        three call sites.
+
+        Returns
+        -------
+        FrameStack | None
+            The stack, times, and calibration together, or ``None`` when
+            these frames should not stand in for the file.
+        """
+        if self.calibration is None or self.truncated:
+            return None
+        return FrameStack(
+            self.data,
+            np.asarray(self.frame_times, dtype="float64"),
+            self.calibration,
+        )
 
 
 class RecordingReadError(RuntimeError):
@@ -899,6 +960,15 @@ def load_recording(
     writer was abandoned before it created ``/entry/data`` (see this
     module's docstring).
 
+    The axis calibration is read too, from a finalized file, so what comes
+    back is enough to *analyze* and not only to display — see
+    :attr:`LoadedRecording.frames`, which is what lets the viewer analyze a
+    file it has opened without reading it a second time. That is a second
+    ``h5py`` open but not a second read of the frames: the axis datasets
+    are ``height + width`` float64 values against the recording's tens of
+    megabytes, and it is skipped entirely for an unfinalized file, which
+    has no axes to read.
+
     Parameters
     ----------
     path : os.PathLike[str] | str
@@ -939,7 +1009,10 @@ def load_recording(
     times: list[float] = []
     used = 0
     truncated = False
+    calibration: FrameCalibration | None = None
     try:
+        if described.finalized:
+            calibration = read_calibration(target)
         for data, elapsed in read_series(target):
             if frames and used + data.nbytes > budget_bytes:
                 truncated = True
@@ -965,6 +1038,7 @@ def load_recording(
         data=np.stack(frames),
         frame_times=tuple(times),
         truncated=truncated,
+        calibration=calibration,
     )
 
 

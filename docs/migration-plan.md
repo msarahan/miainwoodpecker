@@ -1109,15 +1109,52 @@ problem — read their source and docs before designing our own adapters:
     real ratio depends on data that does not exist yet. What is still not
     done is tracking cumulative usage across a shift, or doing anything
     about it beyond saying so.
-  - **A large file is read twice on the analyze-from-disk path** — once by
-    the load job for display, once by the adapter — because the adapters take
-    a path rather than an array. Harmless at pilot scale, wasteful at
-    2048×2048. **Still open, and deliberately**: fixing it means changing
-    what `load_as_hyperspy_signal`, `load_as_libertem_dataset`, and
-    `load_as_diffraction_slice` accept, which is a Phase 4 adapter API
-    change rather than the Phase 5 wiring the rest of this list is. Each has
-    an in-memory constructor to target (`Signal2D`, `MemoryDataSet`,
-    `DiffractionSlice`), so the shape is known; it is scoped, not blocked.
+  - ~~**A large file is read twice on the analyze-from-disk path**~~ —
+    **done**. It was read once by the load job for display and once by the
+    adapter, because the adapters took a path rather than an array;
+    harmless at pilot scale, 16.8MB per frame paid twice at 2048×2048.
+    Each adapter now has an in-memory entry point beside its file-reading
+    one — `hyperspy_signal_from_frames`, `hyperspy_spectrum_from_frames`,
+    `libertem_dataset_from_frames`, `diffraction_slice_from_frames`,
+    targeting exactly the `Signal2D`/`MemoryDataSet`/`DiffractionSlice`
+    constructors this note predicted — and the viewer hands over the
+    frames it already read. The path-taking forms are unchanged and are
+    now one call to their in-memory half, so there is one implementation
+    and the documented scripting API did not move.
+    - **Separate names, not a union-typed parameter.** Whether a call
+      decompresses a large recording is the thing the caller is choosing;
+      an `isinstance` check at the bottom of the stack would hide it,
+      while a name states it at the call site.
+    - **The calibration is what made this an adapter API change rather
+      than wiring**, exactly as this item said. Frames handed over without
+      their axes produce a signal silently claiming bare pixels — worse
+      than the duplicated read, because nothing downstream says so. So the
+      carrier is `FrameStack`: the `(data, frame_time, calibration)`
+      triple `read_frames` already returned, made a named tuple so every
+      existing unpacking still works, rather than a new type. `LoadJob`'s
+      `LoadedRecording` now carries the file's calibration too, and its
+      `frames` property declines to offer them when they are not the whole
+      recording — a truncated read, or an unfinalized file that never
+      wrote its axes — so a saved read can never quietly become a
+      different answer.
+    - **LiberTEM's constraints were measured, not assumed.**
+      `ctx.load("memory", data=stack, sig_dims=2)` infers the same
+      navigation `(n_frames,)` and signal `(height, width)` shapes its
+      HDF5 reader infers from the same file. `sig_dims` is explicit
+      because the same call on a *2D* array builds a dataset with no
+      frames to navigate instead of raising, so a flat single frame is
+      refused here with a sentence. `MemoryDataSet`'s own "not recommended
+      with a distributed executor" is a reason to keep the file-reading
+      form for that case, not to avoid this one — the viewer's executor is
+      inline, where there is no worker to ship an array to.
+    - **The fresh-burst path still reads the file it just wrote**, on
+      purpose: a burst's calibration is only resolved when `NexusWriter`
+      writes it, so short-circuiting that read would mean a second
+      implementation of the rule deciding what a recording's axes are, to
+      save one read of a file this app created moments earlier.
+    - Asserted by counting reads (`tests/integration/test_live_widget.py`
+      instruments both frame readers), because the result is identical
+      either way — nothing about the *answer* can show which happened.
   - ~~**The analysis buttons still block the GUI thread**~~ — **done**. All
     three now hand off to
     [`AnalysisJob`](../src/miainwoodpecker/viewer/jobs.py), which has

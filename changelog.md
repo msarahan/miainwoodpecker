@@ -188,6 +188,46 @@
 
 ### Changed
 
+- Analyzing a recording opened in the viewer now reads it **once**, not twice.
+  Each analysis adapter grew an in-memory entry point beside its
+  file-reading one — `hyperspy_signal_from_frames`,
+  `hyperspy_spectrum_from_frames`, `libertem_dataset_from_frames`,
+  `diffraction_slice_from_frames` — and the viewer hands them the frames the
+  load already read rather than pointing them at the path. The path-taking
+  functions are unchanged and are now one call to their in-memory half, so
+  the two cannot drift and no script or document has to change.
+
+  Separate names rather than one function accepting a path *or* an array:
+  whether a call decompresses a 2048×2048 recording is exactly what the
+  caller is choosing, so it belongs in the name rather than in an
+  `isinstance` check at the bottom of the stack.
+
+  What made this an adapter API change rather than a wiring change is the
+  calibration. Frames handed over without it produce a signal whose axes
+  silently claim bare pixels — a worse bug than the duplicated read — so the
+  carrier is `FrameStack`, the `(data, frame_time, calibration)` triple
+  `read_frames` has always returned, now a named tuple so every existing
+  unpacking still works. `LoadedRecording` carries the file's calibration
+  too, and `LoadedRecording.frames` declines to offer the frames at all when
+  they are not the whole recording: a truncated read, or an unfinalized file
+  that never wrote its axes. The viewer additionally re-checks the frame
+  count against the file, and falls back to the path when they disagree.
+
+  LiberTEM's in-memory form is `MemoryDataSet` via
+  `ctx.load("memory", data=..., sig_dims=2)`, which measured the same
+  navigation/signal shape its HDF5 reader infers from the same recording.
+  `sig_dims` is explicit because the same call on a 2D array yields a
+  dataset with *no frames to navigate* rather than an error, so a flat
+  single frame is refused with a sentence. LiberTEM's own note that
+  `MemoryDataSet` suits a distributed executor poorly is a reason to keep
+  the file-reading form, not to avoid this one: the viewer runs an inline
+  executor, where there is no worker to ship an array to.
+
+  A fresh analysis burst deliberately still reads the file it just wrote:
+  its frames' calibration is only resolved when `NexusWriter` writes them,
+  and short-circuiting that would mean a second implementation of the rule
+  that decides what a recording's axes are.
+
 - CI's `integration` job runs its tests in parallel (`pytest -n auto`),
   cutting that suite from ~140s to ~52s. The worker count had to be
   measured against the whole command: without coverage the suite is

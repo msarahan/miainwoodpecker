@@ -16,7 +16,7 @@ convention over plain HDF5, not one of the vendor/community formats
 RosettaSciIO (HyperSpy's I/O backend) already reads — so there is no
 existing HyperSpy reader for it, and this small function is the genuine
 gap to fill. It does the minimum: read the frame stack and its axis
-calibration (via :func:`miainwoodpecker.storage.nexus.read_calibration`,
+calibration (via :func:`miainwoodpecker.storage.nexus.read_frames`,
 so the ``units``-to-axis-kind inference lives in one place for all three
 adapters) and hand the arrays to ``hyperspy.signals.Signal2D``, which does
 the actual axis bookkeeping. Nothing here reimplements anything HyperSpy
@@ -41,6 +41,31 @@ a spectrum acquired as a 2D image, flattened to one dimension. That is a
 it is a separate function rather than a mode of the first, because
 flattening throws away a real axis and should be asked for explicitly.
 
+Two entry points per signal type, and the pairing is the point
+--------------------------------------------------------------
+Each ``load_as_*`` function reads a file; each ``*_from_frames`` function
+takes frames somebody has already read
+(:class:`~miainwoodpecker.storage.nexus.FrameStack`, which is exactly what
+:func:`~miainwoodpecker.storage.nexus.read_frames` returns) and reads
+nothing. The first is a one-line composition of the second, so there is one
+implementation and no chance of the two drifting apart.
+
+Separate names rather than one function taking a path *or* an array,
+deliberately. The viewer's analyze-from-disk path exists to avoid reading a
+2048x2048 recording twice — once for display, once for the adapter — and
+the whole benefit turns on which of the two happens. A union-typed
+parameter would hide that behind an ``isinstance`` check at the bottom of
+the call stack; a name says it at the call site, where the person deciding
+is. It also keeps the path-taking form's signature exactly as
+``docs/scripting-and-automation.md`` documents it, so no script has to
+change.
+
+Frames rather than a bare array, for the reason the calibration model
+exists at all: an array handed over without its axes produces a signal that
+silently claims bare pixels, and a wrong axis is worse than a duplicated
+read. ``FrameStack`` carries the calibration with the data so passing one
+without the other is not a thing a caller can do by accident.
+
 Requires the ``analysis`` optional dependency group
 (``pip install miainwoodpecker[analysis]``).
 """
@@ -59,7 +84,16 @@ if typing.TYPE_CHECKING:
 
     import numpy as np
 
-    from miainwoodpecker.storage.calibration import AxisCalibration, FrameCalibration
+    from miainwoodpecker.storage.calibration import AxisCalibration
+    from miainwoodpecker.storage.nexus import FrameStack
+
+_UNNAMED_SOURCE = "this recording"
+"""
+What an error message calls frames whose caller did not name them.
+
+The arrays carry no provenance of their own, so a file-reading caller
+passes ``source=`` to keep the filename in the message it always had.
+"""
 
 
 def _frame_time_calibration(values: np.ndarray) -> tuple[float, float]:
@@ -81,32 +115,6 @@ def _frame_time_calibration(values: np.ndarray) -> tuple[float, float]:
     offset = float(values[0]) if len(values) else 0.0
     scale = float(values[1] - values[0]) if len(values) > 1 else 1.0
     return scale, offset
-
-
-def _read(
-    path: os.PathLike[str] | str,
-) -> tuple[np.ndarray, np.ndarray, FrameCalibration]:
-    """
-    Read a written file's frame stack, frame times, and axis calibration.
-
-    Parameters
-    ----------
-    path : os.PathLike[str] | str
-        An HDF5 file written by :class:`~miainwoodpecker.storage.nexus.NexusWriter`.
-
-    Returns
-    -------
-    tuple[np.ndarray, np.ndarray, FrameCalibration]
-        The ``(n_frames, height, width)`` stack, the per-frame elapsed
-        times, and the ``y``/``x`` calibration.
-
-    Notes
-    -----
-    Propagates :class:`~miainwoodpecker.storage.layout.NoFramesError`
-    from :func:`~miainwoodpecker.storage.nexus.read_frames` when the file
-    recorded no frames.
-    """
-    return read_frames(path)
 
 
 def _apply(axis: object, name: str, calibration: AxisCalibration) -> None:
@@ -143,9 +151,14 @@ def load_as_hyperspy_signal(path: os.PathLike[str] | str) -> hs.signals.Signal2D
     supplied. The two signal axes are handled independently, because on an
     EELS frame they genuinely differ.
 
-    Propagates a ``ValueError`` from :func:`_read` if the file was written
-    by an acquisition that produced no frames, so it has no
+    Propagates a ``ValueError`` from
+    :func:`~miainwoodpecker.storage.nexus.read_frames` if the file was
+    written by an acquisition that produced no frames, so it has no
     ``/entry/data`` group to read.
+
+    Reads the file. A caller that already holds the frames — the viewer,
+    which read them to display them — should call
+    :func:`hyperspy_signal_from_frames` instead and read nothing.
 
     Parameters
     ----------
@@ -157,7 +170,33 @@ def load_as_hyperspy_signal(path: os.PathLike[str] | str) -> hs.signals.Signal2D
     hyperspy.signals.Signal2D
         The frame stack, with calibrated navigation and signal axes.
     """
-    data, frame_time, calibration = _read(path)
+    return hyperspy_signal_from_frames(read_frames(path))
+
+
+def hyperspy_signal_from_frames(frames: FrameStack) -> hs.signals.Signal2D:
+    """
+    Build a HyperSpy ``Signal2D`` from frames already in memory.
+
+    The half of :func:`load_as_hyperspy_signal` that does not touch the
+    disk: it takes the stack, times, and calibration that
+    :func:`~miainwoodpecker.storage.nexus.read_frames` returns and does only
+    the axis bookkeeping. Nothing here re-reads or re-derives anything, so
+    the result is identical to the path-taking form's — that form is one
+    call to this one.
+
+    Parameters
+    ----------
+    frames : FrameStack
+        The frames to wrap, with the calibration they were recorded with.
+        Passing the calibration is not optional, because a ``Signal2D``
+        built without it claims bare pixel axes and says nothing about it.
+
+    Returns
+    -------
+    hyperspy.signals.Signal2D
+        The frame stack, with calibrated navigation and signal axes.
+    """
+    data, frame_time, calibration = frames
 
     signal = hs.signals.Signal2D(data)
     nav_axis = signal.axes_manager.navigation_axes[0]
@@ -190,6 +229,9 @@ def load_as_hyperspy_spectrum(path: os.PathLike[str] | str) -> hs.signals.Signal
     heuristic that is silently wrong on a rotated camera, and a wrongly
     assigned energy axis makes every eV value downstream wrong.
 
+    Reads the file; :func:`hyperspy_spectrum_from_frames` is the same
+    flattening applied to frames a caller already holds.
+
     Parameters
     ----------
     path : os.PathLike[str] | str
@@ -203,21 +245,64 @@ def load_as_hyperspy_spectrum(path: os.PathLike[str] | str) -> hs.signals.Signal
         Shape ``(n_frames, n_channels)``: one navigation axis in seconds
         and one signal axis in the recording's energy units.
 
+    Notes
+    -----
+    Raises ``ValueError`` if the file recorded no frames (from
+    :func:`~miainwoodpecker.storage.nexus.read_frames`), or if it has no
+    single energy-calibrated axis to flatten along — including the
+    physically meaningless case of both axes claiming to be energy (from
+    :func:`hyperspy_spectrum_from_frames`, which is where that check
+    lives).
+    """
+    return hyperspy_spectrum_from_frames(read_frames(path), source=str(path))
+
+
+def hyperspy_spectrum_from_frames(
+    frames: FrameStack,
+    *,
+    source: str = _UNNAMED_SOURCE,
+) -> hs.signals.Signal1D:
+    """
+    Flatten frames already in memory into a HyperSpy ``Signal1D``.
+
+    The disk-free half of :func:`load_as_hyperspy_spectrum`; see that
+    function for what the flattening means and why the dispersive direction
+    is read rather than guessed.
+
+    Parameters
+    ----------
+    frames : FrameStack
+        The frames to flatten, with the calibration that says which
+        direction is energy — without it there is nothing to flatten along
+        and this raises, which is the intended outcome rather than a
+        limitation.
+    source : str
+        What to call these frames in an error message. The arrays carry no
+        provenance, so the file-reading form passes its path here to keep
+        the filename in the sentence an operator sees.
+
+    Returns
+    -------
+    hyperspy.signals.Signal1D
+        Shape ``(n_frames, n_channels)``: one navigation axis in seconds
+        and one signal axis in the recording's energy units.
+
     Raises
     ------
     ValueError
-        If the file recorded no frames, or if it has no single
-        energy-calibrated axis to flatten along — including the
-        physically meaningless case of both axes claiming to be energy.
+        If the frames have no single energy-calibrated axis to flatten
+        along — including the physically meaningless case of both axes
+        claiming to be energy.
     """
-    data, frame_time, calibration = _read(path)
+    data, frame_time, calibration = frames
     energy_name = calibration.energy_axis_name()
     if energy_name is None:
         msg = (
-            f"{path} has no single energy-calibrated axis (y={calibration.y.units!r}, "
-            f"x={calibration.x.units!r}), so there is no dispersive direction to "
-            f"flatten along; record it with an energy calibration (see "
-            f"FrameCalibration.spectrum) rather than assuming one"
+            f"{source} has no single energy-calibrated axis "
+            f"(y={calibration.y.units!r}, x={calibration.x.units!r}), so there "
+            f"is no dispersive direction to flatten along; record it with an "
+            f"energy calibration (see FrameCalibration.spectrum) rather than "
+            f"assuming one"
         )
         raise ValueError(msg)
 

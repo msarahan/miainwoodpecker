@@ -21,7 +21,13 @@ pytest.importorskip("napari", reason="requires the 'viewer' extra")
 import napari
 
 from miainwoodpecker.devices import Frame, ScanParameters
-from miainwoodpecker.storage.nexus import NexusWriter, read_series
+from miainwoodpecker.storage.calibration import AxisKind, FrameCalibration
+from miainwoodpecker.storage.nexus import (
+    NexusWriter,
+    read_calibration,
+    read_series,
+    write_frames,
+)
 from miainwoodpecker.storage.session import Session, read_session_context
 from miainwoodpecker.viewer.live import LiveInstrumentWidget
 
@@ -687,6 +693,220 @@ def test_analysis_runs_against_a_file_on_disk_without_acquiring(tmp_path):
         # Nothing was acquired: still one file, and the camera never started.
         assert len(widget.session.recordings()) == 1
         assert not camera.started
+    finally:
+        widget.shutdown()
+        viewer.close()
+
+
+def _count_frame_reads(monkeypatch: pytest.MonkeyPatch) -> dict[str, list[str]]:
+    """
+    Instrument both frame-stack readers and return the log they write to.
+
+    Counting reads is the only way to assert the thing this path is for:
+    the result of analyzing an opened recording is identical whether the
+    file was read once or twice, so nothing about the *answer* can show
+    which happened. Both readers are wrapped rather than one, so the log
+    also proves the instrumentation works — a zero from the adapter is only
+    meaningful next to the one the load itself records.
+
+    Parameters
+    ----------
+    monkeypatch : pytest.MonkeyPatch
+        The fixture doing the patching, so it is undone with the test.
+
+    Returns
+    -------
+    dict[str, list[str]]
+        ``{"display": [...], "analysis": [...]}``, each a list of the paths
+        that reader was asked for, in call order.
+    """
+    # Imported here, not at module scope: hyperspy_bridge needs the
+    # 'analysis' extra, and this file also runs in a viewer-only env where
+    # the tests that use this helper skip themselves.
+    from miainwoodpecker.analysis import hyperspy_bridge  # noqa: PLC0415
+    from miainwoodpecker.storage import session as session_module  # noqa: PLC0415
+
+    log: dict[str, list[str]] = {"display": [], "analysis": []}
+    read_series_real = session_module.read_series
+    read_frames_real = hyperspy_bridge.read_frames
+
+    def counted_read_series(path) -> typing.Iterator[tuple[np.ndarray, float]]:
+        log["display"].append(str(path))
+        return read_series_real(path)
+
+    def counted_read_frames(path) -> object:
+        log["analysis"].append(str(path))
+        return read_frames_real(path)
+
+    monkeypatch.setattr(session_module, "read_series", counted_read_series)
+    monkeypatch.setattr(hyperspy_bridge, "read_frames", counted_read_frames)
+    return log
+
+
+def test_analyzing_an_opened_recording_reads_the_file_once_not_twice(
+    tmp_path, monkeypatch
+):
+    """
+    The load that displayed the recording is the only read of its frames.
+
+    Opening a recording decompresses every frame to draw it; pointing an
+    adapter at the same path made it decompress them all again. At the
+    2048x2048 Ronchigram frames a pilot actually produces that is 16.8MB
+    per frame paid twice for one operation. The frames are handed over
+    instead, and this asserts the second read is gone rather than merely
+    unlikely — while the first read, logged by the same instrumentation,
+    shows the counter would have seen it.
+    """
+    pytest.importorskip("hyperspy", reason="requires the 'analysis' extra")
+    viewer = napari.Viewer(show=False)
+    camera = _FakeCamera()
+    widget = LiveInstrumentWidget(viewer, _FakeScanner(), camera=camera)
+    try:
+        widget.set_session(Session(tmp_path / "shift"))
+        recorded_frames = 2
+        widget._camera_count_spin.setValue(recorded_frames)  # noqa: SLF001 - user input
+        widget.record_camera_frames()
+        _finish_recording(widget)
+        (recording,) = widget.session.recordings()
+
+        log = _count_frame_reads(monkeypatch)
+        widget.open_recording(recording.path)
+        _finish_load(widget)
+        widget._analyze_from_file_check.setChecked(True)  # noqa: SLF001 - user input
+        widget._analyze_camera_in_hyperspy()  # noqa: SLF001 - simulating a click
+        _finish_analysis(widget)
+
+        assert log["display"] == [str(recording.path)]
+        assert log["analysis"] == []
+        # ...and the answer is still the right one: the fake camera's
+        # frames are all ones, so their mean is too.
+        layer = viewer.layers["HyperSpy mean projection (Camera)"]
+        assert layer.data.shape == (8, 8)
+        assert np.allclose(layer.data, 1.0)
+        assert widget._analyze_status.text().startswith("done")  # noqa: SLF001
+    finally:
+        widget.shutdown()
+        viewer.close()
+
+
+def test_a_fresh_burst_still_reads_the_file_it_just_wrote(tmp_path, monkeypatch):
+    """
+    The other half of the count, and a deliberate non-change.
+
+    A burst's frames are in memory too, but their calibration is only
+    decided when ``NexusWriter`` resolves it from the frame metadata — so
+    short-circuiting this read would mean a second implementation of the
+    rule that decides what a recording's axes are, to save one read of a
+    file this app created a moment ago. It still reads, exactly once, and
+    that is what makes the zero in the test above evidence rather than an
+    artefact of the instrumentation.
+    """
+    pytest.importorskip("hyperspy", reason="requires the 'analysis' extra")
+    viewer = napari.Viewer(show=False)
+    camera = _FakeCamera()
+    widget = LiveInstrumentWidget(viewer, _FakeScanner(), camera=camera)
+    try:
+        widget.set_session(Session(tmp_path / "shift"))
+        log = _count_frame_reads(monkeypatch)
+
+        widget._analyze_camera_in_hyperspy()  # noqa: SLF001 - simulating a click
+        _finish_analysis(widget)
+
+        (recording,) = widget.session.recordings()
+        assert log["analysis"] == [str(recording.path)]
+        assert widget._analyze_status.text().startswith("done")  # noqa: SLF001
+    finally:
+        widget.shutdown()
+        viewer.close()
+
+
+def test_the_frames_an_analysis_is_given_carry_the_files_calibration(tmp_path):
+    """
+    Reusing the frames must not cost the axes, or it trades a bug for a saving.
+
+    An adapter handed arrays without their calibration produces a signal
+    whose axes silently claim bare pixels — worse than the duplicated read
+    this path removes, because nothing downstream says so. Asserted on the
+    input the analysis actually receives, since the adapters' own tests
+    cover what they do with it.
+    """
+    viewer = napari.Viewer(show=False)
+    widget = LiveInstrumentWidget(viewer, _FakeScanner(), camera=_FakeCamera())
+    try:
+        session = Session(tmp_path / "shift")
+        widget.set_session(session)
+        target = session.reserve_path("camera")
+        scale_per_nm = 0.05
+        write_frames(
+            target,
+            [_a_frame(), _a_frame()],
+            calibration=FrameCalibration.diffraction(scale_per_nm),
+        )
+        widget.open_recording(target)
+        _finish_load(widget)
+        widget._analyze_from_file_check.setChecked(True)  # noqa: SLF001 - user input
+
+        existing, frames = widget._analysis_source()  # noqa: SLF001 - the GUI-thread half
+        assert existing == target
+        with widget._analysis_input(  # noqa: SLF001 - the worker-thread half
+            frame_count=1,
+            label="unused",
+            title="unused",
+            filename="unused.nxs",
+            existing=existing,
+            existing_frames=frames,
+            note=None,
+        ) as source:
+            assert source.frames is not None
+            assert source.frames.calibration.x.kind is AxisKind.RECIPROCAL_SPACE
+            assert source.frames.calibration.x.scale == pytest.approx(scale_per_nm)
+            assert source.frames.calibration == read_calibration(target)
+            assert source.frames.data.shape == (2, 8, 8)
+    finally:
+        widget.shutdown()
+        viewer.close()
+
+
+def test_frames_that_no_longer_match_the_file_are_not_reused(tmp_path):
+    """
+    The file on disk is the authority on what is in it, not a copy in memory.
+
+    The in-memory shortcut is only sound while the two agree; a recording
+    that has grown since it was opened would otherwise be analyzed as the
+    shorter thing that was displayed, and the status line would still say
+    how many frames the *file* has. Simulated by shortening the copy,
+    because what matters is the mismatch, not how it arose.
+    """
+    viewer = napari.Viewer(show=False)
+    widget = LiveInstrumentWidget(viewer, _FakeScanner(), camera=_FakeCamera())
+    try:
+        session = Session(tmp_path / "shift")
+        widget.set_session(session)
+        target = session.reserve_path("camera")
+        write_frames(target, [_a_frame(), _a_frame(), _a_frame()])
+        widget.open_recording(target)
+        _finish_load(widget)
+        widget._analyze_from_file_check.setChecked(True)  # noqa: SLF001 - user input
+
+        stale = widget._opened_frames  # noqa: SLF001 - what the load kept
+        assert stale is not None
+        widget._opened_frames = stale._replace(data=stale.data[:1])  # noqa: SLF001
+
+        existing, frames = widget._analysis_source()  # noqa: SLF001 - GUI-thread half
+        with widget._analysis_input(  # noqa: SLF001 - worker-thread half
+            frame_count=1,
+            label="unused",
+            title="unused",
+            filename="unused.nxs",
+            existing=existing,
+            existing_frames=frames,
+            note=None,
+        ) as source:
+            # Falls back to the path: the adapter reads the file, which is
+            # the honest answer, and costs only the read this avoids.
+            assert source.frames is None
+            assert source.path == target
+            assert source.frame_count == 3  # noqa: PLR2004 - what the file holds
     finally:
         widget.shutdown()
         viewer.close()
