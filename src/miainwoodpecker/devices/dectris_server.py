@@ -123,6 +123,7 @@ import json
 import logging
 import os
 import socket
+import socketserver
 import struct
 import sys
 import threading
@@ -1874,6 +1875,35 @@ class _SimplonRequestHandler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(payload)
 
 
+class _LoopbackHTTPServer(http.server.ThreadingHTTPServer):
+    """
+    A threading HTTP server that does not do a reverse DNS lookup to bind.
+
+    ``http.server.HTTPServer.server_bind`` calls
+    ``socket.getfqdn(host)`` purely to fill in ``server_name``, which is
+    used for CGI and logging and by nothing here. On Linux that resolves
+    ``127.0.0.1`` from ``/etc/hosts`` instantly. On a machine with no
+    resolver for the loopback range it blocks — and it blocks *inside*
+    ``__init__``, before the mock control unit is listening and long
+    before the device server binds its own RPC ports.
+
+    That is not a hypothetical either: macOS CI runners failed every test
+    that spawns a DECTRIS device server with ``ConnectionRefusedError``,
+    because the server was still stuck in this lookup when the client's
+    15-second connect deadline passed. The whole macOS job took 167
+    seconds against Linux's 40. Skipping the lookup and using the bound
+    address is what the standard library does anyway when the name cannot
+    be resolved, minus the wait.
+    """
+
+    def server_bind(self) -> None:
+        """Bind without resolving a name for the address."""
+        socketserver.TCPServer.server_bind(self)
+        host, port = self.server_address[:2]
+        self.server_name = str(host)
+        self.server_port = port
+
+
 class SimulatedControlUnit:
     """
     A mock DECTRIS control unit, served over real HTTP on localhost.
@@ -1888,7 +1918,7 @@ class SimulatedControlUnit:
 
     def __init__(self, shape: tuple[int, int] = _SIMULATED_SHAPE) -> None:
         self._model = _DetectorModel(shape)
-        self._server = http.server.ThreadingHTTPServer(
+        self._server = _LoopbackHTTPServer(
             ("127.0.0.1", 0),
             _SimplonRequestHandler,
         )

@@ -36,6 +36,7 @@ from miainwoodpecker.devices.dectris_server import (
     DetectorOpenError,
     SimplonClient,
     SimplonError,
+    SimulatedControlUnit,
     _decode_baseline_tiff,
     _open_failure_hint,
     _parse_args,
@@ -739,3 +740,39 @@ def test_a_control_unit_is_reached_directly_rather_than_through_a_proxy(
         camera.close()
     assert frame.data.ndim == _TWO_DIMENSIONS
     assert frame.data.size > 0
+
+
+def test_the_mock_control_unit_binds_without_a_reverse_dns_lookup(monkeypatch):
+    """
+    Starting the simulated backend must not depend on name resolution.
+
+    ``http.server.HTTPServer.server_bind`` calls ``socket.getfqdn`` on
+    the bind address purely to populate ``server_name``, which nothing
+    here reads. On Linux that answers instantly from ``/etc/hosts``; on a
+    machine with no resolver for the loopback range it blocks, and it
+    blocks inside ``__init__`` — before the mock DCU is listening, and
+    long before the device server binds its own RPC ports.
+
+    macOS CI failed every test that spawns a DECTRIS device server for
+    exactly this reason: ``ConnectionRefusedError`` against the RPC
+    listeners, because the server was still in the lookup when the
+    client's connect deadline passed. The macOS job took 167 seconds
+    against Linux's 40.
+
+    Asserted by making the lookup fail loudly rather than by timing it,
+    so this test means the same thing on every platform and in every
+    network environment — a timing assertion would pass on the machines
+    that were never affected.
+    """
+
+    def _refuse(host: str) -> str:
+        msg = f"getfqdn({host!r}) must not be called while binding"
+        raise AssertionError(msg)
+
+    monkeypatch.setattr("socket.getfqdn", _refuse)
+
+    unit = SimulatedControlUnit()
+    try:
+        assert ":" in unit.address
+    finally:
+        unit.shutdown()
