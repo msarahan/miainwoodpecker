@@ -124,6 +124,22 @@ HARDWARE_BACKEND = "hardware"
 BACKENDS = (SIMULATED_BACKEND, HARDWARE_BACKEND)
 """Every backend name the server accepts on its command line."""
 
+REPLAY_BACKEND = "replay"
+"""
+Backend name selecting a recording played back as if it were a device.
+
+Its own name rather than a flavour of :data:`HARDWARE_BACKEND`, because
+``hardware`` carries a promise. ``viewer/app.py`` states the two failures
+its backend selector exists to prevent: driving a microscope you meant to
+simulate, and *believing you are on hardware when you are not*. A backend
+called ``hardware`` that opens a file is the second one. Frame metadata
+saying ``replay`` does not undo a command line saying ``hardware`` — by
+the time anyone reads the metadata the session has already happened.
+
+Only servers that actually offer playback advertise this; it is not in
+:data:`BACKENDS`, which stays the two names every server understands.
+"""
+
 # Below this, a Frame result travels as plain pickle over the socket
 # instead of through shared memory. This is a *protocol* decision - it
 # determines whether the client receives a Frame or a SharedFrameRef - so

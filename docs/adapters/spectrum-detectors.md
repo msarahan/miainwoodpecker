@@ -615,14 +615,24 @@ signal.get_lines_intensity()
 
 - `devices/interface.py` — `Spectrum`, `SpectrumParameters`,
   `SpectrumDetector`, `SPOT_MODE`/`MAP_MODE`.
-- `devices/spectrum_server.py` — two backends. `simulated` synthesises a
-  physically-shaped spectrum (Kramers continuum ending at the
-  Duane–Hunt limit, Gaussian lines at real energies with Fano/noise
-  widths, Poisson counts, a dead-time fraction) and needs **nothing**
-  installed. `hardware` replays a recording this project wrote, which is
-  how instrument data becomes a fixture — and refuses, with an
-  explanation, when asked for a vendor detector, because neither ESPRIT's
-  nor AZtec's control library can be redistributed here.
+- `devices/spectrum_server.py` — three backend names, one of which never
+  returns a device. `simulated` synthesises a physically-shaped spectrum
+  (Kramers continuum ending at the Duane–Hunt limit, Gaussian lines at
+  real energies with Fano/noise widths, Poisson counts, a dead-time
+  fraction) and needs **nothing** installed. `replay` opens a recording
+  this project wrote, which is how instrument data becomes a fixture that
+  runs anywhere. `hardware` is accepted by the parser and then **refused
+  with a sentence** — neither ESPRIT's nor AZtec's control library can be
+  redistributed here, so there is no in-tree vendor backend.
+
+  Playback is `replay` rather than a flavour of `hardware` on purpose.
+  `viewer/app.py` names the two failures its backend selector exists to
+  prevent: driving a microscope you meant to simulate, and *believing you
+  are on hardware when you are not*. A `hardware` backend that opens a
+  file is the second one, and per-spectrum `backend: "replay"` metadata
+  does not undo it — by the time anyone reads that metadata the session
+  has already happened. So `hardware` refuses even when handed a
+  perfectly good recording, and a test pins that.
 - `storage/spectra.py` — `SpectrumWriter`, `write_spectra`,
   `read_spectra`.
 - `analysis/hyperspy_bridge.py` — `load_as_hyperspy_spectrum` (both

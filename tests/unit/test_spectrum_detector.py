@@ -31,6 +31,7 @@ from miainwoodpecker.devices import (
 )
 from miainwoodpecker.devices.remote import (
     HARDWARE_BACKEND,
+    REPLAY_BACKEND,
     SERVER_RESPONSIVE,
     SIMULATED_BACKEND,
     remote_instrument,
@@ -504,9 +505,9 @@ def test_the_command_line_matches_the_protocol():
     """One positional port per target name, and ``--plugin`` as configuration."""
     ports = [str(5000 + index) for index in range(len(TARGET_NAMES))]
     arguments = _parse_args(
-        ["--backend", HARDWARE_BACKEND, "--plugin", "/tmp/a.nxs", *ports],  # noqa: S108
+        ["--backend", REPLAY_BACKEND, "--plugin", "/tmp/a.nxs", *ports],  # noqa: S108
     )
-    assert arguments.backend == HARDWARE_BACKEND
+    assert arguments.backend == REPLAY_BACKEND
     assert arguments.plugin == ["/tmp/a.nxs"]  # noqa: S108
     assert arguments.ports == [int(port) for port in ports]
     assert _parse_args(ports).backend == SIMULATED_BACKEND
@@ -518,18 +519,20 @@ def test_an_unknown_backend_is_rejected_before_a_device_is_opened():
         open_detector("nonesuch", None)
 
 
-def test_asking_for_hardware_with_nothing_to_open_says_why_there_is_none(
+def test_asking_for_hardware_is_refused_rather_than_given_a_replay(
     monkeypatch,
 ):
     """
-    The message explains the absence rather than reporting a missing file.
+    ``hardware`` never returns a device, even with a perfectly good file.
 
-    This is the honest bit of this adapter. There is no in-tree vendor
-    backend and there cannot be one: neither Bruker's ESPRIT nor Oxford's
-    AZtec ships a redistributable control library, so a live detector is
-    an out-of-tree device server. An operator who asks for ``hardware``
-    deserves to be told that, told where an adapter goes, and told what
-    this backend *can* open — not handed a file-not-found.
+    The refusal is the point, and it is not pedantry. ``viewer/app.py``
+    states the two failures its backend selector exists to prevent:
+    driving a microscope you meant to simulate, and believing you are on
+    hardware when you are not. A ``hardware`` backend that opens a
+    recording is the second one, and labelling the spectra ``replay``
+    does not undo it — by the time anyone reads that metadata the session
+    has already happened. So asking for hardware gets a sentence saying
+    there is none, where an adapter goes, and what to use instead.
     """
     monkeypatch.setenv("MIAINWOODPECKER_AUTHKEY", "00" * 32)
     ports = [str(5000 + index) for index in range(len(TARGET_NAMES))]
@@ -537,6 +540,35 @@ def test_asking_for_hardware_with_nothing_to_open_says_why_there_is_none(
 
     with pytest.raises(SpectrumDetectorOpenError, match="out-of-tree"):
         open_detector(HARDWARE_BACKEND, None)
+
+
+def test_hardware_is_refused_even_when_a_real_recording_is_offered(tmp_path):
+    """
+    Handing ``hardware`` a valid file still refuses, rather than replaying it.
+
+    This is the case the rename exists for. If ``hardware`` silently
+    accepted a recording, every operator who typed the wrong backend
+    would get plausible data and no signal that a detector was never
+    involved.
+    """
+    from miainwoodpecker.storage.spectra import write_spectra  # noqa: PLC0415
+
+    source = SimulatedSpectrumDetector()
+    source.configure(
+        SpectrumParameters(live_time_s=0.05, channel_count=_FEW_CHANNELS),
+    )
+    path = tmp_path / "session.nxs"
+    write_spectra(path, [source.acquire_spectrum() for _ in range(_TWO_SPECTRA)])
+    source.close()
+
+    with pytest.raises(SpectrumDetectorOpenError, match="no hardware backend"):
+        open_detector(HARDWARE_BACKEND, str(path))
+
+    replayed = open_detector(REPLAY_BACKEND, str(path))
+    try:
+        assert replayed.acquire_spectrum().metadata["backend"] == "replay"
+    finally:
+        replayed.close()
 
 
 def test_replaying_a_recording_is_a_device(tmp_path):
@@ -560,7 +592,7 @@ def test_replaying_a_recording_is_a_device(tmp_path):
     write_spectra(path, [source.acquire_spectrum() for _ in range(_TWO_SPECTRA)])
     source.close()
 
-    replay = open_detector(HARDWARE_BACKEND, str(path))
+    replay = open_detector(REPLAY_BACKEND, str(path))
     assert isinstance(replay, SpectrumDetector)
     assert replay.acquisition_modes == [SPOT_MODE]
     spectrum = replay.acquire_spectrum()
@@ -579,4 +611,4 @@ def test_opening_something_that_is_not_a_recording_says_so(tmp_path):
     path = tmp_path / "not-a-recording.nxs"
     path.write_bytes(b"certainly not HDF5")
     with pytest.raises(SpectrumDetectorOpenError, match="spectrum recording"):
-        open_detector(HARDWARE_BACKEND, str(path))
+        open_detector(REPLAY_BACKEND, str(path))

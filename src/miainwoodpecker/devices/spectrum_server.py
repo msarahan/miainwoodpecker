@@ -23,14 +23,21 @@ software, no detector, no analysis stack. It exists so the whole path,
 from RPC through storage to a HyperSpy EDS signal, is exercisable in CI
 and on a laptop.
 
-``hardware`` opens what ``--plugin`` names, which today can be one thing:
-a spectrum recording this project wrote. That is the same "a media file
-is a first-class device" idea the camera server uses, and it is worth
-more here than there, because it is how a real EDX session recorded at
-the instrument becomes a regression fixture that anyone can run without
-the instrument. The frames it hands back carry ``backend: "replay"`` and
-the file they came from, so nothing downstream can mistake a replay for a
-measurement.
+``replay`` opens what ``--plugin`` names: a spectrum recording this
+project wrote. That is the same "a media file is a first-class device"
+idea the camera server uses, and it is worth more here than there,
+because it is how a real EDX session recorded at the instrument becomes a
+regression fixture anyone can run without the instrument. Every spectrum
+it hands back carries ``backend: "replay"`` and the file it came from.
+
+``hardware`` is accepted by the parser and then **refused with a
+sentence**, rather than being an alias for ``replay``. The name carries a
+promise: ``viewer/app.py`` says the two failures its backend selector
+exists to prevent are driving a microscope you meant to simulate, and
+believing you are on hardware when you are not. A ``hardware`` backend
+that opens a file is the second one, and honest frame metadata does not
+undo it — by the time anyone reads the metadata, the session has already
+happened.
 
 Why there is no vendor backend here
 -----------------------------------
@@ -91,9 +98,23 @@ from miainwoodpecker.devices.interface import (
     Spectrum,
     SpectrumParameters,
 )
-from miainwoodpecker.devices.rpc import BACKENDS, SIMULATED_BACKEND
+from miainwoodpecker.devices.rpc import (
+    HARDWARE_BACKEND,
+    REPLAY_BACKEND,
+    SIMULATED_BACKEND,
+)
 from miainwoodpecker.devices.serving import accept_loop
 from miainwoodpecker.devices.shared_frame import SharedFrameWriter
+
+SPECTRUM_BACKENDS = (SIMULATED_BACKEND, REPLAY_BACKEND, HARDWARE_BACKEND)
+"""
+What this server accepts on its command line.
+
+``hardware`` is listed so that asking for it gets a sentence rather
+than an argparse error, and then refused: there is no in-tree vendor
+backend, and naming a file playback ``hardware`` would be the exact
+confusion ``viewer/app.py``'s selector exists to prevent.
+"""
 
 if typing.TYPE_CHECKING:
     from collections.abc import Sequence
@@ -844,22 +865,40 @@ def open_detector(
     SpectrumDetectorOpenError
         If the hardware backend was asked for with nothing to open.
     """
-    if backend not in BACKENDS:
-        msg = f"unknown backend {backend!r}; expected one of {', '.join(BACKENDS)}"
+    if backend not in SPECTRUM_BACKENDS:
+        msg = (
+            f"unknown backend {backend!r}; expected one of "
+            f"{', '.join(SPECTRUM_BACKENDS)}"
+        )
         raise ValueError(msg)
     if backend == SIMULATED_BACKEND:
         return SimulatedSpectrumDetector()
+    if backend == HARDWARE_BACKEND:
+        # Refused rather than quietly aliased to replay. A Bruker XFlash
+        # through ESPRIT or an Oxford Ultim through AZtec needs a control
+        # library that cannot be redistributed here, so there is no
+        # in-tree vendor backend and there may never be one; a live
+        # adapter is an out-of-tree device server. Answering "hardware"
+        # with a file would mean an operator could run a whole session
+        # believing a detector was attached.
+        msg = (
+            "this server has no hardware backend. A live EDX detector needs "
+            "a vendor control library that cannot be redistributed here "
+            "(Bruker ESPRIT, Oxford AZtec), so a real adapter is an "
+            "out-of-tree device server - see "
+            "miainwoodpecker.devices.remote.DEFAULT_SERVER_MODULE and "
+            "docs/adapters/spectrum-detectors.md. To replay a spectrum "
+            f"recording this project wrote, use --backend {REPLAY_BACKEND} "
+            f"--plugin PATH; to run without any file, use --backend "
+            f"{SIMULATED_BACKEND}."
+        )
+        raise SpectrumDetectorOpenError(msg)
     if not device:
         msg = (
-            "the hardware backend needs something to open, named with "
-            "--plugin. There is no in-tree vendor backend: a Bruker XFlash "
-            "through ESPRIT or an Oxford Ultim through AZtec needs a control "
-            "library that cannot be redistributed here, so a live adapter is "
-            "an out-of-tree device server (see "
-            "miainwoodpecker.devices.remote.DEFAULT_SERVER_MODULE). What this "
-            "backend can open is a spectrum recording this project wrote, "
-            "which is how instrument data becomes a fixture. Use "
-            f"--backend {SIMULATED_BACKEND} to run without one."
+            f"the {REPLAY_BACKEND} backend needs something to open, named "
+            "with --plugin: the path of a spectrum recording this project "
+            "wrote. That is how instrument data becomes a fixture that runs "
+            f"anywhere. Use --backend {SIMULATED_BACKEND} to run without one."
         )
         raise SpectrumDetectorOpenError(msg)
     return ReplaySpectrumDetector(device)
@@ -946,7 +985,9 @@ def _parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=("Serve a spectrum detector over the miainwoodpecker protocol."),
     )
-    parser.add_argument("--backend", choices=BACKENDS, default=SIMULATED_BACKEND)
+    parser.add_argument(
+        "--backend", choices=SPECTRUM_BACKENDS, default=SIMULATED_BACKEND
+    )
     parser.add_argument(
         "--plugin",
         action="append",

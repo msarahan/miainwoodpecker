@@ -201,6 +201,21 @@
   have*, which is the clearest evidence yet that a fixed positional tuple
   is the wrong mechanism.
 
+- **The spectrum server's playback is `--backend replay`, and
+  `--backend hardware` refuses.** Playback was originally the `hardware`
+  backend, honestly labelled — every spectrum carried `backend: "replay"`
+  and the file it came from. That is not enough. `viewer/app.py` names
+  the two failures its backend selector exists to prevent: driving a
+  microscope you meant to simulate, and *believing you are on hardware
+  when you are not*. A `hardware` backend that opens a file is the
+  second, and per-spectrum metadata does not undo it — by the time anyone
+  reads that metadata the session has already happened. `hardware` is
+  still accepted by the parser, so asking for it gets a sentence saying
+  there is no in-tree vendor backend, where an adapter goes, and what to
+  use instead — rather than an argparse error. It refuses even when
+  handed a perfectly good recording, which is the case the rename exists
+  for and which a test pins.
+
 - **Anisotropic binning: investigated, specified, deliberately not
   built.** EELS is run with vertical binning to trade dynamic range
   against SNR, and `CameraParameters.binning` is a scalar that cannot say
