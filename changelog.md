@@ -550,6 +550,33 @@
   through `available_controls()`, and the sweep generators' graceful
   "control not available" refusals are unchanged.
 
+- **The port-collision retry no longer depends on a stopwatch.**
+  `_free_port()` probes a port and releases it, so the server binds it
+  seconds later and can find it taken; the loser exits with status 4 and
+  the client is meant to re-pick and respawn. Detection was
+  `process.wait(0.4)` immediately after the spawn, which was wrong in
+  both directions: a healthy server never exits, so **every** good
+  startup paid the full 0.4 s for an answer already known, and a machine
+  loaded enough to take longer than 0.4 s to reach its bind — the machine
+  most likely to collide in the first place — turned a curable collision
+  into an anonymous startup error. Seen once in CI after `TARGET_NAMES`
+  grew to five ports.
+
+  The fixed wait is gone and the retry now spans the whole
+  spawn-and-connect. `_connect_with_retry` already polls the child on
+  every attempt, so when it finds it dead with the port-collision status
+  it raises a distinguishable internal error rather than the generic
+  diagnostic, and `_spawn_and_connect` answers that with fresh ports, a
+  fresh child, and a fresh connect deadline — releasing any connections
+  the doomed attempt had already made, since the health connection and
+  the per-target connects come *after* the first one. Every other exit
+  status keeps its diagnostic verbatim, because a missing instrument or
+  an unimportable adapter module would only fail again. A persistent
+  collision still ends at the existing attempt budget with the "claiming
+  localhost ports faster than they can be used" message. Net: healthy
+  startups are 0.4 s faster, and a collision noticed at any point before
+  the session is connected is retried rather than fatal.
+
 - **EDS beam current reached eXSpy a billion times too small.**
   `load_as_eds_signal` wrote `beam_current_a` straight into
   `Acquisition_instrument.TEM.beam_current`, which eXSpy reads as
