@@ -355,6 +355,70 @@ def test_fit_central_disk_in_py4dstem_adds_a_frame_and_shapes_layer():
         viewer.close()
 
 
+def test_the_buttons_work_with_the_analysis_libraries_in_a_worker_process(
+    monkeypatch,
+):
+    """
+    The same three buttons, with every analysis library out of this process.
+
+    The isolated path is off by default (see docs/analysis-isolation.md
+    for why that is the project owner's decision rather than this code's),
+    so without a test that turns it on it would ship unexercised. This is
+    that test: it drives the real handlers through the real
+    ``AnalysisJob`` and asserts the same layers and the same "done" status
+    the in-process tests assert, which is the whole claim — the transport
+    changed and nothing else did.
+
+    One test for all three rather than three, because each one costs a
+    worker start (0.3 s for HyperSpy, 1.1 s for LiberTEM, 2.6 s for
+    py4DSTEM in this environment) and they share every assertion but the
+    layer name.
+    """
+    pytest.importorskip("hyperspy", reason="requires the 'analysis' extra")
+    pytest.importorskip("libertem", reason="requires the 'libertem' extra")
+    pytest.importorskip("py4DSTEM", reason="requires the 'py4dstem' extra")
+    from miainwoodpecker.analysis import remote  # noqa: PLC0415 - viewer-optional
+
+    monkeypatch.setenv(remote.ISOLATION_ENV_VAR, "process")
+    viewer = napari.Viewer(show=False)
+    camera = _FakeCamera()
+    widget = LiveInstrumentWidget(viewer, _FakeScanner(), camera=camera)
+    try:
+        for click, status, layer in (
+            (
+                widget._analyze_camera_in_hyperspy,  # noqa: SLF001
+                widget._analyze_status,  # noqa: SLF001
+                "HyperSpy mean projection (Camera)",
+            ),
+            (
+                widget._analyze_camera_in_libertem,  # noqa: SLF001
+                widget._libertem_status,  # noqa: SLF001
+                "LiberTEM sum projection (Camera)",
+            ),
+            (
+                widget._fit_central_disk_in_py4dstem,  # noqa: SLF001
+                widget._py4dstem_status,  # noqa: SLF001
+                "py4DSTEM disk fit (Camera)",
+            ),
+        ):
+            click()
+            _finish_analysis(widget)
+            assert status.text().startswith("done"), status.text()
+            assert layer in viewer.layers
+            assert viewer.layers[layer].data.shape == (8, 8)
+        # Every runner really was a worker, not the in-process fallback
+        # quietly standing in for one.
+        assert all(
+            isinstance(runner, remote.WorkerRunner)
+            for runner in widget._analysis_runners.values()  # noqa: SLF001
+        )
+    finally:
+        widget.shutdown()
+        viewer.close()
+    # shutdown() reaped them, so nothing is left holding a library.
+    assert widget._analysis_runners == {}  # noqa: SLF001
+
+
 def test_scan_settings_change_takes_effect_on_next_frames():
     """Changing the size control changes the shape of subsequently scanned frames."""
     viewer = napari.Viewer(show=False)

@@ -4,6 +4,30 @@
 
 ### Added
 
+- Optional process isolation for the viewer's analysis buttons
+  (`MIAINWOODPECKER_ANALYSIS_ISOLATION=process`, **off by default**).
+  HyperSpy, eXSpy, py4DSTEM and LiberTEM run in a lazily-spawned worker
+  (`python -m miainwoodpecker.analysis.worker`) that reuses the device
+  layer's `Call`/`Result` protocol, its dispatch loop, and its
+  reused-shared-memory transport. Buys crash containment, a thread
+  budget set *before* `import numpy` (which `analysis/threads.py`
+  documents as the one thing its runtime cap cannot do), and a
+  precondition for separate dependency environments. Measured at about
+  0.8 ms per megabyte moved and nothing at all when the input is a file.
+- `docs/analysis-isolation.md`: what HyperSpy actually buys this project
+  (ten call sites, one of which computes), a capability/licence table
+  with permissive alternatives, and a precise statement of the licence
+  question — including why isolation cannot answer it, since the
+  documented `load_as_*` API returns live library objects by design. Off
+  by default is deliberate: the decision is the project owner's.
+- `scripts/analysis_ipc_benchmark.py`, the analysis-side counterpart to
+  `scripts/ipc_overhead_benchmark.py`. Interleaves the two transports
+  call by call, because measuring them sequentially produced a
+  reproducible 400–560 ms "overhead" that was the container slowing down.
+- `miainwoodpecker.analysis.operations`: the three analyses the viewer's
+  buttons run, as plain functions taking an `AnalysisInput`, so the
+  in-process and isolated paths call one implementation rather than two.
+
 - Device server backend selection (`--backend {simulated,hardware}`, repeatable
   `--plugin MODULE`, with `MIAINWOODPECKER_BACKEND` /
   `MIAINWOODPECKER_HARDWARE_PLUGINS` defaults), so a real instrument can be
@@ -581,6 +605,19 @@
   decide the remaining question.
 
 ### Changed
+
+- `SharedFrameReader` gained an opt-in `stop_tracking=` flag that
+  unregisters each attached segment from *its own* process's
+  `resource_tracker`. The device layer's behaviour is unchanged (the flag
+  defaults off); the analysis worker needs it because it inverts the
+  device layer's lifetimes — there the reader is the long-lived
+  application, here it is a subprocess whose tracker was unlinking the
+  client's live segment on exit. Not the cross-process `unregister` that
+  `shared_frame.py` records as having made things worse: this one talks
+  to the daemon that did the registering.
+- `SharedFrameWriter`/`SharedFrameReader` gained `publish_array` /
+  `read_array` and a `SharedArrayRef`, for payloads that are arrays with
+  no `Frame` or `Spectrum` around them.
 
 - Analyzing a recording opened in the viewer now reads it **once**, not twice.
   Each analysis adapter grew an in-memory entry point beside its

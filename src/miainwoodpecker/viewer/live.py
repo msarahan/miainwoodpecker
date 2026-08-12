@@ -85,6 +85,8 @@ if typing.TYPE_CHECKING:
 
     import napari
 
+    from miainwoodpecker.analysis.operations import AnalysisInput
+    from miainwoodpecker.analysis.remote import AnalysisRunner
     from miainwoodpecker.devices.interface import Camera, Frame, Scanner
     from miainwoodpecker.storage.nexus import FrameStack
     from miainwoodpecker.storage.session import LoadedRecording, Recording
@@ -108,7 +110,6 @@ _NOTES_HEIGHT_PX = 64
 # that an operator who types and immediately clicks Record has their note.
 _CONTEXT_SAVE_DELAY_MS = 750
 _NEXUS_FILE_FILTER = "NeXus recordings (*.nxs *.h5 *.hdf5);;All files (*)"
-_SINGLE_PATTERN_NDIM = 2
 
 
 @dataclasses.dataclass(frozen=True)
@@ -159,6 +160,36 @@ class _AnalysisOutcome:
 
     payload: object
     source: _AnalysisInput
+
+
+def _analysis_job_input(source: _AnalysisInput) -> AnalysisInput:
+    """
+    Restate what this widget resolved as what an analysis runner takes.
+
+    A three-field copy rather than a shared type, because the two
+    dataclasses answer different questions: ``_AnalysisInput`` also
+    carries the frame count the *status line* needs, which is a display
+    concern with no business crossing a process boundary. The conversion
+    is one line and it is here rather than in each button so the three
+    cannot drift.
+
+    Parameters
+    ----------
+    source : _AnalysisInput
+        What :meth:`LiveInstrumentWidget._analysis_input` produced.
+
+    Returns
+    -------
+    AnalysisInput
+        The same file-or-frames pair, plus the name a refusal should use.
+    """
+    from miainwoodpecker.analysis.operations import AnalysisInput  # noqa: PLC0415
+
+    return AnalysisInput(
+        path=str(source.path),
+        frames=source.frames,
+        origin=source.origin,
+    )
 
 
 def _condition(recording: Recording) -> str:
@@ -301,6 +332,12 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         # _start_analysis; all three buttons share the device.
         self._analysis_status: QtWidgets.QLabel | None = None
         self._analysis_display: Callable[[object, _AnalysisInput], str] | None = None
+        # One runner per analysis target, kept for the life of the widget.
+        # Only the isolated runner has anything to keep - a worker process
+        # whose 2.6-5.2s library import must not be paid per click - but
+        # both are cached the same way so the two paths differ in nothing
+        # but transport. Closed in shutdown().
+        self._analysis_runners: dict[str, AnalysisRunner] = {}
         self._opened_file: Path | None = None
         # The frames of _opened_file, kept from the load that displayed
         # them so an analysis of that file does not read it again. Set and
@@ -1443,6 +1480,62 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         self._refresh_session_labels()
         self._maybe_stop_timer()
 
+    def _analysis_runner(self, name: str) -> AnalysisRunner:
+        """
+        Return this widget's runner for one analysis target, making it once.
+
+        Cached for the widget's lifetime because an isolated runner owns a
+        worker process whose library import costs seconds, and paying that
+        per click would turn a demonstrated capability into an annoyance.
+        The in-process runner has nothing to cache and is cached anyway,
+        so the two paths differ in transport and in nothing else.
+
+        Called on the GUI thread, before the analysis job starts, for the
+        same reason every other pre-flight check is: it can raise, and it
+        can talk to a status label.
+
+        Parameters
+        ----------
+        name : str
+            The analysis target, as
+            :data:`~miainwoodpecker.analysis.transfer.ANALYSIS_TARGETS`
+            names it.
+
+        Returns
+        -------
+        AnalysisRunner
+            The runner to hand to the button's ``compute`` closure.
+
+        Notes
+        -----
+        Propagates ``ImportError`` from
+        :func:`~miainwoodpecker.analysis.remote.open_runner` when the
+        target's optional extra is not installed — which each caller turns
+        into its own status message, exactly as the handler's own
+        ``try``/``except`` did before.
+        """
+        existing = self._analysis_runners.get(name)
+        if existing is not None:
+            return existing
+        from miainwoodpecker.analysis.remote import open_runner  # noqa: PLC0415
+
+        runner = open_runner(name)
+        self._analysis_runners[name] = runner
+        return runner
+
+    def _close_analysis_runners(self) -> None:
+        """
+        Shut down every analysis worker this widget started.
+
+        Guarded individually: a worker that has already died should not
+        stop the next one being reaped, and an application on its way out
+        has nothing to gain from a traceback here.
+        """
+        for runner in self._analysis_runners.values():
+            with contextlib.suppress(Exception):
+                runner.close()
+        self._analysis_runners.clear()
+
     def _analyze_camera_in_hyperspy(self) -> None:
         """
         Round-trip a short camera burst through the HyperSpy adapter.
@@ -1460,25 +1553,23 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         push the result into napari as a new image layer. Requires the
         ``analysis`` optional dependency group; reports that in the
         status label rather than crashing the widget if it is missing.
+
+        Whether the HyperSpy call happens in this process or in an
+        isolated worker is
+        :func:`~miainwoodpecker.analysis.remote.analysis_runner`'s
+        decision, not this handler's, and in-process remains the default.
+        See docs/analysis-isolation.md.
         """
         if self._camera is None:
             return
         try:
-            from miainwoodpecker.analysis.hyperspy_bridge import (  # noqa: PLC0415
-                hyperspy_signal_from_frames,
-                load_as_hyperspy_signal,
-            )
+            runner = self._analysis_runner("hyperspy")
         except ImportError:
             self._analyze_status.setText("install the 'analysis' extra")
             return
 
         def compute(source: _AnalysisInput) -> object:
-            signal = (
-                load_as_hyperspy_signal(source.path)
-                if source.frames is None
-                else hyperspy_signal_from_frames(source.frames)
-            )
-            return signal.mean(axis=signal.axes_manager.navigation_axes[0]).data
+            return runner.run("mean_projection", _analysis_job_input(source))
 
         def display(payload: object, source: _AnalysisInput) -> str:
             self._viewer.add_image(
@@ -1517,46 +1608,22 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         and push the result into napari as a new image layer. Requires the
         ``libertem`` optional dependency group; reports that in the status
         label rather than crashing the widget if it is missing.
+
+        The executor stays inline and thread-bounded, unchanged — see
+        :func:`~miainwoodpecker.analysis.operations.sum_projection`, which
+        is where that closure's body now lives so the isolated worker can
+        run the same code rather than a copy of it.
         """
         if self._camera is None:
             return
         try:
-            from libertem.udf.sum import SumUDF  # noqa: PLC0415
-
-            from miainwoodpecker.analysis.libertem_bridge import (  # noqa: PLC0415
-                analysis_context,
-                libertem_dataset_from_frames,
-                load_as_libertem_dataset,
-            )
+            runner = self._analysis_runner("libertem")
         except ImportError:
             self._libertem_status.setText("install the 'libertem' extra")
             return
 
         def compute(source: _AnalysisInput) -> object:
-            # Inline executor: this is a single UDF run over one small,
-            # already-in-memory burst, not the large-dataset workload
-            # LiberTEM's default dask executor is built for - spinning
-            # up a local cluster per button click would be pure overhead
-            # here. It is also what makes the in-memory MemoryDataSet
-            # below the right dataset rather than a testing convenience:
-            # there is no worker to ship the array to (see the adapter's
-            # module docstring).
-            #
-            # Sized rather than left at LiberTEM's default, which is
-            # every physical core: an unbounded inline executor sets the
-            # thread count around *every* partition, so it starves this
-            # thread's own event loop even though it spawns no cluster.
-            # See analysis/threads.py for the measurement.
-            with analysis_context() as ctx:
-                dataset = (
-                    load_as_libertem_dataset(ctx, source.path)
-                    if source.frames is None
-                    else libertem_dataset_from_frames(
-                        ctx, source.frames, source=source.origin
-                    )
-                )
-                result = ctx.run_udf(dataset=dataset, udf=SumUDF())
-                return result["intensity"].data
+            return runner.run("sum_projection", _analysis_job_input(source))
 
         def display(payload: object, source: _AnalysisInput) -> str:
             self._viewer.add_image(
@@ -1605,25 +1672,13 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         if self._camera is None:
             return
         try:
-            from py4DSTEM.process.calibration import get_probe_size  # noqa: PLC0415
-
-            from miainwoodpecker.analysis.py4dstem_bridge import (  # noqa: PLC0415
-                diffraction_slice_from_frames,
-                load_as_diffraction_slice,
-            )
+            runner = self._analysis_runner("py4dstem")
         except ImportError:
             self._py4dstem_status.setText("install the 'py4dstem' extra")
             return
 
         def compute(source: _AnalysisInput) -> object:
-            diffraction_slice = (
-                load_as_diffraction_slice(source.path)
-                if source.frames is None
-                else diffraction_slice_from_frames(source.frames, source=source.origin)
-            )
-            stack = diffraction_slice.data
-            pattern = stack if stack.ndim == _SINGLE_PATTERN_NDIM else stack[0]
-            return (pattern, *get_probe_size(pattern))
+            return runner.run("fit_central_disk", _analysis_job_input(source))
 
         def display(payload: object, source: _AnalysisInput) -> str:
             pattern, radius, x0, y0 = typing.cast(
@@ -1777,6 +1832,11 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
             job.join()
         self.stop_scan()
         self.stop_camera()
+        # After the devices, and deliberately: a worker holds no hardware,
+        # so nothing about the column depends on it going first, while
+        # stopping the camera can take an exposure's worth of time and an
+        # idle worker costs nothing to leave running for it.
+        self._close_analysis_runners()
 
     def closeEvent(self, event: typing.Any) -> None:  # noqa: N802, ANN401 - Qt override
         """Shut down cleanly when the widget is closed."""
