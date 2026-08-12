@@ -277,6 +277,6 @@ def test_the_readout_vocabulary_is_exactly_the_two_modes():
     refuse.
     """
     expected = (IMAGE_READOUT, PROJECTED_READOUT)
-    assert READOUT_MODES == expected
+    assert expected == READOUT_MODES
     for mode in READOUT_MODES:
         assert CameraParameters(exposure_ms=1.0, readout=mode).readout == mode

@@ -379,9 +379,9 @@ def test_a_projected_eels_readout_loads_as_eels_from_the_edx_layout(tmp_path):
     assert energy.offset == pytest.approx(_OFFSET_EV)
     # The peak was put at calibrated zero, so a lost or rescaled axis
     # would move it - the same assertion the frame-stack path makes.
-    assert float(signal.axes_manager.signal_axes[0].axis[int(signal.data.argmax())]) == (
-        pytest.approx(0.0, abs=_DISPERSION_EV)
-    )
+    energy_axis = signal.axes_manager.signal_axes[0].axis
+    peak_energy_ev = float(energy_axis[int(signal.data.argmax())])
+    assert peak_energy_ev == pytest.approx(0.0, abs=_DISPERSION_EV)
     tem = signal.metadata.Acquisition_instrument.TEM
     assert tem.beam_energy == pytest.approx(_HIGH_TENSION_V / 1000.0)
 

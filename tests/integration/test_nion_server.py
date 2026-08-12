@@ -29,6 +29,8 @@ Skipped automatically unless the ``device`` optional dependency group is
 installed (``uv run --extra device --extra tests pytest tests/integration``).
 """
 
+import typing
+
 import numpy as np
 import pytest
 
@@ -50,13 +52,13 @@ from miainwoodpecker.devices import (
 from miainwoodpecker.devices.nion_server import (
     HARDWARE_BACKEND,
     SIMULATED_BACKEND,
+    _SUM_PROJECT_PROCESSING,
     HardwareNotAvailableError,
     NionCamera,
     _axis_calibration_spec,
     _camera_base,
     _instrument_state,
     _parse_args,
-    _SUM_PROJECT_PROCESSING,
     hardware_instrument,
     open_instrument,
     simulated_instrument,
@@ -945,7 +947,7 @@ class _FixedFrameCamera:
     camera_id = "fixed"
     camera_type = "eels"
     binning_values = (1,)
-    calibration_controls = {}
+    calibration_controls: typing.ClassVar[dict[str, object]] = {}
 
     def __init__(self, data) -> None:
         self._data = data
@@ -968,13 +970,13 @@ class _FixedFrameCamera:
         rows, columns = self._data.shape
         return (rows // binning, columns // binning)
 
-    def set_frame_parameters(self, frame_parameters) -> None:
+    def set_frame_parameters(self, frame_parameters: typing.Any) -> None:  # noqa: ANN401 - a vendor CameraFrameParameters
         """
         Record what was asked for, as a real device would.
 
         Parameters
         ----------
-        frame_parameters : object
+        frame_parameters : typing.Any
             A vendor ``CameraFrameParameters``.
         """
         self.processing = frame_parameters.processing
