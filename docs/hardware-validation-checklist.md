@@ -188,3 +188,72 @@ calibration values themselves come from instrument controls.
       **check the axes on the first real recording** rather than assuming.
       Converting angle to reciprocal space needs the electron wavelength,
       which the code deliberately refuses to invent.
+
+## DECTRIS detector — before arming, then with beam
+
+Everything in [`devices/dectris_server.py`](../src/miainwoodpecker/devices/dectris_server.py)
+was verified against a mock control unit built from the published SIMPLON
+documentation. **No item below has met a real detector.** Full reasoning
+and sources: [adapters/dectris.md](adapters/dectris.md).
+
+- [ ] `curl http://<dcu>/detector/api/1.8.0/config/description` — confirm
+      the ELA serves **1.8.0** at that path. A different version 404s
+      cleanly and the adapter says so, but the version is a guess until
+      checked.
+
+- [ ] Read `.../status/state` before starting anything. It must be
+      `idle`. `ready` or `acquire` means GMS/Stela, Nion Swift, or a
+      LiberTEM-live session already owns the detector — that is the
+      ownership interlock, and the point is that it is diagnosed here
+      rather than three calls later.
+
+- [ ] **Highest-consequence item on this list: the trigger-mode
+      arithmetic.** The adapter uses `trigger_mode=ints`, `nimages=1`,
+      `ntrigger=65536` — one image per software `trigger`. LiberTEM-live's
+      controller uses the inverse for `ints` (`nimages` = the whole
+      series, `ntrigger=1`). If the ELA's firmware treats one `trigger` in
+      `ints` as starting the *whole* series, `acquire_frame()` will
+      free-run and the monitor buffer will lag. Confirm by arming, sending
+      exactly one `trigger`, and checking that
+      `monitor/status/buffer_fill_level` (or successive `images/next`
+      calls) shows **one** image, not `nimages`. If it is wrong, switch to
+      `inte` or re-arm per frame.
+
+- [ ] Enable the monitor (`PUT monitor/api/1.8.0/config/mode` =
+      `"enabled"`) and confirm `GET monitor/api/1.8.0/images/next` returns
+      **408** on an empty buffer rather than blocking. The adapter's poll
+      loop depends on it.
+
+- [ ] Save one monitor image and inspect its TIFF tags: compression, byte
+      order, bit depth, strip layout. The built-in decoder handles
+      uncompressed little-endian strips only and refuses anything else by
+      name; if the ELA sends something else, the `dectris` extra is
+      required rather than optional and the docs should say so.
+
+- [ ] Confirm the configuration really is **read-only while armed** (`PUT
+      count_time` while `ready` must fail). `configure()`'s
+      disarm/write/re-arm depends on it; if writes are accepted while
+      armed, the dance is unnecessary and costs a frame.
+
+- [ ] Check which of `description`, `detector_number`, `software_version`,
+      `incident_energy`, `threshold_energy`, `roi_mode`,
+      `sensor_thickness` an ELA actually publishes. Absent keys are
+      tolerated and omitted from the metadata, but which are absent is
+      unknown.
+
+- [ ] **Measure the achievable frame rate** through `acquire_frame()`. One
+      HTTP round trip per frame predicts tens of fps; record the number
+      rather than leaving the docstring's estimate standing.
+
+- [ ] Sanity-check the `count_time` round-trip magnitude (seconds versus
+      milliseconds). A 1000× exposure error is a wasted session, not a
+      rounding error.
+
+- [ ] Confirm `stop()`/`close()` leave the detector `idle`, then hand it
+      to GMS or LiberTEM-live and back. A detector left armed is silently
+      denied to everything else.
+
+- [ ] Try **LiberTEM-live against the ELA** (`DectrisConnectionBuilder`).
+      It documents ARINA and QUADRO and does not name the ELA; whether
+      that is a documentation gap or a real one decides whether the
+      streaming half needs an upstream fix.

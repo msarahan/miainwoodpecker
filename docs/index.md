@@ -53,6 +53,9 @@ measurements included:
 - [Analysis parity](analysis-parity.md) — every analysis Nion Swift
   offers, which ones HyperSpy/LiberTEM/py4DSTEM already cover, and a
   costed list of the ones they do not.
+- [DECTRIS detectors](adapters/dectris.md) — whether the ELA is reachable
+  without Gatan's software, what SIMPLON exposes, and the adapter built
+  on it.
 - [Development docs](documentation/index.md) — environments, linting,
   publishing.
 
@@ -67,7 +70,8 @@ Architecture review <architecture-review>
 Hardware validation checklist <hardware-validation-checklist>
 Work before hardware <pre-hardware-work>
 Other vendors <vendor-support>
-Hitachi SU9000II <adapters/hitachi>
 Analysis parity <analysis-parity>
+Hitachi SU9000II <adapters/hitachi>
+DECTRIS detectors <adapters/dectris>
 Development <documentation/index>
 :::

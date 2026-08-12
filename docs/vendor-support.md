@@ -74,7 +74,7 @@ Talking to the detector directly is frequently *less* work, not more.
 | Detector | Interface | Language | How you get it |
 |---|---|---|---|
 | **Direct Electron** (DE-16, Apollo, Celeritas) | [`deapi`](https://github.com/directelectron/deapi) against DE Mission Control / DE-Server | Python | On PyPI and conda; needs Mission Control and a DE detector |
-| **DECTRIS** (ARINA, QUADRO, EIGER2) | SIMPLON REST API (HTTP/JSON control, ZeroMQ stream) | any | Published; on the detector control unit itself |
+| **DECTRIS** (ARINA, **ELA**, QUADRO, SINGLA — all EIGER2-chip-based) | SIMPLON REST API (HTTP/JSON control, ZeroMQ stream) | any | Published; on the detector control unit itself. **Note the ELA specifically**: it is also sold through Gatan Microscopy Suite as the *Stela* camera, which makes it look like a GMS peripheral. It is not — it speaks SIMPLON directly, and GMS is a second front end. See [DECTRIS](adapters/dectris.md). |
 | **Hamamatsu** (ORCA) | [DCAM-API / DCAM-SDK4](https://www.hamamatsu.com/us/en/product/cameras/software/driver-software/dcam-sdk4.html) | C, Windows **and Linux** | Free SDK registration; Python via [`pyDCAM`](https://pypi.org/project/pyDCAM), `pylablib`, or Micro-Manager |
 | **Quantum Detectors** (Merlin) | TCP control + data | any | Documented; already wrapped by LiberTEM-live |
 | **ASI** (TPX3) | Socket to the ASI software | any | Already wrapped by LiberTEM-live |
@@ -106,6 +106,20 @@ that exists:
 supports Merlin, DECTRIS EIGER2, and ASI TPX3, with Gatan K2 IS and
 others in progress — and this project already depends on LiberTEM for
 analysis.
+
+**Settled, for DECTRIS, and the API drew the line itself.** SIMPLON
+publishes two ways to get images out and they are not the same thing: the
+**stream** subsystem pushes every frame of a series over ZeroMQ as an
+`lz4`/`bslz4` blob and is the recording path (which LiberTEM-live's Rust
+receiver already consumes), while the **monitor** subsystem serves the
+latest image as a TIFF over HTTP and is explicitly a preview channel that
+drops frames by design. The second is pull-per-frame already, so
+[`dectris_server`](adapters/dectris.md) is built on it and touches the
+stream not at all. An ELA runs to 2250 fps full-frame and past 10 kHz on
+a narrow readout; that path is tens of fps and says so in its docstring.
+This is not a compromise — configuring a spectrometer while watching the
+zero-loss peak is exactly what LiberTEM-live does not do, and a spectrum
+image is exactly what a `Camera` should not.
 
 The split is also where the *viewer's* limit lands, measured rather than
 assumed: napari's per-update cost is a fixed ~11 ms on an M2 Pro,
@@ -164,7 +178,7 @@ What such an adapter would still have to work around, honestly:
 
 | Detector | Size | Notes |
 |---|---|---|
-| **DECTRIS** | 3–5 d | REST + JSON, no vendor library, no OS constraint. The reference implementation to write first. |
+| ~~**DECTRIS**~~ | **done** | [`devices/dectris_server.py`](../src/miainwoodpecker/devices/dectris_server.py), both backends; the 3–5 d estimate held. ROI/gain/trigger on `CameraParameters` is the outstanding piece — `roi_mode` is where a DECTRIS detector's readout reduction lives, and it is recorded in the metadata but not settable. |
 | **Direct Electron** | 4–6 d | `deapi` is pip-installable; needs Mission Control running and a detector to test against |
 | **Hamamatsu ORCA** | 5–8 d | C SDK via a Python wrapper; Linux build exists; add ROI and gain mode |
 | **Merlin / ASI** | 2–4 d each | Wrap LiberTEM-live's existing connection behind `Camera` |
@@ -422,18 +436,44 @@ converted from in the frame metadata.
 
 ### `scan_frame` cannot express a simultaneous multi-channel scan
 
+**This is the most consequential wrong shape on this page, and unlike the
+others it is not waiting on a second vendor — it is wrong for the
+instrument this project already drives.**
+
 `scan_frame(parameters, channel)` returns one channel per call, and
 `Frame`'s docstring declines a `scan_id` on the grounds that "a second
-channel is a second pass of the beam". A segmented-detector SEM breaks
-that premise: BF, each HAADF segment, SE, LA-BSE and HA-BSE arrive
-together from one pass. Asking one at a time multiplies dose, loses the
-grouping, and makes DPC/iDPC/centre-of-mass invalid — those take
-differences between segments *at the same probe position*, and segments
-from different passes differ by drift. The fix is a multi-channel call
-returning frames that share a scan identity **only when the device really
-acquired them together**; `scan_id` alone would be the fiction the
-docstring was right to refuse. 3–5 d, and it should land with the adapter
-that needs it.
+channel is a second pass of the beam". **That premise is false, and not
+as an edge case: a scanned instrument gives you one or more signals
+simultaneously, always.** One pass of the probe, every detector reading
+out at once — HAADF and MAADF together on a Nion UltraSTEM, and on a
+segmented-detector SEM such as the SU9000II, BF plus each HAADF segment
+plus SE plus LA-BSE plus HA-BSE, all from the same pass. Simultaneity is
+what a scanned instrument *is*; serial channels are the special case, and
+this API only has the special case.
+
+Three consequences, in increasing order of severity:
+
+- **Dose.** Asking for *k* channels costs *k* passes over the specimen
+  instead of one. On beam-sensitive material that is the difference
+  between a measurement and a hole.
+- **Time and drift.** *k* passes take *k* times as long, and the
+  specimen moves between them.
+- **Correctness.** DPC, iDPC and centre-of-mass take differences between
+  segments **at the same probe position**. Segments from different passes
+  differ by drift, so those analyses are not merely noisier — they are
+  invalid, and nothing in the recorded data says so.
+
+The fix is a multi-channel call returning frames that share a scan
+identity **only when the device really acquired them together**. A
+`scan_id` alone would be worse than nothing: it would assert a shared
+acquisition that did not happen, which is precisely the fiction the
+`Frame` docstring was right to refuse. 3–5 d.
+
+Sizing note: this was found while researching a vendor that does not have
+an adapter yet, and was first written down as that vendor's problem. It
+is not. It applies to the Nion path in production today, so it should be
+scheduled on its own merits rather than bundled with whichever adapter
+happens to surface it again.
 
 ## Task estimates
 
@@ -560,12 +600,12 @@ a different job from a column adapter and is likely to come first.
 
 ## The short version
 
-**Start with a detector or a camera, not a column.** DECTRIS is the
-smallest real adapter in this document — a documented REST API, no vendor
-library, no OS constraint — and a detector-only server now works end to
-end, so it would prove the whole out-of-tree path at a fraction of the
-cost of any column vendor. Direct Electron is a close second and
-pip-installable.
+**Start with a detector or a camera, not a column — and it did.** DECTRIS
+was the smallest real adapter in this document — a documented REST API,
+no vendor library, no OS constraint — and it is now built
+([adapters/dectris.md](adapters/dectris.md)), proving the whole
+detector-only path end to end at a fraction of the cost of any column
+vendor. Direct Electron is the obvious next one and pip-installable.
 
 **The best coverage per day of work is pymmcore.** One device server
 backed by Micro-Manager's core reaches every UVC microscope plus much of

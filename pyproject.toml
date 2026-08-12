@@ -176,6 +176,19 @@ compression = [
 camera = [
     "opencv-python-headless>=4.9",
 ]
+# DECTRIS hybrid-pixel detectors (ARINA, ELA, QUADRO, SINGLA) through
+# miainwoodpecker.devices.dectris_server. Deliberately small, because
+# SIMPLON needs no vendor library at all: control is HTTP and JSON from
+# the standard library, and the *only* thing this buys is decoding the
+# monitor images the control unit returns. Those are TIFFs, and a DCU is
+# free to send any baseline variant it likes - a compression or byte order
+# the module's own narrow reader would have to refuse rather than guess
+# at, since guessing wrong silently reinterprets counts. The simulated
+# backend writes plain uncompressed strips and needs none of this, which
+# is what keeps the whole path runnable in CI.
+dectris = [
+    "tifffile>=2024.7.24",
+]
 docs = [
     "sphinx>=8.2.3",
     "myst-parser>=4.0.1",

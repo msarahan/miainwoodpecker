@@ -143,6 +143,59 @@
   that `hyperspy` and `py4dstem` are themselves GPL-3.0 and imported
   in-process, which §6 does not currently speak to.
 
+- **A DECTRIS device server** (`miainwoodpecker.devices.dectris_server`),
+  MIT and in-tree, driving ARINA/ELA/QUADRO/SINGLA-class detectors over
+  the SIMPLON REST API — the third adapter, and the first *scientific
+  detector with no column around it*. Served on the neutral `camera`
+  target with no scanner. Control needs no vendor library at all:
+  `urllib` and `json` are the whole dependency.
+
+  The doubt that prompted it was well founded and turned out the right
+  way. Gatan sells the ELA as the *Stela* and markets it as the only
+  hybrid-pixel detector fully integrated with Gatan Microscopy Suite,
+  which makes it look like a GMS peripheral. It is not: the detector
+  control unit serves SIMPLON over HTTP itself, and the Nion/DECTRIS
+  characterisation paper (Plotkin-Swing et al., *Ultramicroscopy* 217,
+  113067) records a complete acquisition path — detector, fibre, DCU,
+  10 GbE — with no Gatan software in it. GMS is a second front end.
+
+  SIMPLON also settled where the pull-per-frame line falls, because the
+  API draws it itself: the **stream** subsystem pushes every frame over
+  ZeroMQ and is the recording path LiberTEM-live already consumes, while
+  the **monitor** subsystem serves the latest image as TIFF over HTTP and
+  drops frames by design. The adapter is built on `monitor` and does not
+  touch `stream`. An ELA runs to 2250 fps full-frame; this path is tens
+  of fps and says so. That is not a compromise — aligning a spectrometer
+  while watching the zero-loss peak is what LiberTEM-live does not do,
+  and a spectrum image is what a `Camera` should not.
+
+  The simulated backend is a mock **control unit** rather than a stub
+  camera: a real `http.server` serving the documented resource tree, the
+  `na`/`idle`/`ready` state machine, 403 for read-only parameters and for
+  configuring an armed detector, 404 for a wrong API version, 408 for an
+  empty monitor buffer, and monitor images as real TIFF — with the same
+  client pointed at it, so the tests exercise URL construction, JSON
+  shapes, HTTP statuses and TIFF decoding rather than a stub that always
+  succeeds. New `dectris` extra (`tifffile`) for the hardware backend.
+
+  Metadata is deliberate where it would be easy to guess:
+  `photometrically_linear: True` (threshold-discriminated integer counts,
+  no gain curve or demosaic; the only real nonlinearity is count-rate
+  paralysis, recorded beside it), no `high_tension_v` (the DCU's
+  `incident_energy` is what the detector was *configured for* to set its
+  discriminator, not a column reading), and **no calibration published**
+  — the detector knows its 75 µm pitch and nothing about the optics
+  between it and the specimen, so the axis stays honestly uncalibrated.
+
+- **`docs/adapters/dectris.md`** — whether the ELA is reachable without
+  Gatan's software, which SIMPLON subset an adapter needs, where the
+  pull-per-frame line falls for a 2250 fps detector, what LiberTEM-live
+  already covers, and an itemised list of what stays unverified until a
+  detector is present. The eleven checklist entries it generates are in
+  `docs/hardware-validation-checklist.md`, led by the one most likely to
+  be wrong: this adapter's `ints` trigger arithmetic is the inverse of
+  LiberTEM-live's, and only hardware settles which is right.
+
 - **Hitachi is estimable after all.** `docs/vendor-support.md` said "no
   public API … not estimable", written without a search. The search found
   undocumented Python external-control modules (`MfExtCont`,
@@ -163,18 +216,22 @@
   on an SU9000II rather than an SU7000) is settled by looking at the
   instrument PC rather than by a negotiation.
 
-- **A protocol gap with a named instrument behind it.** `Scanner`
+- **A protocol gap in the instrument we already drive.** `Scanner`
   produces one channel per `scan_frame` call, on the stated premise that
-  a second channel is a second pass of the beam. A segmented-detector SEM
-  produces BF, HAADF segments, SE, LA-BSE and HA-BSE from *one* pass, so
-  requesting them serially multiplies dose, loses the grouping, and makes
-  DPC/iDPC/centre-of-mass invalid — those take differences between
-  segments at the same probe position, and segments from different passes
-  differ by drift. Recorded under "What is still the wrong shape", sized
-  (3–5 d), and deliberately not built ahead of the adapter that needs it.
-  The fix is a multi-channel call, not a `scan_id`: an identifier alone
-  would assert a shared acquisition that did not happen, which is the
-  fiction the `Frame` docstring was right to refuse.
+  "a second channel is a second pass of the beam". That premise is false
+  in general: a scanned instrument delivers one or more signals
+  *simultaneously* from a single pass — HAADF and MAADF together on a
+  Nion UltraSTEM, and BF plus each HAADF segment plus SE plus both BSE
+  signals on a segmented-detector SEM. Requesting them serially costs a
+  pass of dose per channel, takes as many times longer, lets the specimen
+  drift between them, and makes DPC/iDPC/centre-of-mass **invalid**,
+  since those difference segments at the same probe position. Recorded
+  under "What is still the wrong shape" and sized (3–5 d). The fix is a
+  multi-channel call, not a `scan_id`: an identifier alone would assert a
+  shared acquisition that did not happen, which is the fiction the
+  `Frame` docstring was right to refuse. First written down as a Hitachi
+  finding and corrected — it is not vendor-specific and should not wait
+  for a vendor.
 
 - **A device server for commodity cameras**
   (`miainwoodpecker.devices.camera_server`): USB microscopes, webcams, and
