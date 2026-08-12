@@ -4,8 +4,50 @@
 
 ### Added
 
-- Optional process isolation for the viewer's analysis buttons
-  (`MIAINWOODPECKER_ANALYSIS_ISOLATION=process`, **off by default**).
+- **The simultaneous multi-channel scan**, which is what a scanned
+  instrument actually does: one pass of the probe, every enabled
+  detector reading out at once.
+  `Scanner.scan_frames(parameters, channels)` returns one frame per
+  requested channel from **one** pass, so two channels cost one pass of
+  dose rather than two, nothing drifts between them, and DPC / iDPC /
+  centre-of-mass differences are taken between segments at the same
+  probe position. `scan_frame` is untouched; the new call is additive,
+  and `acquisition.multichannel_scan_series` is its series form.
+  Frames of a pass carry `scan_pass_id` (the identity of that one
+  traversal) and `simultaneous_channels` (the siblings that shared it).
+  **The identity is produced by `scan_frames` and by nothing else** —
+  `scan_frame` attaches neither key, so the id can never claim an
+  acquisition that did not happen, which is exactly why a bare `scan_id`
+  was refused before (this project having been bitten by
+  `probe_position`, an identifier nothing established). The old
+  `Frame` docstring premise that "a second channel is a second pass of
+  the beam" was false on real hardware and is now corrected there.
+  The Nion adapter uses the vendor's own mechanism rather than an
+  emulation — `set_channel_enabled`, one `start_frame`, `read_partial`
+  until complete, which is the loop `scan_base.ScanAcquisitionTask`
+  runs, and which returns one data element per enabled channel — and
+  verifies what the device did (no bad frame, the frame number did not
+  move, every requested channel reported) before stamping a shared id.
+  Nion mints a per-frame `uuid4` for the same purpose one layer up
+  (`stem.scan.scan_id`), so the concept is the vendor's; the rule that a
+  call must establish it is this project's.
+  Across the device-server boundary a pass crosses as **one stacked
+  block** in the source's existing shared-memory segment
+  (`SharedFrameSetRef`): the reused-segment design allows exactly one
+  publish per request/response cycle, so N publishes would overwrite
+  each other, N segments would double every source's `/dev/shm`
+  footprint, and N sequential replies would make the server hold a
+  finished pass between calls. Below the shared-memory threshold a pass
+  stays on the pickle path as an ordinary list. Storage needed no
+  change: `NexusWriter` persists each frame's metadata whole, so a
+  recorded series says which frames shared a pass with no new NeXus
+  layout invented for it.
+  `scan_frames` is part of the `Scanner` protocol rather than an
+  optional extra, so an out-of-tree adapter written before it no longer
+  satisfies `isinstance` and must add it — twenty lines, as
+  `tests/unit/test_out_of_tree_server.py`'s example server shows.
+- Process isolation for the viewer's analysis buttons, **on by
+  default** (opt out with `MIAINWOODPECKER_ANALYSIS_ISOLATION=inprocess`).
   HyperSpy, eXSpy, py4DSTEM and LiberTEM run in a lazily-spawned worker
   (`python -m miainwoodpecker.analysis.worker`) that reuses the device
   layer's `Call`/`Result` protocol, its dispatch loop, and its
@@ -18,8 +60,14 @@
   (ten call sites, one of which computes), a capability/licence table
   with permissive alternatives, and a precise statement of the licence
   question — including why isolation cannot answer it, since the
-  documented `load_as_*` API returns live library objects by design. Off
-  by default is deliberate: the decision is the project owner's.
+  documented `load_as_*` API returns live library objects by design. It
+  shipped off by default so the decision would be the project owner's,
+  and the owner made both calls: isolation on, for crash containment —
+  a segfault in a native analysis library used to take the session and
+  any in-flight recording, and now costs one result and a worker
+  restart — and the licensing posture left as it is, expressly not the
+  reason for the switch. The opt-out is the whole word `inprocess`, so
+  a typo cannot silently disable the protection.
 - `scripts/analysis_ipc_benchmark.py`, the analysis-side counterpart to
   `scripts/ipc_overhead_benchmark.py`. Interleaves the two transports
   call by call, because measuring them sequentially produced a
@@ -450,15 +498,16 @@
   on an SU9000II rather than an SU7000) is settled by looking at the
   instrument PC rather than by a negotiation.
 
-- **`InstrumentController` is all-or-nothing to `isinstance`.**
+- **`InstrumentController` was all-or-nothing to `isinstance`.**
   `available_controls()` exists so an instrument can serve some controls
-  and not others, but the protocol is `runtime_checkable`, and that check
-  demands every method regardless of what the instrument says it
-  supports. Two adapters now fail it while working perfectly
+  and not others, but the protocol was `runtime_checkable`, and that
+  check demands every method regardless of what the instrument says it
+  supports. Two adapters failed it while working perfectly
   (`camera_server.ServerInstrument`, `gatan_bridge.BridgeInstrument`), so
-  the check tests for Nion-shapedness rather than conformance. Found
-  independently by two adapters, which is the signal that it is the
-  abstraction rather than the adapters. Recorded, not yet fixed.
+  the check tested for Nion-shapedness rather than conformance. Found
+  independently by two adapters, which was the signal that it was the
+  abstraction rather than the adapters. Now fixed — see the split into
+  `Instrument` and `InstrumentController` under Fixed below.
 
 - **A protocol gap in the instrument we already drive.** `Scanner`
   produces one channel per `scan_frame` call, on the stated premise that
@@ -527,6 +576,48 @@
   a shape would put a number on screen that no acquisition would produce.
 
 ### Fixed
+
+- **The instrument runtime check no longer demands controls an
+  instrument does not serve.** The `isinstance` question every call site
+  was actually asking — "is this an instrument target I can hold a
+  session against" — is now its own `runtime_checkable` protocol,
+  `Instrument`: identity (`stage_size_nm`), capability
+  (`available_controls`), lifecycle (`park`). `InstrumentController` is
+  that core plus the per-control methods, for static typing, and is
+  deliberately no longer `runtime_checkable`, so the old all-or-nothing
+  question raises `TypeError` instead of quietly failing partial
+  adapters. `camera_server.ServerInstrument` (zero controls) and
+  `gatan_bridge.BridgeInstrument` (one control) both pass the runtime
+  check now, each pinned by a test; which *controls* exist is asked
+  through `available_controls()`, and the sweep generators' graceful
+  "control not available" refusals are unchanged.
+
+- **The port-collision retry no longer depends on a stopwatch.**
+  `_free_port()` probes a port and releases it, so the server binds it
+  seconds later and can find it taken; the loser exits with status 4 and
+  the client is meant to re-pick and respawn. Detection was
+  `process.wait(0.4)` immediately after the spawn, which was wrong in
+  both directions: a healthy server never exits, so **every** good
+  startup paid the full 0.4 s for an answer already known, and a machine
+  loaded enough to take longer than 0.4 s to reach its bind — the machine
+  most likely to collide in the first place — turned a curable collision
+  into an anonymous startup error. Seen once in CI after `TARGET_NAMES`
+  grew to five ports.
+
+  The fixed wait is gone and the retry now spans the whole
+  spawn-and-connect. `_connect_with_retry` already polls the child on
+  every attempt, so when it finds it dead with the port-collision status
+  it raises a distinguishable internal error rather than the generic
+  diagnostic, and `_spawn_and_connect` answers that with fresh ports, a
+  fresh child, and a fresh connect deadline — releasing any connections
+  the doomed attempt had already made, since the health connection and
+  the per-target connects come *after* the first one. Every other exit
+  status keeps its diagnostic verbatim, because a missing instrument or
+  an unimportable adapter module would only fail again. A persistent
+  collision still ends at the existing attempt budget with the "claiming
+  localhost ports faster than they can be used" message. Net: healthy
+  startups are 0.4 s faster, and a collision noticed at any point before
+  the session is connected is retried rather than fatal.
 
 - **EDS beam current reached eXSpy a billion times too small.**
   `load_as_eds_signal` wrote `beam_current_a` straight into

@@ -409,20 +409,30 @@ it fixed.
   one signature changed, and — per Part 2's fourth point — those
   functions still import HyperSpy into the caller's process, by design.
 
-### It is off by default
+### It is on by default — the owner's decision, for crash containment
 
-`MIAINWOODPECKER_ANALYSIS_ISOLATION=process` turns it on. Unset, the
-viewer behaves exactly as it did before this work.
+`MIAINWOODPECKER_ANALYSIS_ISOLATION=inprocess` opts out. Unset means
+isolated.
 
-That is a deliberate refusal rather than an unfinished edge. Turning it
-on by default would be answering Part 2's question on the owner's behalf,
-in the direction of "yes, isolate" — and Part 2's conclusion is that
-isolation is not the answer to that question. The mechanism being ready,
-measured and tested is a different thing from the mechanism being on.
-Both paths are covered: `tests/integration/test_analysis_worker.py`
-asserts the isolated results equal the in-process ones, and
+It *shipped* off by default, as a deliberate refusal rather than an
+unfinished edge: turning it on unasked would have answered Part 2's
+question on the owner's behalf, in the direction of "yes, isolate" —
+and Part 2's conclusion is that isolation is not the answer to that
+question. The owner then made both calls explicitly: **isolation on, for
+crash containment** (a segfault in a native analysis dependency used to
+take the session, the UI, and any in-flight recording; now it costs one
+result and a worker restart), and **the licensing posture left where it
+is** — not a major concern at present, and expressly not the reason the
+switch is on. The opt-out is the whole word `inprocess` rather than
+"anything that is not `process`", so a typo cannot silently disable the
+protection it looks like it is configuring.
+
+Both paths stay covered: `tests/integration/test_analysis_worker.py`
+asserts the isolated results equal the in-process ones,
 `test_the_buttons_work_with_the_analysis_libraries_in_a_worker_process`
-drives all three real buttons with the switch flipped.
+drives all three real buttons through the shipped default, and the rest
+of the widget suite pins `inprocess` so its assertions stay about the
+widget rather than the transport.
 
 ## Measurements
 

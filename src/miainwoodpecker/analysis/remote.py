@@ -21,16 +21,17 @@ because they call the same function; the difference is the transport, and
 docs/analysis-isolation.md measures exactly what that transport costs.
 
 :func:`analysis_runner` picks between them, and **the default is
-in-process**, unchanged from before this module existed. That is a
-deliberate refusal to make a decision that is not this code's to make:
-whether the GPL-3.0 analysis extras should be held at arm's length the
-way ``docs/migration-plan.md`` §6 holds ``nion.*`` is a judgement for the
-project owner, and the mechanism being ready is a different thing from
-the mechanism being on. The engineering arguments for turning it on —
-crash containment, a thread budget that can be set before ``import
-numpy``, and dependency trees that never meet — are set out and measured
-in docs/analysis-isolation.md, which also states plainly what isolation
-does *not* buy.
+isolated**. It shipped in-process-by-default — a deliberate refusal to
+make a decision that was not this code's to make — and the project owner
+then decided: on, for **crash containment**, so a segfault in a native
+analysis dependency costs one result and a worker restart instead of the
+session, the UI, and any recording in progress. The other engineering
+arguments (a thread budget set before ``import numpy``, dependency trees
+that never meet) and the measured cost are in
+docs/analysis-isolation.md, which also states plainly what isolation
+does *not* buy — including that it serves no licensing purpose, a
+question the owner has separately decided to leave where it is. The
+opt-out is ``MIAINWOODPECKER_ANALYSIS_ISOLATION=inprocess``.
 
 What it does not buy, stated here too
 --------------------------------------
@@ -109,16 +110,28 @@ ISOLATION_ENV_VAR = "MIAINWOODPECKER_ANALYSIS_ISOLATION"
 """
 Environment variable selecting how the viewer's analysis buttons run.
 
-``"process"`` runs each analysis in a worker subprocess; anything else,
-including unset, keeps the in-process behaviour this project has always
-had. An environment variable rather than a setting in a file because it
-is a deployment choice — a facility that wants the isolation wants it for
-every session on that machine — and because it can be set for one run
-without editing anything, which is what makes the two paths comparable
-side by side.
+``"process"`` (the default when unset) runs each analysis in a worker
+subprocess; ``"inprocess"`` keeps the analysis on a thread in the
+application's own process. An environment variable rather than a setting
+in a file because it is a deployment choice — a facility that wants a
+particular arrangement wants it for every session on that machine — and
+because it can be set for one run without editing anything, which is
+what makes the two paths comparable side by side.
+
+Isolation shipped off by default and was switched on by the project
+owner's decision, for **crash containment**: a segfault in a native
+analysis dependency used to take down the session, the UI, and any
+recording in progress; in a worker it costs one result and the worker is
+restarted. The measured price is ~0.75-0.9 ms per megabyte moved plus a
+one-time worker start per library per session (see
+docs/analysis-isolation.md). Explicitly *not* switched on for licensing
+reasons — that analysis concluded isolation cannot serve that purpose,
+and the owner has separately decided to leave the licensing posture as
+it is.
 """
 
 _ISOLATED = "process"
+_IN_PROCESS = "inprocess"
 
 _WORKER_MODULE = "miainwoodpecker.analysis.worker"
 
@@ -180,9 +193,14 @@ def isolation_enabled() -> bool:
     Returns
     -------
     bool
-        True when :data:`ISOLATION_ENV_VAR` is set to ``"process"``.
+        True unless :data:`ISOLATION_ENV_VAR` is set to ``"inprocess"``.
+        Unset means isolated: the default protects the session and its
+        in-flight recording from a native crash in an analysis library,
+        and the opt-out is spelled ``inprocess`` rather than "anything
+        that is not ``process``" so a typo cannot silently disable the
+        protection it looks like it is configuring.
     """
-    return os.environ.get(ISOLATION_ENV_VAR, "").strip().lower() == _ISOLATED
+    return os.environ.get(ISOLATION_ENV_VAR, "").strip().lower() != _IN_PROCESS
 
 
 def target_available(name: str) -> bool:

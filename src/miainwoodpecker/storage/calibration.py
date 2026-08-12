@@ -907,6 +907,48 @@ def _axis_from_spec(
     return axis
 
 
+def resolve_axis_calibration(
+    spec: object,
+    length: int,
+    name: str = "x",
+) -> AxisCalibration:
+    """
+    Parse one axis's calibration spec, outside the two-axis frame model.
+
+    The single-axis face of :func:`resolve_frame_calibration`, for data
+    that genuinely has one axis: a projected (1D) camera frame carries
+    ``metadata["calibration"] == {"x": spec}`` — only the dispersive axis
+    survives the projection — and :class:`FrameCalibration` is exactly two
+    axes, so parsing that through the frame path would mean inventing a
+    ``y`` the data does not have. Same vocabulary, same strictness, same
+    errors as the per-axis parsing inside the frame path, because it *is*
+    that parsing.
+
+    Parameters
+    ----------
+    spec : object
+        The per-axis mapping, or an :class:`AxisCalibration` already.
+    length : int
+        Number of pixels along the axis, needed only for ``centered``.
+    name : str
+        The axis name, for error messages.
+
+    Returns
+    -------
+    AxisCalibration
+        The axis calibration the spec describes.
+
+    Notes
+    -----
+    Propagates ``TypeError`` when the spec is neither a mapping nor an
+    :class:`AxisCalibration`, and ``ValueError`` when it names a key
+    outside the vocabulary or omits ``kind`` — a typo must not silently
+    degrade to a pixel axis. Both come from the shared parsing, so the
+    sentences an operator sees are the frame path's own.
+    """
+    return _axis_from_spec(spec, length, name)
+
+
 def _from_metadata_mapping(
     spec: object,
     shape: tuple[int, int],

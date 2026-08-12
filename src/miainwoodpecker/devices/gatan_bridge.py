@@ -120,6 +120,7 @@ import numpy as np
 
 from miainwoodpecker.devices.interface import (
     ENERGY_OFFSET_CONTROL,
+    IMAGE_READOUT,
     CameraParameters,
     Frame,
 )
@@ -483,12 +484,22 @@ class SimulatedEELSCamera:
         Raises
         ------
         ValueError
-            If the binning is not one this camera offers.
+            If the binning is not one this camera offers, or a readout
+            other than ``image`` is requested.
         """
         if parameters.binning not in self.binning_values:
             msg = (
                 f"binning {parameters.binning} is not one of "
                 f"{list(self.binning_values)} on {self.camera_id}"
+            )
+            raise ValueError(msg)
+        if parameters.readout != IMAGE_READOUT:
+            msg = (
+                f"readout {parameters.readout!r} is not supported by "
+                f"{self.camera_id}: this simulator stands in for the DM "
+                f"front-image path, which delivers whatever DigitalMicrograph "
+                f"is showing — a projection would be DM's to perform, in its "
+                f"own SI/spectrum modes"
             )
             raise ValueError(msg)
         self._parameters = parameters
@@ -634,13 +645,22 @@ class DigitalMicrographCamera:
         ValueError
             If a binning other than 1 is requested, because pretending to
             accept it would put a wrong number in every frame's metadata
-            and a wrong scale on every calibration.
+            and a wrong scale on every calibration — or a readout other
+            than ``image``, for the same reason DM owns the binning.
         """
         if parameters.binning != 1:
             msg = (
                 f"binning {parameters.binning} cannot be set from this bridge: "
                 f"the front-image path reads what DigitalMicrograph is already "
                 f"acquiring, so binning is set in DM's own camera controls"
+            )
+            raise ValueError(msg)
+        if parameters.readout != IMAGE_READOUT:
+            msg = (
+                f"readout {parameters.readout!r} cannot be set from this "
+                f"bridge: the front-image path reads what DigitalMicrograph "
+                f"is already acquiring, so a projected (summed) readout is "
+                f"DM's to configure in its own spectrum modes"
             )
             raise ValueError(msg)
         self._parameters = parameters

@@ -68,6 +68,21 @@ one-in-flight invariant changes: the analysis protocol is synchronous
 request/response for the same reason
 :mod:`miainwoodpecker.devices.rpc` is.
 
+The simultaneous multi-channel scan
+(:meth:`~miainwoodpecker.devices.interface.Scanner.scan_frames`) then
+asked the one question the synchronous protocol makes interesting: **N
+frames, one reply.** The reuse rule allows exactly one publish per
+request/response cycle, so N publishes into the reused segment would each
+overwrite the last while the client is still on the previous reply. The
+frames of a pass share shape and dtype by construction, so they cross as
+one stacked ``(n, height, width)`` block —
+:class:`SharedFrameSetRef`, :meth:`SharedFrameWriter.publish_frames` and
+:meth:`SharedFrameReader.read_frames` — which costs one copy in and one
+copy out at the same per-byte price as a single frame of the combined
+size, and leaves the ownership rules untouched because it is still one
+segment per source. The alternatives are recorded where the choice is:
+see :class:`SharedFrameSetRef`.
+
 MIT, no ``nion.*`` import — used by
 :mod:`miainwoodpecker.devices.nion_server`,
 :mod:`miainwoodpecker.devices.remote`, and
@@ -89,6 +104,7 @@ from miainwoodpecker.devices.interface import Frame, Spectrum
 
 if typing.TYPE_CHECKING:
     import datetime
+    from collections.abc import Sequence
 
     import numpy.typing as npt
 
@@ -200,6 +216,68 @@ class SharedArrayRef:
 
 
 @dataclass(frozen=True)
+class SharedFrameSetRef:
+    """
+    A reference to several same-shape frames stacked in one shared segment.
+
+    How the frames of one simultaneous multi-channel scan
+    (:meth:`~miainwoodpecker.devices.interface.Scanner.scan_frames`) cross
+    the process boundary. **One block, not N refs**, deliberately: the
+    frames of a pass are produced together and must be returned together,
+    and the reused-segment design allows exactly one publish per
+    request/response cycle — N sequential publishes into one segment would
+    have each overwrite the last, and N segments per source would multiply
+    the ownership and orphan-cleanup rules this module is careful about.
+    Frames from one pass share shape and dtype by construction (same scan
+    geometry, same device), so stacking them as ``(n, height, width)`` in
+    the existing segment costs one copy in and one copy out — the same
+    per-byte price as any single frame of the combined size (measured at
+    ~0.75-0.9 ms/MB; see ``scripts/ipc_overhead_benchmark.py``).
+
+    The third option, **N sequential replies** — one round trip per
+    channel — was rejected on more than speed. It would make the server
+    hold a finished pass's frames between calls, so a client that died
+    mid-pass would pin them, and it would break the property the
+    multi-channel call exists to give: that one request is one
+    acquisition, which is what makes the dose accounting checkable from
+    the outside. Its cost is real too, since each reply pays the
+    round-trip latency again, but that is the smaller half of the
+    argument.
+
+    Sizes, so the choice is not made on principle alone: a two-channel
+    1536² float64 pass is 37.7MB, about 30ms of copying either way at the
+    measured rate — against roughly 340ms had the same two frames gone
+    through pickle at that size (+168ms per 33.6MB frame, measured).
+    Below :data:`~miainwoodpecker.devices.rpc.SHARED_MEMORY_THRESHOLD_BYTES`
+    the set stays on the pickle path as one ordinary list, exactly as a
+    small single frame does.
+
+    Per-frame identity travels alongside the block: entry ``i`` of
+    ``timestamps``/``metadata`` belongs to plane ``i`` of the stack, in
+    the order the frames were published.
+
+    Attributes
+    ----------
+    shm_name : str
+        Name of the shared memory segment holding the stacked block.
+    shape : tuple[int, ...]
+        The stacked block's shape: ``(frame count, *frame shape)``.
+    dtype : str
+        Array dtype, as a string (``np.dtype(dtype)`` reconstructs it).
+    timestamps : tuple[datetime.datetime, ...]
+        Each original frame's timestamp, in stack order.
+    metadata : tuple[typing.Mapping[str, typing.Any], ...]
+        Each original frame's metadata, in stack order.
+    """
+
+    shm_name: str
+    shape: tuple[int, ...]
+    dtype: str
+    timestamps: tuple[datetime.datetime, ...]
+    metadata: tuple[typing.Mapping[str, typing.Any], ...]
+
+
+@dataclass(frozen=True)
 class SharedSpectrumRef:
     """
     A reference to a spectrum's array living in a (possibly reused) segment.
@@ -244,6 +322,11 @@ class SharedSpectrumRef:
     energy_offset_ev: float
     energy_scale_ev: float
     metadata: typing.Mapping[str, typing.Any]
+
+
+# Every reference shape this module hands out names a segment, a shape,
+# and a dtype - which is all the reader's attach-and-wrap core needs.
+_AnySharedRef = SharedFrameRef | SharedSpectrumRef | SharedArrayRef | SharedFrameSetRef
 
 
 class SharedFrameWriter:
@@ -330,6 +413,68 @@ class SharedFrameWriter:
             metadata=spectrum.metadata,
         )
 
+    def publish_frames(self, frames: Sequence[Frame]) -> SharedFrameSetRef:
+        """
+        Copy several same-shape frames into the reused segment as one block.
+
+        The same segment, the same grow-only reuse rule, and the same
+        one-in-flight invariant as :meth:`publish` — the whole set is one
+        publish, which is what makes it safe at all (see
+        :class:`SharedFrameSetRef` for why N separate publishes are not
+        an option here).
+
+        Parameters
+        ----------
+        frames : Sequence[Frame]
+            The frames to publish. Must be non-empty and agree on shape
+            and dtype, which frames of one scanned pass do by
+            construction.
+
+        Returns
+        -------
+        SharedFrameSetRef
+            A reference the reader can use to retrieve every frame.
+
+        Raises
+        ------
+        ValueError
+            If ``frames`` is empty, or if the frames disagree on shape
+            or dtype — a set this method cannot stack, and one no scanned
+            pass produces, so refusing is diagnosis rather than policy.
+        """
+        if not frames:
+            msg = "publish_frames() needs at least one frame"
+            raise ValueError(msg)
+        arrays = [np.ascontiguousarray(frame.data) for frame in frames]
+        first = arrays[0]
+        if any(
+            array.shape != first.shape or array.dtype != first.dtype
+            for array in arrays[1:]
+        ):
+            msg = (
+                f"publish_frames() needs frames agreeing on shape and dtype; "
+                f"got {[(array.shape, str(array.dtype)) for array in arrays]}"
+            )
+            raise ValueError(msg)
+        shape = (len(arrays), *first.shape)
+        with self._lock:
+            segment = self._ensure_capacity(first.nbytes * len(arrays))
+            destination = np.ndarray(shape, dtype=first.dtype, buffer=segment.buf)
+            # Plane by plane rather than one np.stack: stacking would
+            # build the whole block in ordinary memory first, so every
+            # byte would be copied twice on a path whose entire cost is
+            # the copy (~0.75-0.9 ms/MB).
+            for index, array in enumerate(arrays):
+                destination[index] = array
+            shm_name = segment.name
+        return SharedFrameSetRef(
+            shm_name=shm_name,
+            shape=shape,
+            dtype=str(first.dtype),
+            timestamps=tuple(frame.timestamp for frame in frames),
+            metadata=tuple(frame.metadata for frame in frames),
+        )
+
     def publish_array(
         self,
         array: npt.NDArray[typing.Any],
@@ -385,15 +530,36 @@ class SharedFrameWriter:
         """
         data = np.ascontiguousarray(array)
         with self._lock:
-            if self._segment is None or data.nbytes > self._segment.size:
-                self._replace_segment(data.nbytes)
-            assert self._segment is not None  # noqa: S101 - just created above
-            destination = np.ndarray(
-                data.shape, dtype=data.dtype, buffer=self._segment.buf,
-            )
+            segment = self._ensure_capacity(data.nbytes)
+            destination = np.ndarray(data.shape, dtype=data.dtype, buffer=segment.buf)
             destination[:] = data
-            shm_name = self._segment.name
+            shm_name = segment.name
         return shm_name, data
+
+    def _ensure_capacity(self, size: int) -> shared_memory.SharedMemory:
+        """
+        Return the current segment, grown first if it cannot hold ``size``.
+
+        The grow-only reuse rule lives here alone, called by every
+        publish path with ``self._lock`` already held. One place decides
+        when a segment is replaced, because that decision is the measured
+        one this module exists for: replacing costs a syscall pair per
+        publish, which was worse than plain pickling at moderate sizes.
+
+        Parameters
+        ----------
+        size : int
+            Bytes the caller is about to write.
+
+        Returns
+        -------
+        shared_memory.SharedMemory
+            A segment of at least ``size`` bytes.
+        """
+        if self._segment is None or size > self._segment.size:
+            self._replace_segment(size)
+        assert self._segment is not None  # noqa: S101 - just created above
+        return self._segment
 
     def _replace_segment(self, size: int) -> None:
         """Destroy the current segment, if any, and create a right-sized one."""
@@ -509,6 +675,40 @@ class SharedFrameReader:
             metadata=reference.metadata,
         )
 
+    def read_frames(self, reference: SharedFrameSetRef) -> list[Frame]:
+        """
+        Copy every referenced frame out of the writer's shared segment.
+
+        Each frame gets its own private copy of its plane of the stacked
+        block, for exactly the reason :meth:`read` copies: nothing
+        downstream may hold a view of a buffer the writer will overwrite
+        on the next call — and per-frame copies rather than one block
+        copy sliced into views, so releasing one frame does not silently
+        keep its whole pass alive.
+
+        Parameters
+        ----------
+        reference : SharedFrameSetRef
+            A reference returned by :meth:`SharedFrameWriter.publish_frames`.
+
+        Returns
+        -------
+        list[Frame]
+            The frames, in the order they were published, each with its
+            own timestamp, metadata, and private array.
+        """
+        view = self._view(reference)
+        return [
+            Frame(
+                data=view[index].copy(),
+                timestamp=timestamp,
+                metadata=metadata,
+            )
+            for index, (timestamp, metadata) in enumerate(
+                zip(reference.timestamps, reference.metadata, strict=True),
+            )
+        ]
+
     def read_array(self, reference: SharedArrayRef) -> npt.NDArray[typing.Any]:
         """
         Copy a referenced bare array out of the writer's shared segment.
@@ -543,6 +743,28 @@ class SharedFrameReader:
             A copy the caller owns, so nothing downstream reads a buffer
             the writer may overwrite on the next call.
         """
+        return self._view(reference).copy()
+
+    def _view(self, reference: _AnySharedRef) -> npt.NDArray[typing.Any]:
+        """
+        Attach if needed and return a *view* of the referenced array.
+
+        The attach-and-wrap core :meth:`_copy_out` and :meth:`read_frames`
+        share. The view aliases the writer's live buffer, which is why it
+        stays private to this class: every public read path copies out of
+        it before returning.
+
+        Parameters
+        ----------
+        reference : _AnySharedRef
+            Any reference naming a segment, a shape, and a dtype.
+
+        Returns
+        -------
+        npt.NDArray[typing.Any]
+            A view over the shared segment, valid until the next call
+            that re-attaches.
+        """
         if self._segment is None or self._segment.name != reference.shm_name:
             if self._segment is not None:
                 self._segment.close()  # detach only: the writer owns unlink()
@@ -550,12 +772,11 @@ class SharedFrameReader:
             self._last_name = reference.shm_name
             if self._stop_tracking:
                 _stop_tracking(reference.shm_name)
-        view = np.ndarray(
+        return np.ndarray(
             reference.shape,
             dtype=np.dtype(reference.dtype),
             buffer=self._segment.buf,
         )
-        return view.copy()
 
     def close(self) -> None:
         """Detach from the current segment, if any. Never unlinks it."""

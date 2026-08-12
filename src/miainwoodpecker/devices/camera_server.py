@@ -78,7 +78,11 @@ import typing
 
 import numpy as np
 
-from miainwoodpecker.devices.interface import CameraParameters, Frame
+from miainwoodpecker.devices.interface import (
+    IMAGE_READOUT,
+    CameraParameters,
+    Frame,
+)
 from miainwoodpecker.devices.rpc import BACKENDS, SIMULATED_BACKEND
 from miainwoodpecker.devices.serving import accept_loop
 from miainwoodpecker.devices.shared_frame import SharedFrameWriter
@@ -163,12 +167,20 @@ class SimulatedCamera:
         ------
         ValueError
             If a binning other than 1 is requested, which is what a
-            consumer sensor would also say.
+            consumer sensor would also say, or a readout other than
+            ``image``.
         """
         if parameters.binning != 1:
             msg = (
                 f"binning {parameters.binning} is not supported by "
                 f"{self.camera_id}; consumer sensors crop rather than bin"
+            )
+            raise ValueError(msg)
+        if parameters.readout != IMAGE_READOUT:
+            msg = (
+                f"readout {parameters.readout!r} is not supported by "
+                f"{self.camera_id}: a consumer sensor delivers images and has "
+                f"no dispersive axis to project along"
             )
             raise ValueError(msg)
         self._parameters = parameters
@@ -271,12 +283,20 @@ class OpenCVCamera:
         Raises
         ------
         ValueError
-            If a binning other than 1 is requested.
+            If a binning other than 1, or a readout other than
+            ``image``, is requested.
         """
         if parameters.binning != 1:
             msg = (
                 f"binning {parameters.binning} is not supported by "
                 f"{self.camera_id}; consumer sensors crop rather than bin"
+            )
+            raise ValueError(msg)
+        if parameters.readout != IMAGE_READOUT:
+            msg = (
+                f"readout {parameters.readout!r} is not supported by "
+                f"{self.camera_id}: a capture device delivers images and has "
+                f"no dispersive axis to project along"
             )
             raise ValueError(msg)
         import cv2  # noqa: PLC0415 - lazy, see the class docstring

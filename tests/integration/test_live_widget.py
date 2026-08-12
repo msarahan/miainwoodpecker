@@ -35,6 +35,24 @@ from miainwoodpecker.viewer.live import LiveInstrumentWidget
 _DEADLINE_S = 10.0
 
 
+@pytest.fixture(autouse=True)
+def _analysis_stays_in_this_process(monkeypatch) -> None:
+    """
+    Pin the analysis buttons to the in-process transport for this suite.
+
+    Isolation is now the shipped default (the owner's decision, for crash
+    containment), but these tests assert properties of the *operations*
+    and the widget — layers, labels, refusals, and read counts observed
+    by monkeypatching ``hyperspy_bridge.read_frames`` in this process,
+    which a worker subprocess would never see. The transport has its own
+    suites (``test_analysis_worker.py`` end to end, and one widget test
+    below that overrides this fixture to drive all three buttons through
+    real workers), so pinning here loses no coverage and keeps a widget
+    test failure meaning the widget broke rather than the transport.
+    """
+    monkeypatch.setenv("MIAINWOODPECKER_ANALYSIS_ISOLATION", "inprocess")
+
+
 class _FakeScanner:
     """Fake scanner returning zero frames of the requested shape."""
 
@@ -361,13 +379,13 @@ def test_the_buttons_work_with_the_analysis_libraries_in_a_worker_process(
     """
     The same three buttons, with every analysis library out of this process.
 
-    The isolated path is off by default (see docs/analysis-isolation.md
-    for why that is the project owner's decision rather than this code's),
-    so without a test that turns it on it would ship unexercised. This is
-    that test: it drives the real handlers through the real
-    ``AnalysisJob`` and asserts the same layers and the same "done" status
-    the in-process tests assert, which is the whole claim — the transport
-    changed and nothing else did.
+    Isolation is the shipped default, but this suite's autouse fixture
+    pins the other tests in-process so their assertions stay about the
+    widget; this test overrides the fixture and is the one that drives
+    the buttons through the shipped default for real. It drives the real
+    handlers through the real ``AnalysisJob`` and asserts the same layers
+    and the same "done" status the in-process tests assert, which is the
+    whole claim — the transport changed and nothing else did.
 
     One test for all three rather than three, because each one costs a
     worker start (0.3 s for HyperSpy, 1.1 s for LiberTEM, 2.6 s for

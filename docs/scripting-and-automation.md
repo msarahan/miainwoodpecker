@@ -49,7 +49,7 @@ The API is small, and each layer only depends on the one below it:
 | Layer | What it gives you |
 |---|---|
 | `miainwoodpecker.devices` | The instrument: `Camera` (with exposure and binning), `Scanner`, and `InstrumentController` (stage, defocus, beam blanker, spectrometer energy offset). Vendor-neutral, in operator units — pixels, microseconds, nanometres, electronvolts. |
-| `miainwoodpecker.acquisition` | Series as generators: `scan_series`, `camera_series`, `focal_series`, `energy_offset_series`, plus `record()` to stream any of them to disk and `LiveAcquisition` for a latest-frame-wins live loop. |
+| `miainwoodpecker.acquisition` | Series as generators: `scan_series`, `multichannel_scan_series`, `camera_series`, `focal_series`, `energy_offset_series`, plus `record()` to stream any of them to disk and `LiveAcquisition` for a latest-frame-wins live loop. |
 | `miainwoodpecker.storage` | Files and sessions: `Session`, `write_frames`/`read_frames`, per-axis calibration, and the legacy `.ndata` importer. |
 | `miainwoodpecker.analysis` | One-line loaders into HyperSpy, LiberTEM, and py4DSTEM. |
 
@@ -98,6 +98,46 @@ Each frame's metadata records both the requested defocus and the value
 read back from the instrument, so the file says what the microscope
 *did*, not just what it was asked. The original defocus is restored
 afterwards, even if you abandon the series early.
+
+## Two detectors, one pass of the beam
+
+A scanned instrument reads *every* enabled detector out as the probe goes
+past, so asking for HAADF and then MAADF as two separate scans costs
+twice the dose, takes twice as long, and lets the specimen drift in
+between. `scan_frames` asks for both at once:
+
+```python
+from miainwoodpecker.acquisition import multichannel_scan_series, record
+from miainwoodpecker.devices import ScanParameters
+from miainwoodpecker.devices.remote import remote_simulated_instrument
+
+with remote_simulated_instrument() as microscope:
+    parameters = ScanParameters(height=256, width=256,
+                                pixel_time_us=1.0, fov_nm=15.0)
+
+    # One pass, two frames - HAADF and MAADF, in request order:
+    haadf, maadf = microscope.scanner.scan_frames(parameters, [0, 1])
+    assert haadf.metadata["scan_pass_id"] == maadf.metadata["scan_pass_id"]
+
+    # Or a series of passes, streamed to disk:
+    record(
+        multichannel_scan_series(
+            microscope.scanner, parameters, 10, channels=(0, 1),
+        ),
+        "two-channel.nxs",
+    )
+```
+
+Both frames carry the same `scan_pass_id` and a `simultaneous_channels`
+list naming the channels that shared the pass, and both land in the
+recording with that metadata — so a difference taken between two frames
+of one pass (DPC, iDPC, centre of mass) is a difference at the *same*
+probe position, and the file says so. A single-channel `scan_frame`
+carries neither key, deliberately: its frame shared a pass with nothing,
+and an id claiming otherwise would be a fiction.
+
+Use `scanner.channel_names` to see which channels the instrument has;
+asking for one it does not raises `IndexError`.
 
 ## A second experiment: stepping the spectrometer
 

@@ -94,11 +94,17 @@ top of* that shared path rather than beside it: each loads the spectrum
 exactly as above and adds only the two things the shared loader cannot —
 the eXSpy signal type, and the metadata that spectroscopy's own
 quantification reads. They are twins by construction, and each refuses
-the *other* one's layout rather than typing it: both spectroscopies end
-as the same ``Signal1D``, so nothing downstream would catch an EELS
-recording wearing ``EDS_TEM`` (eXSpy would fit X-ray lines to electron
-energy losses) or an EDX one wearing ``EELS`` (it would fit ionisation
-edges to X-ray lines).
+the *other* one's recordings rather than typing them: both
+spectroscopies end as the same ``Signal1D``, so nothing downstream would
+catch an EELS recording wearing ``EDS_TEM`` (eXSpy would fit X-ray lines
+to electron energy losses) or an EDX one wearing ``EELS`` (it would fit
+ionisation edges to X-ray lines). For a frame recording the layout
+answers by itself; for a spectrum recording it no longer can, because a
+camera's **projected readout** stores EELS in the same ``NXspectrum``
+layout as EDX — there the check is of what the recording *says it is*,
+the ``technique`` metadata that
+:func:`~miainwoodpecker.storage.spectra.spectrum_from_projected_frame`
+stamps and ``SpectrumWriter`` writes into ``NXdetector``'s description.
 
 Requires the ``analysis`` optional dependency group
 (``pip install miainwoodpecker[analysis]``).
@@ -140,7 +146,11 @@ from miainwoodpecker.storage.calibration import (
     AxisKind,
 )
 from miainwoodpecker.storage.nexus import read_frames
-from miainwoodpecker.storage.spectra import read_spectra
+from miainwoodpecker.storage.spectra import (
+    EELS_TECHNIQUE,
+    TECHNIQUE_KEY,
+    read_spectra,
+)
 
 if typing.TYPE_CHECKING:
     import os
@@ -447,6 +457,34 @@ def _holds_spectra(path: os.PathLike[str] | str) -> bool:
         return layout.SPECTRUM_INTENSITY in handle
 
 
+def _recorded_technique(metadata: dict[str, object]) -> str:
+    """
+    Return what kind of spectroscopy a spectrum recording says it holds.
+
+    Parameters
+    ----------
+    metadata : dict[str, object]
+        The recording's first spectrum's metadata.
+
+    Returns
+    -------
+    str
+        The ``technique`` value, lower-cased (``"eels"``, ``"eds"``, …),
+        or ``""`` when the recording does not say.
+
+    Notes
+    -----
+    The two loaders read this asymmetrically, deliberately. ``"eels"``
+    is a *claim*, and :func:`load_as_eels_signal` requires it, because
+    the only thing making a projected camera readout distinguishable
+    from EDX on disk is the recording saying so. Silence is not that
+    claim, so it stays EDX's — this layout was EDX's before projection
+    landed in it, and every recording written before that predates the
+    key entirely.
+    """
+    return str(metadata.get(TECHNIQUE_KEY, "") or "").lower()
+
+
 def _spectrum_recording_as_signal(
     path: os.PathLike[str] | str,
 ) -> hs.signals.Signal1D:
@@ -554,7 +592,11 @@ def load_as_eds_signal(
     ValueError
         If the file is a frame recording rather than a spectrum
         recording — an EELS camera stack reaches ``Signal1D`` through
-        :func:`load_as_eels_signal` and is not EDS data.
+        :func:`load_as_eels_signal` and is not EDS data — or a spectrum
+        recording whose ``technique`` metadata says it is EELS: a
+        camera's projected readout lands in the same ``NXspectrum``
+        layout as EDX, so the refusal keys on what the recording says it
+        is rather than on its shape, which can no longer tell.
 
     Notes
     -----
@@ -571,11 +613,25 @@ def load_as_eds_signal(
             f"load_as_hyperspy_signal (an image stack)"
         )
         raise ValueError(msg)
+    recording = read_spectra(path)
+    if _recorded_technique(recording.metadata[0]) == EELS_TECHNIQUE:
+        # A projected EELS camera readout lands in the same NXspectrum
+        # layout as EDX, so the shape can no longer tell them apart - but
+        # the recording says what it is (`technique`, written into
+        # NXdetector's description), and eXSpy fitting X-ray lines to
+        # electron energy losses is exactly the mix-up this refusal
+        # exists to prevent.
+        msg = (
+            f"{path} is an EELS spectrum recording (its technique metadata "
+            f"says 'eels' - a camera's projected readout), not EDS data; "
+            f"load it with load_as_eels_signal, or with "
+            f"load_as_hyperspy_spectrum for an untyped Signal1D"
+        )
+        raise ValueError(msg)
     _require_exspy("EDS", signal_type)
 
     signal = load_as_hyperspy_spectrum(path)
     signal.set_signal_type(signal_type)
-    recording = read_spectra(path)
     _apply_eds_metadata(signal, recording.metadata[0], signal_type)
     return signal
 
@@ -788,25 +844,35 @@ def load_as_eels_signal(path: os.PathLike[str] | str) -> hs.signals.Signal1D:
         A frame recording written by
         :class:`~miainwoodpecker.storage.nexus.NexusWriter` whose axis
         calibration names one direction as energy — an EEL spectrometer
-        dispersing onto a camera. See
-        :meth:`miainwoodpecker.storage.calibration.FrameCalibration.spectrum`.
+        dispersing onto a camera (see
+        :meth:`miainwoodpecker.storage.calibration.FrameCalibration.spectrum`)
+        — or a spectrum recording whose ``technique`` metadata says it is
+        EELS, which is what a camera's **projected readout** produces:
+        the same spectrometer, already summed to 1D at the device, stored
+        by :class:`~miainwoodpecker.storage.spectra.SpectrumWriter` in
+        the ``NXspectrum`` layout with the technique stamped by
+        :func:`~miainwoodpecker.storage.spectra.spectrum_from_projected_frame`.
 
     Returns
     -------
     hyperspy.signals.Signal1D
-        An ``exspy.signals.EELSSpectrum`` with an eV energy axis, frame
-        time in seconds as its navigation axis, and whatever of the
-        metadata above the recording carried.
+        An ``exspy.signals.EELSSpectrum`` with an eV energy axis, the
+        navigation axis the recording has (frame time in seconds for a
+        flattened camera stack, spectrum index for a projected series),
+        and whatever of the metadata above the recording carried.
 
     Raises
     ------
     ValueError
-        If the file is a spectrum recording rather than a frame
-        recording — an EDX detector's counts are not electron energy
-        losses, and once loaded the two are indistinguishable, so this
-        refuses instead of typing it. Also propagated from
-        :func:`load_as_hyperspy_spectrum` when the recording has no
-        single energy-calibrated axis to flatten along.
+        If the file is a spectrum recording that does **not** say it is
+        EELS — an EDX detector's counts are not electron energy losses,
+        and once loaded the two are indistinguishable, so this refuses
+        instead of typing it. The check is of what the recording says it
+        is (``technique``), because a projected EELS readout and an EDX
+        spectrum wear the same layout and the shape can no longer
+        answer. Also propagated from :func:`load_as_hyperspy_spectrum`
+        when a frame recording has no single energy-calibrated axis to
+        flatten along.
 
     Notes
     -----
@@ -816,22 +882,29 @@ def load_as_eels_signal(path: os.PathLike[str] | str) -> hs.signals.Signal1D:
     ``Signal1D``.
     """
     if _holds_spectra(path):
-        msg = (
-            f"{path} is a spectrum recording, not a frame recording, so it is "
-            f"not EELS data: this project's spectrum layout is written by "
-            f"SpectrumWriter for detectors that are natively 1D, of which an "
-            f"EDX detector is the case in hand. Load it with "
-            f"load_as_eds_signal, or with load_as_hyperspy_spectrum for an "
-            f"untyped Signal1D. An EEL spectrometer disperses onto a camera "
-            f"and is recorded as a frame stack"
-        )
-        raise ValueError(msg)
+        metadata = read_spectra(path).metadata[0]
+        if _recorded_technique(metadata) != EELS_TECHNIQUE:
+            msg = (
+                f"{path} is a spectrum recording that does not say it is EELS "
+                f"(technique={metadata.get(TECHNIQUE_KEY)!r}): this project's "
+                f"spectrum layout is written by SpectrumWriter for natively 1D "
+                f"detectors, of which an EDX detector is the case in hand, and "
+                f"for a camera's projected EELS readout, which stamps "
+                f"technique='eels'. Load it with load_as_eds_signal, or with "
+                f"load_as_hyperspy_spectrum for an untyped Signal1D"
+            )
+            raise ValueError(msg)
+    else:
+        metadata = _first_frame_metadata(path)
     _require_exspy("EELS", _EELS)
 
     signal = load_as_hyperspy_spectrum(path)
+    # A no-op for a spectrum recording, whose layout is always eV; a
+    # frame recording's axis may be meV or keV and eXSpy's EELS side
+    # assumes eV without checking.
     _to_electronvolts(signal.axes_manager.signal_axes[0])
     signal.set_signal_type(_EELS)
-    _apply_eels_metadata(signal, _first_frame_metadata(path))
+    _apply_eels_metadata(signal, metadata)
     return signal
 
 

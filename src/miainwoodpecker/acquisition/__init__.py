@@ -5,6 +5,7 @@ from miainwoodpecker.acquisition.sequence import (
     camera_series,
     energy_offset_series,
     focal_series,
+    multichannel_scan_series,
     record,
     scan_series,
 )
@@ -15,6 +16,7 @@ __all__ = [
     "camera_series",
     "energy_offset_series",
     "focal_series",
+    "multichannel_scan_series",
     "record",
     "scan_series",
 ]

@@ -2,17 +2,23 @@
 
 import datetime
 import typing
+import uuid
 
 import numpy as np
+import pytest
 
 from miainwoodpecker.devices import (
     BEAM_BLANKER_CONTROL,
     DEFOCUS_CONTROL,
     ENERGY_OFFSET_CONTROL,
+    IMAGE_READOUT,
+    PROJECTED_READOUT,
+    READOUT_MODES,
     STAGE_POSITION_CONTROL,
     Camera,
     CameraParameters,
     Frame,
+    Instrument,
     InstrumentController,
     ScanParameters,
     Scanner,
@@ -99,6 +105,46 @@ class _FakeScanner:
             timestamp=datetime.datetime.now(tz=datetime.UTC),
             metadata={"channel_index": channel},
         )
+
+    def scan_frames(
+        self,
+        parameters: ScanParameters,
+        channels: typing.Sequence[int],
+    ) -> list[Frame]:
+        """
+        Return one frame per channel, sharing the identity of one fake pass.
+
+        The reference shape of the contract: the pass identity is minted
+        *inside* this call, every sibling carries it plus the channel
+        list, and the single-channel ``scan_frame`` above attaches
+        neither — which is what makes the identity mean something.
+
+        Parameters
+        ----------
+        parameters : ScanParameters
+            Scan geometry, shared by every returned frame.
+        channels : typing.Sequence[int]
+            Channel indices to read out during the fake pass.
+
+        Returns
+        -------
+        list[Frame]
+            One frame per requested channel, in request order.
+        """
+        pass_id = str(uuid.uuid4())
+        timestamp = datetime.datetime.now(tz=datetime.UTC)
+        return [
+            Frame(
+                data=np.zeros(parameters.shape, dtype=np.float32),
+                timestamp=timestamp,
+                metadata={
+                    "channel_index": channel,
+                    "scan_pass_id": pass_id,
+                    "simultaneous_channels": list(channels),
+                },
+            )
+            for channel in channels
+        ]
 
     def close(self) -> None:
         """Release nothing; the fake owns no resources."""
@@ -210,9 +256,58 @@ def test_scan_frame_uses_requested_shape():
     assert frame.data.shape == parameters.shape
 
 
-def test_fake_instrument_satisfies_instrument_controller_protocol():
-    """A structural implementation is recognized by the runtime-checkable protocol."""
-    assert isinstance(_FakeInstrument(), InstrumentController)
+def test_fake_instrument_satisfies_the_instrument_protocol():
+    """A structural implementation is recognized by the runtime-checkable core."""
+    assert isinstance(_FakeInstrument(), Instrument)
+
+
+def test_the_full_controller_is_not_a_runtime_check():
+    """
+    ``isinstance`` against ``InstrumentController`` is a ``TypeError``.
+
+    Deliberate, and worth pinning so it cannot quietly regress: the full
+    control surface used to be ``runtime_checkable``, and its
+    all-or-nothing ``isinstance`` failed two working adapters (a
+    spectrometer with one control, a webcam with none) — it tested for
+    Nion-shapedness rather than conformance. The runtime question is now
+    :class:`Instrument` plus ``available_controls()``; the controller
+    exists for static typing, and asking it at runtime should fail
+    loudly rather than reintroduce the wrong question.
+    """
+    with pytest.raises(TypeError, match="runtime_checkable"):
+        isinstance(_FakeInstrument(), InstrumentController)
+
+
+def test_scan_frames_share_a_pass_identity_that_scan_frame_never_carries():
+    """
+    The pass identity exists exactly where a pass exists.
+
+    This is the contract the interface docstrings promise: frames of one
+    ``scan_frames`` call all name the same ``scan_pass_id`` and the same
+    sibling channels, two *calls* never share one (each is its own pass
+    of the beam), and the single-channel ``scan_frame`` attaches neither
+    key — an identifier nothing establishes would be a claim, which is
+    what the earlier no-``scan_id`` rule was rightly protecting against.
+    """
+    scanner = _FakeScanner()
+    parameters = ScanParameters(height=8, width=16, pixel_time_us=1.0, fov_nm=50.0)
+    first_pass = scanner.scan_frames(parameters, [0, 1])
+    second_pass = scanner.scan_frames(parameters, [0, 1])
+    expected = 2
+    assert len(first_pass) == expected
+    pass_ids = {frame.metadata["scan_pass_id"] for frame in first_pass}
+    assert len(pass_ids) == 1
+    assert all(
+        frame.metadata["simultaneous_channels"] == [0, 1] for frame in first_pass
+    )
+    # A second call is a second pass, so its identity must be fresh.
+    assert (
+        second_pass[0].metadata["scan_pass_id"]
+        != first_pass[0].metadata["scan_pass_id"]
+    )
+    single = scanner.scan_frame(parameters, channel=0)
+    assert "scan_pass_id" not in single.metadata
+    assert "simultaneous_channels" not in single.metadata
 
 
 def test_stage_position_is_y_then_x_like_scan_parameters_shape():
@@ -235,4 +330,44 @@ def test_available_controls_can_report_a_partial_instrument():
     """An instrument without a blanker says so rather than failing on use."""
     instrument = _FakeInstrument(controls=[DEFOCUS_CONTROL])
     assert BEAM_BLANKER_CONTROL not in instrument.available_controls()
-    assert isinstance(instrument, InstrumentController)
+    assert isinstance(instrument, Instrument)
+
+
+def test_camera_parameters_default_to_the_image_readout():
+    """
+    The default readout is today's behaviour, so nothing existing changes shape.
+
+    ``readout`` arrived after every caller and every adapter, so its
+    default has to be the mode they were all written against; a default
+    of ``projected`` would silently turn every existing camera call into
+    a 1D acquisition.
+    """
+    assert CameraParameters(exposure_ms=10.0).readout == IMAGE_READOUT
+
+
+def test_camera_parameters_reject_a_readout_no_camera_could_act_on():
+    """
+    A misspelt mode is refused at construction, not silently imaged.
+
+    The vocabulary is closed on purpose: an adapter that fell through to
+    imaging on an unrecognised mode would answer an operator asking for a
+    spectrum with a picture, and the frame's own metadata would agree
+    with the picture.
+    """
+    with pytest.raises(ValueError, match="readout must be one of"):
+        CameraParameters(exposure_ms=10.0, readout="sum_project")
+
+
+def test_the_readout_vocabulary_is_exactly_the_two_modes():
+    """
+    Both modes are in ``READOUT_MODES``, which is what adapters validate against.
+
+    Pinned because the tuple is the shared contract: an adapter that
+    cannot project compares against these names, and a third mode added
+    without an adapter behind it would be a field every adapter must
+    refuse.
+    """
+    expected = (IMAGE_READOUT, PROJECTED_READOUT)
+    assert expected == READOUT_MODES
+    for mode in READOUT_MODES:
+        assert CameraParameters(exposure_ms=1.0, readout=mode).readout == mode

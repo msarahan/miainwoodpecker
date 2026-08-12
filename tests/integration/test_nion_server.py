@@ -29,6 +29,8 @@ Skipped automatically unless the ``device`` optional dependency group is
 installed (``uv run --extra device --extra tests pytest tests/integration``).
 """
 
+import typing
+
 import numpy as np
 import pytest
 
@@ -38,19 +40,24 @@ from miainwoodpecker.devices import (
     BEAM_BLANKER_CONTROL,
     DEFOCUS_CONTROL,
     ENERGY_OFFSET_CONTROL,
+    IMAGE_READOUT,
+    PROJECTED_READOUT,
     STAGE_POSITION_CONTROL,
     Camera,
     CameraParameters,
-    InstrumentController,
+    Instrument,
     ScanParameters,
     Scanner,
 )
 from miainwoodpecker.devices.nion_server import (
     HARDWARE_BACKEND,
     SIMULATED_BACKEND,
+    _SUM_PROJECT_PROCESSING,
     HardwareNotAvailableError,
     NionCamera,
+    NionScanner,
     _axis_calibration_spec,
+    _camera_base,
     _instrument_state,
     _parse_args,
     hardware_instrument,
@@ -123,6 +130,287 @@ def test_scanner_honors_non_square_shape_and_reports_channel():
         assert frame.data.shape == parameters.shape
         assert frame.metadata["channel_name"] == "HAADF"
         assert frame.metadata["fov_nm"] == parameters.fov_nm
+
+
+# --------------------------------------- the simultaneous multi-channel scan
+#
+# One pass of the probe, every enabled detector reading out at once, is
+# what a scanned instrument *is* (docs/vendor-support.md). These tests are
+# against the vendor device itself rather than a stand-in, because the
+# whole claim ``scan_frames`` makes is about what the *device* was asked
+# to do: a shared ``scan_pass_id`` that some emulation layer could have
+# minted around two separate scans would be exactly the fiction the
+# ``Frame`` docstring spent three phases refusing.
+
+# Small enough that the scan-box simulator's per-pixel timing keeps these
+# tests to milliseconds; non-square so the (height, width) convention is
+# under test here too.
+_PASS_PARAMETERS = ScanParameters(
+    height=16,
+    width=24,
+    pixel_time_us=1.0,
+    fov_nm=40.0,
+)
+_TWO_CHANNELS = 2
+
+
+class _CountingScanDevice:
+    """
+    A pass-through around Nion's scan device that counts what it was asked.
+
+    Everything is delegated to the real ``nion.device_kit.ScanDevice``,
+    so the adapter under test drives the genuine vendor object; the only
+    additions are counters on the two entry points that mean "acquire".
+    ``start_frame`` is the one that matters for dose — it is what begins
+    a traversal of the specimen — and its return value is the device's
+    own frame number, which is the device saying, in its own bookkeeping,
+    how many frames it thinks it has run.
+
+    Parameters
+    ----------
+    device : object
+        The vendor scan device to wrap.
+    """
+
+    def __init__(self, device: object) -> None:
+        self._device = device
+        self.started_frames: list[int] = []
+        self.generated_scans = 0
+
+    def __getattr__(self, name: str) -> object:
+        """
+        Delegate everything not overridden to the wrapped vendor device.
+
+        Parameters
+        ----------
+        name : str
+            Attribute being looked up.
+
+        Returns
+        -------
+        object
+            The vendor device's attribute.
+        """
+        return getattr(self._device, name)
+
+    def start_frame(self, is_continuous: bool) -> int:  # noqa: FBT001 - vendor signature
+        """
+        Begin one frame, recording the frame number the device gives back.
+
+        Parameters
+        ----------
+        is_continuous : bool
+            The vendor's continuous-acquisition flag.
+
+        Returns
+        -------
+        int
+            The device's frame number for the frame just started.
+        """
+        number = self._device.start_frame(is_continuous)
+        self.started_frames.append(int(number))
+        return number
+
+    def get_scan_data(self, frame_parameters: object, channel: object) -> np.ndarray:
+        """
+        Synthesise one channel's data, counting the call.
+
+        Parameters
+        ----------
+        frame_parameters : object
+            The vendor scan parameters.
+        channel : object
+            Channel index or channel object.
+
+        Returns
+        -------
+        np.ndarray
+            The simulated frame.
+        """
+        self.generated_scans += 1
+        return self._device.get_scan_data(frame_parameters, channel)
+
+
+def test_a_two_channel_pass_asks_the_device_for_exactly_one_scan():
+    """
+    The dose accounting, asserted against the device's own frame counter.
+
+    This is the entire point of the call: two channels must cost *one*
+    pass over the specimen, not two. Two independent witnesses are used
+    because a single call count could be satisfied by an adapter that
+    scanned twice and reported once — the device is asked to begin a
+    frame exactly once, and its own frame number (which it hands back
+    from ``start_frame``) advances by one per two-channel pass rather
+    than by one per channel.
+
+    The single-channel path is counted alongside as the contrast: it
+    reaches the vendor through ``get_scan_data``, which is one
+    synthesised traversal per call, so the naive way of getting two
+    channels really is two of them.
+    """
+    with simulated_instrument() as microscope:
+        device = _CountingScanDevice(microscope.scanner._device)  # noqa: SLF001
+        scanner = NionScanner(device, None)
+
+        first = scanner.scan_frames(_PASS_PARAMETERS, [0, 1])
+        second = scanner.scan_frames(_PASS_PARAMETERS, [0, 1])
+
+        assert len(first) == _TWO_CHANNELS
+        assert len(second) == _TWO_CHANNELS
+        assert len(device.started_frames) == _TWO_CHANNELS  # two passes, not four
+        assert device.started_frames[1] == device.started_frames[0] + 1
+        assert device.generated_scans == 0  # the pass path never goes there
+
+        scanner.scan_frame(_PASS_PARAMETERS, channel=0)
+        scanner.scan_frame(_PASS_PARAMETERS, channel=1)
+        assert device.generated_scans == _TWO_CHANNELS
+
+
+def test_two_channels_of_one_pass_share_an_identity_and_agree_on_geometry():
+    """
+    What the shared pass id has to mean for DPC or iDPC to be valid.
+
+    Both halves matter. The *identity* says these two frames came from
+    one traversal, so a difference taken between them is a difference at
+    the same probe position. The *geometry* is what makes that difference
+    computable at all: same shape, same field of view, same rotation and
+    centre, so pixel (i, j) of one names the same place as pixel (i, j)
+    of the other. A pair agreeing on one but not the other would be
+    quietly useless.
+
+    The arrays themselves must be separate objects, since a downstream
+    subtraction that turned out to be a frame minus itself would produce
+    a perfectly plausible field of zeros.
+    """
+    with simulated_instrument() as microscope:
+        frames = microscope.scanner.scan_frames(_PASS_PARAMETERS, [0, 1])
+
+        assert len(frames) == _TWO_CHANNELS
+        haadf, maadf = frames
+        assert haadf.metadata["scan_pass_id"] == maadf.metadata["scan_pass_id"]
+        assert haadf.metadata["scan_pass_id"]  # a real value, not an empty string
+        assert haadf.metadata["simultaneous_channels"] == [0, 1]
+        assert maadf.metadata["simultaneous_channels"] == [0, 1]
+        # Requested order, and each frame still says which channel it is.
+        assert haadf.metadata["channel_index"] == 0
+        assert maadf.metadata["channel_index"] == 1
+        assert haadf.metadata["channel_name"] == "HAADF"
+        assert maadf.metadata["channel_name"] == "MAADF"
+        # One pass, one clock.
+        assert haadf.timestamp == maadf.timestamp
+        for key in ("fov_nm", "fov_size_nm", "pixel_time_us", "rotation_rad",
+                    "center_nm", "line_time_us", "frame_time_s"):
+            assert haadf.metadata[key] == maadf.metadata[key]
+        assert haadf.data.shape == _PASS_PARAMETERS.shape
+        assert maadf.data.shape == _PASS_PARAMETERS.shape
+        assert haadf.data is not maadf.data
+
+
+def test_a_second_pass_is_a_second_identity():
+    """
+    Two calls are two traversals, so they must not share an id.
+
+    The failure this rules out is the one that would be least visible: a
+    pass id minted once per device or per session would group every frame
+    ever acquired, and every difference computed across two of them would
+    silently be a difference across drift.
+    """
+    with simulated_instrument() as microscope:
+        scanner = microscope.scanner
+        first = scanner.scan_frames(_PASS_PARAMETERS, [0, 1])
+        second = scanner.scan_frames(_PASS_PARAMETERS, [0, 1])
+        assert (
+            first[0].metadata["scan_pass_id"] != second[0].metadata["scan_pass_id"]
+        )
+
+
+def test_a_single_channel_scan_carries_no_pass_identity():
+    """
+    ``scan_frame`` fabricates nothing, and a pass of one is still honest.
+
+    The rule the ``Frame`` docstring now states: the identity exists
+    where a call established it and nowhere else. A ``scan_frame`` frame
+    has no siblings, so it carries neither key — a reader finding a pass
+    id on it would have to conclude some other frame shares its probe
+    positions, and none does.
+
+    A one-channel ``scan_frames`` is the interesting boundary: that
+    genuinely *was* a pass, so it does carry the identity, and its
+    sibling list names only itself. Nothing is claimed that did not
+    happen either way.
+    """
+    with simulated_instrument() as microscope:
+        scanner = microscope.scanner
+        single = scanner.scan_frame(_PASS_PARAMETERS, channel=0)
+        assert "scan_pass_id" not in single.metadata
+        assert "simultaneous_channels" not in single.metadata
+
+        (alone,) = scanner.scan_frames(_PASS_PARAMETERS, [0])
+        assert alone.metadata["scan_pass_id"]
+        assert alone.metadata["simultaneous_channels"] == [0]
+
+
+def test_a_pass_rejects_channels_the_scanner_does_not_have():
+    """
+    An impossible request fails, and the device is fine afterwards.
+
+    ``IndexError`` deliberately, because that is what the single-channel
+    path already raises for the same operator mistake (a bad channel
+    index reaching Nion's own channel list), so an adapter-conformance
+    suite or a caller branching on the error kind sees one vocabulary
+    rather than two. The message names the range, since "99 is not a
+    channel" is not actionable if the caller cannot see what is.
+
+    The recovery half is not decoration: this call enables and disables
+    detector channels on the device, so a request that dies partway
+    through must not leave the scan unit configured for a scan nobody
+    asked for.
+    """
+    with simulated_instrument() as microscope:
+        scanner = microscope.scanner
+        before = tuple(microscope.scanner._device.channels_enabled)  # noqa: SLF001
+
+        with pytest.raises(IndexError, match=r"channels 0\.\.3"):
+            scanner.scan_frames(_PASS_PARAMETERS, [0, 99])
+
+        assert tuple(microscope.scanner._device.channels_enabled) == before  # noqa: SLF001
+        recovered = scanner.scan_frames(_PASS_PARAMETERS, [0, 1])
+        assert len(recovered) == _TWO_CHANNELS
+
+
+def test_a_pass_rejects_a_request_no_scanner_could_honour():
+    """
+    No channels, or the same channel twice, is a caller bug rather than a scan.
+
+    ``ValueError`` rather than ``IndexError`` because these are not about
+    which channels exist: zero channels asks for no readout at all, and a
+    detector cannot be read out twice during one traversal — a duplicate
+    would have to be answered with two copies of one frame, which is a
+    claim about dose that nothing in the device supports.
+    """
+    with simulated_instrument() as microscope:
+        scanner = microscope.scanner
+        with pytest.raises(ValueError, match="at least one channel"):
+            scanner.scan_frames(_PASS_PARAMETERS, [])
+        with pytest.raises(ValueError, match="duplicate channels"):
+            scanner.scan_frames(_PASS_PARAMETERS, [1, 1])
+
+
+def test_a_pass_restores_the_channels_the_device_had_enabled():
+    """
+    Enabling channels for a pass is borrowed, not taken.
+
+    The device's enabled-channel set is instrument state that outlives
+    this call: it is what a subsequent vendor-level operation (Nion
+    Swift's own live view, on a shared instrument PC) would scan. A
+    ``scan_frames`` that left its own selection behind would silently
+    change what someone else's next acquisition recorded.
+    """
+    with simulated_instrument() as microscope:
+        device = microscope.scanner._device  # noqa: SLF001
+        before = tuple(device.channels_enabled)
+        microscope.scanner.scan_frames(_PASS_PARAMETERS, [1, 2])
+        assert tuple(device.channels_enabled) == before
 
 
 def _mean_abs_diff(first: np.ndarray, second: np.ndarray) -> float:
@@ -245,7 +533,7 @@ def test_hardware_backend_discovers_devices_from_a_named_plugin():
         assert microscope.ronchigram_camera.camera_id == "usim_ronchigram_camera"
         assert microscope.eels_camera.camera_id == "usim_eels_camera"
         assert microscope.scanner.scanner_id == "usim_scan_device"
-        assert isinstance(microscope.instrument, InstrumentController)
+        assert isinstance(microscope.instrument, Instrument)
         assert microscope.stage_size_nm > 0
 
 
@@ -696,6 +984,10 @@ def test_an_instrument_that_reports_nothing_contributes_no_keys():
 # integer factor on every binned frame.
 
 _UNSUPPORTED_BINNING = 3
+_IMAGE_RANK = 2
+# The projection is a float32 sum either way; only the order of the
+# additions differs between numpy's reduction and the assertion's.
+_PROJECTION_RTOL = 1e-5
 # A supported factor big enough that a wrongly-scaled axis is unmistakable.
 _TEST_BINNING = 4
 
@@ -805,3 +1097,272 @@ def test_an_unsupported_binning_is_refused_rather_than_rounded():
             )
         # And the camera is unchanged, not left half-configured.
         assert camera.parameters().binning == 1
+
+
+def test_the_plain_acquire_path_does_not_honour_nions_sum_project():
+    """
+    Measured, not assumed: this is why the server projects and says it did.
+
+    ``processing = "sum_project"`` is the only per-axis reduction Nion's
+    camera API has, and the mapping is right — but the device consults it
+    only on the sequence/SI paths (``_acquire_sequence``,
+    ``CameraTask.start``). ``acquire_image``, which is the whole of what
+    this project drives, never reads it and asserts a 2D buffer. Nion's
+    own tests say the same in prose ('"sum_project" is for sequence/SI
+    only'), and ``camera_base.CameraHardwareSource.__init__`` clears the
+    field off view parameters outright.
+
+    This asserts it against the installed simulator rather than trusting
+    that prose, because the whole honesty of ``projected_by`` rests on
+    it: if a future usim *did* honour it here, the frames would arrive 1D
+    and be labelled ``"sensor"``, and this test failing is how anyone
+    would find out.
+    """
+    with simulated_instrument() as microscope:
+        device = microscope.eels_camera._device  # noqa: SLF001
+        frame_parameters = _camera_base.CameraFrameParameters(
+            exposure_ms=10.0,
+            binning=1,
+            processing=_SUM_PROJECT_PROCESSING,
+        )
+        validated = device.validate_frame_parameters(frame_parameters)
+        # The device keeps the mode - it is not rejected or dropped...
+        assert validated.processing == _SUM_PROJECT_PROCESSING
+        device.set_frame_parameters(validated)
+        device.start_live()
+        try:
+            element = device.acquire_image()
+        finally:
+            device.stop_live()
+        # ...and then ignores it on this path, returning the full sensor.
+        expected_2d = 2
+        assert element["data"].ndim == expected_2d
+        assert element["data"].shape == device.get_expected_dimensions(1)
+
+
+def test_a_projected_readout_is_configured_and_reported_back():
+    """
+    ``configure`` says what the device took, readout included.
+
+    The standing contract, extended to the new field: a caller that needs
+    to know what the next frame will be must be able to read it back
+    rather than assume the request was honoured — which matters more here
+    than for exposure, because this one changes the frame's *rank* and so
+    which writer the recording path will use.
+    """
+    with simulated_instrument() as microscope:
+        camera = microscope.eels_camera
+        took = camera.configure(
+            CameraParameters(exposure_ms=10.0, readout=PROJECTED_READOUT),
+        )
+        assert took.readout == PROJECTED_READOUT
+        assert camera.parameters() == took
+        # And back again, so the mode is a setting rather than a latch.
+        assert camera.configure(CameraParameters(exposure_ms=10.0)).readout == (
+            IMAGE_READOUT
+        )
+
+
+def test_a_projected_readout_produces_a_1d_frame_that_says_who_summed_it():
+    """
+    The frame is 1D, and its metadata does not claim the sensor did it.
+
+    ``projected_by`` is the whole point of recording this rather than
+    just ``readout``: a sensor that sums before readout pays one
+    readout's noise and a server summing N rows pays N of them, so a
+    recording that implied the first while getting the second would
+    misstate its own noise statistics — invisibly, and in exactly the
+    direction that flatters the data.
+    """
+    with simulated_instrument() as microscope:
+        camera = microscope.eels_camera
+        camera.configure(CameraParameters(exposure_ms=10.0, readout=PROJECTED_READOUT))
+        camera.start()
+        try:
+            frame = camera.acquire_frame()
+        finally:
+            camera.stop()
+
+    assert frame.data.ndim == 1
+    assert frame.data.shape == (camera._device.get_expected_dimensions(1)[1],)  # noqa: SLF001
+    assert frame.metadata["readout"] == PROJECTED_READOUT
+    assert frame.metadata["projected_by"] == "server"
+    assert frame.metadata["binning"] == 1
+
+
+def test_a_projected_frame_keeps_the_dispersive_axis_the_image_frame_had():
+    """
+    Verbatim: same dispersion, same offset, same units. The summed axis is gone.
+
+    The correctness claim the storage route depends on. The projection
+    removes the non-dispersive direction and nothing else, so an energy
+    axis that shifted or rescaled between the two readouts would mean the
+    projection had silently reinterpreted the detector — and every eV in
+    every projected recording would be wrong with the file still
+    perfectly readable.
+    """
+    with simulated_instrument() as microscope:
+        camera = microscope.eels_camera
+        camera.configure(CameraParameters(exposure_ms=10.0))
+        camera.start()
+        try:
+            imaged = camera.acquire_frame()
+            camera.configure(
+                CameraParameters(exposure_ms=10.0, readout=PROJECTED_READOUT),
+            )
+            # One frame of overlap, as for any other reconfigure.
+            camera.acquire_frame()
+            projected = camera.acquire_frame()
+        finally:
+            camera.stop()
+
+    assert imaged.data.ndim == _IMAGE_RANK
+    assert projected.data.ndim == 1
+    assert projected.metadata["calibration"]["x"] == imaged.metadata["calibration"]["x"]
+    # The other axis is not merged into the survivor: it is absent.
+    assert "y" not in projected.metadata["calibration"]
+
+
+class _FixedFrameCamera:
+    """A camera device returning one known array, so the sum is checkable."""
+
+    camera_id = "fixed"
+    camera_type = "eels"
+    binning_values = (1,)
+    calibration_controls: typing.ClassVar[dict[str, object]] = {}
+
+    def __init__(self, data) -> None:
+        self._data = data
+        self.processing = None
+
+    def get_expected_dimensions(self, binning: int) -> tuple[int, int]:
+        """
+        Return the shape this device produces at the given binning.
+
+        Parameters
+        ----------
+        binning : int
+            The binning factor.
+
+        Returns
+        -------
+        tuple[int, int]
+            The unbinned shape divided by the factor.
+        """
+        rows, columns = self._data.shape
+        return (rows // binning, columns // binning)
+
+    def set_frame_parameters(self, frame_parameters: typing.Any) -> None:  # noqa: ANN401 - a vendor CameraFrameParameters
+        """
+        Record what was asked for, as a real device would.
+
+        Parameters
+        ----------
+        frame_parameters : typing.Any
+            A vendor ``CameraFrameParameters``.
+        """
+        self.processing = frame_parameters.processing
+
+    def acquire_image(self) -> dict:
+        """
+        Return the fixed array, ignoring ``processing`` exactly as usim does.
+
+        Returns
+        -------
+        dict
+            A Nion data element wrapping the fixed array.
+        """
+        return {"data": self._data, "properties": {}}
+
+    def close(self) -> None:
+        """Release nothing; this device owns no threads."""
+
+
+def test_the_server_side_projection_is_a_sum_along_the_non_dispersive_axis():
+    """
+    Which axis is summed is Nion's own definition, checked arithmetically.
+
+    ``sum_project`` sums axis 0 and keeps the trailing one — that is what
+    ``Core.function_sum(..., 0)`` does in ``_acquire_sequence`` and what
+    ``CameraTask.start``'s ``[1:]`` slice of the expected dimensions
+    agrees with. Following that definition rather than inventing one is
+    what makes the surviving axis the same ``x`` the device calibrates.
+
+    Against a fixed array rather than the simulator, because the
+    simulator's counts change frame to frame: comparing a projected frame
+    to a *different* image frame's column sums would test nothing except
+    that both are noisy.
+    """
+    data = np.arange(24, dtype="float32").reshape(4, 6)
+    camera = NionCamera(_FixedFrameCamera(data))
+    camera.configure(CameraParameters(exposure_ms=1.0, readout=PROJECTED_READOUT))
+
+    frame = camera.acquire_frame()
+
+    np.testing.assert_allclose(frame.data, data.sum(axis=0), rtol=_PROJECTION_RTOL)
+    assert frame.metadata["projected_by"] == "server"
+    # The mode still reached the device, so a camera that can project in
+    # its own readout gets the chance to.
+    assert camera._device.processing == _SUM_PROJECT_PROCESSING  # noqa: SLF001
+
+
+def test_a_device_that_projects_in_hardware_is_credited_rather_than_re_summed():
+    """
+    A 1D frame from the device is labelled ``"sensor"``, and is not summed again.
+
+    Unreachable through usim, and that is exactly why it is pinned here:
+    the branch exists for a vendor camera that honours the mode in its
+    own readout, and a bug in it would either double-sum a spectrum or
+    quietly credit the sensor for the server's arithmetic — the second
+    being the misstatement about noise this metadata exists to prevent.
+    """
+    spectrum = np.arange(6, dtype="float32")
+    camera = NionCamera(_FixedFrameCamera(spectrum))
+    camera.configure(CameraParameters(exposure_ms=1.0, readout=PROJECTED_READOUT))
+
+    frame = camera.acquire_frame()
+
+    np.testing.assert_array_equal(frame.data, spectrum)
+    assert frame.metadata["projected_by"] == "sensor"
+    assert frame.metadata["readout"] == PROJECTED_READOUT
+
+
+def test_a_1d_frames_binning_is_recovered_from_its_shape_like_any_other():
+    """
+    Shape recovery survives the rank change, which keeps in-flight frames honest.
+
+    ``_binning_of`` exists because a camera reconfigured while running
+    finishes the frame already in flight at the old settings, and
+    labelling that frame with the new binning puts an axis on stored data
+    wrong by the whole factor. A device that projects in its own readout
+    delivers 1D frames, and the recovery has to keep working for them —
+    matched against the *trailing* axis of ``get_expected_dimensions``,
+    which is the dimension Nion's own ``sum_project`` keeps
+    (``CameraTask.start`` slices ``[1:]``).
+
+    Driven against the real device's dimensions rather than a stub, so
+    the widths being distinct per factor — which is what makes the match
+    unambiguous — is a fact about the camera and not about the test.
+    """
+    with simulated_instrument() as microscope:
+        camera = microscope.eels_camera
+        for value in camera.binning_values:
+            rows, columns = camera._device.get_expected_dimensions(value)  # noqa: SLF001
+            assert camera._binning_of((rows, columns)) == value  # noqa: SLF001
+            assert camera._binning_of((columns,)) == value  # noqa: SLF001
+
+
+def test_a_shape_no_binning_explains_falls_back_to_the_configured_one():
+    """
+    An unrecognisable shape yields the setting, which is the documented answer.
+
+    The fallback matters because it is what a vendor camera with a
+    cropped readout area would hit: guessing a factor by division would
+    put a confidently wrong number in the metadata, where reporting the
+    configured one is at least the thing that was asked for.
+    """
+    with simulated_instrument() as microscope:
+        camera = microscope.eels_camera
+        camera.configure(CameraParameters(exposure_ms=10.0, binning=_TEST_BINNING))
+        assert camera._binning_of((7, 13)) == _TEST_BINNING  # noqa: SLF001
+        assert camera._binning_of((13,)) == _TEST_BINNING  # noqa: SLF001

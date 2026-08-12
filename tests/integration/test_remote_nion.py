@@ -17,6 +17,7 @@ Skipped automatically unless the ``device`` optional dependency group is
 installed.
 """
 
+import json
 import os
 import pathlib
 import signal
@@ -25,12 +26,18 @@ import threading
 import time
 from multiprocessing.connection import Client
 
+import h5py
 import numpy as np
 import pytest
 
 pytest.importorskip("nion.usim_device", reason="requires the 'device' extra")
 
-from miainwoodpecker.acquisition import energy_offset_series, focal_series
+from miainwoodpecker.acquisition import (
+    energy_offset_series,
+    focal_series,
+    multichannel_scan_series,
+    record,
+)
 from miainwoodpecker.devices import (
     BEAM_BLANKER_CONTROL,
     DEFOCUS_CONTROL,
@@ -38,7 +45,7 @@ from miainwoodpecker.devices import (
     STAGE_POSITION_CONTROL,
     Camera,
     CameraParameters,
-    InstrumentController,
+    Instrument,
     ScanParameters,
     Scanner,
     remote,
@@ -395,6 +402,182 @@ def test_a_big_scan_does_not_prevent_the_next_one(microscope):
     assert float(np.std(frame.data)) > 0.0
 
 
+# ------------------------------- the simultaneous multi-channel pass, over IPC
+#
+# The device-side half of this lives in test_nion_server.py, where the
+# vendor object can be counted directly. What is genuinely different here
+# is the transport: N frames have to cross a boundary whose whole design
+# rests on *one* publish per request/response cycle, since the segment is
+# reused. They cross as one stacked block (shared_frame.SharedFrameSetRef),
+# so the questions are whether per-frame identity survives the stacking
+# and whether the copy-out contract still holds for every frame of a set,
+# not just for a single one.
+
+_PASS_CHANNELS = (0, 1)
+_TWO_CHANNELS = 2
+
+
+def test_a_small_pass_crosses_on_the_pickle_path_with_its_identity(microscope):
+    """
+    Below the threshold a pass is an ordinary list, and loses nothing.
+
+    Both transports must produce indistinguishable frames, so the small
+    case is asserted as carefully as the large one: the pass id and the
+    sibling list are metadata, and metadata is exactly what a transport
+    change is most likely to drop on the floor.
+    """
+    parameters = ScanParameters(
+        height=32,
+        width=48,
+        pixel_time_us=1.0,
+        fov_nm=microscope.stage_size_nm * 0.1,
+    )
+    frames = microscope.scanner.scan_frames(parameters, _PASS_CHANNELS)
+
+    assert len(frames) == _TWO_CHANNELS
+    assert sum(frame.data.nbytes for frame in frames) < _SHARED_MEMORY_THRESHOLD_BYTES
+    assert frames[0].metadata["scan_pass_id"] == frames[1].metadata["scan_pass_id"]
+    assert frames[0].metadata["simultaneous_channels"] == [0, 1]
+    assert [frame.metadata["channel_name"] for frame in frames] == ["HAADF", "MAADF"]
+    assert all(frame.data.shape == parameters.shape for frame in frames)
+
+
+def test_a_large_pass_crosses_as_one_block_in_the_usual_segment(microscope):
+    """
+    Two big frames share one publish, one segment, and one identity.
+
+    The transport decision under test: a pass is stacked into the
+    source's existing segment rather than published N times (each publish
+    would overwrite the last) or given N segments (which would double
+    every source's ``/dev/shm`` footprint and duplicate the ownership
+    rules). White-box on the segment name for the same reason the
+    single-frame reuse test is — that a set reuses one segment is not
+    something the public API can be asked.
+
+    The two arrays must also be independent copies: they arrive as
+    neighbouring planes of one block, so a reader that sliced views
+    instead of copying would hand back two frames aliasing the buffer the
+    server overwrites next.
+    """
+    scanner = microscope.scanner
+    parameters = _identity_scan_parameters(microscope)
+    frames = scanner.scan_frames(parameters, _PASS_CHANNELS)
+
+    assert len(frames) == _TWO_CHANNELS
+    assert sum(frame.data.nbytes for frame in frames) >= _SHARED_MEMORY_THRESHOLD_BYTES
+    assert frames[0].metadata["scan_pass_id"] == frames[1].metadata["scan_pass_id"]
+    set_segment = scanner._reader._segment.name  # noqa: SLF001
+    # A following single frame lands in the same segment: one per source,
+    # whether the source publishes one frame or a stacked pass.
+    scanner.scan_frame(parameters, channel=0)
+    assert scanner._reader._segment.name == set_segment  # noqa: SLF001
+
+    first, second = frames
+    assert first.data is not second.data
+    original = float(np.sum(second.data))
+    first.data[:] = 0.0
+    assert float(np.sum(second.data)) == original
+
+
+def test_a_held_pass_does_not_change_when_the_next_pass_arrives(microscope):
+    """
+    The frame-identity contract, extended to every frame of a set.
+
+    A pass lands in the reused segment exactly where the previous pass's
+    bytes were, so a caller holding the earlier frames is in precisely
+    the situation the copy-out exists to survive — and now for two frames
+    at once, either of which could have been left as a view.
+    """
+    scanner = microscope.scanner
+    parameters = _identity_scan_parameters(microscope)
+    held = scanner.scan_frames(parameters, _PASS_CHANNELS)
+    checksums = [float(np.sum(frame.data)) for frame in held]
+
+    for _ in range(_IDENTITY_FRAME_COUNT):
+        scanner.scan_frames(parameters, _PASS_CHANNELS)
+
+    assert [float(np.sum(frame.data)) for frame in held] == checksums
+
+
+def test_a_bad_channel_in_a_pass_surfaces_typed_and_leaves_the_device_usable(
+    microscope,
+):
+    """
+    The error path for a channel the scanner does not have, across the boundary.
+
+    Server-side this raises ``IndexError`` — the same exception the
+    single-channel path raises for the same mistake — and the name is
+    what crosses, so a caller can tell an impossible channel from a
+    transport failure without parsing prose. The recovery half matters
+    more here than in-process: a pass enables and disables detector
+    channels, and a request that failed partway through must leave both
+    the device and the connection fit for the next scan.
+    """
+    scanner = microscope.scanner
+    parameters = ScanParameters(
+        height=16,
+        width=16,
+        pixel_time_us=1.0,
+        fov_nm=microscope.stage_size_nm * 0.1,
+    )
+    with pytest.raises(RemoteCallError) as failure:
+        scanner.scan_frames(parameters, (0, _BAD_CHANNEL))
+    assert failure.value.error_type == "IndexError"
+
+    recovered = scanner.scan_frames(parameters, _PASS_CHANNELS)
+    assert len(recovered) == _TWO_CHANNELS
+    assert recovered[0].metadata["scan_pass_id"]
+
+
+def test_a_recorded_multichannel_series_keeps_its_pass_identity(microscope, tmp_path):
+    """
+    End to end: device, IPC, and storage, with the identity intact at each.
+
+    The whole point of minting the pass id in the device adapter is that
+    it reaches a file. Nothing multi-channel-specific was added to the
+    storage layer — ``NexusWriter`` persists each frame's metadata
+    mapping whole — so what this proves is that nothing needed to be: a
+    reader with only the file can say which frames shared a traversal of
+    the specimen, which channels those were, and in what order, without
+    inferring anything from timestamps.
+    """
+    path = tmp_path / "pass.nxs"
+    parameters = ScanParameters(
+        height=32,
+        width=32,
+        pixel_time_us=1.0,
+        fov_nm=microscope.stage_size_nm * 0.1,
+    )
+    written = record(
+        multichannel_scan_series(
+            microscope.scanner,
+            parameters,
+            2,
+            channels=_PASS_CHANNELS,
+        ),
+        path,
+        title="simultaneous HAADF and MAADF",
+    )
+    expected_frames = 4  # two passes, two channels each
+    assert written == expected_frames
+
+    with h5py.File(path, "r") as handle:
+        stored = [
+            json.loads(entry)
+            for entry in handle["entry/metadata/frame_metadata_json"][()]
+        ]
+    assert [item["channel_index"] for item in stored] == [0, 1, 0, 1]
+    assert stored[0]["scan_pass_id"] == stored[1]["scan_pass_id"]
+    assert stored[2]["scan_pass_id"] == stored[3]["scan_pass_id"]
+    assert stored[0]["scan_pass_id"] != stored[2]["scan_pass_id"]
+    assert all(item["simultaneous_channels"] == [0, 1] for item in stored)
+    # The frame counter still counts frames, gapless, so a dropped one
+    # would still be visible; grouping is the pass id's job, not its.
+    assert [item["frame_index"] for item in stored] == sorted(
+        item["frame_index"] for item in stored
+    )
+
+
 # ------------------------------------------ device errors and recovery
 #
 # Nion asserts that a device error stops acquisition, surfaces, and leaves
@@ -612,9 +795,16 @@ def _exercise_shared_memory(
 # --------------------------------------------------- instrument controls
 
 
-def test_remote_instrument_satisfies_the_controller_protocol(microscope):
-    """RemoteInstrument is recognized by the runtime-checkable protocol."""
-    assert isinstance(microscope.instrument, InstrumentController)
+def test_remote_instrument_satisfies_the_instrument_protocol(microscope):
+    """
+    RemoteInstrument is recognized by the runtime-checkable core.
+
+    The check is against ``Instrument`` — identity, capability,
+    ``park()`` — because that is the runtime question; the full control
+    surface is a static-typing protocol, and this proxy's conformance to
+    it is what the sweeps and control tests below exercise for real.
+    """
+    assert isinstance(microscope.instrument, Instrument)
 
 
 def test_describe_reports_the_backend_targets_and_controls(microscope):

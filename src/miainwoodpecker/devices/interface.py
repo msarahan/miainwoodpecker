@@ -8,16 +8,19 @@ adapter without touching those layers (see docs/migration-plan.md, §2).
 
 These are deliberately the *smallest* interfaces that support the phase
 that needs them: a camera produces frames continuously once started, and a
-scanner produces one frame per request (live scanning is a repeated
-``scan_frame`` loop). Exposure/settings modeling and hardware-synchronized
-multi-signal acquisition are still deferred.
+scanner produces the frames of one scanned pass per request — one channel
+through ``scan_frame`` (live scanning is a repeated loop of it), several
+channels simultaneously through ``scan_frames``, because one pass of the
+probe reads every enabled detector out at once. Synchronising a *camera*
+to the scan (the cross-device pass 4D-STEM needs) is still deferred.
 
-:class:`InstrumentController` is the Phase 3 addition, and holds to the
-same rule. It exposes four controls — stage position, defocus, beam
-blanker, spectrometer energy offset — because those are what a parameter
-sweep (``acquisition.sequence.focal_series``,
+:class:`Instrument` and :class:`InstrumentController` are the Phase 3
+addition, and hold to the same rule. The controller exposes four controls
+— stage position, defocus, beam blanker, spectrometer energy offset —
+because those are what a parameter sweep
+(``acquisition.sequence.focal_series``,
 ``acquisition.sequence.energy_offset_series``) and a safe teardown
-(:meth:`InstrumentController.park`) actually need, not because the
+(:meth:`Instrument.park`) actually need, not because the
 underlying instruments expose only four. A real Nion STEM controller has
 hundreds of named controls (``C10``, ``C12``, ``CAperture``, ``EHT``, …);
 proxying all of them would be a vendor API in vendor-neutral clothing.
@@ -88,7 +91,11 @@ class Frame:
         Frames produced by this device since it was opened, from 0.
         Monotonic and gapless, so a *missing* index in a recording is
         visible evidence of a dropped frame rather than silently absent
-        data.
+        data. It counts **frames, not passes**: a two-channel
+        :meth:`Scanner.scan_frames` advances it by two, because two
+        frames were produced. What groups those two is ``scan_pass_id``
+        below, and keeping the two jobs apart is what lets the
+        dropped-frame check keep working unchanged.
     ``high_tension_v``, ``defocus_nm``, ``beam_current_a``
         Instrument state at acquisition time, read per frame rather than
         cached — a focal series changes the defocus between frames, and
@@ -111,6 +118,44 @@ class Frame:
         Scan orientation and centre, without which the field of view does
         not say *which* region was scanned.
 
+    Frames from a simultaneous multi-channel scan
+    (:meth:`Scanner.scan_frames`) additionally:
+
+    ``scan_pass_id``
+        The identity of the **one pass of the probe** these frames came
+        from, as an opaque unique string minted by the device adapter
+        inside the multi-channel acquisition path — never supplied by a
+        caller, and never attached by :meth:`Scanner.scan_frame`, whose
+        frames genuinely are one pass each and have no siblings to name.
+        Two frames with equal ``scan_pass_id`` were read out during the
+        same traversal of the specimen, so per-pixel arithmetic between
+        them (DPC, iDPC, centre of mass) compares the same probe
+        positions.
+
+        Opaque, and specifically **not derived from the vendor's frame
+        counter**: those restart at zero with the device, so two
+        recordings made on two days would claim to share passes. A
+        random unique string cannot make that mistake. This is also what
+        Nion itself does one layer above the device
+        (``scan_base.ScanAcquisitionTask`` mints a ``uuid4`` per frame
+        and writes it to every simultaneously-read channel as
+        ``stem.scan.scan_id``), so the concept is the vendor's; only the
+        neutral spelling — and the rule that a call must establish it —
+        is this project's.
+    ``simultaneous_channels``
+        The channel indices that shared that pass, in the order they were
+        requested — each frame names its siblings, including itself, so a
+        single frame pulled out of a recording still says what else
+        exists and where to look for it.
+
+        Channel indices rather than device ids, which is what the
+        spectrum side's :class:`Spectrum` ``simultaneous_with`` names,
+        because these siblings are channels of *one* scan unit reading
+        out together. A pass shared across separate devices — the
+        scan unit and an EDX detector, or a camera per probe position —
+        is a different and still-missing claim; see
+        :meth:`SpectrumDetector.acquire_map`.
+
     Cameras additionally:
 
     ``camera_name``, ``camera_type``
@@ -126,15 +171,33 @@ class Frame:
         where the rest of it is. The caveat ``nion_server`` records
         applies: this is the *configured* exposure, which the frame
         already in flight during a ``configure`` was not taken at.
+    ``readout``, ``projected_by``
+        Which readout mode the frame was actually taken with — recovered
+        from the data's rank, not echoed from the request, for the same
+        in-flight reason as ``binning``. ``projected_by`` is present only
+        on a projected frame and says **who summed**: ``"sensor"`` when
+        the detector itself projected (accumulating before readout, so
+        one readout's noise), ``"server"`` when the device server summed
+        an image the sensor delivered (N rows' readout noise). The noise
+        statistics differ, so the distinction is recorded rather than
+        implied.
     ``counts_per_electron``
         Detector gain, where the device publishes it.
     ``frame_number``, ``integration_count``
         Passed through from the vendor's own frame properties.
 
-    **No ``scan_id``.** Nion carries one to group the channels of a single
-    simultaneous multi-channel scan. This interface has no such call — a
-    second channel is a second ``scan_frame``, and therefore a second pass
-    of the beam — so an id claiming to group them would be a fiction.
+    **Why the pass identity is earned, not declared.** An earlier
+    revision of this docstring declined a ``scan_id`` outright, on the
+    grounds that "a second channel is a second pass of the beam". That
+    premise was false on real hardware — a scanned instrument reads every
+    enabled detector out during *one* pass, always — but the refusal had
+    the right instinct: an identifier nothing establishes is a claim,
+    which is exactly how ``probe_position`` bit this project
+    (docs/migration-plan.md, §7). So the identity exists now that a call
+    exists to establish it: ``scan_pass_id`` is produced by
+    :meth:`Scanner.scan_frames` and only by it, and the single-channel
+    :meth:`Scanner.scan_frame` still attaches nothing — its frames never
+    shared a pass with anything, and a recording must not say otherwise.
 
     Attributes
     ----------
@@ -151,22 +214,22 @@ class Frame:
         **natively** 1D, of which an EDX silicon drift detector is the
         case in hand; it is not a second home for EELS.
 
-        **The 1D case is real but still unstored.** This said "may be 1D
-        for binned spectra", and Nion's own device layer can produce
-        one: ``CameraFrameParameters.processing = "sum_project"`` makes
-        the camera sum the whole non-dispersive direction and return a
-        spectrum (``nion.usim_device.CameraDevice``, measured — and
-        Nion's own ``CameraControl_test`` notes it is "for sequence/SI
-        only", not live view). This project never requests it,
-        ``nion_server``'s ``calibration_metadata`` already handles the
-        shape if it ever arrives, and
-        :class:`~miainwoodpecker.storage.nexus.NexusWriter` names exactly
-        two frame axes and raises on any other rank
+        **The 1D case is real and now stored.** A camera configured with
+        :data:`PROJECTED_READOUT` produces a 1D frame whose one axis is
+        the dispersive one, calibration kept verbatim.
+        :class:`~miainwoodpecker.storage.nexus.NexusWriter` still names
+        exactly two frame axes and raises on any other rank
         (docs/architecture-review.md, §1.6: "a layout decision, not a
-        shape guess"). The layout now exists —
-        :class:`~miainwoodpecker.storage.spectra.SpectrumWriter` — so
-        that decision is reachable; wiring a projected readout to it is
-        the follow-up docs/adapters/spectrum-detectors.md specifies.
+        shape guess") — a projected frame is routed by the recording path
+        into :class:`~miainwoodpecker.storage.spectra.SpectrumWriter`
+        instead, landing in the same ``NXspectrum`` layout as EDX
+        (:func:`miainwoodpecker.acquisition.sequence.record` is the
+        seam). On the Nion side the mode maps onto
+        ``CameraFrameParameters.processing = "sum_project"`` — which the
+        device honours only for sequence/SI acquisition, measured, so on
+        the plain-acquire path this project drives the server sums and
+        the frame's ``projected_by`` metadata says so; see
+        docs/adapters/spectrum-detectors.md §6.
 
         **Deliberately not 3D**, which a colour sensor would need. A
         camera with a colour filter array should deliver its raw Bayer
@@ -248,16 +311,46 @@ class ScanParameters:
         return (self.height * pixel_nm, self.width * pixel_nm)
 
 
+IMAGE_READOUT = "image"
+"""
+Camera readout mode: the sensor's 2D image, unchanged. The default.
+"""
+
+PROJECTED_READOUT = "projected"
+"""
+Camera readout mode: the whole non-dispersive direction summed to 1D.
+
+The operation an EELS operator asks for when trading dynamic range
+against SNR — vertical binning taken to its limit — and deliberately a
+*readout mode* rather than a per-axis binning factor, because that is
+what the only adapter behind this interface can honour: Nion's
+``CameraFrameParameters`` has no per-axis binning anywhere, and what it
+offers is ``processing = "sum_project"``, a full projection to 1D. See
+docs/adapters/spectrum-detectors.md §6 for the measurement behind the
+decision, and for when a per-axis tuple would earn its place (a second
+camera adapter that can honour one).
+
+A projected readout produces a **1D** :class:`Frame` whose surviving
+axis keeps the dispersive calibration verbatim; the summed axis is gone,
+not merged. Cameras that cannot project refuse in ``configure`` with a
+sentence, rather than silently imaging.
+"""
+
+READOUT_MODES = (IMAGE_READOUT, PROJECTED_READOUT)
+"""Every readout mode a :class:`CameraParameters` may request."""
+
+
 @dataclass(frozen=True)
 class CameraParameters:
     """
     Settings for a camera acquisition, in vendor-neutral units.
 
     The camera's counterpart to :class:`ScanParameters`, and a value
-    object for the same reason: a camera has two settings that must change
+    object for the same reason: a camera has settings that must change
     together to stay coherent, since binning changes both the frame shape
-    and the calibration scale. Setting them one at a time leaves a window
-    in which the two disagree.
+    and the calibration scale, and the readout mode changes the frame's
+    very rank. Setting them one at a time leaves a window in which they
+    disagree.
 
     Attributes
     ----------
@@ -268,10 +361,17 @@ class CameraParameters:
         direction. A binned pixel spans proportionally more of the axis,
         so this multiplies the calibration scale — which is why the two
         are one type. Must be one of the camera's ``binning_values``.
+    readout : str
+        One of :data:`READOUT_MODES`. :data:`IMAGE_READOUT` (the
+        default) delivers the sensor's 2D image exactly as before;
+        :data:`PROJECTED_READOUT` sums the whole non-dispersive
+        direction and delivers a 1D spectrum. A camera that cannot
+        project refuses in ``configure`` rather than silently imaging.
     """
 
     exposure_ms: float
     binning: int = 1
+    readout: str = IMAGE_READOUT
 
     def __post_init__(self) -> None:
         """Reject values no camera could act on."""
@@ -280,6 +380,11 @@ class CameraParameters:
             raise ValueError(msg)
         if self.binning < 1:
             msg = f"binning must be at least 1, got {self.binning!r}"
+            raise ValueError(msg)
+        if self.readout not in READOUT_MODES:
+            msg = (
+                f"readout must be one of {READOUT_MODES}, got {self.readout!r}"
+            )
             raise ValueError(msg)
 
 
@@ -353,12 +458,31 @@ class Camera(typing.Protocol):
 @typing.runtime_checkable
 class Scanner(typing.Protocol):
     """
-    A scan generator that produces one scanned frame per request.
+    A scan generator that produces the frames of one scanned pass per request.
+
+    Two acquisition calls, one physics distinction between them.
+    ``scan_frame`` is one pass of the probe read out on one detector
+    channel; ``scan_frames`` is one pass read out on *several* channels at
+    once, which is what a scanned instrument natively does — every
+    enabled detector sees the same traversal of the specimen. Serial
+    single-channel acquisition is the special case, not the general one,
+    and asking for k channels through ``scan_frame`` costs k passes of
+    dose with drift between them.
 
     Continuous live imaging is a repeated ``scan_frame`` loop (migration
-    plan, Phase 2). Hardware-synchronized multi-signal acquisition
-    (e.g. camera-per-probe-position spectrum imaging) is deliberately not
-    part of this interface yet; it arrives with Phase 3.
+    plan, Phase 2). Synchronising a *camera* to the scan
+    (camera-per-probe-position spectrum imaging, 4D-STEM) is still
+    deliberately not part of this interface: that is a cross-device pass,
+    and ``scan_frames`` covers only the scan unit's own channels.
+
+    ``scan_frames`` is part of the protocol rather than an optional
+    extra, so an adapter written before it exists no longer satisfies
+    this ``isinstance`` check and a remote one answers *unknown method*.
+    That is the intended reading: every scanned instrument reads its
+    enabled detectors out together, so an adapter that cannot say what
+    happens when two are asked for has not finished describing its
+    device. What it must not do is loop ``scan_frame`` — see that
+    method.
     """
 
     @property
@@ -373,6 +497,60 @@ class Scanner(typing.Protocol):
 
     def scan_frame(self, parameters: ScanParameters, channel: int = 0) -> Frame:
         """Scan and return a single frame from the given detector channel."""
+        ...
+
+    def scan_frames(
+        self,
+        parameters: ScanParameters,
+        channels: typing.Sequence[int],
+    ) -> typing.Sequence[Frame]:
+        """
+        Scan **once** and return one frame per requested channel.
+
+        The contract is the physics: every returned frame comes from the
+        same single pass of the probe, so the device is asked for one
+        scan, not ``len(channels)`` of them — one pass of dose, no drift
+        between channels, and per-pixel arithmetic between the returned
+        frames (DPC, iDPC, centre of mass) compares the same probe
+        positions. Each frame carries ``scan_pass_id`` and
+        ``simultaneous_channels`` in its metadata (see :class:`Frame`)
+        precisely because this call is what establishes them.
+
+        An implementation whose hardware cannot read the requested
+        channels out simultaneously must raise rather than quietly loop
+        ``scan_frame`` — k sequential passes labelled as one shared pass
+        would put a false identity on stored data, which is worse than an
+        honest error. A single-channel request is always satisfiable:
+        one pass with one readout is still one pass.
+
+        Frames are returned in the order the channels were requested.
+
+        **One error vocabulary across adapters**, so a caller (or the
+        conformance suite docs/vendor-support.md proposes) can branch on
+        the kind of mistake rather than on an adapter's phrasing:
+        ``ValueError`` for a request no scanner could honour (no
+        channels, or the same channel twice — a detector cannot read
+        itself out twice in one pass), and ``IndexError`` for a channel
+        index this scanner does not have, which is the exception the
+        single-channel path already raises for that mistake. Across the
+        device-server boundary those arrive as the ``error_type`` on
+        :class:`~miainwoodpecker.devices.rpc.RemoteCallError`.
+
+        Parameters
+        ----------
+        parameters : ScanParameters
+            Scan geometry and timing, shared by every returned frame.
+        channels : typing.Sequence[int]
+            Detector channel indices to read out during the pass. Must
+            be non-empty and without duplicates; a channel index the
+            scanner does not have is an error.
+
+        Returns
+        -------
+        typing.Sequence[Frame]
+            One frame per requested channel, in request order, all from
+            the same pass.
+        """
         ...
 
     def close(self) -> None:
@@ -685,7 +863,7 @@ class SpectrumDetector(typing.Protocol):
     **Which modes exist is asked, not assumed.** A detector reports
     :attr:`acquisition_modes`, and a caller consults it before driving
     one, exactly as it consults
-    :meth:`InstrumentController.available_controls` before driving a
+    :meth:`Instrument.available_controls` before driving a
     control. This project has been bitten before by treating "the setter
     returned" as "the control works" (docs/migration-plan.md, §7), and a
     map on an unsynchronised detector is the same trap with a much more
@@ -784,22 +962,20 @@ class SpectrumDetector(typing.Protocol):
         alongside them. Serial acquisition is the special case, not
         simultaneity.
 
-        Nothing in this project can currently express that: :class:`Scanner`
-        returns one channel per call, so a second channel costs a second
-        pass of dose and lets the specimen drift between them; and the
-        transport gives each target its own connection with no shared
-        trigger, so two overlapping calls overlap in *wall-clock time*
-        rather than sharing a probe position. (:class:`Frame`'s note
-        declining a ``scan_id`` reasons from the premise that "a second
-        channel is a second pass of the beam", which is false on real
-        hardware; that note is superseded and belongs with the
-        ``Scanner`` change rather than with this one.)
+        Within one scan unit that is now expressed:
+        :meth:`Scanner.scan_frames` reads several detector channels out
+        of one pass and stamps the frames with the shared
+        ``scan_pass_id`` that call establishes. What is still missing is
+        the *cross-device* pass: the transport gives each target its own
+        connection with no shared trigger, so a scan overlapping this
+        map's acquisition overlaps in *wall-clock time* rather than
+        sharing a probe position.
 
         So this method is deliberately the *device-level* primitive and
         not the acquisition-level answer. The acquisition-level answer is
-        a pass that yields a set of correlated outputs, and it is the
-        same missing concept that blocks multi-channel scanning,
-        simultaneous EELS, and 4D-STEM — one change, not four. See
+        a pass that yields a set of correlated outputs across devices,
+        and it is the same missing concept that blocks simultaneous EELS
+        and 4D-STEM — one change, not three. See
         docs/adapters/spectrum-detectors.md for the options and the
         recommendation.
         """
@@ -828,6 +1004,55 @@ ENERGY_OFFSET_CONTROL = "energy_offset"
 
 
 @typing.runtime_checkable
+class Instrument(typing.Protocol):
+    """
+    What every ``instrument`` target implements, and the one runtime check.
+
+    Three methods, and exactly three on purpose: an identity a caller can
+    size a field of view against (:meth:`stage_size_nm`), the capability
+    question (:meth:`available_controls`), and the safe-state hook every
+    teardown calls (:meth:`park`). That is the whole of what the
+    ``isinstance`` call sites were actually asking — "is this an
+    instrument target I can hold a session against" — and it is what a
+    detector-only server can honestly provide: a Gatan spectrometer has
+    an energy offset and no stage, a commodity camera has no controls at
+    all, and both are complete instruments *of their kind*.
+
+    Which controls exist is asked through :meth:`available_controls`, not
+    through ``isinstance``. The per-control methods live on
+    :class:`InstrumentController`, the full control surface for static
+    typing, which is deliberately **not** ``runtime_checkable``: a
+    ``runtime_checkable`` Protocol's ``isinstance`` is all-or-nothing, so
+    checking against the full control surface demanded every method
+    regardless of what the instrument said it supported. Two adapters
+    (``camera_server.ServerInstrument``, ``gatan_bridge.BridgeInstrument``)
+    failed that check while working perfectly, which meant it was testing
+    for Nion-shapedness rather than for conformance. This split is the
+    fix: the runtime check tests the core every instrument has, and the
+    capability list carries the rest.
+    """
+
+    def stage_size_nm(self) -> float:
+        """Return the usable stage extent, for choosing a sensible field of view."""
+        ...
+
+    def available_controls(self) -> typing.Sequence[str]:
+        """Return the ``*_CONTROL`` names this instrument actually implements."""
+        ...
+
+    def park(self) -> None:
+        """
+        Put the instrument in a safe unattended state.
+
+        Blanks the beam if a blanker exists, and does nothing — honestly —
+        on an instrument with no beam to blank. Deliberately *not* a full
+        teardown: stopping detectors and releasing devices belongs to the
+        code that owns them (the device server's shutdown handshake), not
+        to a single-instrument control surface.
+        """
+        ...
+
+
 class InstrumentController(typing.Protocol):
     """
     Instrument-level controls that are not owned by any single detector.
@@ -841,6 +1066,26 @@ class InstrumentController(typing.Protocol):
     must consult :meth:`available_controls` before driving one rather than
     assuming a successful setter means a working control — a distinction
     this project has already been bitten by (docs/migration-plan.md, §7).
+
+    This is the *static* face of an instrument: annotate with it when the
+    code genuinely calls the control methods (a defocus sweep, an energy
+    series), and the type checker holds the implementation to them. It is
+    deliberately not ``runtime_checkable`` — ``isinstance`` against it
+    raises ``TypeError`` — because the runtime question is never "does
+    this object have every method" but "is this an instrument"
+    (:class:`Instrument`) followed by "does it serve this control"
+    (:meth:`~Instrument.available_controls`). An adapter that implements
+    a subset of the controls is a partial *controller* but a whole
+    *instrument*, and the type system now says exactly that.
+
+    A superset of :class:`Instrument` by re-declaration rather than by
+    inheritance, and the distinction is load-bearing: ``runtime_checkable``
+    is *inherited* by protocol subclasses (the flag is a class attribute,
+    and there is no opt-out), so a subclass of :class:`Instrument` would
+    quietly keep the all-or-nothing ``isinstance`` this split exists to
+    remove. Protocols are structural, so every implementation — and every
+    value typed as this protocol — still satisfies :class:`Instrument`
+    without naming it.
     """
 
     def stage_size_nm(self) -> float:
@@ -849,6 +1094,14 @@ class InstrumentController(typing.Protocol):
 
     def available_controls(self) -> typing.Sequence[str]:
         """Return the ``*_CONTROL`` names this instrument actually implements."""
+        ...
+
+    def park(self) -> None:
+        """
+        Put the instrument in a safe unattended state.
+
+        See :meth:`Instrument.park`, whose contract this repeats.
+        """
         ...
 
     def stage_position_nm(self) -> tuple[float, float]:
@@ -881,15 +1134,4 @@ class InstrumentController(typing.Protocol):
 
     def set_beam_blanked(self, *, blanked: bool) -> None:
         """Blank or unblank the beam."""
-        ...
-
-    def park(self) -> None:
-        """
-        Put the instrument in a safe unattended state.
-
-        Blanks the beam if a blanker exists. Deliberately *not* a full
-        teardown: stopping detectors and releasing devices belongs to the
-        code that owns them (the device server's shutdown handshake), not
-        to a single-instrument control surface.
-        """
         ...
