@@ -35,6 +35,7 @@ from miainwoodpecker.analysis.hyperspy_bridge import (
 from miainwoodpecker.devices.interface import (
     Frame,
     ScanParameters,
+    Spectrum,
     SpectrumParameters,
 )
 from miainwoodpecker.devices.spectrum_server import (
@@ -171,6 +172,47 @@ def test_the_detector_metadata_lands_where_exspy_looks_for_it(spot_recording):
     assert eds.solid_angle == pytest.approx(0.7)
     assert eds.energy_resolution_MnKa == pytest.approx(129.0)
     assert eds.EDS_det == "sdd"
+
+
+def test_the_beam_current_arrives_in_the_nanoamps_exspy_reads_it_as(tmp_path):
+    """
+    Amps to nanoamps, the conversion that was missing and was invisible.
+
+    eXSpy holds ``Acquisition_instrument.TEM.beam_current`` in **nA**:
+    its dose calculation (``exspy/signals/eds_tem.py``) multiplies the
+    stored value by 1e-9 to reach coulombs, with a comment saying that is
+    because the current is in nA. This project holds current in amps
+    everywhere, as it holds voltage in volts, so a 200 pA probe written
+    through unconverted arrived as 2e-10 nA — every dose-based
+    quantification wrong by a factor of a billion, with nothing at either
+    end range-checking it.
+
+    Nothing caught it because nothing in the suite computed a dose, which
+    is exactly why the assertion is on the stored value rather than on a
+    downstream result: it is the conversion itself that has to be pinned.
+    The detector simulator reports no beam current, so this builds the
+    spectrum rather than acquiring it — the value under test comes from
+    the instrument, not from the detector.
+    """
+    pytest.importorskip("exspy", reason="needs exspy for EDS signal types")
+    path = tmp_path / "with_beam_current.nxs"
+    write_spectra(
+        path,
+        [
+            Spectrum(
+                data=np.ones(256, dtype=np.uint32),
+                timestamp=datetime.datetime(2026, 1, 1, tzinfo=datetime.UTC),
+                energy_offset_ev=0.0,
+                energy_scale_ev=10.0,
+                metadata={"high_tension_v": 100_000.0, "beam_current_a": 2.0e-10},
+            ),
+        ],
+    )
+
+    signal = load_as_eds_signal(path)
+    tem = signal.metadata.Acquisition_instrument.TEM
+    assert tem.beam_energy == pytest.approx(100.0)
+    assert tem.beam_current == pytest.approx(0.2)
 
 
 def test_a_spectrum_image_arrives_with_two_navigation_axes_in_nanometres(tmp_path):

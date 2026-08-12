@@ -462,20 +462,31 @@ differently from the same recording that managed two. `stack_0d` with
 
 ---
 
-## 4. Units: three conversions, each in exactly one place
+## 4. Units: the conversions, each in exactly one place
 
 | quantity | this project | Bruker | Oxford | eXSpy |
 |---|---|---|---|---|
 | energy calibration | **eV** | keV | eV | eV or keV |
 | detector angles | **deg** | deg | **rad** | deg |
 | accelerating voltage | **V** | kV | — | **keV** |
+| beam current | **A** | — | — | **nA** |
 
-The volts→keV conversion happens once, in
-`analysis/hyperspy_bridge._apply_eds_metadata`. The others are an
-adapter's job at the point where vendor data enters. This is the same
-discipline the py4DSTEM adapter already applies to `1/nm` → `Å⁻¹`, and
-for the same reason: a factor loose in the metadata makes every
-downstream number wrong by exactly that factor with nothing saying so.
+The volts→keV and amps→nA conversions happen once each, in
+`analysis/hyperspy_bridge`. The others are an adapter's job at the point
+where vendor data enters. This is the same discipline the py4DSTEM
+adapter already applies to `1/nm` → `Å⁻¹`, and for the same reason: a
+factor loose in the metadata makes every downstream number wrong by
+exactly that factor with nothing saying so.
+
+**The beam-current row is there because it was got wrong first.** The
+EDS metadata mapping wrote `beam_current_a` straight into
+`Acquisition_instrument.TEM.beam_current`, and eXSpy reads that item as
+**nanoamps** — `exspy/signals/eds_tem.py`'s dose calculation multiplies
+it by 1e-9 to reach coulombs, with the comment saying so. A 200 pA probe
+therefore arrived as 2e-10 nA and made every dose a billion times too
+small, silently, since neither end range-checks it. Nothing in the test
+suite caught it because nothing computed a dose. Exactly the failure
+this section exists to prevent, one row short of preventing it.
 
 ---
 
@@ -509,14 +520,33 @@ two layouts diverge the first time either grows an option, and the
 convergence is the point.
 
 `load_as_eds_signal` then sits *on top of* that shared path, adding only
-the EDS signal type and eXSpy's detector metadata. Anything that later
-wants `EELS` typing for the camera path adds the same kind of thin layer
-and inherits the same loader.
+the EDS signal type and eXSpy's detector metadata.
 
-It **refuses a frame recording**, deliberately. Both end up as 1D spectra,
-which is exactly why: once loaded they are indistinguishable, so nothing
-downstream would catch an EELS recording wearing `EDS_TEM` while eXSpy
-happily fitted X-ray lines to electron energy losses.
+`load_as_eels_signal` is that same thin layer for the camera path, and
+it now exists: it adds the `EELS` signal type, eXSpy's TEM metadata, and
+one thing the EDS side does not need — normalizing the energy axis to
+eV, because eXSpy's EELS code assumes eV everywhere and checks nowhere,
+while its EDS code validates (`_get_line_energy` raises for any unit but
+eV/keV). See `docs/analysis-parity.md` for the item-by-item mapping and
+for the two semi-angles nothing here records.
+
+Each **refuses the other's layout**, deliberately. Both end up as 1D
+spectra, which is exactly why: once loaded they are indistinguishable,
+so nothing downstream would catch an EELS recording wearing `EDS_TEM`
+while eXSpy happily fitted X-ray lines to electron energy losses, or an
+EDX recording wearing `EELS` while it fitted ionisation edges to X-ray
+lines. The question is one the file can answer — `intensity` for a
+spectrum recording, `data` for a frame recording — so neither loader has
+to ask the caller.
+
+The one case that will need more than the layout to decide is the
+projected EELS readout §6 specifies: a camera summing its own
+non-dispersive direction produces a 1D frame that belongs in
+`SpectrumWriter`'s layout, and would then be an EELS recording wearing
+the EDX shape. The evidence to key on already exists — `NXdetector`'s
+`description`, written from the spectrum's `technique` metadata — so
+that refusal becomes a check of what the recording says it is. Nothing
+writes `technique = "EELS"` today, so nothing implements it today.
 
 ---
 
@@ -636,7 +666,7 @@ signal.get_lines_intensity()
 - `storage/spectra.py` — `SpectrumWriter`, `write_spectra`,
   `read_spectra`.
 - `analysis/hyperspy_bridge.py` — `load_as_hyperspy_spectrum` (both
-  layouts), `load_as_eds_signal`.
+  layouts), `load_as_eds_signal`, `load_as_eels_signal`.
 
 **A real vendor adapter is out-of-tree**, launched with
 `remote_instrument(server_module=...)`, exactly as

@@ -254,10 +254,18 @@ individual gap.
 inferred from release notes: on the installed HyperSpy 2.4.0,
 `hs.signals` offers `Signal1D`, `Signal2D`, `BaseSignal` and their
 complex and lazy variants — and no `EELSSpectrum`. EELS and EDS moved out
-to **eXSpy** at the HyperSpy 2.0 split. This project's `analysis` extra
-is `hyperspy>=2.0`, so **it does not currently provide any EELS
-capability at all**, and any claim that HyperSpy covers Swift's EELS menu
-is a claim about HyperSpy 1.x.
+to **eXSpy** at the HyperSpy 2.0 split. Any claim that HyperSpy covers
+Swift's EELS menu is a claim about HyperSpy 1.x.
+
+**Since this audit was written, the adapter half of that gap is
+closed.** `exspy` is in the `analysis` extra (it arrived with the EDX
+work), and `analysis/hyperspy_bridge.py` now has `load_as_eels_signal`:
+an EELS camera recording reaches an `exspy.signals.EELSSpectrum` with
+its own energy axis, flattened across the spectrometer slit by the same
+shared loader an EDX recording uses. What that leaves open is the
+*menu-action* half of the estimate below, and the instrument geometry
+eXSpy needs for quantification — see "What the adapter can and cannot
+tell eXSpy" after the table.
 
 With eXSpy installed the coverage is not merely adequate — it is better
 than Swift's:
@@ -273,6 +281,46 @@ than Swift's:
 | Calibrate Spectrum | this project already reads dispersion and offset from the device ([pre-hardware work §1](pre-hardware-work.md)) | Subsumed |
 | Measure Temperature | nothing found | **Gap** |
 | AREELS High Contrast colour map | a napari colormap | Display only |
+
+#### What the adapter can and cannot tell eXSpy
+
+Read from `exspy/signals/eels.py` rather than from memory. eXSpy's EELS
+model reads three instrument items, and checks for exactly them in
+`_are_microscope_parameters_missing`:
+
+| eXSpy item | unit | from this project's recordings |
+|---|---|---|
+| `Acquisition_instrument.TEM.beam_energy` | **keV** | `high_tension_v`, ÷1000 |
+| `…TEM.beam_current` | **nA** | `beam_current_a`, ×1e9 |
+| `…TEM.Detector.EELS.exposure` | s | `exposure_ms`, ÷1000 |
+| `…TEM.convergence_angle` | mrad | **nothing records one** |
+| `…TEM.Detector.EELS.collection_angle` | mrad | **nothing records one** |
+
+The two semi-angles are the gap, and they are left unset rather than
+guessed. The collection angle is set by the spectrometer entrance
+aperture and the camera length, which no device here reports. The only
+convergence angle anywhere in this stack is usim's `ConvergenceAngle`
+control, which appears in **no** Nion package outside the simulator
+(checked across the installed `nion.*` tree) — recording it would be
+dressing a simulator detail as an instrument convention, the mistake
+`nion_server`'s control-name list is careful not to make.
+
+Leaving them absent is also the *safe* state, and that is not a
+consolation: eXSpy refuses the operations that need them
+(`estimate_thickness(density=…)` raises rather than applying an angular
+correction from someone else's geometry), where a plausible wrong angle
+would have produced a number that looks like a result. An operator
+supplies them per session with eXSpy's own
+`signal.set_microscope_parameters(...)`.
+
+**The energy axis is normalized to eV on the way in**, which the EDS
+side does not need to do. eXSpy's EDS code validates its axis unit
+(`_get_line_energy` takes eV or keV and raises otherwise); its EELS code
+checks nowhere while assuming eV everywhere — the ionisation-edge onsets
+it matches against the axis are tabulated in eV, `align_zero_loss_peak`'s
+subpixel window defaults to ±3 eV, `kramers_kronig_analysis` works in
+eV. This project's energy vocabulary also admits meV and keV, so the
+exact within-kind conversion happens in the adapter.
 
 The quantification comparison is worth stating plainly because it inverts
 the usual direction of these audits. Swift's cross-section code
@@ -337,18 +385,48 @@ vocabulary of axis kinds — so the mapping is well defined in both
 directions, including the honest uncalibrated case, and it is the same
 mapping the HyperSpy adapter already does for `AxesManager`.
 
-### EELS — 4–7 days
+### EELS — 4–7 days, of which the first item is now done
 
-| Task | Size |
-|---|---|
-| `exspy` as an extra, and an adapter from a recording to `EELSSpectrum` with a real energy axis | 2–3 d |
-| Wire background subtraction and thickness as menu actions | 1–2 d |
-| Zero-loss alignment over a series, against `energy_offset_series` output | 1–2 d |
+| Task | Size | State |
+|---|---|---|
+| `exspy` as an extra, and an adapter from a recording to `EELSSpectrum` with a real energy axis | 2–3 d | **done** — `load_as_eels_signal` |
+| Wire background subtraction and thickness as menu actions | 1–2 d | open, and see below |
+| Zero-loss alignment over a series, against `energy_offset_series` output | 1–2 d | the *test* exists; the workflow does not |
 
-This is the largest genuine capability gap in the project today, and it
-is not a Swift-specific one: it is that the `analysis` extra was chosen
-before the HyperSpy 2.0 split and nobody has needed EELS since. The
-adapter is small; the decision it forces is the licence one above.
+This was the largest genuine capability gap in the project, and it was
+not a Swift-specific one: it is that the `analysis` extra was chosen
+before the HyperSpy 2.0 split and nobody had needed EELS since. The
+adapter was indeed small; the decision it forces is the licence one
+above, which is still open.
+
+`tests/integration/test_eels_round_trip.py` is the third row's evidence
+rather than its workflow: it sweeps the spectrometer with
+`energy_offset_series`, loads each step as an `EELSSpectrum`, and shows
+eXSpy finding the zero-loss peak at 0 eV in every one while the peak
+itself moves 160 channels across the detector. That pins the axis
+end to end. What it is *not* is the operator-facing thing the row
+describes — assembling a sweep into one wider spectrum, or aligning a
+drifting ZLP across a series and summing. Both want a per-frame energy
+axis, and a NeXus frame stack carries one calibration for the whole
+stack, which is the honest reason the test writes one file per step.
+
+**No viewer button, and this is a decision rather than an omission.**
+The three existing analysis buttons act on the viewer's single camera,
+and `viewer/app.py::_choose_camera` prefers the **Ronchigram** camera
+wherever there is one — so on the default Nion configuration an EELS
+button would be pointed at a camera with angular axes and would refuse
+every click with "no single energy-calibrated axis". Beyond that, every
+EELS operation past loading needs a parameter an operator must choose:
+`estimate_thickness` requires a threshold or a ZLP signal (eXSpy raises
+without one), background removal requires a fit window, elemental
+mapping requires the edges. `align_zero_loss_peak` is the one with
+usable defaults, and its result is a recalibrated copy of the input —
+nothing to put in a napari layer that the existing mean-projection
+button does not already show. A button that ran an arbitrary operation
+on the wrong camera would be worse than no button. What would change
+the answer: a camera *selector* in the viewer, plus the parameter
+widgets, which is the "interactive half" this document already declines
+to cost.
 
 ### Thermometry — 2–3 days
 
@@ -512,10 +590,12 @@ what is cheapest or most interesting.
    permissively-licensed option on the page, and it closes the core menu
    in one move rather than fifty. If only one item from this document is
    ever done, this is it.
-2. **eXSpy and the EELS chain** (4–7 d). The project currently has *no*
-   EELS capability, on an instrument class where EELS is often the reason
-   the instrument exists. This is the largest real gap, and it was
-   invisible until someone checked what HyperSpy 2.x actually contains.
+2. **eXSpy and the EELS chain** (4–7 d, ~2–3 d of it done). The project
+   had *no* EELS capability, on an instrument class where EELS is often
+   the reason the instrument exists. This was the largest real gap, and
+   it was invisible until someone checked what HyperSpy 2.x actually
+   contains. `load_as_eels_signal` closes the adapter half; what remains
+   is the operator-facing workflow and the instrument geometry above.
 3. **Fourier-filter mask shapes** (2–4 d), and the viewer work to make
    them draggable. Lattice imaging is routine; periodic-noise removal is
    routine; the current answer is "write a script".
