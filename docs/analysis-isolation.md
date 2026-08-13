@@ -440,6 +440,10 @@ widget rather than the transport.
 device side's `scripts/ipc_overhead_benchmark.py`. Five-frame bursts of
 float32 noise, seven timed calls per configuration after a warm-up, on a
 4-core container (so the thread budget is 2), Python 3.11.
+`scripts/real_4dstem_benchmark.py` is its counterpart on a real 4D-STEM
+datacube — see [Real 4D-STEM
+data](#real-4d-stem-data-and-what-it-did-and-did-not-change) at the end
+of this page.
 
 **The two arms are interleaved call by call, and that is not a
 refinement.** Running one arm to completion and then the other produced a
@@ -577,31 +581,63 @@ now reachable and was used, so the caveat can be replaced with a result.
 **The data.** Zenodo record [8233585](https://zenodo.org/records/8233585),
 "Mixed Phase Test Datasets for py4dstem", CC-BY-4.0, file
 `20210306_084059.hdf5`: a **(254, 255, 384, 384) `uint8`** datacube — a
-genuine 2D scan of 2D diffraction patterns, 152 MB on disk and 9.55 GB
+genuine 2D scan of 2D diffraction patterns, 153 MB on disk and 9.55 GB
 raw. Sparse, as real fast-scan 4D-STEM is: a five-pattern burst has
 **1.9 % of pixels non-zero** and a mean of **0.03 counts**.
 
+**Everything below is reproducible**, which for a page that had to
+correct its own first table is not a footnote:
+
+```console
+$ uv run --extra analysis --extra libertem --extra py4dstem \
+    python scripts/real_4dstem_benchmark.py --download --repeats 30
+```
+
+`--download` fetches the cube from Zenodo's REST API over plain HTTPS —
+not through py4DSTEM's own downloader, which is Google Drive-backed and
+still unreachable from here.
+
 ### The transport conclusion survives
 
-Real frames and synthetic frames of *identical shape and dtype*, 142 ×
-384 × 384 `float32` = 83.8 MB — the same 84 MB payload as the rows above
-— interleaved over fifteen rounds so machine drift cancels, on 4 cores:
+`scripts/real_4dstem_benchmark.py`, which runs real frames and synthetic
+frames of *identical shape and dtype* — 142 × 384 × 384 `float32` =
+83.8 MB, the same 84 MB payload as the rows above — round-robin across
+both datasets and both transports, so machine drift cancels. n=30 per
+arm, on a contended 4-core container, with the in-process arm inside
+`limit_analysis_threads()` so both arms get the same cores:
 
-| Frames | in-process median | worker median | delta |
-|---|---|---|---|
-| **Real** | 15.2 ms | 51.4 ms | **+36.3 ms** |
-| **Synthetic** | 16.5 ms | 60.7 ms | **+44.2 ms** |
+| Operation | real, worker delta | synthetic, worker delta |
+|---|---|---|
+| `hyperspy.mean_projection` | +33.8 ms (3.03×) | +31.5 ms (3.01×) |
+| `libertem.sum_projection` | +39.3 ms (2.21×) | +74.7 ms (3.41×) |
+| `py4dstem.fit_central_disk` | +625.3 ms (37.4×) | +666.1 ms (38.1×) |
 
-Indistinguishable, and expected to be: the shared-memory path does no
-compression, so it cannot care what the bytes mean. Real data was never
-going to move this number, and it did not. The p95s — 678 ms real,
-665 ms synthetic against ~50 ms medians — corroborate the noise caveat
-above rather than contradicting anything.
+**Real data does not change the transport answer.** Two of the three
+rows match to within a couple of milliseconds. The LiberTEM row differs
+by 35 ms, which is not resolvable at this sample size on this box: p95s
+on the isolated arm run from 0.85 s to 2.15 s against medians of 50–110
+ms, so the tail dominates anything that small. Nothing here should be
+read as real frames being *cheaper* to move. The mechanism says they
+cannot be: the shared-memory path does no compression, so it never looks
+at the bytes.
 
-An earlier non-interleaved run produced a 2337 ms real median against
-46 ms synthetic. That was machine noise, and it is recorded because it
-is the shape of mistake this page could have made: one uninterleaved
-pass would have "found" a 50× real-data penalty that does not exist.
+Two honest caveats on the absolute numbers. This container is slower and
+more contended than the one the tables above were taken on — py4DSTEM's
+84 MB overhead measures +625 ms here against the +367 ms recorded
+earlier — so these rows are a **real-versus-synthetic comparison**, not
+a re-measurement of the earlier ones. And that py4DSTEM overhead is the
+same on both datasets, which is one more thing the open item about it
+has to explain.
+
+**Two methodology notes, recorded because both were mistakes made here
+first.** An earlier attempt measured real frames to completion and then
+synthetic frames, and reported a 2337 ms real median against 46 ms
+synthetic — a 50× "real data penalty" on a transport that does not read
+the data. It was drift. The same attempt also left the in-process arm
+uncapped while the worker ran under its thread budget, which is not a
+comparison. The sibling benchmark's `_interleaved` already documented
+both hazards; not reading it first cost a wrong table, which was briefly
+committed to this page and is corrected here.
 
 ### What real data did break
 
