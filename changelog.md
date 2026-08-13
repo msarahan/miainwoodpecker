@@ -4,6 +4,51 @@
 
 ### Added
 
+- **A read-only instrument survey to hand to a facility**
+  (`scripts/superstem_survey.py`, with `docs/superstem-survey.md` as its
+  runbook). Several design decisions rest on guesses about instruments
+  nobody here can reach: whether Nion drives SuperSTEM 2's Enfina
+  (`eels_camera` plus a `ZLPoffset` control would mean the spectrometer
+  is already supported with no Gatan code at all), whether an SU9000II
+  has the `Mf*` external-control modules, and which SIMPLON version and
+  configuration keys a HERMES ELA actually publishes.
+  The script asks those questions and nothing else. Its safety is
+  structural rather than careful, which is what makes it handable: the
+  Nion section reads a registry Nion Swift populated and **never loads a
+  device plug-in**, because this project's own device server does load
+  them and a second process doing so would claim hardware the running
+  Swift already owns; the DECTRIS section is `GET`-only, so it never
+  arms, triggers, disarms or configures, and is safe to run
+  mid-experiment; the Hitachi section resolves modules with
+  `importlib.util.find_spec`, which locates without executing, because
+  importing a vendor control module may open a connection to the column.
+  Each of those three properties is pinned by a test rather than left as
+  intent — the `GET`-only one asserts at the transport, against the
+  simulated control unit, so a probe added later cannot quietly break
+  it.
+  Stdlib-only and parses on **Python 3.7**, the floor Gatan Microscopy
+  Suite sets by embedding it. A `--check` mode reports the interpreter
+  and what it could answer while touching nothing, because for the Nion
+  and Hitachi sections the interpreter matters more than the machine:
+  run from the wrong Python, an empty registry or a missing `MfExtCont`
+  is a confident wrong answer rather than an error.
+
+### Changed
+
+- **EDX and EELS run together on SuperSTEM 2** — confirmed by the
+  facility, and they do not physically block one another. This was an
+  open question in `docs/adapters/spectrum-detectors.md` about dose,
+  dead time and whether the Enfina's acquisition takes the scan; the
+  blocking half is answered outright, so simultaneous EDX + EELS is a
+  workflow to support rather than a configuration this project may
+  reject. The consequence for the design recorded there is that the
+  **pass** concept now has a confirmed user rather than a projected one:
+  two spectrometers of different kinds reading out during one traversal
+  is the correlated-output set a pass exists to group, and
+  `metadata["simultaneous_with"]` has a device that genuinely knows. It
+  does not change the recommendation — the device shape still ships
+  first — but it removes "we may never need this" as a reason to defer
+  the pass indefinitely.
 - **The simultaneous multi-channel scan**, which is what a scanned
   instrument actually does: one pass of the probe, every enabled
   detector reading out at once.

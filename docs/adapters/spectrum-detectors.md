@@ -15,8 +15,9 @@ SuperSTEM 2 carries a **Bruker XFlash 6T-100** silicon drift detector
 driven by ESPRIT, *alongside* a UHV Enfina EEL spectrometer. SuperSTEM 4
 carries an **Oxford Instruments Ultim Extreme** driven by AZtec. So
 "simultaneous EDX and EELS" is a workflow on an instrument that exists,
-not a hypothetical, and the two vendors have to be first-class rather
-than one being the example.
+not a hypothetical — the facility confirms the two do run together and
+do not physically block one another — and the two vendors have to be
+first-class rather than one being the example.
 
 ---
 
@@ -692,7 +693,19 @@ plumbing is about eighty lines; everything else is vendor work.
   angle, and the as-installed Mn Kα resolution for the XFlash 6T-100 and
   the Ultim Extreme. The simulator's defaults are the published *class*
   of values, not these units' calibration reports.
-- **Whether EDX and EELS can physically run together** on SuperSTEM 2
-  (dose, dead time, and whether the Enfina's own acquisition blocks the
-  scan). The workflow is claimed; the interaction is not documented
-  anywhere reachable.
+**Settled, and no longer open:** EDX and EELS *do* run together on
+SuperSTEM 2 — confirmed by the facility. They do not physically block one
+another, so the Enfina's acquisition does not take the scan away from the
+EDX detector or the reverse. This was previously listed here as an open
+question about dose, dead time and blocking; the blocking half is
+answered outright, and simultaneous EDX + EELS is therefore a workflow to
+support rather than a configuration this project may reject.
+
+That has one design consequence worth stating where the decision was
+made: the **pass** concept in §2.3 now has a confirmed user rather than a
+projected one. Two spectrometers of different kinds reading out during
+one traversal is exactly the correlated-output set a pass exists to
+group, and `metadata["simultaneous_with"]` has a device that genuinely
+knows. It does not change the recommendation there — option A still
+ships the device shape first — but it removes "we may never need this"
+as a reason to defer the pass indefinitely.
