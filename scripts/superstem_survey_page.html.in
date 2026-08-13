@@ -1,0 +1,516 @@
+<title>SuperSTEM Instrument Survey</title>
+<style>
+  :root {
+    --ground: #f6f8f9;
+    --surface: #ffffff;
+    --raised: #eef3f5;
+    --ink: #152029;
+    --muted: #5b6e7d;
+    --accent: #0e6b74;
+    --accent-soft: #dcecee;
+    --caution: #9c5d12;
+    --caution-soft: #f7eddc;
+    --border: #dbe3e8;
+    --shadow: 0 1px 2px rgba(21, 32, 41, .06), 0 8px 24px rgba(21, 32, 41, .05);
+    --serif: ui-serif, "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, serif;
+    --sans: ui-sans-serif, system-ui, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    --mono: ui-monospace, "Cascadia Mono", Consolas, "SF Mono", Menlo, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --ground: #0d1317;
+      --surface: #141d23;
+      --raised: #1b262d;
+      --ink: #e3ebf0;
+      --muted: #93a6b2;
+      --accent: #54c3cb;
+      --accent-soft: #10333a;
+      --caution: #dda05a;
+      --caution-soft: #2e2417;
+      --border: #243138;
+      --shadow: 0 1px 2px rgba(0, 0, 0, .4), 0 8px 24px rgba(0, 0, 0, .3);
+    }
+  }
+  :root[data-theme="dark"] {
+    --ground: #0d1317;
+    --surface: #141d23;
+    --raised: #1b262d;
+    --ink: #e3ebf0;
+    --muted: #93a6b2;
+    --accent: #54c3cb;
+    --accent-soft: #10333a;
+    --caution: #dda05a;
+    --caution-soft: #2e2417;
+    --border: #243138;
+    --shadow: 0 1px 2px rgba(0, 0, 0, .4), 0 8px 24px rgba(0, 0, 0, .3);
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--ground);
+    color: var(--ink);
+    font-family: var(--sans);
+    font-size: 16.5px;
+    line-height: 1.65;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap {
+    max-width: 46rem;
+    margin: 0 auto;
+    padding: 3.5rem 1.5rem 6rem;
+    display: flex;
+    flex-direction: column;
+    gap: 2.75rem;
+  }
+
+  header { display: flex; flex-direction: column; gap: .85rem; }
+  .eyebrow {
+    font-size: .72rem;
+    letter-spacing: .13em;
+    text-transform: uppercase;
+    color: var(--accent);
+    font-weight: 650;
+  }
+  h1 {
+    font-family: var(--serif);
+    font-size: clamp(2.1rem, 5.5vw, 2.9rem);
+    line-height: 1.12;
+    margin: 0;
+    font-weight: 600;
+    letter-spacing: -.015em;
+    text-wrap: balance;
+  }
+  .standfirst { margin: 0; color: var(--muted); font-size: 1.06rem; max-width: 34rem; }
+
+  section { display: flex; flex-direction: column; gap: .9rem; }
+  h2 {
+    font-family: var(--serif);
+    font-size: 1.5rem;
+    margin: 0;
+    font-weight: 600;
+    letter-spacing: -.01em;
+    text-wrap: balance;
+  }
+  h3 { font-size: .95rem; margin: 0; font-weight: 650; letter-spacing: .005em; }
+  p { margin: 0; }
+  a { color: var(--accent); text-underline-offset: 2px; }
+  strong { font-weight: 650; }
+  hr {
+    border: 0;
+    border-top: 1px solid var(--border);
+    margin: .25rem 0;
+    width: 100%;
+  }
+
+  /* ---- the download panel: the reason this page exists ---- */
+  .get {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 1.5rem;
+    box-shadow: var(--shadow);
+    display: flex;
+    flex-direction: column;
+    gap: 1rem;
+  }
+  .filemeta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: .4rem 1.1rem;
+    font-size: .82rem;
+    color: var(--muted);
+    font-variant-numeric: tabular-nums;
+  }
+  .filemeta code { background: none; padding: 0; color: var(--muted); }
+  .actions { display: flex; flex-wrap: wrap; gap: .65rem; align-items: center; }
+  button {
+    font: inherit;
+    font-size: .93rem;
+    font-weight: 600;
+    border-radius: 7px;
+    padding: .6rem 1.15rem;
+    cursor: pointer;
+    border: 1px solid transparent;
+    transition: background .12s ease, border-color .12s ease;
+  }
+  .primary { background: var(--accent); color: var(--ground); }
+  .primary:hover { filter: brightness(1.08); }
+  .secondary { background: transparent; color: var(--ink); border-color: var(--border); }
+  .secondary:hover { background: var(--raised); }
+  button:focus-visible, a:focus-visible, summary:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+  button[disabled] { opacity: .5; cursor: not-allowed; }
+  #status { font-size: .87rem; color: var(--muted); min-height: 1.3em; }
+  #status.ok { color: var(--accent); }
+  #status.warn { color: var(--caution); }
+
+  /* ---- commands ---- */
+  pre.cmd {
+    background: var(--raised);
+    border: 1px solid var(--border);
+    border-radius: 7px;
+    padding: .8rem 1rem;
+    margin: 0;
+    overflow-x: auto;
+    font-family: var(--mono);
+    font-size: .87rem;
+    line-height: 1.55;
+  }
+  code {
+    font-family: var(--mono);
+    font-size: .87em;
+    background: var(--raised);
+    padding: .12em .38em;
+    border-radius: 4px;
+  }
+
+  /* ---- callouts ---- */
+  .note {
+    border-left: 3px solid var(--caution);
+    background: var(--caution-soft);
+    border-radius: 0 7px 7px 0;
+    padding: .85rem 1.1rem;
+    display: flex;
+    flex-direction: column;
+    gap: .5rem;
+    font-size: .95rem;
+  }
+  .note .lede { color: var(--caution); font-weight: 650; }
+
+  /* ---- runs ---- */
+  .run {
+    border: 1px solid var(--border);
+    background: var(--surface);
+    border-radius: 10px;
+    padding: 1.35rem 1.5rem;
+    display: flex;
+    flex-direction: column;
+    gap: .8rem;
+  }
+  .runhead { display: flex; align-items: baseline; gap: .8rem; flex-wrap: wrap; }
+  .runno {
+    font-family: var(--mono);
+    font-size: .78rem;
+    color: var(--accent);
+    background: var(--accent-soft);
+    padding: .16rem .5rem;
+    border-radius: 4px;
+    font-weight: 600;
+  }
+  .runhead h2 { font-size: 1.22rem; }
+  dl { margin: 0; display: grid; grid-template-columns: max-content 1fr; gap: .3rem 1rem; font-size: .9rem; }
+  dt { color: var(--muted); }
+  dd { margin: 0; }
+
+  ul { margin: 0; padding-left: 1.15rem; display: flex; flex-direction: column; gap: .45rem; }
+  li { padding-left: .15rem; }
+
+  details {
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    background: var(--surface);
+    padding: 0;
+    overflow: hidden;
+  }
+  summary { cursor: pointer; padding: .95rem 1.3rem; font-weight: 600; font-size: .95rem; }
+  details[open] summary { border-bottom: 1px solid var(--border); }
+  #sourceview {
+    margin: 0;
+    padding: 1.1rem 1.3rem;
+    overflow: auto;
+    max-height: 26rem;
+    font-family: var(--mono);
+    font-size: .78rem;
+    line-height: 1.55;
+    background: var(--ground);
+  }
+  footer { color: var(--muted); font-size: .84rem; }
+  @media (prefers-reduced-motion: reduce) {
+    * { transition: none !important; animation: none !important; }
+  }
+</style>
+
+<div class="wrap">
+  <header>
+    <div class="eyebrow">SuperSTEM &middot; Daresbury</div>
+    <h1>Instrument Survey</h1>
+    <p class="standfirst">
+      One read-only script, three runs, three JSON files to send back. It answers
+      questions about your instruments that we are currently guessing at &mdash; and
+      guessing wrong costs weeks of the wrong adapter.
+    </p>
+  </header>
+
+  <div class="get">
+    <div>
+      <h3>Get the script</h3>
+      <div class="filemeta" style="margin-top:.45rem">
+        <span><code>superstem_survey.txt</code></span>
+        <span>__KIB__&nbsp;KB</span>
+        <span>__LINES__ lines</span>
+        <span>rev __REV__</span>
+        <span>no dependencies</span>
+      </div>
+    </div>
+    <div class="actions">
+      <button class="primary" id="save">Download script</button>
+      <button class="secondary" id="copy">Copy to clipboard</button>
+    </div>
+    <div id="status"></div>
+    <p style="font-size:.9rem;color:var(--muted)">
+      It downloads as <code>.txt</code> rather than <code>.py</code> &mdash; that is a
+      restriction of this page, not of the script. <strong>You do not need to rename
+      it.</strong> Python runs a file whatever its extension, so
+      <code>python superstem_survey.txt --check</code> works as-is. Rename it if you
+      prefer; nothing depends on the name.
+    </p>
+  </div>
+
+  <section>
+    <h2>Before anything else</h2>
+    <p>
+      Check the interpreter. The script needs <strong>Python 3.7 or newer</strong> &mdash;
+      that floor is set by Gatan Microscopy Suite, which embeds 3.7 and is the oldest
+      Python plausibly sitting near this hardware. On anything older the file will not
+      parse, and you get a <code>SyntaxError</code> rather than a useful message.
+    </p>
+    <pre class="cmd">python -c "import sys; print(sys.version)"</pre>
+    <p>Then run the preflight. It touches no hardware and opens no socket:</p>
+    <pre class="cmd">python superstem_survey.txt --check</pre>
+    <p>
+      It prints which interpreter it is in and which sections that interpreter could
+      answer. If it disagrees with what you expect, <strong>the interpreter is the thing
+      to change, not the machine.</strong>
+    </p>
+    <div class="note">
+      <span class="lede">Which Python matters more than which computer</span>
+      <p>
+        Two of the three sections can only see what is importable from the interpreter
+        they run in, and running from the wrong one gives a confident wrong answer rather
+        than an error. A missing module from a Python the vendor software never installed
+        into is not evidence of absence. If a machine has several Pythons, run it once
+        per interpreter with a different <code>--out</code> and send all the files.
+      </p>
+    </div>
+  </section>
+
+  <section>
+    <h2>What it will not do</h2>
+    <p>
+      The script's safety is structural, not a matter of care. Precisely what that means
+      for each instrument:
+    </p>
+    <ul>
+      <li>
+        <strong>Nion.</strong> Reads a component registry that something else populated,
+        and reads named controls. Never sets a control, never blanks or unblanks, never
+        moves the stage, never starts a scan &mdash; and never loads a device plug-in.
+        If the registry is empty it says so and asks you to run it from Swift's own
+        Python console, rather than populating the registry itself.
+      </li>
+      <li>
+        <strong>DECTRIS.</strong> HTTP <code>GET</code> only. Never writes a
+        configuration, never arms, triggers, disarms or aborts. Safe to run while
+        somebody else is using the detector &mdash; and the state it reports will tell
+        you if somebody is.
+      </li>
+      <li>
+        <strong>Hitachi.</strong> Resolves module <em>specifications</em>, which locates
+        a module without executing it, and lists directories. Never imports a vendor
+        control module, because importing one may open a connection to the column.
+      </li>
+    </ul>
+    <p>
+      No section reads or transmits acquired data. The report contains instrument
+      capability, versions and file paths &mdash; no images, no spectra, no credentials.
+    </p>
+  </section>
+
+  <section>
+    <h2>The three runs</h2>
+    <p>
+      Three machines, so three separate runs. They are independent &mdash; do them in
+      whatever order suits the schedule.
+    </p>
+
+    <div class="run">
+      <div class="runhead"><span class="runno">RUN 1</span><h2>SuperSTEM 2 &mdash; Nion UltraSTEM 100</h2></div>
+      <dl>
+        <dt>Where</dt><dd>The instrument control computer</dd>
+        <dt>Interpreter</dt><dd><strong>Nion Swift's own Python console</strong>, while Swift is running</dd>
+      </dl>
+      <pre class="cmd">python superstem_survey.txt --nion --out superstem2.json</pre>
+      <p>
+        <strong>The highest-value run of the three.</strong> It asks whether the STEM
+        controller exposes an <code>eels_camera</code> and publishes a
+        <code>ZLPoffset</code> control. If it does both, the UHV Enfina is already
+        reachable through Nion, the spectrometer is already drivable, and no Gatan-side
+        code is needed here at all. If it does neither, an adapter that has to live
+        inside Gatan Microscopy Suite comes back onto the plan.
+      </p>
+      <p>
+        Safe to run during a session. A system Python on the same computer will usually
+        report an empty registry &mdash; that is a fact about that interpreter, not about
+        your instrument.
+      </p>
+    </div>
+
+    <div class="run">
+      <div class="runhead"><span class="runno">RUN 2</span><h2>HERMES &mdash; DECTRIS control unit</h2></div>
+      <dl>
+        <dt>Where</dt><dd>Any machine on the control network, a laptop included</dd>
+        <dt>Interpreter</dt><dd>Any Python 3.7+</dd>
+      </dl>
+      <pre class="cmd">python superstem_survey.txt --dectris 192.168.1.10 --out hermes.json</pre>
+      <p>
+        Use the address of the <strong>control unit</strong>, not the detector head
+        &mdash; SIMPLON is served by the DCU on port 80.
+      </p>
+      <p>
+        This settles which SIMPLON version answers, which configuration keys an ELA
+        actually publishes, and whether the <code>monitor</code> subsystem is enabled.
+        Our adapter was written against published documentation and open-source clients;
+        several of its assumptions are guesses that one <code>GET</code> each can confirm
+        or kill. Safe to run mid-experiment.
+      </p>
+    </div>
+
+    <div class="run">
+      <div class="runhead"><span class="runno">RUN 3</span><h2>SuperSTEM 4 &mdash; Hitachi SU9000II</h2></div>
+      <dl>
+        <dt>Where</dt><dd>The SU9000II control computer</dd>
+        <dt>Interpreter</dt><dd>Whichever Python the vendor software installed into &mdash; if unsure, all of them</dd>
+      </dl>
+      <pre class="cmd">python superstem_survey.txt --hitachi --out superstem4.json</pre>
+      <p>
+        This looks for three undocumented external-control modules &mdash;
+        <code>MfExtCont</code>, <code>MfKeyMouse</code>, <code>MfCommon</code> &mdash;
+        evidenced on an SU7000 and unknown on an SU9000II. Whether they are present is
+        the single fact deciding between an adapter we can write in a couple of weeks and
+        a conversation with Hitachi.
+      </p>
+      <p>
+        Nothing is imported, so nothing connects to the column.
+      </p>
+      <div class="note">
+        <span class="lede">While you are at that machine &mdash; two free minutes</span>
+        <p>
+          The script cannot see these, and they are worth more than they cost. Is
+          <strong>EM Flow Creator</strong> installed and licensed? Is
+          <strong>ElementView</strong> there &mdash; Hitachi's in-house EELS acquisition
+          software, named in the published methods for this platform &mdash; and does it
+          have any scripting, macro, batch or watch-folder option? And who made the EELS
+          spectrometer and the diffraction camera? A CEOS or Gatan spectrometer is
+          something we can drive on our own terms; a Hitachi one is behind the same wall
+          as the column.
+        </p>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Sending results back</h2>
+    <p>
+      One JSON file per run. They are small, they are text, and they contain no acquired
+      data &mdash; reading one through before sending takes a moment and is worth doing
+      if anything in it looks sensitive.
+    </p>
+    <p>
+      <strong>If a run fails, send the file anyway.</strong> Every probe is wrapped so a
+      failure is recorded as data rather than stopping the run. A report full of errors
+      still says which questions the machine could not answer and why, which is itself an
+      answer.
+    </p>
+  </section>
+
+  <details>
+    <summary>Read the script first (__LINES__ lines)</summary>
+    <pre id="sourceview"></pre>
+  </details>
+
+  <footer>
+    Revision <code>__REV__</code> of <code>scripts/superstem_survey.py</code> in
+    <code>miainwoodpecker</code>. The download and the source above are the same bytes.
+  </footer>
+</div>
+
+<pre id="src" hidden>__SCRIPT_SOURCE__</pre>
+
+<script>
+  (function () {
+    var src = document.getElementById("src").textContent;
+    document.getElementById("sourceview").textContent = src;
+
+    var saveBtn = document.getElementById("save");
+    var copyBtn = document.getElementById("copy");
+    var status = document.getElementById("status");
+
+    function say(message, kind) {
+      status.textContent = message;
+      status.className = kind || "";
+    }
+
+    var downloads = window.claude && window.claude.downloads;
+    if (!downloads) {
+      saveBtn.disabled = true;
+      say("Downloading is not available in this view \u2014 use Copy to clipboard, then paste into an empty file and save it as superstem_survey.py", "warn");
+    }
+
+    saveBtn.addEventListener("click", function () {
+      if (!downloads) return;
+      say("Waiting for you to confirm the save\u2026");
+      downloads
+        .save({ filename: "superstem_survey.txt", data: src })
+        .then(function () {
+          say("Saved. Run it with: python superstem_survey.txt --check", "ok");
+        })
+        .catch(function (error) {
+          var code = (error && error.code) || "unavailable";
+          if (code === "declined") {
+            say("Save cancelled. Nothing was written.");
+          } else if (code === "rate_limited") {
+            say("A save prompt is already open \u2014 finish that one, then try again.", "warn");
+          } else if (code === "bad_request" || code === "transform_error") {
+            say("The file could not be prepared. Use Copy to clipboard instead.", "warn");
+          } else {
+            saveBtn.disabled = true;
+            say("Downloading is not available in this view \u2014 use Copy to clipboard instead.", "warn");
+          }
+        });
+    });
+
+    copyBtn.addEventListener("click", function () {
+      function fallback() {
+        var area = document.createElement("textarea");
+        area.value = src;
+        area.setAttribute("readonly", "");
+        area.style.position = "fixed";
+        area.style.opacity = "0";
+        document.body.appendChild(area);
+        area.select();
+        var ok = false;
+        try {
+          ok = document.execCommand("copy");
+        } catch (e) {
+          ok = false;
+        }
+        document.body.removeChild(area);
+        if (ok) {
+          say("Copied. Paste into an empty file and save it as superstem_survey.py", "ok");
+        } else {
+          say("Could not copy automatically \u2014 open \u201cRead the script first\u201d below, select all, and copy.", "warn");
+        }
+      }
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(src).then(function () {
+          say("Copied. Paste into an empty file and save it as superstem_survey.py", "ok");
+        }, fallback);
+      } else {
+        fallback();
+      }
+    });
+  })();
+</script>

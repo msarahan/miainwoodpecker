@@ -9,10 +9,52 @@ and several weeks of adapter work.
 `scripts/superstem_survey.py` asks those questions. It is a single file
 with no dependencies, it reads and never writes, and it produces one
 JSON file to send back. Reading it before running it is encouraged — it
-is about 600 lines, most of them explaining themselves.
+is about 850 lines, most of them explaining themselves.
 
 This page is the runbook: what to run, on which machine, in which
 interpreter, and what the script deliberately leaves for a human.
+
+## Getting the script to the instrument
+
+**For the SuperSTEM team, there is a hosted page that needs no git, no
+GitHub account and no package index:**
+
+> **<https://claude.ai/code/artifact/f60f60c4-8cc4-4a30-8109-427cb53ad4ef>**
+
+It carries a download button, the full source to read first, and a
+condensed version of this runbook. Two things about it are worth knowing
+before sending the link on:
+
+- **It downloads as `superstem_survey.txt`, not `.py`**, because the
+  host only permits an allowlist of extensions and `.py` is not on it.
+  **No rename is needed** — Python runs a file whatever its extension is,
+  so `python superstem_survey.txt --check` works as-is. The page says so
+  too, in those words, because an instrument scientist handed a `.txt`
+  will otherwise reasonably assume it is broken.
+- **The page is private until shared.** It has to be shared from the
+  artifact's own share menu before anyone at Daresbury can open it.
+
+Anyone who can reach GitHub can of course take
+`scripts/superstem_survey.py` from the repository instead; it is the same
+file, and the hosted page names the revision it was built from so the two
+can be told apart.
+
+**When the script changes, the hosted page must be republished** — it
+embeds a copy of the source rather than linking to it, which is what lets
+it work on a machine with no access to this repository:
+
+```
+python scripts/build_survey_page.py --out superstem-survey.html
+```
+
+`scripts/build_survey_page.py` reads the script, escapes it into
+`scripts/superstem_survey_page.html.in`, and stamps in the revision, so
+the bytes the download hands over are the bytes in this repository *by
+construction* — the page is never hand-edited and cannot drift from the
+script silently. What it cannot do is publish: the generated file has to
+be republished to the same artifact URL, or the hosted page keeps serving
+the previous revision. The revision marker in the page footer is how to
+tell which one is up there.
 
 ## What it will not do
 
@@ -66,6 +108,11 @@ Then run the preflight, which touches no hardware and opens no socket:
 ```
 python superstem_survey.py --check
 ```
+
+Every command below names the file `superstem_survey.py`. If you took it
+from the hosted page it will be called `superstem_survey.txt` instead —
+substitute the name and change nothing else. Python does not care about
+the extension.
 
 It prints which interpreter it is in and which sections that interpreter
 could answer. If it disagrees with what you expect, the interpreter is
