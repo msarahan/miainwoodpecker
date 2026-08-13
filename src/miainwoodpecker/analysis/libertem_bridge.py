@@ -107,10 +107,13 @@ frame stack. LiberTEM's own documentation only lists such datasets
 hosted on Zenodo (0.18-14.2 GB, DOIs under 10.5281/zenodo.*); py4DSTEM's
 small sample-data registry hosts its files on Google Drive. Both hosts
 returned a blocked ``CONNECT`` (HTTP 403) through this environment's
-proxy, as did HuggingFace, OSF, and Figshare when tried as alternatives
-— this environment's network policy allows package registries
-(PyPI, npm, crates.io, the Go proxy) and GitHub, not general data
-hosting. py4DSTEM's registry entry for its smallest nominal sample
+proxy, as did HuggingFace, OSF, and Figshare when tried as alternatives.
+That was true of the network policy in force when this adapter was
+written; **Zenodo has since been allowed**, and a real 4D-STEM datacube
+has been fetched and analysed (see ``docs/analysis-isolation.md``), so
+only the Google Drive half of this paragraph still holds. This adapter
+is unchanged either way: it takes the 3D stack a recording is.
+py4DSTEM's registry entry for its smallest nominal sample
 (``small_datacube``) also turned out to be an unreliable candidate on
 its own terms: its own source carries a ``TODO`` noting the ID currently
 points at the same file as an unrelated fixture (``vac_probe``), pending

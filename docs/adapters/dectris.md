@@ -159,6 +159,20 @@ EIGER2-chip-based and speaks the same API — but it is not a claim this
 project should make on LiberTEM-live's behalf, and it is the first thing
 to check on a hardware day.
 
+*(**Verified** — `libertem-live` 0.3.0's sdist was downloaded from PyPI
+and read, so none of the paragraph above rests on documentation any
+more. `DectrisConnectionBuilder`'s `api_host`/`api_port`/`data_host`/
+`data_port`, the active and passive modes, `bslz4`/`lz4`, the bundled
+`DEigerClient.py`, and the Rust receiver via `libertem-dectris>=0.2.14`
+are all present as described. The trigger arithmetic in §6 item 2 is
+confirmed at `libertem_live/detectors/dectris/controller.py:63-71`:
+`ints` sets `ntrigger=1, nimages=prod(nav_shape)`, and `exte`/`exts`
+take the mirror image of that. And the string **"ELA" appears nowhere in
+the package** — not in the supported list, not in a test, not in a
+comment — so this page's refusal to claim ELA support on LiberTEM-live's
+behalf was the right call and is now a checked fact rather than a
+caution.)*
+
 What that means for scope:
 
 - **The streaming path is not worth building.** If it works, it is
@@ -281,10 +295,14 @@ speak the protocol, and needs a real ELA:
 2. **The trigger-mode arithmetic.** This adapter uses `ints` with
    `nimages=1` and `ntrigger=65536`, i.e. one image per software trigger.
    LiberTEM-live's controller uses the other arrangement for `ints`
-   (`nimages` = the whole series, `ntrigger=1`), which is the same series
-   with the numbers the other way round. If the ELA's firmware treats one
-   `trigger` in `ints` as starting the *whole* series, this must change to
-   `inte`, or to re-arming per frame.
+   (`nimages` = the whole series, `ntrigger=1`) — **now read from the
+   source rather than the docs**, at
+   `libertem_live/detectors/dectris/controller.py:63-71` — which is the
+   same series with the numbers the other way round. If the ELA's
+   firmware treats one `trigger` in `ints` as starting the *whole*
+   series, this must change to `inte`, or to re-arming per frame. Note
+   that the disagreement is now known to be a real disagreement between
+   two implementations, not a possible misreading of one.
 3. **Whether `monitor` is enabled and usable on an ELA at all**, and what
    its buffer semantics are under `mode=enabled` — including whether
    `images/next` really returns 408 rather than blocking when empty.
