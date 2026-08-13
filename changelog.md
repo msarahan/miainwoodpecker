@@ -32,6 +32,30 @@
   and Hitachi sections the interpreter matters more than the machine:
   run from the wrong Python, an empty registry or a missing `MfExtCont`
   is a confident wrong answer rather than an error.
+- **A hosted download page for that survey script**
+  (`scripts/build_survey_page.py`, its template
+  `scripts/superstem_survey_page.html.in`, and the link recorded in
+  `docs/superstem-survey.md`). The runbook assumed whoever runs the
+  survey can get the script out of this repository; on an instrument
+  control PC that is the wrong assumption, since there is often no git,
+  no GitHub account and no route to a package index. The page carries a
+  download button, the full source to read first, and a condensed
+  runbook.
+  It **embeds** the script rather than linking to it — which is what
+  lets it work on an isolated machine, and is also the thing that could
+  go stale. The builder is how it does not go stale silently: it reads
+  `scripts/superstem_survey.py`, escapes it into the template, and
+  stamps the revision into the page footer, so the downloaded bytes are
+  the repository's bytes by construction rather than by anyone
+  remembering to re-paste them. What the builder cannot do is publish,
+  so a changed script still needs the page republished, and the footer
+  revision is how to tell which one is live.
+  One wrinkle is recorded rather than left to be discovered at the
+  instrument: the file downloads as `superstem_survey.txt`, because the
+  host permits only an allowlist of extensions and `.py` is not on it.
+  **No rename is needed** — Python runs a file whatever its extension —
+  and the page says so in those words, because a scientist handed a
+  `.txt` will otherwise reasonably conclude it is broken.
 
 ### Changed
 
