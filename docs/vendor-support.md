@@ -30,7 +30,7 @@ first; `Camera` faces the other two.
 | **Thermo Fisher** (TEM) | TEM Scripting + Advanced Scripting | COM | Installed with the microscope; [`temscript`](https://github.com/niermann/temscript) (BSD-3) and [`pyTEM`](https://github.com/basf/pyTEM) wrap it in Python | Yes, on Windows |
 | **Thermo Fisher** (TEM) | [AutoScript TEM](https://www.thermofisher.com/us/en/home/electron-microscopy/products/software-em-3d-vis/autoscript-tem-software.html) | Python 3.11 | Paid add-on, installed on the instrument | Yes |
 | **Thermo Fisher** (SEM/DualBeam) | [AutoScript 4](https://www.thermofisher.com/us/en/home/electron-microscopy/products/software-em-3d-vis/autoscript-4-software.html) | Python | Paid add-on | Yes |
-| **JEOL** | [PyJEM](https://www.jeolusa.com/PRODUCTS/Transmission-Electron-Microscopes-TEM/Analytical-Data-Optimization/PyJEM) over TEM_External/TEMCenter | Python | On the TEM PC; [docs are public](https://github.com/PyJEM/PyJEM), package is not on PyPI | Yes |
+| **JEOL** | [PyJEM](https://www.jeolusa.com/PRODUCTS/Transmission-Electron-Microscopes-TEM/Analytical-Data-Optimization/PyJEM) over TEM_External/TEMCenter | Python | On the TEM PC; [docs are public](https://github.com/PyJEM/PyJEM), package is **confirmed absent from PyPI** | Yes |
 | **Zeiss** | [SmartSEM Remote API](https://www.zeiss.com/microscopy/en/products/software/zeiss-smartsem.html) (`CZEMApi.ocx`) | ActiveX/COM | **Requires an agreement with Zeiss** to develop against | Yes, on Windows |
 | **Hitachi** | Undocumented Python external control (`MfExtCont`), evidenced on an SU7000 FE-SEM | Python | Not published; on the instrument PC, apparently with sample scripts | Presumed yes — unverified |
 | **Bruker** | ESPRIT scripting | In-app | Analyzer software (EDS/EBSD/µXRF), **not a column API** | No |
@@ -45,6 +45,27 @@ add-on, and `temscript` is BSD-3 on PyPI with a documented class map
 It also ships a **dummy implementation for offline development**, which
 is the thing that made Nion's adapter testable without hardware and would
 do the same again.
+
+*(**Verified** — `temscript` 2.1.0's sdist was downloaded from PyPI and
+read. All six classes are present in `temscript/_instrument_com.py`; the
+licence is BSD-3; the offline dummy is a real `NullMicroscope`, not a
+stub interface.)* Reading it turned up something this table did not
+know, and it matters more than the confirmation:
+
+> **`temscript` already ships its own out-of-process remoting.** It
+> carries a `MicroscopeServer` built on the standard library's
+> `http.server`, and a `RemoteMicroscope` client that speaks to it with
+> a choice of JSON or PICKLE transport.
+
+That is the same problem this project solves with
+`devices/*_server.py`, solved upstream, by the wrapper, permissively
+licensed. It bears directly on the 6–10 day Thermo Fisher estimate under
+"Task estimates" below: a Thermo adapter
+may not need this project's subprocess machinery at all on the
+instrument side, and could instead be a client of a server Thermo users
+already run. Nobody has costed that variant, and it is not costed here —
+but the estimate below assumes work that may be partly done, and should
+not be quoted without this paragraph.
 
 **Bruker is not a column vendor.** ESPRIT is EDS/EBSD/µXRF analysis
 software that sits *beside* a Zeiss, Thermo, JEOL, or Hitachi column. Its
@@ -591,6 +612,15 @@ then arrive with a real acceptance suite on day one.
 and a class map that matches the protocols. The real work is calibration,
 where Nion's "read the controls the device names" trick has no
 counterpart — the scale has to be derived from optics state.
+
+**This estimate is probably too high, and is left as it stands rather
+than adjusted on a guess.** It assumes a `*_server.py` of this project's
+own, but `temscript` 2.1.0 already ships `MicroscopeServer` and
+`RemoteMicroscope` (see "The landscape", above).
+Whether adopting them is cheaper than writing another server — against
+the loss of one uniform transport across every adapter, which §6's
+boundary exists to keep — is a design question nobody has answered.
+Re-cost it before committing to the number.
 
 ### JEOL (via PyJEM) — 8–14 days
 

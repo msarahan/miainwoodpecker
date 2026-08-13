@@ -101,12 +101,15 @@ happens to match the engineering ordering too.
 
 ## How this inventory was taken
 
-Enumerated by reading the actual sources, not the marketing pages.
-Swift's own documentation site was unreachable from this environment
-(the egress proxy blocks `readthedocs.io`), so the doc sources were read
-from the repositories instead — which is the better source anyway, since
-the menu is registered in code and the published page describes only a
-handful of items.
+Enumerated by reading the actual sources, not the marketing pages. Swift's
+own documentation site was unreachable when this was first taken, so the
+doc sources were read from the repositories instead. It has since been
+read — see [What is unverified](#what-is-unverified) — and the guess made
+here turned out to be correct: the published pages describe mechanisms
+and a handful of named items, the menu is registered in code, and three
+of the four packages publish no documentation at all. The repositories
+were the better source, and for `eels-analysis`, `experimental` and
+`niondata` they were the only one.
 
 | Source | Version read | Licence |
 |---|---|---|
@@ -119,6 +122,8 @@ handful of items.
 | [eXSpy](https://github.com/hyperspy/exspy) | master; 0.3.2 released | GPL-3.0 |
 | [LiberTEM](https://github.com/LiberTEM/LiberTEM) | 0.17.0.dev0 (master) | MIT |
 | [py4DSTEM](https://github.com/py4dstem/py4DSTEM) | 0.14.19 (master) | GPL-3.0 |
+| [Nion Swift docs](https://nionswift.readthedocs.io/en/stable/) | all 27 pages, read after the egress change | — |
+| [Nion Swift Instrumentation docs](https://nionswift-instrumentation.readthedocs.io/en/latest/) | cameras, scanning, STEM instrument, synchronized acquisition | — |
 
 Where a claim about upstream could be checked by running code rather than
 reading it, it was: HyperSpy 2.4.0 is installed in this environment and
@@ -620,15 +625,51 @@ follows the synchronized acquisition mode, whenever that arrives.
 Stated plainly, because an audit whose facts are guessed is worse than no
 audit.
 
-- **Swift's published documentation was never read.** `readthedocs.io` is
-  blocked by this environment's egress proxy, so the entire Swift-side
-  inventory comes from the repositories: the menu registrations, the
-  computation expressions, and the plugins' own registration lists. That
-  is the more authoritative source, but it means anything Nion documents
-  but does not register in code — a workflow, a keyboard-driven habit, a
-  recipe in the scripting guide — is not represented here. What would
-  settle it: reading the Processing, Graphics, and Extended Data pages
-  from an unblocked network.
+- ~~**Swift's published documentation was never read.**~~ **It has been
+  read now, and it changes no conclusion on this page.** `readthedocs.io`
+  became reachable and all twenty-seven pages of
+  [nionswift.readthedocs.io](https://nionswift.readthedocs.io/en/stable/)
+  were fetched, including the three this section named — Processing,
+  Graphics, and Extended Data. What was found:
+
+  - **The docs do not contain an operation catalogue.** The Processing
+    and Analysis page explains *mechanisms* — live computations, multiple
+    inputs, Edit Computation, duplicate/snapshot/capture, line profiles,
+    picks, Run Script — and names only a handful of menu items in
+    passing. It is not a list of the fifty-six, and could not have been
+    used to build one.
+  - **Nion say so themselves.** The Extended Data Guide's final section,
+    "Useful Recipes for Data", is a single sentence: "Many `xdata`
+    examples can be found by choosing menu items in the `Processing` menu
+    and examining the resulting computation code (use the computation
+    inspector)." The one place a recipe *could* have hidden points the
+    reader back at the registrations this inventory was built from.
+  - **Three of the four packages have no published docs at all.**
+    `nionswift-eels-analysis`, `nionswift-experimental` and `niondata`
+    all 404 on readthedocs. Those hold groups 2 and 3 — about thirty-one
+    of the ninety operations — so for them the repositories were never
+    the *more* authoritative source, they were the only source.
+    `nionswift-instrumentation` does publish, and its pages corroborate
+    group 4 and the camera model
+    [the Gatan page](adapters/gatan.md) depends on.
+  - **What the docs did add, and the inventory does not cover:** twelve
+    `graphics.*` actions (Add Line/Ellipse/Rectangle/Point/Interval/
+    Channel/Spot/Angular/Band-Pass/Lattice Graphic, Add to Mask, Remove
+    from Mask), and a layer of keyboard and drag workflow — `l` for line
+    profile, `p` for pick, `Tab` to cycle graphics, copy-paste a line
+    profile graphic to clone its computation onto another display,
+    Alt-drag a crop into an input control. These are region and
+    annotation tools and UI habits rather than analysis operations, so
+    leaving them out was right; recording that they were left out is
+    also right, because a menu-registration scrape cannot see them and
+    this is exactly the blind spot the original caveat predicted.
+  - One number drifted: `DocumentController.py` on master today
+    registers **50** `processing.*` actions against the 49 recorded here
+    at 16.18.1. Version drift, not an error, and it moves nothing.
+
+  Remaining limit, unchanged: the docs describe what Swift *is*, not what
+  any operator reaches for. That is still [Phase 5](migration-plan.md)'s
+  usage audit, below.
 - **No claim here is based on using Swift.** This is a source-level
   capability audit. Which of these fifty-odd operations an operator
   actually reaches for daily is exactly the question

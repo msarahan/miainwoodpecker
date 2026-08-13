@@ -18,8 +18,16 @@ SuperSTEM 2 is a Nion UltraSTEM 100 with a Gatan UHV Enfina EEL
 spectrometer ([SuperSTEM][superstem]). Nion's instrumentation kit models
 an **optional `eels_camera`** as one of the two primary cameras on the
 STEM controller, reached through `Registry.get_component("stem_controller")`
-([nionswift-instrumentation][nion-cameras]) — and that is exactly the
-mechanism `devices/nion_server.py` already reads. This project already:
+— and that is exactly the mechanism `devices/nion_server.py` already
+reads. Nion's *published* documentation now confirms this, in as many
+words: "There can be several cameras on a STEM microscope, but the
+Ronchigram and optional EELS camera are the primary ones"
+([Cameras][nion-cameras-doc]), and the accessor is
+`stem_controller.eels_camera`, of which the STEM Instrument page says
+directly: **"On systems without an EELS detector, the `eels_camera`
+property will be `None`"** ([STEM Instrument][nion-stem-doc]). That last
+sentence is the whole of the check below — a `None` is an answer, not a
+failure. This project already:
 
 - serves whatever Nion registers as the EELS camera on the `eels_camera`
   target, with its calibration resolved from the device's own
@@ -64,10 +72,11 @@ Two related cautions:
 
 ### The launch inversion is real, and the vendor says so
 
-Gatan's Python FAQ states plainly that *the DigitalMicrograph-Python API
-is dependent on the DigitalMicrograph application; therefore it is not
-possible to execute DigitalMicrograph functions from Python outside of
-the DigitalMicrograph application* ([Gatan Python FAQ][gatan-faq]). Python
+Gatan's Python FAQ — **read directly this time**, not through a search
+index — states plainly that *"DigitalMicrograph-Python API is dependent
+on the DigitalMicrograph application; therefore, it is not possible to
+execute DigitalMicrograph functions from python outside of the
+DigitalMicrograph application"* ([Gatan Python FAQ][gatan-faq]). Python
 integration in GMS 3 runs *inside* DM, with "all native Gatan data objects
 and existing hardware controls directly accessible in Python code"
 ([Gatan][gatan-python-integration]).
@@ -111,8 +120,21 @@ the morning and outlives many runs of the client.
 
 ### What can be driven from GMS's embedded Python
 
-- **Camera acquisition: yes.** Gatan publish example scripts doing Python
-  processing of a camera's live view ([Gatan][gatan-python-integration]).
+- **Camera acquisition: yes, and the calls are now read rather than
+  assumed.** Gatan's own script library ships `Camera_acquisition.py`,
+  which uses `DM.GetActiveCamera()`, `cam.PrepareForAcquire()`,
+  `cam.AcquireImage(exposure, binX, binY, kUnproc)`,
+  `cam.CreateImageForAcquire(...)`, `cam.AcquireInPlace(...)`, and — for
+  live view — `cam.StartContinuousAcquisition(...)`,
+  `cam.GetFrameInContinuousMode(dst, timeout_s)` and
+  `cam.StopContinuousAcquisition()`, with the processing level from
+  `DM.GetCameraUnprocessedEnum()`
+  ([Gatan scripts library][gatan-scripts-library]). The same library's
+  `DigiScan_acquisition.py` gives the scan side — `DM.DS_CreateParameters`,
+  `DM.DS_SetParametersSignal`, `DM.DS_StartAcquisition_2`,
+  `DM.DS_DialogEnabled`, `DM.DS_DeleteParameters` — and
+  `Microscope_access.py` gives the column: `DM.Py_Microscope()` with
+  `GetBrightness`, `GetFocus`, `SetFocus`, `GetCondenserAperture`.
 - **Anything DM-Script can do: yes, via `DM.ExecuteScriptString`.** This
   is the escape hatch that matters, and it is well attested — it is what
   `execdmscript` is built on, together with `DM.GetPersistentTagGroup`,
@@ -121,15 +143,84 @@ the morning and outlives many runs of the client.
   whatever the Python API happens to wrap: the camera manager (`CM_*`) and
   imaging-filter families are reachable, with values returned through the
   persistent tag tree.
-- **EELS spectrometer control: reachable in principle, spelling
-  unverified.** Gatan's script library documents an example that sets the
-  GIF drift-tube voltage and lists the imaging-filter control commands,
-  and it requires `Gatan IF Interface Plug-in.dll`. The exact command
-  names could not be retrieved from this sandbox — `gatan.com`,
-  `dmscripting.com`, the archived DM help, and the FELMI/TU Graz script
-  database are all unreachable through the egress proxy. **This is the
-  single largest unverified item on the page**, and it is why the bridge
-  takes those snippets as parameters rather than hard-coding a guess.
+- **EELS spectrometer control: reachable, and the spelling is now
+  known.** This used to be the single largest unverified item on the
+  page. It is settled, though not from the source the page expected —
+  see [the imaging-filter commands](#the-imaging-filter-commands-verified)
+  below.
+
+### The imaging-filter commands (verified)
+
+**First, a correction to what this page used to say.** It claimed
+"Gatan's script library documents an example that sets the GIF
+drift-tube voltage and lists the imaging-filter control commands, and it
+requires `Gatan IF Interface Plug-in.dll`". Gatan's script library was
+read this time — all nine pages, all 87 entries, all 78 downloadable
+files — and **it contains no such example**. The example described is
+Dave Mitchell's, on `dmscripting.com`, which is a private community site
+and not Gatan's library. The attribution was wrong, and it was wrong in
+the way [migration plan §7](../migration-plan.md) warns about: it was
+written from a search-index snippet and never re-checked once the page
+became reachable.
+
+Worse for the original plan: **Gatan do not publish a scripting command
+reference at all.** Their scripting page offers a `*.dm5` help file and
+then points readers at three community sites — the FELMI/TU Graz script
+database, `dmscript.tavernmaker.de` and `dmscripting.com`
+([Gatan][gatan-scripting]). All three are still blocked here. So the
+named sources for this item were, and remain, either non-existent or
+unreachable.
+
+The commands were instead read from **SerialEM's own source**, which is
+a better artefact than any of them: production C++ that has been driving
+Gatan energy filters through `DM::ExecuteScriptString` for two decades.
+`CCameraController::SetupFilter` composes this script
+([`SerialEM/CameraController.cpp:11910-11946`][serialem-cc]):
+
+| Command | Arity | What SerialEM does with it |
+|---|---|---|
+| `IFCGetFilterMode()` | → number | `0` means **spectroscopy**; SerialEM refuses and exits rather than acquire |
+| `IFCSetFilterMode(n)` | number | present, but commented out — SerialEM will not switch the mode for you |
+| `IFCGetAperture()` / `IFCSetAperture(n)` | → number / number | needs a `Delay(20)` after a change |
+| `IFCGetSlitIn()` / `IFCSetSlitIn(0\|1)` | → number / number | slit in or out, with a configured settling delay |
+| `IFCGetSlitWidth()` / `IFCSetSlitWidth(eV)` | → number / number | compared with a 0.1 eV tolerance when the slit is in |
+| `IFCGetSpectrumOffset()` / `IFCSetSpectrumOffset(eV)` | → number / number | the **preferred** energy-offset route |
+| `IFCGetEnergyShift()` / `IFCSetEnergyShift(eV)` | → number / number | the fallback route |
+| `IFCGetOffsetOn()` / `IFCSetOffsetOn(1)` | → number / number | must be on before spectrum offset takes effect |
+| `IFCGetTVIn()` / `IFCSetTVIn(0\|1)` | → number / number | retracts the TV camera before a filtered acquisition |
+
+Three things in that table are worth more than the names:
+
+1. **There are two energy-offset routes and they disagree about sign.**
+   SerialEM picks `SpectrumOffset` by default and falls back to
+   `EnergyShift`; when it drives energy shift instead of spectrum offset
+   on a Gatan filter it **negates the requested loss**
+   (`CameraController.cpp:11722`, `:11733-11735`). A bridge that offers
+   only one of the two, or that copies the other's sign convention, will
+   move the spectrum the wrong way.
+2. **`IFCSetOffsetOn(1)` is a precondition**, not a nicety
+   (`:11720-11721`).
+3. **Everything is polled, and settling is explicit.** SerialEM reads the
+   whole filter state back in one script by arithmetic packing —
+   `IFCGetSlitWidth() + 1000 * (IFCGetAperture() + 8 * IFCGetTVIn() + 16 * IFCGetSlitIn() + 32 * IFCGetFilterMode())`
+   (`:12058-12059`) — because a round trip through `ExecuteScriptString`
+   is worth avoiding. That is a pattern this bridge should copy.
+
+**What this does not settle.** These are *GIF* commands, verified against
+a Gatan imaging filter of the GIF generation. Nothing here is evidence
+about a **UHV Enfina**, which is older and a different product, and the
+page's standing caution applies unchanged. The bridge still takes the
+snippets as parameters — but the default no longer has to be a guess.
+
+**A related find, for the spectrometer question elsewhere.** The same
+SerialEM tree drives a **CEOS** filter over a completely different
+route: JSON-RPC 2.0 in netstring framing over a plain TCP socket, default
+port **7081**, methods `getInfo`, `getFilterMode`, `getSlit`, `setSlit`,
+`getHighTensionOffset`, `setHighTensionOffset`, `getLinerTubeVoltage`,
+`setLinerTubeVoltage` ([`SerialEM/CEOSFilter.cpp`][serialem-ceos],
+`CEOSFilter.h`). No DM, no vendor plug-in, no launch inversion. That
+matters for [the Hitachi page](hitachi.md), where the identity of
+SuperSTEM 4's spectrometer is an open question.
 
 ### What the embedded interpreter constrains
 
@@ -142,6 +233,10 @@ Three constraints, all of which changed the code:
 2. **Long work belongs off the calling thread**, and loading SciPy on a
    GMS background thread does not work ([LiberTEM tips][libertem-tips]).
    Hence `start_bridge()`, which returns a handle instead of blocking.
+   The vendor corroborates the hazard from the other side: the FAQ notes
+   that some libraries, SciPy among them, must run in the main thread,
+   and DM's script window carries an "Execute on Background Thread"
+   checkbox to choose ([Gatan Python FAQ][gatan-faq]).
 3. **The interpreter is old, and one consequence is a silent data
    corruption risk.** Gatan's FAQ names Python 3.7.2 and NumPy 1.18.2 for
    the GMS 3.4-era `GMS_VENV_PYTHON` environment (a Miniconda env under
@@ -175,7 +270,12 @@ Three constraints, all of which changed the code:
    into a 3.7 environment will be refused, so on such a GMS the three
    modules the bridge needs (`interface`, `rpc`, `serving`) have to be
    copied in by hand. `gatan_bridge.py` is written to import on 3.8 for
-   that reason.
+   that reason. Copying by hand is also the *safer* route on this
+   environment for a reason the FAQ gives: Gatan recommend `pip install`
+   over `conda install` there, because DigitalMicrograph uses
+   OpenBLAS-based NumPy and `conda install` tends to pull the MKL-based
+   build ([Gatan Python FAQ][gatan-faq]). Touching that env's NumPy at
+   all is a risk this bridge does not need to take.
 
 ### Licence position
 
@@ -329,8 +429,10 @@ the handle carries any failure the bridge thread hit.
   `DigitalMicrographSpectrometer`. `DM.GetFrontImage`, `GetNumArray`,
   `ExecuteScriptString` and `GetPersistentTagGroup` are all attested in
   public code and documentation, but this combination has not been run;
-- the imaging-filter command names — the placeholders are almost certainly
-  wrong for an Enfina and possibly wrong for anything;
+- the imaging-filter command names. The `IFC*` family itself is no longer
+  a guess — it is read from SerialEM's production source, above — but it
+  is verified against a **GIF**, not against an Enfina, and no snippet
+  here has been executed against any Gatan filter;
 - cross-interpreter operation. The pickle cap and the authkey
   compatibility are both reasoned from CPython source, not observed
   between a 3.7 and a 3.12 peer;
@@ -353,8 +455,13 @@ Proposed for [the hardware validation checklist](../hardware-validation-checklis
 4. Run the bridge's `simulated` backend *inside GMS* against a client on
    the same network. This tests the transport, the pickle cap and the
    authkey across the real interpreter pair, with no hardware at risk.
-5. Find the real imaging-filter DM-Script commands for this spectrometer
-   and record them; replace the placeholder snippets.
+5. Check whether the `IFC*` commands read from SerialEM
+   (`IFCGetFilterMode`, `IFCGetSlitWidth`, `IFCGetSpectrumOffset`,
+   `IFCGetEnergyShift`, …) exist on *this* spectrometer. One
+   `DM.ExecuteScriptString("Exit(IFCGetFilterMode())")` answers it. If
+   they do, record which of `SpectrumOffset` and `EnergyShift` this
+   filter honours, **and the sign** — SerialEM negates the loss for one
+   and not the other.
 6. Confirm `DM.GetFrontImage()` returns the live spectrum image while a
    live view runs, and that `GetNumArray()` gives the shape and dtype
    expected.
@@ -362,6 +469,12 @@ Proposed for [the hardware validation checklist](../hardware-validation-checklis
 
 [superstem]: https://www.superstem.org/facility/superstem-laboratory
 [nion-cameras]: https://github.com/nion-software/nionswift-instrumentation-kit/blob/master/docs/cameras.rst
+[nion-cameras-doc]: https://nionswift-instrumentation.readthedocs.io/en/latest/cameras.html
+[nion-stem-doc]: https://nionswift-instrumentation.readthedocs.io/en/latest/stem_controller.html
+[gatan-scripts-library]: https://www.gatan.com/resources/scripts-library
+[gatan-scripting]: https://www.gatan.com/resources/scripts
+[serialem-cc]: https://github.com/mastcu/SerialEM/blob/master/CameraController.cpp
+[serialem-ceos]: https://github.com/mastcu/SerialEM/blob/master/CEOSFilter.cpp
 [gatan-faq]: https://www.gatan.com/python-faq
 [gatan-python-integration]: https://www.gatan.com/resources/media-library/gms-3-analysis-tools-python-integration
 [mam-2024]: https://doi.org/10.1093/mam/ozae044.208

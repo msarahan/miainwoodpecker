@@ -983,6 +983,16 @@ problem — read their source and docs before designing our own adapters:
     LiberTEM needs one to be useful here — the 1D-navigation PoC above
     is real, working, and sufficient to answer the question this item
     was scoped to answer.
+
+    **Superseded, in part, by a later egress change.** `zenodo.org` is
+    now reachable from this environment and a real 4D-STEM datacube has
+    been fetched and analysed — a (254, 255, 384, 384) `uint8` cube,
+    genuine 2D navigation, from Zenodo 8233585. See
+    [analysis isolation](analysis-isolation.md). `drive.google.com`
+    remains blocked, so py4DSTEM's own downloader still cannot run here
+    and both `gdown` findings above stand unchanged. What this
+    supersedes is only the "no real dataset is reachable" half; the
+    reasoning about LiberTEM's optional-dependency group is unaffected.
 - [x] Follow-up PoC: py4DSTEM specifically —
   [`src/miainwoodpecker/analysis/py4dstem_bridge.py`](../src/miainwoodpecker/analysis/py4dstem_bridge.py),
   wired into

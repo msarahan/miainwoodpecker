@@ -564,10 +564,109 @@ API and the status messages are transport-independent already.
   metadata, with the README naming `io` as the MIT part). The individual
   module files carry no per-file headers, so the README is the whole of
   the evidence. Anyone depending on it should confirm with the project.
-- **No 4D-STEM dataset was analysed.** The same environment limitation
-  [analysis parity](analysis-parity.md) and the py4DSTEM adapter both
-  record: the sample datasets are hosted where this environment's egress
-  proxy will not go. The measurements above use synthetic noise frames of
-  realistic size and dtype, which is the right input for a *transport*
-  benchmark and the wrong one for a scientific claim — and no scientific
-  claim is made from them.
+- ~~**No 4D-STEM dataset was analysed.**~~ **One has been now.** See
+  [Real 4D-STEM data](#real-4d-stem-data-and-what-it-did-and-did-not-change)
+  below: the transport conclusion survives unchanged, and a separate
+  problem turned up that only real data could expose.
+
+## Real 4D-STEM data, and what it did and did not change
+
+The measurements above were taken on synthetic noise. A real dataset is
+now reachable and was used, so the caveat can be replaced with a result.
+
+**The data.** Zenodo record [8233585](https://zenodo.org/records/8233585),
+"Mixed Phase Test Datasets for py4dstem", CC-BY-4.0, file
+`20210306_084059.hdf5`: a **(254, 255, 384, 384) `uint8`** datacube — a
+genuine 2D scan of 2D diffraction patterns, 152 MB on disk and 9.55 GB
+raw. Sparse, as real fast-scan 4D-STEM is: a five-pattern burst has
+**1.9 % of pixels non-zero** and a mean of **0.03 counts**.
+
+### The transport conclusion survives
+
+Real frames and synthetic frames of *identical shape and dtype*, 142 ×
+384 × 384 `float32` = 83.8 MB — the same 84 MB payload as the rows above
+— interleaved over fifteen rounds so machine drift cancels, on 4 cores:
+
+| Frames | in-process median | worker median | delta |
+|---|---|---|---|
+| **Real** | 15.2 ms | 51.4 ms | **+36.3 ms** |
+| **Synthetic** | 16.5 ms | 60.7 ms | **+44.2 ms** |
+
+Indistinguishable, and expected to be: the shared-memory path does no
+compression, so it cannot care what the bytes mean. Real data was never
+going to move this number, and it did not. The p95s — 678 ms real,
+665 ms synthetic against ~50 ms medians — corroborate the noise caveat
+above rather than contradicting anything.
+
+An earlier non-interleaved run produced a 2337 ms real median against
+46 ms synthetic. That was machine noise, and it is recorded because it
+is the shape of mistake this page could have made: one uninterleaved
+pass would have "found" a 50× real-data penalty that does not exist.
+
+### What real data did break
+
+`fit_central_disk` — py4DSTEM's `get_probe_size`, the viewer's "Fit
+central disk" button. On synthetic input it returns a confident,
+centred, **entirely fictitious** disk:
+
+| Input (384 × 384) | fitted radius | fitted centre |
+|---|---|---|
+| uniform noise `U(0,1)` | 157.31 px | (191.7, 191.8) |
+| all ones | 216.65 px | (191.5, 191.5) |
+| Gaussian noise | 46.52 px | (190.5, 193.7) |
+| Poisson, λ = 0.03 | 20.94 px | (190.1, 193.3) |
+| all zeros | 0.00 px | (nan, nan) — with a divide warning |
+
+Threshold-and-centroid on a structureless field always lands on the
+array centre. **So every synthetic-data exercise of that button was
+vacuous**: it could not have failed, whatever the code did. Nothing on
+this page claimed otherwise — no scientific claim was made from the
+noise frames — but "no claim made" and "the check could not fail" are
+different admissions, and the second is the true one.
+
+On the real cube the operation behaves, given enough electrons:
+
+| Real input | fitted radius | fitted centre |
+|---|---|---|
+| 255 patterns summed (one scan row) | 3.99 px | (190.8, 192.5) |
+| 256 patterns sampled across the scan | 5.19 px | (191.7, 191.5) |
+| single pattern, ×5 consecutive | 1.80–3.05 px | drifts to (181.2, 203.5) |
+| 16 × 16 block from mid-scan, summed | **0.64 px** | **(128.0, 266.0)** |
+
+Two findings there, neither visible in noise:
+
+1. **One sparse pattern is not enough.** The button fits the *first*
+   frame by deliberate design, and the adapter's docstring gives a good
+   reason ("averaging several first would fit something that was never
+   acquired"). On this data that design returns a radius varying by 70 %
+   between consecutive patterns and a centre 15 px off. The reasoning is
+   still sound; the input is simply too sparse for it, and an operator
+   pointing the button at a fast scan will get a number that looks fine
+   and is not.
+2. **Strong diffraction defeats it outright.** The mid-scan block sums
+   256 patterns — more than the row that worked — and fits a 0.64 px
+   "disk" at (128, 266), which is exactly that block's brightest pixel.
+   This is a mixed-phase specimen; on a strongly diffracting grain a
+   Bragg disk outshines the direct beam and `get_probe_size` locks onto
+   the wrong one. More data does not help when the data is structured
+   the wrong way.
+
+Neither is a defect in this repository — `fit_central_disk` calls
+py4DSTEM correctly and returns what py4DSTEM returns. Both are reasons
+the button's output should not be trusted without an operator looking at
+the fitted disk drawn on the pattern, which is, to its credit, exactly
+what the adapter already returns the pattern for. Recorded here so that
+[the hardware validation checklist](hardware-validation-checklist.md)
+can carry it: **check the central-disk fit against a summed pattern from
+a real specimen before believing a single-frame fit.**
+
+### What is still unverified about this
+
+- One dataset, one specimen, one detector geometry. Nothing here is a
+  survey.
+- The file path was not re-measured on the real cube; this is
+  frames-already-in-memory only. The cube is HyperSpy-format HDF5, not
+  the NeXus this project writes, so a like-for-like file-path row would
+  have needed a conversion whose cost is not the thing being measured.
+- `drive.google.com` and `web.archive.org` are still egress-blocked, so
+  py4DSTEM's own downloader still cannot run here. Zenodo can.
