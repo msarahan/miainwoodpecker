@@ -51,7 +51,8 @@ the beam. Third-party scan generators plug into it and are a product
 category, not a hack: point electronic's **DISS6** acquires **4 analog
 and 12 digital inputs simultaneously** — expandable to 20 analog — and
 ships an SDK with **Windows and Linux** control libraries, API
-documentation and demo applications. On a 200 kV TEM that route barely
+documentation and demo applications, plus a **JSON-RPC remote control
+interface**. On a 200 kV TEM that route barely
 exists.
 On this instrument, a scanned image is reachable *even if Hitachi says
 no*.
@@ -342,12 +343,26 @@ need not be:
   toolKit comprising **"Windows and Linux control libraries"**, a "DLL
   control library", "Library API documentation" and "Demo applications".
   It claims compatibility with "all major scanning microscope models".
+  Under custom software integration the same page also offers a
+  **"JSON-RPC remote control interface for seamless integration with any
+  system"**, alongside the SDK's "access to all hardware functions".
   *(**Verified** — [DISS6](https://www.pointelectronic.de/en/parts/smart-controllers/diss6-imaging-scanner-sem/)
   and [digital image scanning](https://www.pointelectronic.de/en/systems/digital-image-acquisition/),
-  both read directly. Two corrections to what this page said from search:
-  the analog count is **expandable to 20**, not fixed at 4, and the SDK
-  ships **Linux** libraries as well as Windows — which matters, because
-  this project's device servers are Linux-first. The page names no
+  both read directly. Three corrections to what this page said from
+  search: the analog count is **expandable to 20**, not fixed at 4; the
+  SDK ships **Linux** libraries as well as Windows — which matters,
+  because this project's device servers are Linux-first; and the
+  **JSON-RPC interface was missed entirely**. That last one changes the
+  shape of Scenario C rather than just its detail: a "DLL control
+  library" implies a Windows in-process shim of the kind
+  [the Gatan page](gatan.md) has to work around, whereas an out-of-process
+  JSON-RPC endpoint is the same integration shape SerialEM already uses
+  for CEOS filters (unverified item 3 below), and one a Linux device
+  server can speak
+  without a vendor runtime at all. The page does not state the transport,
+  framing or method names, so **what is verified is that the interface
+  exists, not how to call it** — that needs vendor question 13 or the SDK
+  documentation. The page names no
   manufacturer or model, so "all major scanning microscope models" is the
   strongest claim available; whether they have fitted an SU9000II
   specifically remains **unverified**.)*
@@ -945,8 +960,11 @@ the eleven that still need an instrument or a vendor still need one.
       the pages from an ordinary browser, or one PDF from the facility.
     - **ScienceDirect — not settled, and recorded as a firm negative.**
       `sciencedirect.com` also answers **403** at its own edge. There is
-      no open-access route from here either: `doi.org` resolves but
-      redirects into the same 403, and `api.crossref.org`,
+      no open-access route from here either, though the two blocks have
+      *different* causes and this page should not blur them: `doi.org`
+      resolves and issues a normal **302**, but its redirect target
+      `linkinghub.elsevier.com` is refused at the **gateway** — a policy
+      denial, not an origin refusal. `api.crossref.org`,
       `api.openalex.org`, `api.unpaywall.org`, `europepmc.org` and
       `pubmed.ncbi.nlm.nih.gov` are all refused at the gateway. This
       applies to both ScienceDirect items — the Ultramicroscopy 2024
@@ -954,7 +972,12 @@ the eleven that still need an instrument or a vendor still need one.
       spectrometer (§1's "1024 × 256 CCD" claim), and the
       Ultramicroscopy ELA paper `10.1016/j.ultramic.2020.113067` cited
       from [the DECTRIS page](dectris.md). Neither abstract nor full
-      text was obtainable. Both stay *reported*, indefinitely.
+      text was obtainable. Both stay *reported*, indefinitely — with one
+      genuine upgrade: the ELA DOI is now **verified to exist**, because
+      `doi.org` resolved it to Elsevier PII `S0304399120302187` rather
+      than returning "DOI not found". That settles that the citation is
+      real and correctly transcribed; it settles nothing about what the
+      paper says.
 
 ## What survived the re-target
 
@@ -994,7 +1017,8 @@ Verified — read directly:
   configuration, quoted verbatim in "The instrument"
 - [point electronic DISS6](https://www.pointelectronic.de/en/parts/smart-controllers/diss6-imaging-scanner-sem/)
   and [digital image scanning](https://www.pointelectronic.de/en/systems/digital-image-acquisition/)
-  — inputs, scan interface and SDK contents
+  — inputs, scan interface, SDK contents and the JSON-RPC remote
+  control interface
 - [`mastcu/SerialEM`](https://github.com/mastcu/SerialEM) —
   `CEOSFilter.cpp` and `CEOSFilter.h`, the CEOS energy-filter JSON-RPC
   protocol

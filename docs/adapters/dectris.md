@@ -159,7 +159,7 @@ EIGER2-chip-based and speaks the same API — but it is not a claim this
 project should make on LiberTEM-live's behalf, and it is the first thing
 to check on a hardware day.
 
-*(**Verified** — `libertem-live` 2.3.0's sdist was downloaded from PyPI
+*(**Verified** — `libertem-live` 0.3.0's sdist was downloaded from PyPI
 and read, so none of the paragraph above rests on documentation any
 more. `DectrisConnectionBuilder`'s `api_host`/`api_port`/`data_host`/
 `data_port`, the active and passive modes, `bslz4`/`lz4`, the bundled
