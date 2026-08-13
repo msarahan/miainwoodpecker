@@ -32,6 +32,23 @@
   and Hitachi sections the interpreter matters more than the machine:
   run from the wrong Python, an empty registry or a missing `MfExtCont`
   is a confident wrong answer rather than an error.
+
+### Changed
+
+- **EDX and EELS run together on SuperSTEM 2** — confirmed by the
+  facility, and they do not physically block one another. This was an
+  open question in `docs/adapters/spectrum-detectors.md` about dose,
+  dead time and whether the Enfina's acquisition takes the scan; the
+  blocking half is answered outright, so simultaneous EDX + EELS is a
+  workflow to support rather than a configuration this project may
+  reject. The consequence for the design recorded there is that the
+  **pass** concept now has a confirmed user rather than a projected one:
+  two spectrometers of different kinds reading out during one traversal
+  is the correlated-output set a pass exists to group, and
+  `metadata["simultaneous_with"]` has a device that genuinely knows. It
+  does not change the recommendation — the device shape still ships
+  first — but it removes "we may never need this" as a reason to defer
+  the pass indefinitely.
 - **The simultaneous multi-channel scan**, which is what a scanned
   instrument actually does: one pass of the probe, every enabled
   detector reading out at once.

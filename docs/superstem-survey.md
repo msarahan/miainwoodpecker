@@ -164,9 +164,9 @@ Safe to run: nothing is imported, so nothing connects to the column.
 
 ## What the script cannot answer
 
-Three things need an operator, hardware time, and a decision that it is
-worth the beam. None of them is urgent, and all three are worth
-scheduling together.
+Two things need an operator, hardware time, and a decision that it is
+worth the beam. Neither is urgent, and both are worth scheduling
+together.
 
 **The DECTRIS trigger arithmetic.** Our adapter uses SIMPLON's `ints`
 mode with `nimages=1` and `ntrigger=65536` — one image per software
@@ -177,10 +177,6 @@ and sending a trigger, which is precisely the thing the survey refuses
 to do, so it has to be a deliberate act with somebody watching. The
 outcome is one bit: does one `trigger` in `ints` produce one image, or
 start the whole series?
-
-**Whether EDX and EELS can run together** on SuperSTEM 2 — physically,
-not just in software. This determines whether simultaneous acquisition
-is a feature to build or a configuration to reject.
 
 **What drives SuperSTEM 4's EELS spectrometer and diffraction camera.**
 Make, model, and which software owns each. The published description
