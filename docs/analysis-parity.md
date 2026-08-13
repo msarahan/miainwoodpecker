@@ -299,7 +299,7 @@ model reads three instrument items, and checks for exactly them in
 | `…TEM.beam_current` | **nA** | `beam_current_a`, ×1e9 |
 | `…TEM.Detector.EELS.exposure` | s | `exposure_ms`, ÷1000 |
 | `…TEM.convergence_angle` | mrad | **nothing records one** |
-| `…TEM.Detector.EELS.collection_angle` | mrad | **nothing records one** |
+| `…TEM.Detector.EELS.collection_angle` | mrad | **nothing records one** — but see below |
 
 The two semi-angles are the gap, and they are left unset rather than
 guessed. The collection angle is set by the spectrometer entrance
@@ -317,6 +317,20 @@ correction from someone else's geometry), where a plausible wrong angle
 would have produced a number that looks like a result. An operator
 supplies them per session with eXSpy's own
 `signal.set_microscope_parameters(...)`.
+
+**One instrument is known to make the collection angle trivial**, and it
+is worth recording because it cuts against the paragraph above rather
+than confirming it. On the Hitachi SU9000-series platform the published
+methods state that "due to the in-lens disposition of the microscope and
+the absence of the projector lens below the sample, the collection angle
+of the EELS spectrometer is **constrained to 5 mrad**"
+([adapters/hitachi.md](adapters/hitachi.md) §1). Where there is no
+projector lens the angle is not a per-session variable set by aperture
+and camera length at all — it is a fixed property of the column, and a
+device adapter for such an instrument could report it as a constant with
+no guessing. That does not change anything for a Nion column, and it is
+not a reason to invent a field before an adapter exists; it is a reason
+not to assume this gap is the same shape on every vendor.
 
 **The energy axis is normalized to eV on the way in**, which the EDS
 side does not need to do. eXSpy's EDS code validates its axis unit
