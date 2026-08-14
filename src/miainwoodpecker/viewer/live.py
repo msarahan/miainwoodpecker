@@ -47,9 +47,12 @@ Importing this module requires the ``viewer`` optional dependency group.
 The camera group's "Analyze in HyperSpy", "Sum in LiberTEM", and "Fit
 central disk (py4DSTEM)" buttons additionally need the ``analysis``,
 ``libertem``, and ``py4dstem`` groups respectively (migration plan,
-Phase 4); all three libraries are imported lazily so this module still
-imports and the buttons still render without them, only reporting the
-missing extra in the status label if clicked.
+Phase 4). All three libraries are imported lazily, so this module still
+imports without them — and **each button is built only when its own
+extra is installed**, with a single row naming the enabled and available
+extras standing in for the ones that are not. A button that cannot work
+is worse than an absent one: it teaches the operator that this
+application's buttons sometimes do nothing.
 """
 
 from __future__ import annotations
@@ -594,30 +597,131 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
             self._camera_save_button,
             self._camera_record_button,
         ) = self._build_record_controls(camera_group, camera_form)
-        self._analyze_button = QtWidgets.QPushButton(
-            "Analyze in HyperSpy", camera_group
-        )
-        camera_form.addRow(self._analyze_button)
-        self._analyze_status = QtWidgets.QLabel("", camera_group)
-        camera_form.addRow("Analysis", self._analyze_status)
-        self._libertem_button = QtWidgets.QPushButton("Sum in LiberTEM", camera_group)
-        camera_form.addRow(self._libertem_button)
-        self._libertem_status = QtWidgets.QLabel("", camera_group)
-        camera_form.addRow("LiberTEM", self._libertem_status)
-        self._py4dstem_button = QtWidgets.QPushButton(
-            "Fit central disk (py4DSTEM)", camera_group
-        )
-        camera_form.addRow(self._py4dstem_button)
-        self._py4dstem_status = QtWidgets.QLabel("", camera_group)
-        camera_form.addRow("py4DSTEM", self._py4dstem_status)
+        self._build_analysis_rows(camera_group, camera_form)
 
         self._camera_button.clicked.connect(self._toggle_camera)
         self._camera_save_button.clicked.connect(self.save_camera_frame)
         self._camera_record_button.clicked.connect(self.record_camera_frames)
-        self._analyze_button.clicked.connect(self._analyze_camera_in_hyperspy)
-        self._libertem_button.clicked.connect(self._analyze_camera_in_libertem)
-        self._py4dstem_button.clicked.connect(self._fit_central_disk_in_py4dstem)
         return camera_group
+
+    def _build_analysis_rows(
+        self,
+        camera_group: QtWidgets.QGroupBox,
+        camera_form: QtWidgets.QFormLayout,
+    ) -> None:
+        """
+        Add a button per *installed* analysis extra, and name the rest.
+
+        A button for a library that is not installed is a button that
+        cannot work, and offering it teaches the operator that this
+        application's buttons sometimes do nothing. So each one is built
+        only when its extra is importable, and the extras that are not
+        take a single summary row instead — which is more useful than
+        three dead buttons, because it says what is installed as well as
+        what is missing.
+
+        The check is
+        :func:`~miainwoodpecker.analysis.remote.target_available`, which
+        resolves the module *spec* without executing it. Importing
+        py4DSTEM to discover whether py4DSTEM is installed would stall
+        building the window for seconds to answer a question with a cheap
+        answer.
+
+        This is a availability check, not a guarantee: a spec can resolve
+        for a half-installed distribution whose import then fails. Each
+        handler therefore keeps its own ``ImportError`` branch, and that
+        branch is reachable rather than dead code.
+
+        Parameters
+        ----------
+        camera_group : QtWidgets.QGroupBox
+            The group the widgets are parented to.
+        camera_form : QtWidgets.QFormLayout
+            The layout the rows are added to.
+        """
+        from miainwoodpecker.analysis.remote import target_available  # noqa: PLC0415
+        from miainwoodpecker.analysis.transfer import (  # noqa: PLC0415
+            ANALYSIS_TARGETS,
+        )
+
+        specifications = (
+            ("hyperspy", "Analyze in HyperSpy", "Analysis"),
+            ("libertem", "Sum in LiberTEM", "LiberTEM"),
+            ("py4dstem", "Fit central disk (py4DSTEM)", "py4DSTEM"),
+        )
+        handlers = {
+            "hyperspy": self._analyze_camera_in_hyperspy,
+            "libertem": self._analyze_camera_in_libertem,
+            "py4dstem": self._fit_central_disk_in_py4dstem,
+        }
+        attributes = {
+            "hyperspy": ("_analyze_button", "_analyze_status"),
+            "libertem": ("_libertem_button", "_libertem_status"),
+            "py4dstem": ("_py4dstem_button", "_py4dstem_status"),
+        }
+        for button_attribute, status_attribute in attributes.values():
+            setattr(self, button_attribute, None)
+            setattr(self, status_attribute, None)
+
+        enabled: list[str] = []
+        missing: list[str] = []
+        for name, text, row_label in specifications:
+            extra = ANALYSIS_TARGETS[name].extra
+            if not target_available(name):
+                missing.append(extra)
+                continue
+            enabled.append(extra)
+            button_attribute, status_attribute = attributes[name]
+            button = QtWidgets.QPushButton(text, camera_group)
+            camera_form.addRow(button)
+            status = QtWidgets.QLabel("", camera_group)
+            camera_form.addRow(row_label, status)
+            button.clicked.connect(handlers[name])
+            setattr(self, button_attribute, button)
+            setattr(self, status_attribute, status)
+
+        if missing:
+            camera_form.addRow(
+                "Analysis extras",
+                self._build_extras_summary(camera_group, enabled, missing),
+            )
+
+    @staticmethod
+    def _build_extras_summary(
+        camera_group: QtWidgets.QGroupBox,
+        enabled: list[str],
+        missing: list[str],
+    ) -> QtWidgets.QLabel:
+        """
+        Describe which analysis extras are installed and which are not.
+
+        Names both halves rather than only the missing one, because "no
+        analysis buttons" and "analysis is installed but this build has
+        no camera" look identical from the outside, and an operator
+        deciding whether to install anything needs to see the whole set.
+
+        Parameters
+        ----------
+        camera_group : QtWidgets.QGroupBox
+            The group the label is parented to.
+        enabled : list[str]
+            Extras whose libraries are importable.
+        missing : list[str]
+            Extras whose libraries are not.
+
+        Returns
+        -------
+        QtWidgets.QLabel
+            A two-line summary, selectable so the install command can be
+            copied out of it.
+        """
+        lines = [f"enabled: {', '.join(enabled)}" if enabled else "enabled: none"]
+        lines.append(f"available: {', '.join(missing)}")
+        lines.append(f"pip install \"miainwoodpecker[{','.join(missing)}]\"")
+        label = QtWidgets.QLabel("\n".join(lines), camera_group)
+        label.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+        label.setWordWrap(True)
+        return label
 
     def _on_scan_settings_changed(self) -> None:
         size = int(self._size_combo.currentText())
@@ -1560,12 +1664,15 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         decision, not this handler's, and in-process remains the default.
         See docs/analysis-isolation.md.
         """
-        if self._camera is None:
+        status = self._analyze_status
+        if self._camera is None or status is None:
             return
         try:
             runner = self._analysis_runner("hyperspy")
         except ImportError:
-            self._analyze_status.setText("install the 'analysis' extra")
+            # target_available said yes and the import still failed: a
+            # half-installed distribution whose spec resolves.
+            status.setText("the 'analysis' extra is installed but broken")
             return
 
         def compute(source: _AnalysisInput) -> object:
@@ -1580,7 +1687,7 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
             return f"done - mean of {source.frame_count} frames from {source.origin}"
 
         self._start_analysis(
-            status=self._analyze_status,
+            status=status,
             compute=compute,
             display=display,
             frame_count=_ANALYSIS_BURST_FRAME_COUNT,
@@ -1614,12 +1721,15 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         is where that closure's body now lives so the isolated worker can
         run the same code rather than a copy of it.
         """
-        if self._camera is None:
+        status = self._libertem_status
+        if self._camera is None or status is None:
             return
         try:
             runner = self._analysis_runner("libertem")
         except ImportError:
-            self._libertem_status.setText("install the 'libertem' extra")
+            # target_available said yes and the import still failed: a
+            # half-installed distribution whose spec resolves.
+            status.setText("the 'libertem' extra is installed but broken")
             return
 
         def compute(source: _AnalysisInput) -> object:
@@ -1634,7 +1744,7 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
             return f"done - sum of {source.frame_count} frames from {source.origin}"
 
         self._start_analysis(
-            status=self._libertem_status,
+            status=status,
             compute=compute,
             display=display,
             frame_count=_ANALYSIS_BURST_FRAME_COUNT,
@@ -1669,12 +1779,15 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         group; reports that in the status label rather than crashing the
         widget if it is missing.
         """
-        if self._camera is None:
+        status = self._py4dstem_status
+        if self._camera is None or status is None:
             return
         try:
             runner = self._analysis_runner("py4dstem")
         except ImportError:
-            self._py4dstem_status.setText("install the 'py4dstem' extra")
+            # target_available said yes and the import still failed: a
+            # half-installed distribution whose spec resolves.
+            status.setText("the 'py4dstem' extra is installed but broken")
             return
 
         def compute(source: _AnalysisInput) -> object:
@@ -1707,7 +1820,7 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
             )
 
         self._start_analysis(
-            status=self._py4dstem_status,
+            status=status,
             compute=compute,
             display=display,
             frame_count=1,

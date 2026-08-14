@@ -21,6 +21,7 @@ pytest.importorskip("napari", reason="requires the 'viewer' extra")
 import napari
 from qtpy import QtWidgets
 
+from miainwoodpecker.analysis import remote as analysis_remote
 from miainwoodpecker.devices import Frame, ScanParameters
 from miainwoodpecker.storage.calibration import AxisKind, FrameCalibration
 from miainwoodpecker.storage.nexus import (
@@ -181,6 +182,126 @@ def _finish_analysis(widget: LiveInstrumentWidget) -> None:
         return widget._analysis_job is None  # noqa: SLF001
 
     assert _wait_until(done)
+
+
+def _analysis_extras_summary(widget: LiveInstrumentWidget) -> str | None:
+    """
+    Return the camera group's analysis-extras summary text, if it is shown.
+
+    Found by its content rather than by holding a reference, so the test
+    asserts on what an operator can actually read on the panel.
+
+    Parameters
+    ----------
+    widget : LiveInstrumentWidget
+        The widget to search.
+
+    Returns
+    -------
+    str | None
+        The summary label's text, or None when no summary row was built.
+    """
+    for label in widget.findChildren(QtWidgets.QLabel):
+        if label.text().startswith("enabled:"):
+            return label.text()
+    return None
+
+
+def _widget_with_extras(
+    monkeypatch: pytest.MonkeyPatch,
+    available: set[str],
+) -> LiveInstrumentWidget:
+    """
+    Build a camera-only widget that believes exactly ``available`` is installed.
+
+    Patches the availability check rather than the environment, so the
+    three cases are all reachable from one test run whatever this
+    machine actually has installed — which matters because CI installs
+    all three extras and would otherwise only ever exercise one branch.
+
+    Parameters
+    ----------
+    monkeypatch : pytest.MonkeyPatch
+        The patcher.
+    available : set[str]
+        Analysis target names to report as installed.
+
+    Returns
+    -------
+    LiveInstrumentWidget
+        The built widget; the caller shuts it down.
+    """
+    monkeypatch.setattr(
+        analysis_remote,
+        "target_available",
+        lambda name: name in available,
+    )
+    viewer = napari.Viewer(show=False)
+    return LiveInstrumentWidget(viewer, None, camera=_FakeCamera())
+
+
+def test_analysis_buttons_are_absent_when_no_extra_is_installed(monkeypatch):
+    """
+    With no analysis extra installed, no analysis button is built at all.
+
+    A button for a library that is not installed cannot work, and
+    offering it teaches the operator that this application's buttons
+    sometimes do nothing. The summary row replaces all three and names
+    every extra, so "nothing installed" is distinguishable from "this
+    build has no analysis at all".
+    """
+    widget = _widget_with_extras(monkeypatch, set())
+    try:
+        assert widget._analyze_button is None  # noqa: SLF001
+        assert widget._libertem_button is None  # noqa: SLF001
+        assert widget._py4dstem_button is None  # noqa: SLF001
+
+        summary = _analysis_extras_summary(widget)
+        assert summary is not None
+        assert "enabled: none" in summary
+        assert "available: analysis, libertem, py4dstem" in summary
+        assert 'pip install "miainwoodpecker[analysis,libertem,py4dstem]"' in summary
+    finally:
+        widget.shutdown()
+
+
+def test_only_installed_analysis_buttons_are_built(monkeypatch):
+    """
+    A partly-installed set builds its own buttons and names the rest.
+
+    The case that matters most: the summary has to report both halves,
+    because an operator deciding whether to install anything needs to see
+    what is already there as well as what is missing.
+    """
+    widget = _widget_with_extras(monkeypatch, {"hyperspy"})
+    try:
+        assert widget._analyze_button is not None  # noqa: SLF001
+        assert widget._libertem_button is None  # noqa: SLF001
+        assert widget._py4dstem_button is None  # noqa: SLF001
+
+        summary = _analysis_extras_summary(widget)
+        assert summary is not None
+        assert "enabled: analysis" in summary
+        assert "available: libertem, py4dstem" in summary
+    finally:
+        widget.shutdown()
+
+
+def test_no_extras_summary_when_everything_is_installed(monkeypatch):
+    """
+    With all three installed there is nothing to report, so nothing is shown.
+
+    The summary exists to stand in for missing buttons; with none missing
+    it would be clutter restating what the three buttons already say.
+    """
+    widget = _widget_with_extras(monkeypatch, {"hyperspy", "libertem", "py4dstem"})
+    try:
+        assert widget._analyze_button is not None  # noqa: SLF001
+        assert widget._libertem_button is not None  # noqa: SLF001
+        assert widget._py4dstem_button is not None  # noqa: SLF001
+        assert _analysis_extras_summary(widget) is None
+    finally:
+        widget.shutdown()
 
 
 def _a_frame() -> Frame:

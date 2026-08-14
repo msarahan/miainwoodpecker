@@ -115,8 +115,22 @@ the result back into napari as a new layer:
 By default each button grabs a fresh burst from the camera (saved into
 the session, so the analysis input is kept too). Tick **Analysis buttons
 use the opened file** to run them against a recording you opened
-instead. Each needs its optional dependency installed (`analysis`,
-`libertem`, or `py4dstem` extra) and says so if it is missing.
+instead.
+
+**A button only appears when its extra is installed** — `analysis`,
+`libertem` and `py4dstem` respectively. In place of the missing ones the
+Camera group shows a single **Analysis extras** row naming what is
+enabled, what is available, and the command to install it:
+
+```
+enabled: analysis
+available: libertem, py4dstem
+pip install "miainwoodpecker[libertem,py4dstem]"
+```
+
+With all three installed the row is not shown, because the three buttons
+already say so. A button that cannot work is worse than an absent one:
+it teaches you that this application's buttons sometimes do nothing.
 
 These are deliberately previews, not an analysis suite. For real
 analysis, the same recordings open directly in HyperSpy, LiberTEM, or
