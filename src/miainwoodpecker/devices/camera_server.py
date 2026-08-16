@@ -27,27 +27,39 @@ does for the Nion side. ``hardware`` opens a real capture device.
 
 Which device, and how it is named
 ---------------------------------
-``--plugin`` is the protocol's server-specific configuration channel (see
-:data:`~miainwoodpecker.devices.remote.DEFAULT_SERVER_MODULE`), so this
-server reads it as *what to open*: an index (``"0"``), a device path
-(``"/dev/video0"``), or a media file. A file is not a curiosity — it is
-how a capture is replayed, which makes a recorded session into a
-regression fixture.
+**Say nothing and every working camera is served.** With no ``--plugin``,
+the hardware backend probes the capture indices, keeps the ones that
+deliver a frame, and opens all of them. That is the default because the
+index of a USB microscope is not knowable in advance and is usually *not*
+0 — a laptop's built-in webcam takes that — so a fixed default would show
+the wrong camera and look exactly like a broken device.
 
-**Repeat it for each camera.** A laptop with a built-in webcam and a USB
-microscope plugged in has two cameras, and wanting the microscope
-without unplugging the webcam is the ordinary case rather than an exotic
-one::
+``--plugin`` overrides discovery entirely. It is the protocol's
+server-specific configuration channel (see
+:data:`~miainwoodpecker.devices.remote.DEFAULT_SERVER_MODULE`), read here
+as *what to open*: an index (``"0"``), a device path (``"/dev/video0"``),
+or a media file. A file is not a curiosity — it is how a capture is
+replayed, which makes a recorded session into a regression fixture, and
+it is a thing no probe could ever find.
 
-    --plugin 0 --plugin 1
+**Repeat it for each camera you want named.** A laptop with a built-in
+webcam and a USB microscope has two, and wanting only the microscope is
+the ordinary case::
 
-Each opens on its own target — ``camera``, then ``camera:2``,
+    --plugin 1
+
+Naming beats finding: an operator who says which camera to open has
+answered the question, and quietly adding a webcam they did not ask for
+would be worse than useless on an instrument.
+
+Each device opens on its own target — ``camera``, then ``camera:2``,
 ``camera:3`` — and all of them are live at once. The first keeps the
 plain ``camera`` name that every existing recording and every existing
 test already uses. The number is a **slot**, not an identity: which
 physical device is behind it is in ``device_id`` on every frame and in
-the endpoint label, because the order the devices were named on the
-command line is not something a stored file should depend on.
+the endpoint label, because neither the order they were named in nor the
+order a probe happened to find them is something a stored file should
+depend on.
 
 Targets past the first are names the *client* cannot know in advance, so
 it cannot allocate their ports. They bind on an OS-assigned port instead
@@ -89,6 +101,7 @@ Binning is ``[1]``. Consumer sensors crop; they do not bin.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime
 import logging
 import os
@@ -129,6 +142,17 @@ CAMERA_TARGET = "camera"
 _DEFAULT_DEVICE = "0"
 _SIMULATED_SHAPE = (480, 640)
 _DEFAULT_EXPOSURE_MS = 33.0
+
+# How far discovery looks, and when it gives up. Capture indices are
+# contiguous from 0 on every platform this runs on, so a run of misses
+# means the end of the list rather than a gap - but "a run" is three
+# rather than one, because a laptop whose built-in camera is disabled or
+# already held leaves exactly that kind of hole at index 0, and stopping
+# there would miss the microscope at index 1. The ceiling then bounds the
+# cost on a machine with none at all: probing is not free, and the
+# client's connect deadline is spent while it happens.
+DISCOVERY_MAX_INDEX = 8
+DISCOVERY_MISS_LIMIT = 3
 
 
 class CameraOpenError(RuntimeError):
@@ -638,6 +662,125 @@ class ServerInstrument:
         return {"beam_blanked": False, "errors": errors, "closed": closed}
 
 
+def probe_capture_devices(
+    max_index: int = DISCOVERY_MAX_INDEX,
+    miss_limit: int = DISCOVERY_MISS_LIMIT,
+) -> list[dict[str, object]]:
+    """
+    Open each candidate capture index and report what it delivered.
+
+    **A frame is the test, not an open.** A capture device that opens and
+    then delivers nothing is an ordinary outcome on this class of
+    hardware — a microscope behind an underpowered hub is the usual
+    cause — and serving it would put a target in the viewer that can
+    never produce an image. So the frame is read here and the ones that
+    fail are reported rather than returned as usable.
+
+    Nothing is held: every device is released before this returns, and
+    the server re-opens the ones it was told to serve. That costs one
+    extra open per camera and buys the guarantee that a probe never
+    leaves a device claimed.
+
+    Parameters
+    ----------
+    max_index : int
+        Highest capture index to try, counting from 0.
+    miss_limit : int
+        Stop after this many consecutive indices fail to open. See
+        :data:`DISCOVERY_MISS_LIMIT` for why it is not 1.
+
+    Returns
+    -------
+    list[dict[str, object]]
+        One entry per index that opened, each with ``index``, ``width``,
+        ``height``, ``backend`` and ``frame`` — the last being the shape
+        delivered, or None for a device that opened and gave nothing.
+
+    Raises
+    ------
+    CameraOpenError
+        If OpenCV is not installed, so there is no way to look at all.
+    """
+    try:
+        import cv2  # noqa: PLC0415 - lazy, so the base package needs no OpenCV
+    except ImportError as error:
+        msg = (
+            "discovering cameras needs OpenCV, which is not installed. "
+            "Install this project's 'camera' extra, or name the device "
+            f"with --plugin, or use --backend {SIMULATED_BACKEND}."
+        )
+        raise CameraOpenError(msg) from error
+
+    # Probing absent indices is what this does, so the backend's warning
+    # per miss is expected rather than informative - and on a machine
+    # with no camera it is the only thing the operator would see.
+    with contextlib.suppress(AttributeError):  # older OpenCV builds lack it
+        cv2.utils.logging.setLogLevel(cv2.utils.logging.LOG_LEVEL_SILENT)
+
+    found: list[dict[str, object]] = []
+    misses = 0
+    for index in range(max_index + 1):
+        capture = cv2.VideoCapture(index)
+        try:
+            if not capture.isOpened():
+                misses += 1
+                if misses >= miss_limit:
+                    break
+                continue
+            misses = 0
+            ok, frame = capture.read()
+            found.append(
+                {
+                    "index": index,
+                    "width": int(capture.get(cv2.CAP_PROP_FRAME_WIDTH)),
+                    "height": int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT)),
+                    "backend": capture.getBackendName(),
+                    "frame": None if not ok or frame is None else frame.shape,
+                },
+            )
+        finally:
+            capture.release()
+    return found
+
+
+def discover_devices(
+    max_index: int = DISCOVERY_MAX_INDEX,
+    miss_limit: int = DISCOVERY_MISS_LIMIT,
+) -> list[str]:
+    """
+    Return every capture device worth serving, as ``--plugin`` would name it.
+
+    What ``--plugin`` does by hand. It exists because the index of a USB
+    microscope is not knowable in advance and is usually *not* 0 — a
+    laptop's built-in webcam takes that — so "plug it in and run the
+    viewer" would otherwise show the wrong camera and look like a broken
+    device.
+
+    Only devices that delivered a frame are returned; see
+    :func:`probe_capture_devices` for why an open is not enough.
+
+    Parameters
+    ----------
+    max_index : int
+        Highest capture index to try, counting from 0.
+    miss_limit : int
+        Stop after this many consecutive indices fail to open.
+
+    Returns
+    -------
+    list[str]
+        Device strings in index order, ready to pass to
+        :func:`serve`. Empty when nothing usable was found, which the
+        caller reports — this function does not decide that having no
+        camera is an error, because a caller may be probing.
+    """
+    return [
+        str(candidate["index"])
+        for candidate in probe_capture_devices(max_index, miss_limit)
+        if candidate["frame"]
+    ]
+
+
 def open_camera(backend: str, device: str) -> SimulatedCamera | OpenCVCamera:
     """
     Build the camera the requested backend describes.
@@ -826,13 +969,67 @@ def main(argv: Sequence[str] | None = None) -> int:
     arguments = _parse_args(sys.argv[1:] if argv is None else argv)
     ports = {INSTRUMENT_TARGET: arguments.instrument_port}
     authkey = bytes.fromhex(os.environ["MIAINWOODPECKER_AUTHKEY"])
-    devices = list(arguments.plugin) if arguments.plugin else [_DEFAULT_DEVICE]
     try:
+        devices = _devices_to_serve(arguments.backend, list(arguments.plugin))
         serve(ports, authkey, backend=arguments.backend, devices=devices)
     except CameraOpenError as error:
         _LOGGER.error("%s", error)  # noqa: TRY400 - the message is the diagnostic
         return NO_CAMERA_EXIT_STATUS
     return 0
+
+
+def _devices_to_serve(backend: str, plugins: list[str]) -> list[str]:
+    """
+    Decide which cameras to open: the named ones, or everything found.
+
+    **Naming beats finding, always.** ``--plugin`` given is taken
+    literally, in order, and nothing is discovered — an operator who
+    says which camera to open has answered the question, and quietly
+    adding a webcam they did not ask for would be worse than useless on
+    an instrument. Discovery is what happens when nobody said.
+
+    The simulated backend never discovers, because there is nothing to
+    discover: it synthesises frames and exists so the whole stack runs
+    with nothing plugged in.
+
+    Parameters
+    ----------
+    backend : str
+        ``"simulated"`` or ``"hardware"``.
+    plugins : list[str]
+        What ``--plugin`` named, possibly empty.
+
+    Returns
+    -------
+    list[str]
+        Devices for :func:`serve` to open, in order.
+
+    Raises
+    ------
+    CameraOpenError
+        If discovery ran and found nothing usable. Distinguished from
+        "the device you named would not open" because the fix differs:
+        there is nothing to correct in the command line.
+    """
+    if plugins:
+        return plugins
+    if backend == SIMULATED_BACKEND:
+        return [_DEFAULT_DEVICE]
+    found = discover_devices()
+    if not found:
+        msg = (
+            "no camera was found to serve. No --plugin was given, so every "
+            f"capture index up to {DISCOVERY_MAX_INDEX} was tried and none "
+            f"delivered a frame. {_open_failure_hint()} Name a device "
+            f"explicitly with --plugin, or use --backend {SIMULATED_BACKEND} "
+            "to run without one."
+        )
+        raise CameraOpenError(msg)
+    _LOGGER.info(
+        "no --plugin given; serving discovered %s",
+        ", ".join(f"index {device}" for device in found),
+    )
+    return found
 
 
 if __name__ == "__main__":

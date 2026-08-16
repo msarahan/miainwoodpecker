@@ -238,10 +238,20 @@ from miainwoodpecker.devices.remote import remote_instrument
 with remote_instrument(
     server_module="miainwoodpecker.devices.camera_server",
     backend="hardware",
-    plugin_names=["0"],          # camera index, /dev/video0, or a video file
+    # plugin_names omitted: every working camera is found and served.
+    # Name them - "0", "/dev/video0", or a video file - to pick a subset.
 ) as scope:
     frame = scope.camera.acquire_frame()
 ```
+
+Discovery is the default because a USB microscope's index is not
+knowable in advance and is usually *not* 0 — a laptop's built-in webcam
+takes that — so a fixed default shows the wrong camera and looks exactly
+like a broken device. Naming beats finding: `plugin_names` given is
+taken literally and nothing is discovered, because an operator who says
+which camera to open has answered the question, and quietly adding a
+webcam they did not ask for would be worse than useless on an
+instrument.
 
 Two backends, for the reason `nion_server` has two: `simulated`
 synthesises moving frames and needs **nothing installed**, so the whole
@@ -569,8 +579,9 @@ What landed:
   later, and `PORT_UNAVAILABLE_EXIT_STATUS` exists for exactly that
   window. A port assigned at bind time has no such window.
 - `camera_server` serves **one camera per `--plugin`**, as `camera`,
-  `camera:2`, `camera:3`. The first keeps the name every existing
-  recording uses.
+  `camera:2`, `camera:3`, and with no `--plugin` it discovers and serves
+  every working one. The first keeps the name every existing recording
+  uses.
 - The client honoured `endpoints` when a server reported one and fell
   back to the argv-allocated ports when it did not. That was a
   transitional state, and it is what let the servers move one at a time
