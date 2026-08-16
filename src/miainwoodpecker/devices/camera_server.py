@@ -34,7 +34,27 @@ server reads it as *what to open*: an index (``"0"``), a device path
 how a capture is replayed, which makes a recorded session into a
 regression fixture.
 
-The camera is served on the neutral ``camera`` target rather than
+**Repeat it for each camera.** A laptop with a built-in webcam and a USB
+microscope plugged in has two cameras, and wanting the microscope
+without unplugging the webcam is the ordinary case rather than an exotic
+one::
+
+    --plugin 0 --plugin 1
+
+Each opens on its own target — ``camera``, then ``camera:2``,
+``camera:3`` — and all of them are live at once. The first keeps the
+plain ``camera`` name that every existing recording and every existing
+test already uses. The number is a **slot**, not an identity: which
+physical device is behind it is in ``device_id`` on every frame and in
+the endpoint label, because the order the devices were named on the
+command line is not something a stored file should depend on.
+
+Targets past the first are names the *client* cannot know in advance, so
+it cannot allocate their ports. They bind on an OS-assigned port instead
+and the server reports where, through ``describe()``'s ``endpoints``
+map. See docs/vendor-support.md, "The target names are a fixed tuple".
+
+Cameras are served on the neutral ``camera`` family rather than
 ``ronchigram_camera``, because calling a USB microscope a Ronchigram
 camera would put a fiction in every file.
 
@@ -84,7 +104,7 @@ from miainwoodpecker.devices.interface import (
     Frame,
 )
 from miainwoodpecker.devices.rpc import BACKENDS, SIMULATED_BACKEND
-from miainwoodpecker.devices.serving import accept_loop
+from miainwoodpecker.devices.serving import accept_loop, bind_targets
 from miainwoodpecker.devices.shared_frame import SharedFrameWriter
 
 if typing.TYPE_CHECKING:
@@ -509,6 +529,22 @@ class ServerInstrument:
         self._stop = stop_event
         self._backend = backend
         self._shutting_down = False
+        self._endpoints: dict[str, dict[str, object]] = {}
+
+    def publish_endpoints(self, endpoints: dict[str, dict[str, object]]) -> None:
+        """
+        Record where each target is listening, for ``describe`` to report.
+
+        Set after the listeners bind rather than passed to ``__init__``,
+        because a target bound on an OS-assigned port does not know its
+        own port until it has one.
+
+        Parameters
+        ----------
+        endpoints : dict[str, dict[str, object]]
+            Target name to its ``port``, ``kind`` and ``label``.
+        """
+        self._endpoints = endpoints
 
     def stage_size_nm(self) -> float:
         """
@@ -536,13 +572,17 @@ class ServerInstrument:
         Returns
         -------
         dict[str, object]
-            ``backend``, ``targets``, ``controls`` and ``stage_size_nm``.
+            ``backend``, ``targets``, ``controls``, ``stage_size_nm``
+            and ``endpoints`` — the last naming the port, kind and
+            label of every target, so a client can dial targets whose
+            names it does not know in advance.
         """
         return {
             "backend": self._backend,
             "targets": [name for name in self._targets if name != "instrument"],
             "controls": [],
             "stage_size_nm": self.stage_size_nm(),
+            "endpoints": self._endpoints,
         }
 
     def health(self) -> dict[str, object]:
@@ -623,26 +663,58 @@ def open_camera(backend: str, device: str) -> SimulatedCamera | OpenCVCamera:
     return OpenCVCamera(device)
 
 
+def camera_target_name(index: int) -> str:
+    """
+    Return the target name for the *index*-th camera this server opens.
+
+    The first keeps the plain ``camera`` name every existing recording
+    and every existing test already uses; the rest are numbered from two,
+    which is how an operator refers to them out loud. The number is a
+    **slot**, not an identity — which physical device is behind it is in
+    ``device_id`` on every frame, and in the endpoint's label, because
+    the order the devices were named on the command line is not
+    something a file should depend on.
+
+    Parameters
+    ----------
+    index : int
+        Zero-based position in the served list.
+
+    Returns
+    -------
+    str
+        ``"camera"`` for the first, ``"camera:2"``, ``"camera:3"``, … after.
+    """
+    return CAMERA_TARGET if index == 0 else f"{CAMERA_TARGET}:{index + 1}"
+
+
 def serve(
     ports: typing.Mapping[str, int],
     authkey: bytes,
     *,
     backend: str = SIMULATED_BACKEND,
-    device: str = _DEFAULT_DEVICE,
+    devices: Sequence[str] = (_DEFAULT_DEVICE,),
 ) -> None:
     """
-    Open the camera and serve it until a client shuts the server down.
+    Open every requested camera and serve until a client shuts the server down.
+
+    More than one camera is an ordinary case rather than an exotic one:
+    a laptop with a built-in webcam and a USB microscope plugged in has
+    two, and an operator wants the microscope without unplugging
+    anything. Each opens on its own target, so both are live at once.
 
     Parameters
     ----------
     ports : typing.Mapping[str, int]
-        Port for each target name; only the ones served are bound.
+        Ports the client allocated, by target name. Targets it could not
+        name in advance — every camera after the first — bind on an
+        OS-assigned port and are reported through ``describe``.
     authkey : bytes
         Shared secret for every Listener.
     backend : str
         ``"simulated"`` or ``"hardware"``.
-    device : str
-        What the hardware backend opens.
+    devices : Sequence[str]
+        What the hardware backend opens, one camera per entry.
 
     Raises
     ------
@@ -650,24 +722,38 @@ def serve(
         With :data:`PORT_UNAVAILABLE_EXIT_STATUS` when a listener cannot
         bind, so the client retries with fresh ports.
     """
-    from multiprocessing.connection import Listener  # noqa: PLC0415 - see nion_server
-
-    camera = open_camera(backend, device)
     stop_event = threading.Event()
-    targets: dict[str, object] = {CAMERA_TARGET: camera}
-    targets["instrument"] = ServerInstrument(targets, stop_event, backend)
-    writers = {CAMERA_TARGET: SharedFrameWriter(), "instrument": None}
+    targets: dict[str, object] = {}
+    writers: dict[str, SharedFrameWriter | None] = {}
+    labels: dict[str, str] = {}
+    for index, device in enumerate(devices):
+        name = camera_target_name(index)
+        camera = open_camera(backend, device)
+        targets[name] = camera
+        writers[name] = SharedFrameWriter()
+        labels[name] = camera.camera_id
+    instrument = ServerInstrument(targets, stop_event, backend)
+    targets["instrument"] = instrument
+    writers["instrument"] = None
 
     names = list(targets)
     try:
-        listeners = [
-            Listener(("localhost", ports[name]), authkey=authkey) for name in names
-        ]
+        listeners, bound = bind_targets(names, ports, authkey)
     except OSError as error:
         _LOGGER.error(  # noqa: TRY400 - a traceback adds nothing here
             "could not bind a listener (%s); the client will retry", error,
         )
         raise SystemExit(PORT_UNAVAILABLE_EXIT_STATUS) from error
+    instrument.publish_endpoints(
+        {
+            name: {
+                "port": bound[name],
+                "kind": "instrument" if name == "instrument" else "camera",
+                "label": labels.get(name, "instrument"),
+            }
+            for name in names
+        },
+    )
 
     _LOGGER.info("serving %s on backend %s", ", ".join(names), backend)
     for listener, name in zip(listeners, names, strict=True):
@@ -741,9 +827,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     arguments = _parse_args(sys.argv[1:] if argv is None else argv)
     ports = dict(zip(TARGET_NAMES, arguments.ports, strict=True))
     authkey = bytes.fromhex(os.environ["MIAINWOODPECKER_AUTHKEY"])
-    device = arguments.plugin[0] if arguments.plugin else _DEFAULT_DEVICE
+    devices = list(arguments.plugin) if arguments.plugin else [_DEFAULT_DEVICE]
     try:
-        serve(ports, authkey, backend=arguments.backend, device=device)
+        serve(ports, authkey, backend=arguments.backend, devices=devices)
     except CameraOpenError as error:
         _LOGGER.error("%s", error)  # noqa: TRY400 - the message is the diagnostic
         return NO_CAMERA_EXIT_STATUS

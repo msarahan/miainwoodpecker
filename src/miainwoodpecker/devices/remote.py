@@ -110,7 +110,7 @@ import sys
 import threading
 import time
 import typing
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from miainwoodpecker.devices.rpc import (
     BACKENDS,
@@ -1654,6 +1654,15 @@ class RemoteInstrumentDevices:
         position — a test, a script, an out-of-tree tool — keeps working
         untouched. An EELS spectrometer is **not** here; it disperses
         onto a camera and is served as one.
+    additional_cameras : typing.Mapping[str, RemoteCamera]
+        Cameras served under names this client has no field for. A
+        commodity server opening a webcam *and* a USB microscope serves
+        ``camera`` and ``camera:2``; only the first has a named slot
+        here. Rather than invent fields or drop the rest, the extras
+        live here and :meth:`cameras` returns the whole set, which is
+        what a caller asking "what is on this instrument?" wants. The
+        three named fields stay because the viewer, the scripts and
+        every recording are written against them.
     """
 
     ronchigram_camera: RemoteCamera | None
@@ -1663,6 +1672,9 @@ class RemoteInstrumentDevices:
     instrument: RemoteInstrument
     stage_size_nm: float
     spectrum_detector: RemoteSpectrumDetector | None = None
+    additional_cameras: typing.Mapping[str, RemoteCamera] = field(
+        default_factory=dict,
+    )
 
     def spectrum_detectors(self) -> dict[str, RemoteSpectrumDetector]:
         """
@@ -1702,7 +1714,7 @@ class RemoteInstrumentDevices:
         dict[str, RemoteCamera]
             Target name to camera, omitting those this server lacks.
         """
-        return {
+        named = {
             name: camera
             for name, camera in zip(
                 _CAMERA_TARGET_NAMES,
@@ -1711,6 +1723,7 @@ class RemoteInstrumentDevices:
             )
             if camera is not None
         }
+        return {**named, **dict(self.additional_cameras)}
 
 
 # Historical name, kept because the migration plan and README refer to it.
@@ -1868,6 +1881,48 @@ class _ConnectedSession:
     devices: tuple[_RemoteDevice, ...]
 
 
+
+def _reported_endpoints(
+    description: typing.Mapping[str, object],
+) -> dict[str, dict[str, object]]:
+    """
+    Return the endpoint map a server reported, or an empty one.
+
+    A server that binds targets on OS-assigned ports has to say where
+    they are, and it says so here — target name to ``port``, ``kind``
+    and ``label``. That is what lets a server offer targets this client
+    could not have allocated a port for, because it did not know their
+    names: a second commodity camera, or a detector list from an adapter
+    written after this client shipped.
+
+    Absent for a server that serves only the names in
+    :data:`~miainwoodpecker.devices.rpc.TARGET_NAMES`, which are reached
+    on the ports the client allocated and passed on the command line.
+    Returning an empty mapping rather than raising keeps those servers
+    working unchanged, which is what makes this migration one server at
+    a time rather than all of them at once.
+
+    Parameters
+    ----------
+    description : typing.Mapping[str, object]
+        What ``instrument.describe()`` returned.
+
+    Returns
+    -------
+    dict[str, dict[str, object]]
+        The endpoint map, or ``{}`` when the server reported none or
+        reported something the wrong shape.
+    """
+    reported = description.get("endpoints")
+    if not isinstance(reported, dict):
+        return {}
+    return {
+        str(name): entry
+        for name, entry in reported.items()
+        if isinstance(entry, dict) and "port" in entry
+    }
+
+
 def _connect_session(
     ports: typing.Mapping[str, int],
     authkey: bytes,
@@ -1931,15 +1986,34 @@ def _connect_session(
     )
     description = instrument.describe()
     served = typing.cast("Sequence[str]", description["targets"])
+    endpoints = _reported_endpoints(description)
     for name in served:
+        # A server that reports endpoints has told us where each target
+        # is listening, including targets whose names this client could
+        # not allocate a port for. One that does not is served entirely
+        # from the client-allocated ports, exactly as before.
+        port = endpoints[name]["port"] if name in endpoints else ports[name]
         connections[name] = _connect_with_retry(
-            ports[name], authkey, deadline, process, server_module,
+            int(typing.cast("int", port)),
+            authkey,
+            deadline,
+            process,
+            server_module,
         )
 
+    camera_names = [
+        name
+        for name in served
+        if name in connections
+        and (
+            endpoints[name].get("kind") == "camera"
+            if name in endpoints
+            else name in _CAMERA_TARGET_NAMES
+        )
+    ]
     cameras = {
         name: RemoteCamera(connections[name], name, lifecycle)
-        for name in _CAMERA_TARGET_NAMES
-        if name in connections
+        for name in camera_names
     }
     # Optional for the same reason the cameras are. A detector-only
     # server - a camera driven directly, with no scan unit - used to
@@ -2260,6 +2334,11 @@ def remote_instrument(
                 spectrum_detector=session.spectrum_detectors.get(
                     "spectrum_detector",
                 ),
+                additional_cameras={
+                    name: camera
+                    for name, camera in session.cameras.items()
+                    if name not in _CAMERA_TARGET_NAMES
+                },
             )
         finally:
             _shut_down_server(
@@ -3036,6 +3115,11 @@ def attached_instrument(  # noqa: PLR0913 - one entry point, published in full
                     stage_size_nm=float(
                         typing.cast("float", description["stage_size_nm"]),
                     ),
+                    additional_cameras={
+                        name: camera
+                        for name, camera in cameras.items()
+                        if name not in _CAMERA_TARGET_NAMES
+                    },
                 )
             finally:
                 _detach_server(instrument, devices)

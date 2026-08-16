@@ -44,14 +44,70 @@ from miainwoodpecker.devices.rpc import (
 )
 
 if typing.TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Sequence
     from multiprocessing.connection import Listener
 
     from miainwoodpecker.devices.shared_frame import SharedFrameWriter
 
-__all__ = ["accept_loop", "invoke", "serve_connection"]
+__all__ = ["accept_loop", "bind_targets", "invoke", "serve_connection"]
 
 _LOGGER = logging.getLogger("miainwoodpecker.devices.serving")
+
+
+
+def bind_targets(
+    names: Sequence[str],
+    ports: typing.Mapping[str, int],
+    authkey: bytes,
+) -> tuple[list[Listener], dict[str, int]]:
+    """
+    Bind one listener per target, letting the OS choose unnamed ports.
+
+    The client allocates and passes a port only for the targets it can
+    name in advance. Anything else — a second commodity camera, a
+    detector list this client has never heard of — binds on **port 0**,
+    which is the OS choosing a free ephemeral port, and the port it
+    actually got is reported back through ``describe()`` for the client
+    to dial.
+
+    That is what lets a server serve targets whose names the client
+    does not know, and it removes a race as a side effect: a
+    client-allocated port is probed free and bound later, so something
+    else on the machine can take it in between (the
+    :data:`PORT_UNAVAILABLE_EXIT_STATUS` retry exists for exactly that
+    window). A port the OS assigns at bind time cannot be lost that way,
+    because there is no gap between choosing and binding.
+
+    Parameters
+    ----------
+    names : Sequence[str]
+        Target names to bind, in the order the listeners are returned.
+    ports : typing.Mapping[str, int]
+        Ports the client allocated, by target name. A name absent from
+        this mapping binds on an OS-assigned port.
+    authkey : bytes
+        Shared secret for every listener.
+
+    Returns
+    -------
+    tuple[list[Listener], dict[str, int]]
+        The listeners, and the port each one actually bound.
+
+    Notes
+    -----
+    A listener that cannot bind raises ``OSError`` from ``Listener``
+    itself; callers translate that into
+    :data:`PORT_UNAVAILABLE_EXIT_STATUS` so the client respawns.
+    """
+    from multiprocessing.connection import Listener  # noqa: PLC0415 - see nion_server
+
+    listeners: list[Listener] = []
+    bound: dict[str, int] = {}
+    for name in names:
+        listener = Listener(("localhost", ports.get(name, 0)), authkey=authkey)
+        listeners.append(listener)
+        bound[name] = int(listener.address[1])
+    return listeners, bound
 
 
 def _stackable_frames(value: object) -> list[Frame] | None:

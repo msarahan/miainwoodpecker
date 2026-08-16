@@ -555,10 +555,40 @@ name is a fiction.
 The fix is a protocol change, not a rename: bind **one** well-known
 port for `instrument`, have the server choose and report the rest through
 `describe()`, and let the client connect to what it is told. That removes
-the positional-argv fragility as a side effect. It touches spawn,
-connect, teardown, and roughly a dozen tests. Deliberately not done
-speculatively — it should land *with* the second adapter, when there is a
-real device list to test it against.
+the positional-argv fragility as a side effect.
+
+**This is now half done, and the trigger was not the one predicted here.**
+This section said the redesign should wait for a second *column* adapter,
+"when there is a real device list to test it against". The real device
+list turned out to be two USB cameras on a desk — a webcam and a USB
+microscope — which exercises exactly the same protocol question for the
+price of plugging something in, with no beam time and no vendor
+conversation. Waiting for a column adapter was waiting for the expensive
+version of a cheap test.
+
+What has landed:
+
+- `describe()` reports an **`endpoints`** map — target name to `port`,
+  `kind` and `label` — so a server can serve targets whose names the
+  client could not have allocated a port for.
+- Targets the client cannot name bind on **port 0**, which is the OS
+  choosing a free ephemeral port. That also removes a race rather than
+  only a limitation: a client-allocated port is probed free and bound
+  later, and `PORT_UNAVAILABLE_EXIT_STATUS` exists for exactly that
+  window. A port assigned at bind time has no such window.
+- `camera_server` serves **one camera per `--plugin`**, as `camera`,
+  `camera:2`, `camera:3`. The first keeps the name every existing
+  recording uses.
+- The client honours `endpoints` when a server reports one and falls
+  back to the argv-allocated ports when it does not, which is what makes
+  this a migration rather than a flag day.
+
+What has **not** landed: `nion_server`, `dectris_server` and
+`spectrum_server` still take the positional port list and are still
+limited to the fixed tuple. They work unchanged — that is the point of
+the fallback — but the argv shape cannot be deleted until they move, and
+until it is deleted the fragility it causes is still there for them.
+`TARGET_NAMES` is therefore still append-only for those three.
 
 ### `ScanParameters.fov_nm` encodes Nion's convention
 
