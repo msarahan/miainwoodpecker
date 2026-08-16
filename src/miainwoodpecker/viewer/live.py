@@ -339,6 +339,9 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         # a reference for identity comparison only; the array itself is
         # the layer's, not a second copy.
         self._displayed: dict[str, Frame] = {}
+        # Section title to section, so a caller - and a test - can ask
+        # which devices the window offered and whether each is folded.
+        self._device_sections: dict[str, devices_panel.CollapsibleSection] = {}
         self._session: Session | None = None
         self._recording_job: RecordingJob | None = None
         self._load_job: LoadJob | None = None
@@ -382,10 +385,7 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         layout = QtWidgets.QVBoxLayout(self)
         layout.addWidget(session_panel.build_session_group(self))
         layout.addWidget(recordings_panel.build_recordings_group(self))
-        if self._scanner is not None:
-            layout.addWidget(devices_panel.build_scan_group(self))
-        if self._camera is not None:
-            layout.addWidget(devices_panel.build_camera_group(self))
+        layout.addWidget(devices_panel.build_devices_panel(self))
         layout.addStretch(1)
 
     def _on_scan_settings_changed(self) -> None:

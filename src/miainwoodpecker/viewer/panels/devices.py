@@ -272,3 +272,152 @@ def build_extras_summary(
     label.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
     label.setWordWrap(True)
     return label
+
+
+class CollapsibleSection(QtWidgets.QWidget):
+    """
+    One device's controls, behind a header that folds them away.
+
+    An instrument with a scan unit, three cameras and a spectrometer has
+    more controls than fit on a screen, and an operator aligning one
+    detector does not want the other four in the way. Folding is the
+    cheapest answer that keeps *several* open at once, which tabs would
+    not: watching a camera while a scan runs is the ordinary case.
+
+    A disclosure triangle rather than ``QGroupBox.setCheckable``, which
+    would put a checkbox in the title. On an instrument panel a checkbox
+    beside a device name reads as "switch this device off", and a
+    control that looks like it turns hardware off had better turn
+    hardware off.
+    """
+
+    def __init__(
+        self,
+        title: str,
+        content: QtWidgets.QWidget,
+        parent: QtWidgets.QWidget | None = None,
+        *,
+        expanded: bool = True,
+    ) -> None:
+        super().__init__(parent)
+        self._toggle = QtWidgets.QToolButton(self)
+        self._toggle.setText(title)
+        self._toggle.setCheckable(True)
+        self._toggle.setChecked(expanded)
+        self._toggle.setStyleSheet("QToolButton { border: none; font-weight: 600; }")
+        self._toggle.setToolButtonStyle(QtCore.Qt.ToolButtonTextBesideIcon)
+        self._toggle.setArrowType(
+            QtCore.Qt.DownArrow if expanded else QtCore.Qt.RightArrow,
+        )
+        self._content = content
+        content.setParent(self)
+        content.setVisible(expanded)
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self._toggle)
+        layout.addWidget(content)
+        self._toggle.toggled.connect(self.set_expanded)
+
+    @property
+    def title(self) -> str:
+        """Return the header text, which names the device."""
+        return self._toggle.text()
+
+    def is_expanded(self) -> bool:
+        """
+        Report whether this section's controls are showing.
+
+        Returns
+        -------
+        bool
+            True when the content is visible.
+        """
+        return self._toggle.isChecked()
+
+    def set_expanded(self, expanded: bool) -> None:  # noqa: FBT001
+        """
+        Show or fold this section's controls.
+
+        Positionally typed ``bool`` because this is a Qt slot: it is
+        connected to ``QToolButton.toggled``, which calls it with the
+        new state as the one positional argument.
+
+        Parameters
+        ----------
+        expanded : bool
+            True to show the content, False to fold it away.
+        """
+        if self._toggle.isChecked() != expanded:
+            self._toggle.setChecked(expanded)
+        self._toggle.setArrowType(
+            QtCore.Qt.DownArrow if expanded else QtCore.Qt.RightArrow,
+        )
+        self._content.setVisible(expanded)
+
+
+def build_devices_panel(widget: LiveInstrumentWidget) -> QtWidgets.QGroupBox:
+    """
+    Build the Devices panel: one foldable section per device served.
+
+    Built from what the instrument actually has rather than from a fixed
+    list, which is the same rule ``_build_ui`` already followed for the
+    scan group and is now worth stating: a detector-only instrument gets
+    no Scan section, and gets no empty placeholder either.
+
+    The first section opens and the rest fold, so a one-device
+    instrument looks exactly as it did before this panel existed and a
+    five-device one still fits on a screen.
+
+    Parameters
+    ----------
+    widget : LiveInstrumentWidget
+        The widget that owns the resulting controls; every
+        ``_``-prefixed attribute set here belongs to it.
+
+    Returns
+    -------
+    QtWidgets.QGroupBox
+        The assembled panel, for the caller to add to its layout.
+    """
+    panel = QtWidgets.QGroupBox("Devices", widget)
+    layout = QtWidgets.QVBoxLayout(panel)
+    built: list[tuple[str, QtWidgets.QWidget]] = []
+    if widget._scanner is not None:
+        built.append(("Scan", build_scan_group(widget)))
+    if widget._camera is not None:
+        built.append((_camera_section_title(widget), build_camera_group(widget)))
+
+    widget._device_sections = {}
+    for index, (title, content) in enumerate(built):
+        # The section header names the device now, so the group box
+        # inside it would otherwise say the same word twice.
+        if isinstance(content, QtWidgets.QGroupBox):
+            content.setTitle("")
+        section = CollapsibleSection(title, content, panel, expanded=index == 0)
+        widget._device_sections[title] = section
+        layout.addWidget(section)
+    return panel
+
+
+def _camera_section_title(widget: LiveInstrumentWidget) -> str:
+    """
+    Name the camera section after the device, not after the slot.
+
+    ``camera`` tells an operator nothing when there are two of them, so
+    the section is titled with what the device calls itself and falls
+    back to the target name when it will not say.
+
+    Parameters
+    ----------
+    widget : LiveInstrumentWidget
+        The widget holding the camera.
+
+    Returns
+    -------
+    str
+        A human-readable section title.
+    """
+    camera = widget._camera
+    identifier = getattr(camera, "camera_id", None)
+    return f"Camera - {identifier}" if identifier else "Camera"

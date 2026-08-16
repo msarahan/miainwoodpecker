@@ -1526,13 +1526,19 @@ def test_camera_only_instrument_builds_a_window_with_no_scan_group():
     is *missing* from the window rather than present and disabled: a
     greyed-out Scan group would invite an operator to look for the
     scanner that is not there.
+
+    Asserted on the Devices panel's section titles, which is where a
+    device's name now lives — the section header names it, so the group
+    box inside no longer repeats the word.
     """
     viewer = napari.Viewer(show=False)
     camera = _FakeCamera()
     widget = LiveInstrumentWidget(viewer, None, camera=camera)
     try:
+        sections = set(widget._device_sections)  # noqa: SLF001
+        assert sections == {"Camera - fake_camera"}
+        assert not any(title.startswith("Scan") for title in sections)
         titles = {box.title() for box in widget.findChildren(QtWidgets.QGroupBox)}
-        assert "Camera" in titles
         assert "Scan" not in titles
 
         widget.start_camera()
@@ -1626,6 +1632,63 @@ def test_disk_warning_uses_the_camera_shape_when_there_is_no_scanner(
 
         assert "warning" in widget._space_label.text()  # noqa: SLF001
         assert "camera frames need up to" in widget._space_label.text()  # noqa: SLF001
+    finally:
+        widget.shutdown()
+        viewer.close()
+
+
+def test_devices_panel_has_a_section_per_device():
+    """
+    Each device served gets its own foldable section, named after itself.
+
+    The camera section is titled with what the device calls itself
+    rather than with its target name: ``camera`` tells an operator
+    nothing once there is more than one of them.
+    """
+    viewer = napari.Viewer(show=False)
+    widget = LiveInstrumentWidget(viewer, _FakeScanner(), camera=_FakeCamera())
+    try:
+        sections = widget._device_sections  # noqa: SLF001
+        assert list(sections) == ["Scan", "Camera - fake_camera"]
+    finally:
+        widget.shutdown()
+        viewer.close()
+
+
+def test_the_devices_panel_offers_only_what_is_served():
+    """
+    A detector-only instrument gets no Scan section, and no placeholder.
+
+    Built from what the instrument has rather than from a fixed list,
+    which is the rule ``_build_ui`` already followed for the scan group
+    and which the Devices panel now applies to every device.
+    """
+    viewer = napari.Viewer(show=False)
+    widget = LiveInstrumentWidget(viewer, None, camera=_FakeCamera())
+    try:
+        assert list(widget._device_sections) == ["Camera - fake_camera"]  # noqa: SLF001
+    finally:
+        widget.shutdown()
+        viewer.close()
+
+
+def test_the_first_section_opens_and_the_rest_fold():
+    """
+    A one-device window looks as it always did; a many-device one fits.
+
+    Folding rather than tabs, because several devices open at once is
+    the ordinary case: watching a camera while a scan runs.
+    """
+    viewer = napari.Viewer(show=False)
+    widget = LiveInstrumentWidget(viewer, _FakeScanner(), camera=_FakeCamera())
+    try:
+        sections = list(widget._device_sections.values())  # noqa: SLF001
+        assert [section.is_expanded() for section in sections] == [True, False]
+
+        sections[1].set_expanded(True)
+        assert sections[1].is_expanded()
+        sections[0].set_expanded(False)
+        assert [section.is_expanded() for section in sections] == [False, True]
     finally:
         widget.shutdown()
         viewer.close()
