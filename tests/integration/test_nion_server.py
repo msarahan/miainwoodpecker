@@ -64,7 +64,6 @@ from miainwoodpecker.devices.nion_server import (
     open_instrument,
     simulated_instrument,
 )
-from miainwoodpecker.devices.rpc import TARGET_NAMES
 from miainwoodpecker.storage.calibration import (
     AxisKind,
     FrameCalibration,
@@ -437,11 +436,13 @@ def _camera_frame(camera) -> np.ndarray:
 # environment made ``--plugin foo`` mean "the environment's plug-ins *and*
 # foo". On a hardware backend that loads vendor plug-ins nobody asked for.
 
-# Derived from the protocol rather than written out: the server takes one
-# positional port per target name, so a hard-coded list silently becomes
-# an argparse error the day a target is added - which is exactly what
-# happened when the neutral "camera" target arrived.
-_PORTS = [str(5001 + index) for index in range(len(TARGET_NAMES))]
+# The whole port list, which is now one port: everything else the server
+# serves binds where the OS says and is reported through describe(). This
+# used to be derived from TARGET_NAMES, because a hard-coded list became
+# an argparse error the day a target was added - which is exactly what
+# happened when the neutral "camera" target arrived, and is the fragility
+# the one-port shape removes.
+_PORTS = ["--instrument-port", "5001"]
 
 
 def test_named_plugins_override_the_environment(monkeypatch):

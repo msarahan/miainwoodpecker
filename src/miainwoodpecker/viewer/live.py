@@ -47,9 +47,25 @@ Importing this module requires the ``viewer`` optional dependency group.
 The camera group's "Analyze in HyperSpy", "Sum in LiberTEM", and "Fit
 central disk (py4DSTEM)" buttons additionally need the ``analysis``,
 ``libertem``, and ``py4dstem`` groups respectively (migration plan,
-Phase 4); all three libraries are imported lazily so this module still
-imports and the buttons still render without them, only reporting the
-missing extra in the status label if clicked.
+Phase 4). All three libraries are imported lazily, so this module still
+imports without them — and **each button is built only when its own
+extra is installed**, with a single row naming the enabled and available
+extras standing in for the ones that are not. A button that cannot work
+is worse than an absent one: it teaches the operator that this
+application's buttons sometimes do nothing.
+
+Where the panels live
+---------------------
+This module assembles the window; each panel is built in its own module
+under :mod:`miainwoodpecker.viewer.panels`, which is where they moved
+when this file passed 1900 lines. They are **builders taking the
+widget**, not methods on it and not widget subclasses, and that is the
+whole point of the arrangement: the construction moved out, the *state*
+did not. Every control is still an attribute of this class, so every
+method here, and every test, reaches for it exactly where it always
+did. A panel that owned its own children would have moved
+``_analyze_status`` to ``_camera_panel._analyze_status`` and made a file
+split into an API change.
 """
 
 from __future__ import annotations
@@ -79,6 +95,17 @@ from miainwoodpecker.storage.session import (
     free_space,
 )
 from miainwoodpecker.viewer.jobs import AnalysisJob
+from miainwoodpecker.viewer.panels import devices as devices_panel
+from miainwoodpecker.viewer.panels import instrument as instrument_panel
+from miainwoodpecker.viewer.panels import recordings as recordings_panel
+from miainwoodpecker.viewer.panels import session as session_panel
+from miainwoodpecker.viewer.panels.defaults import (
+    _DEFAULT_DWELL_US,
+    _DEFAULT_FOV_NM,
+    _DEFAULT_SCAN_SIZE_INDEX,
+    _NO_SESSION_MESSAGE,
+    _SCAN_SIZES,
+)
 
 if typing.TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Iterator, Sequence
@@ -87,29 +114,70 @@ if typing.TYPE_CHECKING:
 
     from miainwoodpecker.analysis.operations import AnalysisInput
     from miainwoodpecker.analysis.remote import AnalysisRunner
-    from miainwoodpecker.devices.interface import Camera, Frame, Scanner
+    from miainwoodpecker.devices.interface import (
+        Camera,
+        Frame,
+        Instrument,
+        Scanner,
+    )
     from miainwoodpecker.storage.nexus import FrameStack
     from miainwoodpecker.storage.session import LoadedRecording, Recording
 
 _DEFAULT_DISPLAY_INTERVAL_MS = 33
-_SCAN_SIZES = (128, 256, 512)
-_DEFAULT_SCAN_SIZE_INDEX = 1  # 256
-_DEFAULT_DWELL_US = 1.0
-_DEFAULT_FOV_NM = 15.0
 _ANALYSIS_BURST_FRAME_COUNT = 5
-_DEFAULT_RECORD_FRAME_COUNT = 10
-_MAX_RECORD_FRAME_COUNT = 100000
-_NO_SESSION_MESSAGE = "no session - data is not being kept"
 # Shown when a live loop would not release the device in time. Refusing is
 # deliberate: driving a device from two threads corrupts frames silently
 # rather than raising (docs/architecture-review.md, §1.2).
 _SCANNER_BUSY_MESSAGE = "scanner still busy - live scan did not stop, try again"
 _CAMERA_BUSY_MESSAGE = "camera still busy - live loop did not stop, try again"
-_NOTES_HEIGHT_PX = 64
 # Long enough that typing a sentence writes the sidecar once, short enough
 # that an operator who types and immediately clicks Record has their note.
-_CONTEXT_SAVE_DELAY_MS = 750
 _NEXUS_FILE_FILTER = "NeXus recordings (*.nxs *.h5 *.hdf5);;All files (*)"
+
+
+@dataclasses.dataclass
+class _CameraBinding:
+    """
+    One camera, with the controls and the live loop that drive it.
+
+    An instrument can serve several cameras — a webcam and a USB
+    microscope, a Ronchigram camera and an EELS camera — and each needs
+    its own start/stop state, its own frame counter and its own napari
+    layer. Grouping them here rather than in parallel dictionaries keeps
+    "which loop belongs to which button" impossible to get wrong.
+
+    Attributes
+    ----------
+    name : str
+        The target name the server serves this camera on.
+    camera : Camera
+        The device itself.
+    layer_name : str
+        The napari layer its frames are pushed into. One layer per
+        camera, so two live cameras do not overwrite each other.
+    loop : LiveAcquisition | None
+        Its live-acquisition loop while running, None otherwise.
+    button : QtWidgets.QPushButton | None
+        Start/stop, or None before the panel is built.
+    status : QtWidgets.QLabel | None
+        Its status line.
+    count_spin : QtWidgets.QSpinBox | None
+        How many frames its Record button records.
+    save_button : QtWidgets.QPushButton | None
+        Save the displayed frame.
+    record_button : QtWidgets.QPushButton | None
+        Record a series.
+    """
+
+    name: str
+    camera: Camera
+    layer_name: str
+    loop: LiveAcquisition | None = None
+    button: QtWidgets.QPushButton | None = None
+    status: QtWidgets.QLabel | None = None
+    count_spin: QtWidgets.QSpinBox | None = None
+    save_button: QtWidgets.QPushButton | None = None
+    record_button: QtWidgets.QPushButton | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -281,7 +349,19 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         The scan device to drive, or None for a detector-only instrument.
     camera : Camera | None
         An optional camera to offer a live view for (e.g. Ronchigram, or
-        a commodity USB camera).
+        a commodity USB camera). The one-entry case of ``cameras``, kept
+        because the viewer, the scripts and every existing test use it.
+    cameras : typing.Mapping[str, Camera] | None
+        Every camera the instrument serves, by target name — a webcam
+        *and* a USB microscope, or a Ronchigram *and* an EELS camera.
+        Each gets its own section, its own live loop and its own napari
+        layer, so two can run at once. The first is what a call that
+        names no camera acts on.
+    instrument : Instrument | None
+        The instrument itself, for the Instrument panel: what this is
+        connected to, and the controls it publishes. None gives a panel
+        that says what it knows and offers no controls, which is what a
+        caller constructing the widget without one has always had.
     display_interval_ms : int
         How often the display polls for new frames.
     parent : QtWidgets.QWidget | None
@@ -296,16 +376,24 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         opening empty.
     """
 
-    def __init__(
+    def __init__(  # noqa: PLR0913 - all but viewer/scanner are keyword-only
         self,
         viewer: napari.Viewer,
         scanner: Scanner | None,
         *,
         camera: Camera | None = None,
+        cameras: typing.Mapping[str, Camera] | None = None,
+        instrument: Instrument | None = None,
         display_interval_ms: int = _DEFAULT_DISPLAY_INTERVAL_MS,
         parent: QtWidgets.QWidget | None = None,
     ) -> None:
-        if scanner is None and camera is None:
+        served = dict(cameras) if cameras else {}
+        if camera is not None and camera not in served.values():
+            # The single-camera keyword stays, because the viewer, the
+            # scripts and every existing test use it. It is the one-entry
+            # case of the mapping rather than a separate path.
+            served = {"camera": camera, **served}
+        if scanner is None and not served:
             msg = (
                 "LiveInstrumentWidget needs a scanner, a camera, or both - "
                 "an instrument with neither has nothing to display"
@@ -314,14 +402,28 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         super().__init__(parent)
         self._viewer = viewer
         self._scanner = scanner
-        self._camera = camera
+        self._instrument = instrument
+        self._instrument_controls: dict[str, QtWidgets.QDoubleSpinBox] = {}
+        self._instrument_stage_y: QtWidgets.QDoubleSpinBox | None = None
+        self._instrument_stage_x: QtWidgets.QDoubleSpinBox | None = None
+        self._instrument_blanker: QtWidgets.QCheckBox | None = None
+        self._camera_bindings: dict[str, _CameraBinding] = {
+            name: _CameraBinding(
+                name=name,
+                camera=device,
+                layer_name="Camera" if index == 0 else f"Camera ({name})",
+            )
+            for index, (name, device) in enumerate(served.items())
+        }
         self._scan_loop: LiveAcquisition | None = None
-        self._camera_loop: LiveAcquisition | None = None
         # Newest frame already pushed into each napari layer, so a display
         # tick that finds nothing new can skip the upload entirely. Holds
         # a reference for identity comparison only; the array itself is
         # the layer's, not a second copy.
         self._displayed: dict[str, Frame] = {}
+        # Section title to section, so a caller - and a test - can ask
+        # which devices the window offered and whether each is folded.
+        self._device_sections: dict[str, devices_panel.CollapsibleSection] = {}
         self._session: Session | None = None
         self._recording_job: RecordingJob | None = None
         self._load_job: LoadJob | None = None
@@ -361,263 +463,220 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         self._timer.setInterval(display_interval_ms)
         self._timer.timeout.connect(self.refresh_display)
 
+
+    @property
+    def _camera(self) -> Camera | None:
+        """The first camera served, which is what ``camera=`` used to mean."""
+        binding = self._first_binding()
+        return binding.camera if binding is not None else None
+
+    @property
+    def _camera_loop(self) -> LiveAcquisition | None:
+        """The first camera's live loop, kept for callers written before N."""
+        binding = self._first_binding()
+        return binding.loop if binding is not None else None
+
+    @property
+    def _camera_status(self) -> QtWidgets.QLabel | None:
+        """The first camera's status line, kept for callers written before N."""
+        binding = self._first_binding()
+        return binding.status if binding is not None else None
+
+    @property
+    def _camera_button(self) -> QtWidgets.QPushButton | None:
+        """The first camera's start/stop button, kept for pre-N callers."""
+        binding = self._first_binding()
+        return binding.button if binding is not None else None
+
+    @property
+    def _camera_count_spin(self) -> QtWidgets.QSpinBox | None:
+        """The first camera's frame count, kept for pre-N callers."""
+        binding = self._first_binding()
+        return binding.count_spin if binding is not None else None
+
+    @property
+    def _camera_save_button(self) -> QtWidgets.QPushButton | None:
+        """The first camera's save button, kept for pre-N callers."""
+        binding = self._first_binding()
+        return binding.save_button if binding is not None else None
+
+    @property
+    def _camera_record_button(self) -> QtWidgets.QPushButton | None:
+        """The first camera's record button, kept for pre-N callers."""
+        binding = self._first_binding()
+        return binding.record_button if binding is not None else None
+
+    def _first_binding(self) -> _CameraBinding | None:
+        """
+        Return the camera a call that names none should act on.
+
+        The first served, which on a one-camera instrument is the only
+        one and is exactly what every existing caller meant.
+
+        Returns
+        -------
+        _CameraBinding | None
+            The first binding, or None on a scanner-only instrument.
+        """
+        return next(iter(self._camera_bindings.values()), None)
+
+    def _binding(self, name: str | None) -> _CameraBinding | None:
+        """
+        Resolve a camera by target name, defaulting to the first.
+
+        Parameters
+        ----------
+        name : str | None
+            The target name, or None for the first camera.
+
+        Returns
+        -------
+        _CameraBinding | None
+            The binding, or None when there is no such camera.
+        """
+        if name is None:
+            return self._first_binding()
+        return self._camera_bindings.get(name)
+
+    def refresh_instrument(self) -> None:
+        """
+        Re-read the instrument's identity and control values.
+
+        On demand rather than on the display timer: four control reads
+        every 33 ms would put traffic on the wire to answer a question
+        nobody asked. Called once when the panel is built, and whenever
+        **Refresh** is pressed.
+
+        A control that refuses to be read is reported in the status line
+        and leaves its field alone, because a stale number an operator
+        can see beats a zero they might act on.
+        """
+        from miainwoodpecker.devices.interface import (  # noqa: PLC0415
+            BEAM_BLANKER_CONTROL,
+            DEFOCUS_CONTROL,
+            ENERGY_OFFSET_CONTROL,
+            STAGE_POSITION_CONTROL,
+        )
+
+        if self._instrument is None:
+            return
+        try:
+            description = self._instrument.describe()
+        except Exception as error:  # noqa: BLE001 - any failure is a status line
+            self._instrument_status.setText(f"could not describe: {error}")
+            return
+        self._instrument_backend_label.setText(
+            str(description.get("backend", "unknown")),
+        )
+        targets = description.get("targets") or []
+        self._instrument_targets_label.setText(
+            ", ".join(str(name) for name in targets) or "no devices",
+        )
+
+        readers = {
+            DEFOCUS_CONTROL: self._instrument.defocus_nm,
+            ENERGY_OFFSET_CONTROL: self._instrument.energy_offset_ev,
+        }
+        failures: list[str] = []
+        for name, spin in self._instrument_controls.items():
+            try:
+                spin.setValue(float(readers[name]()))
+            except Exception as error:  # noqa: BLE001 - reported, not raised
+                failures.append(f"{name}: {error}")
+        if self._instrument_stage_y is not None:
+            try:
+                y_nm, x_nm = self._instrument.stage_position_nm()
+                self._instrument_stage_y.setValue(float(y_nm))
+                self._instrument_stage_x.setValue(float(x_nm))
+            except Exception as error:  # noqa: BLE001 - reported, not raised
+                failures.append(f"{STAGE_POSITION_CONTROL}: {error}")
+        if self._instrument_blanker is not None:
+            try:
+                self._instrument_blanker.setChecked(
+                    bool(self._instrument.is_beam_blanked()),
+                )
+            except Exception as error:  # noqa: BLE001 - reported, not raised
+                failures.append(f"{BEAM_BLANKER_CONTROL}: {error}")
+        self._instrument_status.setText(
+            "; ".join(failures) if failures else "read",
+        )
+
+    def apply_instrument_control(self, name: str) -> None:
+        """
+        Send one control's field value to the instrument.
+
+        No range check happens here, deliberately: limits belong behind
+        the setters, where the hardware knows them
+        (:class:`~miainwoodpecker.devices.interface.InstrumentController`).
+        A refusal is shown rather than pre-empted, and the field keeps
+        what the operator typed so it can be corrected rather than
+        retyped.
+
+        Parameters
+        ----------
+        name : str
+            The control to apply, as ``available_controls`` reports it.
+        """
+        from miainwoodpecker.devices.interface import (  # noqa: PLC0415
+            DEFOCUS_CONTROL,
+            ENERGY_OFFSET_CONTROL,
+            STAGE_POSITION_CONTROL,
+        )
+
+        if self._instrument is None:
+            return
+        try:
+            if name == STAGE_POSITION_CONTROL:
+                self._instrument.set_stage_position_nm(
+                    self._instrument_stage_y.value(),
+                    self._instrument_stage_x.value(),
+                )
+            elif name == DEFOCUS_CONTROL:
+                self._instrument.set_defocus_nm(
+                    self._instrument_controls[name].value(),
+                )
+            elif name == ENERGY_OFFSET_CONTROL:
+                self._instrument.set_energy_offset_ev(
+                    self._instrument_controls[name].value(),
+                )
+            else:  # pragma: no cover - only built controls have buttons
+                return
+        except Exception as error:  # noqa: BLE001 - the refusal is the message
+            self._instrument_status.setText(f"{name} refused: {error}")
+            return
+        self._instrument_status.setText(f"{name} set")
+
+    def apply_beam_blanker(self, *, blanked: bool) -> None:
+        """
+        Blank or unblank the beam.
+
+        The one control here that turns the beam off, which is why it is
+        an explicit operator action with its own checkbox rather than
+        something a limit elsewhere does as a side effect.
+
+        Parameters
+        ----------
+        blanked : bool
+            True to blank the beam, False to unblank it.
+        """
+        if self._instrument is None:
+            return
+        try:
+            self._instrument.set_beam_blanked(blanked=blanked)
+        except Exception as error:  # noqa: BLE001 - the refusal is the message
+            self._instrument_status.setText(f"beam blanker refused: {error}")
+            # Put the box back where the hardware actually is.
+            self.refresh_instrument()
+            return
+        self._instrument_status.setText("beam blanked" if blanked else "beam unblanked")
+
     def _build_ui(self) -> None:
         layout = QtWidgets.QVBoxLayout(self)
-        layout.addWidget(self._build_session_group())
-        layout.addWidget(self._build_recordings_group())
-        if self._scanner is not None:
-            layout.addWidget(self._build_scan_group())
-        if self._camera is not None:
-            layout.addWidget(self._build_camera_group())
+        layout.addWidget(instrument_panel.build_instrument_panel(self))
+        layout.addWidget(session_panel.build_session_group(self))
+        layout.addWidget(recordings_panel.build_recordings_group(self))
+        layout.addWidget(devices_panel.build_devices_panel(self))
         layout.addStretch(1)
-
-    def _build_recordings_group(self) -> QtWidgets.QGroupBox:
-        """
-        Build the group for looking at data already on disk.
-
-        The combo lists the current session's recordings; "Open from
-        disk..." reaches any file, including one recorded on another machine
-        or in a session that has since been closed. The checkbox is how the
-        three Phase 4 analysis buttons are pointed at a file instead of a
-        fresh burst — one switch rather than three more buttons, since the
-        choice is "what do I analyze", not "what analysis".
-
-        Returns
-        -------
-        QtWidgets.QGroupBox
-            The assembled group.
-        """
-        group = QtWidgets.QGroupBox("Recordings", self)
-        form = QtWidgets.QFormLayout(group)
-        self._recording_combo = QtWidgets.QComboBox(group)
-        self._recording_combo.setPlaceholderText("no recordings in this session")
-        form.addRow("File", self._recording_combo)
-        self._all_sessions_check = QtWidgets.QCheckBox(
-            "List every session in the parent directory", group
-        )
-        form.addRow(self._all_sessions_check)
-        self._open_recording_button = QtWidgets.QPushButton("Open selected", group)
-        form.addRow(self._open_recording_button)
-        self._open_file_button = QtWidgets.QPushButton("Open from disk...", group)
-        form.addRow(self._open_file_button)
-        self._analyze_from_file_check = QtWidgets.QCheckBox(
-            "Analysis buttons use the opened file, not a fresh burst", group
-        )
-        form.addRow(self._analyze_from_file_check)
-        self._load_status = QtWidgets.QLabel("nothing opened yet", group)
-        self._load_status.setWordWrap(True)
-        form.addRow("Opened", self._load_status)
-        self._annotation_edit = QtWidgets.QLineEdit(group)
-        self._annotation_edit.setPlaceholderText("note to add to the opened recording")
-        form.addRow("Add note", self._annotation_edit)
-        self._annotate_button = QtWidgets.QPushButton("Annotate opened", group)
-        form.addRow(self._annotate_button)
-
-        self._open_recording_button.clicked.connect(self.open_selected_recording)
-        self._open_file_button.clicked.connect(self.choose_and_open_recording)
-        self._all_sessions_check.toggled.connect(self._refresh_session_labels)
-        self._annotate_button.clicked.connect(self.annotate_opened_recording)
-        self._annotation_edit.returnPressed.connect(self.annotate_opened_recording)
-        return group
-
-    def _build_session_group(self) -> QtWidgets.QGroupBox:
-        """Build the group showing where data goes and the session context."""
-        session_group = QtWidgets.QGroupBox("Session", self)
-        session_form = QtWidgets.QFormLayout(session_group)
-        self._session_path_label = QtWidgets.QLabel(_NO_SESSION_MESSAGE, session_group)
-        self._session_path_label.setWordWrap(True)
-        session_form.addRow("Saving to", self._session_path_label)
-        self._change_session_button = QtWidgets.QPushButton(
-            "Change directory...", session_group
-        )
-        session_form.addRow(self._change_session_button)
-        self._build_session_context_rows(session_group, session_form)
-        self._space_label = QtWidgets.QLabel("", session_group)
-        self._space_label.setWordWrap(True)
-        session_form.addRow("Disk", self._space_label)
-        self._recorded_label = QtWidgets.QLabel("nothing recorded yet", session_group)
-        self._recorded_label.setWordWrap(True)
-        session_form.addRow("Recorded", self._recorded_label)
-        self._recording_status = QtWidgets.QLabel("idle", session_group)
-        self._recording_status.setWordWrap(True)
-        session_form.addRow("Recording", self._recording_status)
-        self._cancel_record_button = QtWidgets.QPushButton(
-            "Stop recording", session_group
-        )
-        self._cancel_record_button.setEnabled(False)
-        session_form.addRow(self._cancel_record_button)
-
-        self._change_session_button.clicked.connect(self.change_session_directory)
-        self._cancel_record_button.clicked.connect(self.cancel_recording)
-        return session_group
-
-    def _build_session_context_rows(
-        self,
-        parent: QtWidgets.QWidget,
-        form: QtWidgets.QFormLayout,
-    ) -> None:
-        """
-        Add the operator/sample/notes fields, and the next recording's note.
-
-        Notes are multi-line: a single-line field was enough to prove the
-        wiring and not enough for a shift's worth of observations. Two
-        scopes, because they answer different questions — "Session notes"
-        is the shift's standing context and is written to every subsequent
-        recording, while "Note for next recording" describes the individual
-        file (see :meth:`~miainwoodpecker.storage.session.Session.record`).
-
-        ``QPlainTextEdit`` has no ``editingFinished`` signal, so a
-        single-shot timer debounces ``textChanged`` instead: typing a
-        paragraph should not rewrite ``session.json`` once per keystroke.
-
-        Parameters
-        ----------
-        parent : QtWidgets.QWidget
-            The group box owning the new widgets.
-        form : QtWidgets.QFormLayout
-            The group's layout, appended to.
-        """
-        self._operator_edit = QtWidgets.QLineEdit(parent)
-        self._operator_edit.setPlaceholderText("who is on the instrument")
-        form.addRow("Operator", self._operator_edit)
-        self._sample_edit = QtWidgets.QLineEdit(parent)
-        self._sample_edit.setPlaceholderText("sample identifier")
-        form.addRow("Sample", self._sample_edit)
-        self._notes_edit = QtWidgets.QPlainTextEdit(parent)
-        self._notes_edit.setPlaceholderText("notes for the whole session")
-        self._notes_edit.setMaximumHeight(_NOTES_HEIGHT_PX)
-        form.addRow("Session notes", self._notes_edit)
-        self._recording_note_edit = QtWidgets.QPlainTextEdit(parent)
-        self._recording_note_edit.setPlaceholderText(
-            "what this next recording is - kept until you change it"
-        )
-        self._recording_note_edit.setMaximumHeight(_NOTES_HEIGHT_PX)
-        form.addRow("Note for next recording", self._recording_note_edit)
-
-        self._context_save_timer = QtCore.QTimer(self)
-        self._context_save_timer.setSingleShot(True)
-        self._context_save_timer.setInterval(_CONTEXT_SAVE_DELAY_MS)
-        self._context_save_timer.timeout.connect(self._on_session_context_edited)
-        for edit in (self._operator_edit, self._sample_edit):
-            edit.editingFinished.connect(self._on_session_context_edited)
-        self._notes_edit.textChanged.connect(self._context_save_timer.start)
-
-    def _build_scan_group(self) -> QtWidgets.QGroupBox:
-        # Only reached when there is a scanner: _build_ui skips this group
-        # entirely for a detector-only instrument, so the widgets it
-        # creates (_channel_combo, _scan_count_spin, _scan_status, ...) do
-        # not exist in that case. Every method that touches them checks
-        # _scanner rather than hasattr, because the scanner is the reason
-        # they exist and is the honest thing to ask about.
-        scanner = typing.cast("Scanner", self._scanner)
-        scan_group = QtWidgets.QGroupBox("Scan", self)
-        scan_form = QtWidgets.QFormLayout(scan_group)
-        self._channel_combo = QtWidgets.QComboBox(scan_group)
-        self._channel_combo.addItems(list(scanner.channel_names))
-        scan_form.addRow("Channel", self._channel_combo)
-        self._size_combo = QtWidgets.QComboBox(scan_group)
-        self._size_combo.addItems([str(size) for size in _SCAN_SIZES])
-        self._size_combo.setCurrentIndex(_DEFAULT_SCAN_SIZE_INDEX)
-        scan_form.addRow("Size (px)", self._size_combo)
-        self._dwell_spin = QtWidgets.QDoubleSpinBox(scan_group)
-        self._dwell_spin.setRange(0.1, 1000.0)
-        self._dwell_spin.setValue(_DEFAULT_DWELL_US)
-        self._dwell_spin.setSuffix(" µs")
-        scan_form.addRow("Dwell", self._dwell_spin)
-        self._fov_spin = QtWidgets.QDoubleSpinBox(scan_group)
-        self._fov_spin.setRange(0.1, 100000.0)
-        self._fov_spin.setValue(_DEFAULT_FOV_NM)
-        self._fov_spin.setSuffix(" nm")
-        scan_form.addRow("FOV", self._fov_spin)
-        self._scan_button = QtWidgets.QPushButton("Start scan", scan_group)
-        scan_form.addRow(self._scan_button)
-        self._scan_status = QtWidgets.QLabel("stopped", scan_group)
-        scan_form.addRow("Status", self._scan_status)
-        (
-            self._scan_count_spin,
-            self._scan_save_button,
-            self._scan_record_button,
-        ) = self._build_record_controls(scan_group, scan_form)
-
-        self._channel_combo.currentIndexChanged.connect(self._on_scan_settings_changed)
-        self._size_combo.currentIndexChanged.connect(self._on_scan_settings_changed)
-        self._dwell_spin.valueChanged.connect(self._on_scan_settings_changed)
-        self._fov_spin.valueChanged.connect(self._on_scan_settings_changed)
-        self._scan_button.clicked.connect(self._toggle_scan)
-        self._scan_save_button.clicked.connect(self.save_scan_frame)
-        self._scan_record_button.clicked.connect(self.record_scan_frames)
-        return scan_group
-
-    def _build_record_controls(
-        self,
-        parent: QtWidgets.QWidget,
-        form: QtWidgets.QFormLayout,
-    ) -> tuple[QtWidgets.QSpinBox, QtWidgets.QPushButton, QtWidgets.QPushButton]:
-        """
-        Add "save displayed frame" and "record N frames" controls to a group.
-
-        Shared by the scan and camera groups so both sources get the same
-        two recording affordances without duplicating the widget setup.
-
-        Parameters
-        ----------
-        parent : QtWidgets.QWidget
-            The group box owning the new widgets.
-        form : QtWidgets.QFormLayout
-            The group's layout, appended to.
-
-        Returns
-        -------
-        tuple[QtWidgets.QSpinBox, QtWidgets.QPushButton, QtWidgets.QPushButton]
-            The frame-count spin box, the save button, and the record
-            button, for the caller to connect.
-        """
-        save_button = QtWidgets.QPushButton("Save displayed frame", parent)
-        form.addRow(save_button)
-        count_spin = QtWidgets.QSpinBox(parent)
-        count_spin.setRange(1, _MAX_RECORD_FRAME_COUNT)
-        count_spin.setValue(_DEFAULT_RECORD_FRAME_COUNT)
-        form.addRow("Frames", count_spin)
-        record_button = QtWidgets.QPushButton("Record frames", parent)
-        form.addRow(record_button)
-        return count_spin, save_button, record_button
-
-    def _build_camera_group(self) -> QtWidgets.QGroupBox:
-        camera_group = QtWidgets.QGroupBox("Camera", self)
-        camera_form = QtWidgets.QFormLayout(camera_group)
-        self._camera_button = QtWidgets.QPushButton("Start camera", camera_group)
-        camera_form.addRow(self._camera_button)
-        self._camera_status = QtWidgets.QLabel("stopped", camera_group)
-        camera_form.addRow("Status", self._camera_status)
-        (
-            self._camera_count_spin,
-            self._camera_save_button,
-            self._camera_record_button,
-        ) = self._build_record_controls(camera_group, camera_form)
-        self._analyze_button = QtWidgets.QPushButton(
-            "Analyze in HyperSpy", camera_group
-        )
-        camera_form.addRow(self._analyze_button)
-        self._analyze_status = QtWidgets.QLabel("", camera_group)
-        camera_form.addRow("Analysis", self._analyze_status)
-        self._libertem_button = QtWidgets.QPushButton("Sum in LiberTEM", camera_group)
-        camera_form.addRow(self._libertem_button)
-        self._libertem_status = QtWidgets.QLabel("", camera_group)
-        camera_form.addRow("LiberTEM", self._libertem_status)
-        self._py4dstem_button = QtWidgets.QPushButton(
-            "Fit central disk (py4DSTEM)", camera_group
-        )
-        camera_form.addRow(self._py4dstem_button)
-        self._py4dstem_status = QtWidgets.QLabel("", camera_group)
-        camera_form.addRow("py4DSTEM", self._py4dstem_status)
-
-        self._camera_button.clicked.connect(self._toggle_camera)
-        self._camera_save_button.clicked.connect(self.save_camera_frame)
-        self._camera_record_button.clicked.connect(self.record_camera_frames)
-        self._analyze_button.clicked.connect(self._analyze_camera_in_hyperspy)
-        self._libertem_button.clicked.connect(self._analyze_camera_in_libertem)
-        self._py4dstem_button.clicked.connect(self._fit_central_disk_in_py4dstem)
-        return camera_group
 
     def _on_scan_settings_changed(self) -> None:
         size = int(self._size_combo.currentText())
@@ -645,11 +704,14 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         else:
             self.start_scan()
 
-    def _toggle_camera(self) -> None:
-        if self._camera_loop is not None and self._camera_loop.is_running:
-            self.stop_camera()
+    def _toggle_camera(self, name: str | None = None) -> None:
+        binding = self._binding(name)
+        if binding is None:
+            return
+        if binding.loop is not None and binding.loop.is_running:
+            self.stop_camera(binding.name)
         else:
-            self.start_camera()
+            self.start_camera(binding.name)
 
     def start_scan(self) -> None:
         """Start the live scan loop and the display timer. No-op with no scanner."""
@@ -689,22 +751,38 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
             self._scan_status.setText("still finishing a scan - try again")
         return stopped
 
-    def start_camera(self) -> None:
-        """Start the camera and its live loop and the display timer."""
-        if self._camera is None:
+    def start_camera(self, name: str | None = None) -> None:
+        """
+        Start a camera, its live loop, and the display timer.
+
+        Parameters
+        ----------
+        name : str | None
+            Which camera, by target name. None means the first served,
+            which is what a one-camera instrument has always meant.
+        """
+        binding = self._binding(name)
+        if binding is None:
             return
-        if self._camera_loop is not None and self._camera_loop.is_running:
+        if binding.loop is not None and binding.loop.is_running:
             return
-        self._camera.start()
-        self._camera_loop = LiveAcquisition(self._camera.acquire_frame)
-        self._camera_loop.start()
-        self._camera_button.setText("Stop camera")
-        self._camera_status.setText("running")
+        binding.camera.start()
+        binding.loop = LiveAcquisition(binding.camera.acquire_frame)
+        binding.loop.start()
+        if binding.button is not None:
+            binding.button.setText("Stop camera")
+        if binding.status is not None:
+            binding.status.setText("running")
         self._timer.start()
 
-    def stop_camera(self) -> bool:
+    def stop_camera(self, name: str | None = None) -> bool:
         """
-        Stop the camera's live loop and pause the camera.
+        Stop a camera's live loop and pause the camera.
+
+        Parameters
+        ----------
+        name : str | None
+            Which camera, by target name. None means the first served.
 
         Returns
         -------
@@ -713,16 +791,21 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
             is still in flight and the camera is still in use; the camera
             is left running rather than stopped underneath it.
         """
+        binding = self._binding(name)
+        if binding is None:
+            return True
         stopped = True
-        if self._camera_loop is not None:
-            stopped = self._camera_loop.stop()
+        if binding.loop is not None:
+            stopped = binding.loop.stop()
         if not stopped:
-            self._camera_status.setText("still finishing an exposure - try again")
+            if binding.status is not None:
+                binding.status.setText("still finishing an exposure - try again")
             return False
-        if self._camera is not None:
-            self._camera.stop()
-            self._camera_button.setText("Start camera")
-            self._camera_status.setText("stopped")
+        binding.camera.stop()
+        if binding.button is not None:
+            binding.button.setText("Start camera")
+        if binding.status is not None:
+            binding.status.setText("stopped")
         self._maybe_stop_timer()
         return True
 
@@ -969,7 +1052,10 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         frame = self._camera_loop.latest() if self._camera_loop is not None else None
         if frame is None:
             return None
-        frames = self._camera_count_spin.value()
+        binding = self._first_binding()
+        if binding is None or binding.count_spin is None:
+            return None
+        frames = binding.count_spin.value()
         return frames, estimate_size(frame.data.shape, frames), "camera"
 
     def save_scan_frame(self) -> None:
@@ -979,11 +1065,19 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         label = f"scan-{self._scan_request[2]}-frame"
         self._save_displayed_frame(self._scan_loop, label)
 
-    def save_camera_frame(self) -> None:
-        """Save the camera frame currently on screen into the session."""
-        if self._camera is None:
+    def save_camera_frame(self, name: str | None = None) -> None:
+        """
+        Save the camera frame currently on screen into the session.
+
+        Parameters
+        ----------
+        name : str | None
+            Which camera, by target name. None means the first served.
+        """
+        binding = self._binding(name)
+        if binding is None:
             return
-        self._save_displayed_frame(self._camera_loop, "camera-frame")
+        self._save_displayed_frame(binding.loop, "camera-frame")
 
     def _save_displayed_frame(self, loop: LiveAcquisition | None, label: str) -> None:
         """
@@ -1027,20 +1121,29 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
             f"scan-{channel_name}",
         )
 
-    def record_camera_frames(self) -> None:
-        """Record the requested number of camera frames into the session."""
-        if self._camera is None:
+    def record_camera_frames(self, name: str | None = None) -> None:
+        """
+        Record the requested number of camera frames into the session.
+
+        Parameters
+        ----------
+        name : str | None
+            Which camera, by target name. None means the first served.
+        """
+        binding = self._binding(name)
+        if binding is None or binding.count_spin is None:
             return
         if self._session is None:
             self._recording_status.setText(_NO_SESSION_MESSAGE)
             return
+        count = binding.count_spin.value()
         # Same one-driver-per-device rule as record_scan_frames; camera_series
         # starts and stops the camera around the series itself.
-        if not self.stop_camera():
+        if not self.stop_camera(binding.name):
             self._recording_status.setText(_CAMERA_BUSY_MESSAGE)
             return
         self._start_recording(
-            camera_series(self._camera, self._camera_count_spin.value()), "camera"
+            camera_series(binding.camera, count), "camera"
         )
 
     def _start_recording(self, frames: Iterable[Frame], label: str) -> None:
@@ -1422,10 +1525,12 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         if self._analysis_job is not None and self._analysis_job.is_running:
             status.setText("another analysis is running")
             return
+        binding = self._first_binding()
         if (
-            self._camera_loop is not None
-            and self._camera_loop.is_running
-            and not self.stop_camera()
+            binding is not None
+            and binding.loop is not None
+            and binding.loop.is_running
+            and not self.stop_camera(binding.name)
         ):
             # Refusing is the point rather than pessimism: an exposure
             # still in flight means the live loop has not released the
@@ -1560,12 +1665,15 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         decision, not this handler's, and in-process remains the default.
         See docs/analysis-isolation.md.
         """
-        if self._camera is None:
+        status = self._analyze_status
+        if self._camera is None or status is None:
             return
         try:
             runner = self._analysis_runner("hyperspy")
         except ImportError:
-            self._analyze_status.setText("install the 'analysis' extra")
+            # target_available said yes and the import still failed: a
+            # half-installed distribution whose spec resolves.
+            status.setText("the 'analysis' extra is installed but broken")
             return
 
         def compute(source: _AnalysisInput) -> object:
@@ -1580,7 +1688,7 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
             return f"done - mean of {source.frame_count} frames from {source.origin}"
 
         self._start_analysis(
-            status=self._analyze_status,
+            status=status,
             compute=compute,
             display=display,
             frame_count=_ANALYSIS_BURST_FRAME_COUNT,
@@ -1614,12 +1722,15 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         is where that closure's body now lives so the isolated worker can
         run the same code rather than a copy of it.
         """
-        if self._camera is None:
+        status = self._libertem_status
+        if self._camera is None or status is None:
             return
         try:
             runner = self._analysis_runner("libertem")
         except ImportError:
-            self._libertem_status.setText("install the 'libertem' extra")
+            # target_available said yes and the import still failed: a
+            # half-installed distribution whose spec resolves.
+            status.setText("the 'libertem' extra is installed but broken")
             return
 
         def compute(source: _AnalysisInput) -> object:
@@ -1634,7 +1745,7 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
             return f"done - sum of {source.frame_count} frames from {source.origin}"
 
         self._start_analysis(
-            status=self._libertem_status,
+            status=status,
             compute=compute,
             display=display,
             frame_count=_ANALYSIS_BURST_FRAME_COUNT,
@@ -1669,12 +1780,15 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         group; reports that in the status label rather than crashing the
         widget if it is missing.
         """
-        if self._camera is None:
+        status = self._py4dstem_status
+        if self._camera is None or status is None:
             return
         try:
             runner = self._analysis_runner("py4dstem")
         except ImportError:
-            self._py4dstem_status.setText("install the 'py4dstem' extra")
+            # target_available said yes and the import still failed: a
+            # half-installed distribution whose spec resolves.
+            status.setText("the 'py4dstem' extra is installed but broken")
             return
 
         def compute(source: _AnalysisInput) -> object:
@@ -1707,7 +1821,7 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
             )
 
         self._start_analysis(
-            status=self._py4dstem_status,
+            status=status,
             compute=compute,
             display=display,
             frame_count=1,
@@ -1718,7 +1832,10 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
 
     def _maybe_stop_timer(self) -> None:
         scan_running = self._scan_loop is not None and self._scan_loop.is_running
-        camera_running = self._camera_loop is not None and self._camera_loop.is_running
+        camera_running = any(
+            binding.loop is not None and binding.loop.is_running
+            for binding in self._camera_bindings.values()
+        )
         recording = self._recording_job is not None and self._recording_job.is_running
         loading = self._load_job is not None and self._load_job.is_running
         analyzing = self._analysis_job is not None
@@ -1743,13 +1860,14 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
                 status_label=self._scan_status,
                 autocontrast_every_frame=True,
             )
-        if self._camera_loop is not None:
-            self._refresh_source(
-                self._camera_loop,
-                layer_name="Camera",
-                status_label=self._camera_status,
-                autocontrast_every_frame=False,
-            )
+        for binding in self._camera_bindings.values():
+            if binding.loop is not None and binding.status is not None:
+                self._refresh_source(
+                    binding.loop,
+                    layer_name=binding.layer_name,
+                    status_label=binding.status,
+                    autocontrast_every_frame=False,
+                )
 
     def _refresh_source(
         self,

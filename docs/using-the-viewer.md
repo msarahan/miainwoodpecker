@@ -33,7 +33,7 @@ The layout will feel familiar, with a few deliberate differences:
 | You are used to | Here |
 |---|---|
 | Swift's live display panels / DM's **View** window | The napari canvas. One layer per source (`Scan (HAADF)`, `Camera`), with napari's own zoom, contrast, and colormap controls. |
-| Swift's **Record** / DM's **Record** | **Record frames** in the Scan or Camera group — writes straight to disk as frames arrive, rather than into memory first. |
+| Swift's **Record** / DM's **Record** | **Record frames** in the Scan or Camera section — writes straight to disk as frames arrive, rather than into memory first. |
 | DM's *Save Display As...* | **Save displayed frame** — keeps exactly the frame on screen, without touching the instrument. |
 | Swift's project/library | A **session**: a plain folder of files. No database, no import step — the folder *is* the library, and you can browse it in a file manager. |
 | `.ndata` / `.dm3`/`.dm4` files | NeXus HDF5 (`.nxs`) — an open format that HyperSpy, py4DSTEM, and any HDF5 tool can read directly. No export step. |
@@ -43,15 +43,72 @@ processing chains, on purpose: analysis belongs to the scientific Python
 tools you already use, and the [scripting guide](scripting-and-automation.md)
 shows how recordings load into them in one line.
 
+## The Instrument panel
+
+The top of the dock says **what you are connected to** — the backend and
+the devices the server serves. That question had no answer in the window
+before: if you launched against the wrong backend, you found out from the
+images.
+
+Below it are the instrument's controls — **only the ones it publishes**.
+A microscope with no beam blanker gets no blanker checkbox, for the same
+reason a detector-only instrument gets no Scan section: a dead control
+invites you to go looking for hardware that is not fitted.
+
+- **Defocus (nm)**, **Energy offset (eV)** and **Stage (nm)** each have a
+  **Set** button. Nothing is sent while you type or click the arrows —
+  otherwise a spin box would drive the optics once per click on the way
+  to a value, and typing `150` into an empty field would pass through
+  `1` and `15`.
+- **Beam** blanks or unblanks on click, with no Set button: it is one bit
+  and the click *is* the decision.
+- **Refresh** re-reads everything. Values are not polled — asking the
+  instrument for four controls thirty times a second would put traffic on
+  the wire to answer a question nobody asked.
+
+**The viewer applies no range limits, on purpose.** Limits live behind
+the instrument's own setters, where the hardware knows them; a second set
+of limits in the viewer would be a second source of truth, and one that
+had drifted would silently send a different value than the one on your
+screen. So the instrument refuses what it will not do, the refusal is
+shown in the status line, and **your number stays in the field** to be
+corrected rather than retyped.
+
+Nothing here blanks the beam as a side effect of anything else. Blanking
+is yours, on the Beam checkbox, and nowhere else.
+
 ## Live viewing
 
-**Scan group** — pick a detector channel, size, dwell time, and field of
-view, then **Start scan**. The image updates continuously; changing any
-setting takes effect on the next frame, while a scan is running. The
+Every device the instrument serves gets its own section in the
+**Devices** panel, named after the device rather than after its slot —
+`Camera - usb_microscope`, not `camera`, which tells you nothing once
+there are two of them. Click a section header to fold it away.
+
+Several sections can be open at once, which is the point of folding
+rather than tabs: watching a camera while a scan runs is the ordinary
+case. The first section starts open and the rest folded, so a
+one-device instrument looks exactly as it always did and a five-device
+one still fits on a screen.
+
+**A device you do not have has no section.** A detector-only
+instrument shows no Scan section and no greyed-out placeholder either —
+a disabled control would invite you to go looking for a scanner that is
+not fitted.
+
+**Scan section** — pick a detector channel, size, dwell time, and field
+of view, then **Start scan**. The image updates continuously; changing
+any setting takes effect on the next frame, while a scan is running. The
 status line shows the acquisition rate.
 
-**Camera group** — **Start camera** runs the Ronchigram camera
-continuously.
+**Camera section** — **Start camera** runs that camera continuously.
+**Each camera gets its own section, and its own controls.** Start the USB
+microscope and the webcam beside it stays off; both can run at once, each
+into its own napari layer (`Camera`, `Camera (camera:2)`), so they never
+overwrite each other's image.
+
+The analysis buttons sit in the *first* camera's section and run against
+that camera. Repeating them in every section would offer three buttons
+per camera with no way to tell which burst you were about to take.
 
 The display never slows the instrument down: if the scan is faster than
 the screen, frames are skipped on screen but acquisition is unaffected.
@@ -74,7 +131,7 @@ you where data will go — or warns `no session - data is not being kept`.
   current scan settings.
 
 To record: set **Frames**, press **Record frames** in the Scan or Camera
-group. Recording streams to disk in the background — the window stays
+section. Recording streams to disk in the background — the window stays
 responsive — and **Stop recording** keeps everything captured so far as
 a complete, valid file. Filenames are automatic and collision-proof:
 `0001-scan-haadf-20260810T182524Z.nxs`.
@@ -104,7 +161,7 @@ process is reported as damaged.
 
 ## First-look analysis
 
-Three buttons in the Camera group run one real operation each and put
+Three buttons in the Camera section run one real operation each and put
 the result back into napari as a new layer:
 
 - **Analyze in HyperSpy** — mean projection over a short burst.
@@ -115,8 +172,22 @@ the result back into napari as a new layer:
 By default each button grabs a fresh burst from the camera (saved into
 the session, so the analysis input is kept too). Tick **Analysis buttons
 use the opened file** to run them against a recording you opened
-instead. Each needs its optional dependency installed (`analysis`,
-`libertem`, or `py4dstem` extra) and says so if it is missing.
+instead.
+
+**A button only appears when its extra is installed** — `analysis`,
+`libertem` and `py4dstem` respectively. In place of the missing ones the
+Camera section shows a single **Analysis extras** row naming what is
+enabled, what is available, and the command to install it:
+
+```
+enabled: analysis
+available: libertem, py4dstem
+pip install "miainwoodpecker[libertem,py4dstem]"
+```
+
+With all three installed the row is not shown, because the three buttons
+already say so. A button that cannot work is worse than an absent one:
+it teaches you that this application's buttons sometimes do nothing.
 
 These are deliberately previews, not an analysis suite. For real
 analysis, the same recordings open directly in HyperSpy, LiberTEM, or

@@ -279,7 +279,11 @@ grown two or more implementations that will drift.
   `remote.py` and `nion_server.py`, and the positional-port argv ordering
   is an undocumented protocol contract (`strict=True` catches count, not
   order). Move all three into `rpc.py`/`shared_frame.py`, which is what
-  "the entire license boundary" should mean.
+  "the entire license boundary" should mean. — **Done**, and the last
+  part by deletion rather than documentation: the ports are no longer
+  positional, so there is no ordering left to get wrong. See
+  [vendor support](vendor-support.md), "The target names are a fixed
+  tuple".
 - **Camera vs scanner metadata are different species**
   (`nion_server.py:248` raw vendor dict vs `:310-315` hand-built neutral
   keys), which is the concrete shape of the plan's open "nothing feeds
@@ -386,7 +390,13 @@ These matter little against usim and a lot against a real column:
   binding) — two concurrent sessions or xdist workers can collide, and
   the failure surfaces as the misleading hardware-startup error. Bind in
   the parent and inherit fds, or have the server bind port 0 and report
-  back.
+  back. — **Mostly fixed**, by the second of those: every target but
+  `instrument` now binds port 0 and reports back, so the window is one
+  port instead of six rather than gone. `instrument` still goes through
+  `_free_port()`, because the client has to know one address before it
+  can be told the rest. Detection also moved into the connect loop,
+  which already polls the child, so a collision is recognised whenever
+  it happens and a healthy startup waits for nothing.
 - ✅ **Fixed — `rpc.py` and `shared_frame.py` had zero unit tests** and are only
   covered via tests gated on the `device` extra — in the base
   environment the license-boundary module and the shared-memory module

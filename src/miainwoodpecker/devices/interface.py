@@ -1067,6 +1067,22 @@ class InstrumentController(typing.Protocol):
     assuming a successful setter means a working control — a distinction
     this project has already been bitten by (docs/migration-plan.md, §7).
 
+    **Range limits belong behind these setters, not in front of them**,
+    and that is the project owner's decision rather than an omission.
+    A caller — the viewer's instrument panel included — passes the value
+    the operator asked for and lets the instrument refuse it. Clamping in
+    a client would mean two sources of truth for a limit that only the
+    hardware knows, and a client whose idea of the limit had drifted
+    would silently send a *different* value than the one on screen, which
+    is worse than an honest refusal.
+
+    One thing a safety limit must never do here is **turn the beam off**.
+    Blanking is an operator action with its own control
+    (:meth:`set_beam_blanked`); a clamp that blanked as a side effect
+    would abort an acquisition to prevent a setting, and an operator who
+    lost an hour of beam time to a guard rail would be right to be
+    furious.
+
     This is the *static* face of an instrument: annotate with it when the
     code genuinely calls the control methods (a defocus sweep, an energy
     series), and the type checker holds the implementation to them. It is

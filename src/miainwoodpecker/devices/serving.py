@@ -15,7 +15,8 @@ being entirely vendor-free — and the moment a second adapter appeared
 (``camera_server.py``) the choice was to copy it or to move it. Anything
 out-of-tree faces the same choice, which is the better argument: an
 adapter author should be writing device code, not a socket loop, and
-``docs/vendor-support.md`` measures the difference at about eighty lines.
+``docs/vendor-support.md`` measures the difference at about a hundred
+lines.
 
 **Dispatch is here; lifecycle is not.** Deliberately. Which devices exist,
 what a safe parked state is, whether an orphaned server should shut itself
@@ -41,17 +42,122 @@ from miainwoodpecker.devices.rpc import (
     Call,
     Result,
     disable_nagle,
+    target_kind,
 )
 
 if typing.TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Sequence
     from multiprocessing.connection import Listener
 
     from miainwoodpecker.devices.shared_frame import SharedFrameWriter
 
-__all__ = ["accept_loop", "invoke", "serve_connection"]
+__all__ = [
+    "accept_loop",
+    "bind_targets",
+    "endpoint_map",
+    "invoke",
+    "serve_connection",
+]
 
 _LOGGER = logging.getLogger("miainwoodpecker.devices.serving")
+
+
+
+def bind_targets(
+    names: Sequence[str],
+    ports: typing.Mapping[str, int],
+    authkey: bytes,
+) -> tuple[list[Listener], dict[str, int]]:
+    """
+    Bind one listener per target, letting the OS choose unnamed ports.
+
+    The client allocates and passes a port only for the targets it can
+    name in advance. Anything else — a second commodity camera, a
+    detector list this client has never heard of — binds on **port 0**,
+    which is the OS choosing a free ephemeral port, and the port it
+    actually got is reported back through ``describe()`` for the client
+    to dial.
+
+    That is what lets a server serve targets whose names the client
+    does not know, and it removes a race as a side effect: a
+    client-allocated port is probed free and bound later, so something
+    else on the machine can take it in between (the
+    :data:`PORT_UNAVAILABLE_EXIT_STATUS` retry exists for exactly that
+    window). A port the OS assigns at bind time cannot be lost that way,
+    because there is no gap between choosing and binding.
+
+    Parameters
+    ----------
+    names : Sequence[str]
+        Target names to bind, in the order the listeners are returned.
+    ports : typing.Mapping[str, int]
+        Ports the client allocated, by target name. A name absent from
+        this mapping binds on an OS-assigned port.
+    authkey : bytes
+        Shared secret for every listener.
+
+    Returns
+    -------
+    tuple[list[Listener], dict[str, int]]
+        The listeners, and the port each one actually bound.
+
+    Notes
+    -----
+    A listener that cannot bind raises ``OSError`` from ``Listener``
+    itself; callers translate that into
+    :data:`PORT_UNAVAILABLE_EXIT_STATUS` so the client respawns.
+    """
+    from multiprocessing.connection import Listener  # noqa: PLC0415 - see nion_server
+
+    listeners: list[Listener] = []
+    bound: dict[str, int] = {}
+    for name in names:
+        listener = Listener(("localhost", ports.get(name, 0)), authkey=authkey)
+        listeners.append(listener)
+        bound[name] = int(listener.address[1])
+    return listeners, bound
+
+
+def endpoint_map(
+    bound: typing.Mapping[str, int],
+    labels: typing.Mapping[str, str] | None = None,
+) -> dict[str, dict[str, object]]:
+    """
+    Build the ``endpoints`` map ``describe()`` reports, from bound ports.
+
+    Every server in this tree builds it the same way — port from
+    :func:`bind_targets`, kind from
+    :func:`~miainwoodpecker.devices.rpc.target_kind`, label from the
+    device if it has one — so it is built here once. An out-of-tree
+    adapter is not obliged to use this function, only to report a map of
+    the same shape; using it is the way to be sure the ``kind`` strings
+    match what the client looks for.
+
+    Parameters
+    ----------
+    bound : typing.Mapping[str, int]
+        Target name to the port its listener actually bound, as
+        :func:`bind_targets` returns.
+    labels : typing.Mapping[str, str] | None
+        Human-readable label per target — a ``camera_id``, a
+        ``scanner_id`` — for the client to name a device by what it is
+        rather than by which slot it landed in. A name absent here is
+        labelled with itself.
+
+    Returns
+    -------
+    dict[str, dict[str, object]]
+        Target name to its ``port``, ``kind`` and ``label``.
+    """
+    labels = labels or {}
+    return {
+        name: {
+            "port": port,
+            "kind": target_kind(name),
+            "label": labels.get(name, name),
+        }
+        for name, port in bound.items()
+    }
 
 
 def _stackable_frames(value: object) -> list[Frame] | None:

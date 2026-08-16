@@ -460,12 +460,12 @@ def test_a_server_serving_no_spectrum_detector_is_unchanged():
     """
     The commodity-camera server behaves exactly as it did, with no detector.
 
-    Backward compatibility, asserted rather than assumed. Adding a name to
-    ``TARGET_NAMES`` changes the argv every server receives, so the
-    failure mode of getting this wrong is not subtle — but it would land
-    on adapters rather than here, and this is the cheapest place to
-    notice. The camera server is a good probe precisely because it knows
-    nothing about spectra.
+    Backward compatibility, asserted rather than assumed. ``TARGET_NAMES``
+    no longer reaches the argv of any server, so adding a name to it can
+    no longer break one — but which handle a target gets is still decided
+    from what ``describe()`` reports, and getting *that* wrong would land
+    on adapters rather than here. The camera server is a good probe
+    precisely because it knows nothing about spectra.
     """
     with remote_instrument(
         server_module="miainwoodpecker.devices.camera_server",
@@ -480,10 +480,10 @@ def test_the_target_name_is_the_only_protocol_change():
     """
     One name added, before ``instrument``, and the device list follows.
 
-    ``TARGET_NAMES`` is positional argv, so where a name goes matters.
-    Appending before ``instrument`` keeps every existing name's position
-    and keeps ``instrument`` last, which is the invariant the protocol
-    test already pins. Nothing else about the wire vocabulary moved.
+    Position no longer reaches the wire — the ports are not positional
+    any more — but ``instrument`` stays last, which is the invariant the
+    protocol test already pins, and the new name sits with the devices
+    rather than after it. Nothing else about the wire vocabulary moved.
     """
     assert SPECTRUM_TARGET_NAMES == (SPECTRUM_TARGET,)
     assert TARGET_NAMES[-1] == "instrument"
@@ -502,15 +502,21 @@ def test_the_target_name_is_the_only_protocol_change():
 
 
 def test_the_command_line_matches_the_protocol():
-    """One positional port per target name, and ``--plugin`` as configuration."""
-    ports = [str(5000 + index) for index in range(len(TARGET_NAMES))]
+    """One port, for ``instrument``, and ``--plugin`` as configuration."""
     arguments = _parse_args(
-        ["--backend", REPLAY_BACKEND, "--plugin", "/tmp/a.nxs", *ports],  # noqa: S108
+        [
+            "--backend",
+            REPLAY_BACKEND,
+            "--plugin",
+            "/tmp/a.nxs",  # noqa: S108
+            "--instrument-port",
+            "5000",
+        ],
     )
     assert arguments.backend == REPLAY_BACKEND
     assert arguments.plugin == ["/tmp/a.nxs"]  # noqa: S108
-    assert arguments.ports == [int(port) for port in ports]
-    assert _parse_args(ports).backend == SIMULATED_BACKEND
+    assert arguments.instrument_port == 5000  # noqa: PLR2004 - the port passed above
+    assert _parse_args(["--instrument-port", "5000"]).backend == SIMULATED_BACKEND
 
 
 def test_an_unknown_backend_is_rejected_before_a_device_is_opened():
@@ -535,8 +541,10 @@ def test_asking_for_hardware_is_refused_rather_than_given_a_replay(
     there is none, where an adapter goes, and what to use instead.
     """
     monkeypatch.setenv("MIAINWOODPECKER_AUTHKEY", "00" * 32)
-    ports = [str(5000 + index) for index in range(len(TARGET_NAMES))]
-    assert main(["--backend", HARDWARE_BACKEND, *ports]) == NO_DETECTOR_EXIT_STATUS
+    assert (
+        main(["--backend", HARDWARE_BACKEND, "--instrument-port", "5000"])
+        == NO_DETECTOR_EXIT_STATUS
+    )
 
     with pytest.raises(SpectrumDetectorOpenError, match="out-of-tree"):
         open_detector(HARDWARE_BACKEND, None)

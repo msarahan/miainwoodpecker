@@ -428,8 +428,17 @@ device server and drives the whole client against it — command line,
 authkey handshake, `describe()`, both device protocols, shutdown — with
 no `device` extra installed. It is both the regression test and the
 executable specification an adapter writes against, and the measurement
-it gives is the useful one: **the protocol plumbing is about eighty lines**.
-Everything beyond that in a real adapter is vendor work.
+it gives is the useful one: **the protocol plumbing is about a hundred
+lines** — the instrument target, an accept loop, a dispatch loop, and a
+`main`. Everything beyond that in a real adapter is vendor work.
+
+That number was *eighty* when this paragraph was written, and it has
+grown twice since, both times for something a server gained rather than
+something the protocol got clumsier about: a `health()` the client can
+probe without touching a device, and the `endpoints` map that let the
+target list stop being a fixed tuple. It is worth re-measuring rather
+than re-quoting — the stand-in server is in the tree, so the count is
+checkable.
 
 **`InstrumentController` was all-or-nothing to `isinstance`.**
 `available_controls()` exists precisely so an instrument can serve some
@@ -522,6 +531,82 @@ concept, not three (see
 [spectrum detectors](adapters/spectrum-detectors.md)), and `scan_frames`
 deliberately does not pretend to cover it.
 
+### The target names were a fixed tuple, and positional argv
+
+*Kept with its original diagnosis, because the fix is easier to judge
+against the problem it was written for.*
+
+`rpc.TARGET_NAMES = ("ronchigram_camera", "eels_camera", "scanner",
+"instrument")` was Nion's device list, and it was *positional argv*: the
+client allocated one port per name before it could talk to the server, so
+the set could not be discovered. A Thermo Fisher STEM with three
+detectors, or a SEM with SE and BSE and no camera, had to map onto those
+four names — which works, but means a file's `device_id` is honest while
+its target name is a fiction.
+
+The fix is a protocol change, not a rename: bind **one** well-known
+port for `instrument`, have the server choose and report the rest through
+`describe()`, and let the client connect to what it is told. That removes
+the positional-argv fragility as a side effect.
+
+**This is now done, and the trigger was not the one predicted here.**
+This section said the redesign should wait for a second *column* adapter,
+"when there is a real device list to test it against". The real device
+list turned out to be two USB cameras on a desk — a webcam and a USB
+microscope — which exercises exactly the same protocol question for the
+price of plugging something in, with no beam time and no vendor
+conversation. Waiting for a column adapter was waiting for the expensive
+version of a cheap test.
+
+What landed:
+
+- `describe()` reports an **`endpoints`** map — target name to `port`,
+  `kind` and `label` — so a server can serve targets whose names the
+  client could not have allocated a port for.
+- Targets the client cannot name bind on **port 0**, which is the OS
+  choosing a free ephemeral port. That also removes a race rather than
+  only a limitation: a client-allocated port is probed free and bound
+  later, and `PORT_UNAVAILABLE_EXIT_STATUS` exists for exactly that
+  window. A port assigned at bind time has no such window.
+- `camera_server` serves **one camera per `--plugin`**, as `camera`,
+  `camera:2`, `camera:3`. The first keeps the name every existing
+  recording uses.
+- The client honoured `endpoints` when a server reported one and fell
+  back to the argv-allocated ports when it did not. That was a
+  transitional state, and it is what let the servers move one at a time
+  rather than in one commit.
+- **All four servers** — `nion_server`, `camera_server`,
+  `dectris_server`, `spectrum_server` — now take `--instrument-port` and
+  nothing else. The positional port list is gone from the client, from
+  every server, and from the two out-of-tree stand-ins in the test
+  suite; so is the client's fallback, because there is nothing left to
+  fall back for.
+- Which handle a target gets is read from the endpoint's **`kind`**
+  rather than guessed from its name. A server can therefore serve
+  `camera:2`, or a name written after this client shipped, and have it
+  arrive as a camera.
+- `TARGET_NAMES` is **no longer append-only**, and no longer reaches any
+  server's command line. What it still decides is which names get a
+  *named attribute* on `RemoteInstrumentDevices`; everything else is
+  reached by name through `cameras()` / `additional_cameras`.
+
+What this costs an out-of-tree adapter: the argv change is a **flag
+day**. A server written against the old shape takes N positional ports
+and will fail argument parsing against this client. The fix is the edits
+`tests/unit/test_out_of_tree_server.py` makes — swap the positional
+`ports` for `--instrument-port`, bind everything else on port 0, and
+return an `endpoints` map from `describe()` — about ten lines. There is
+no version negotiation in the protocol to soften it, which is a real
+limitation and the honest reason it was worth doing before there were
+adapters in the field rather than after.
+
+One thing did **not** change: the attach path
+(`attached_instrument()`, `gatan_bridge`) still carries an explicit port
+per target in its `AttachInvitation`. It has to. The client is not the
+end that binds there, so it cannot learn a port the far end chose
+without a rendezvous it does not have — the invitation *is* the
+rendezvous, and it is written before either end is listening.
+
 ## What is still the wrong shape
 
 Two, neither fixed, both estimated below rather than pre-emptively built.
@@ -541,24 +626,6 @@ frame correctly labelled. Model the *readout mode* instead, and route a
 projected readout into `SpectrumWriter` so it lands in the same
 `NXspectrum` layout as EDX. 2–4 days; specification in
 [spectrum detectors](adapters/spectrum-detectors.md) §6.
-
-### The target names are a fixed tuple
-
-`rpc.TARGET_NAMES = ("ronchigram_camera", "eels_camera", "scanner",
-"instrument")` is Nion's device list, and it is *positional argv*: the
-client allocates one port per name before it can talk to the server, so
-the set cannot be discovered. A Thermo Fisher STEM with three detectors,
-or a SEM with SE and BSE and no camera, has to map onto those four names —
-which works, but means a file's `device_id` is honest while its target
-name is a fiction.
-
-The fix is a protocol change, not a rename: bind **one** well-known
-port for `instrument`, have the server choose and report the rest through
-`describe()`, and let the client connect to what it is told. That removes
-the positional-argv fragility as a side effect. It touches spawn,
-connect, teardown, and roughly a dozen tests. Deliberately not done
-speculatively — it should land *with* the second adapter, when there is a
-real device list to test it against.
 
 ### `ScanParameters.fov_nm` encodes Nion's convention
 

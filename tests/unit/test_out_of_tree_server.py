@@ -61,7 +61,7 @@ import uuid
 from multiprocessing.connection import Listener
 
 from miainwoodpecker.devices.interface import CameraParameters, Frame
-from miainwoodpecker.devices.rpc import TARGET_NAMES, Result
+from miainwoodpecker.devices.rpc import Result, target_kind
 
 VENDOR_CAMERA_ID = "{camera_id}"
 VENDOR_SCANNER_ID = "{scanner_id}"
@@ -165,6 +165,10 @@ class FakeInstrument:
     def __init__(self, targets, stop_event):
         self._targets = targets
         self._stop = stop_event
+        self._endpoints = {{}}
+
+    def publish_endpoints(self, endpoints):
+        self._endpoints = endpoints
 
     def stage_size_nm(self):
         return 1000.0
@@ -181,6 +185,7 @@ class FakeInstrument:
             "targets": list(self._targets),
             "controls": [],
             "stage_size_nm": self.stage_size_nm(),
+            "endpoints": self._endpoints,
         }}
 
     def health(self):
@@ -237,7 +242,7 @@ def main():
     parser.add_argument("--backend", default="simulated")
     parser.add_argument("--plugin", action="append", default=[])
     parser.add_argument("--enable-test-hooks", action="store_true")
-    parser.add_argument("ports", nargs=len(TARGET_NAMES), type=int)
+    parser.add_argument("--instrument-port", type=int, required=True)
     arguments = parser.parse_args()
 
     authkey = bytes.fromhex(os.environ["MIAINWOODPECKER_AUTHKEY"])
@@ -249,26 +254,52 @@ def main():
     # module names; nothing requires that, and this stand-in reads it as
     # which targets to serve. An adapter is free to use it for a device
     # address, a config file, or nothing at all.
-    served = tuple(arguments.plugin or ("ronchigram_camera", "scanner"))
+    # One reserved token, so a test can ask for the one thing a server
+    # must not do: serve a target and then not say where it is.
+    forgotten = [
+        name.split(":", 1)[1]
+        for name in arguments.plugin
+        if name.startswith("forget:")
+    ]
+    requested = [name for name in arguments.plugin if not name.startswith("forget:")]
+    served = tuple(requested or ("ronchigram_camera", "scanner"))
     available = {{
         "ronchigram_camera": FakeCamera,
         "eels_camera": FakeCamera,
         "scanner": FakeScanner,
     }}
     targets = {{name: available[name]() for name in served}}
-    targets["instrument"] = FakeInstrument(served, stop_event)
-    threads = []
-    for name, port in zip(TARGET_NAMES, arguments.ports):
-        if name not in targets:
-            continue
-        listener = Listener(("localhost", port), authkey=authkey)
-        thread = threading.Thread(
+    instrument = FakeInstrument(served, stop_event)
+    targets["instrument"] = instrument
+    # One port is given, for "instrument"; everything else binds port 0
+    # and the OS chooses. Saying where they landed is the whole of what a
+    # server owes the client here, and it is what makes this vendor's
+    # device list its own rather than one it had to borrow.
+    listeners = {{
+        name: Listener(
+            ("localhost", arguments.instrument_port if name == "instrument" else 0),
+            authkey=authkey,
+        )
+        for name in targets
+    }}
+    endpoints = {{
+        name: {{
+            "port": listener.address[1],
+            "kind": target_kind(name),
+            "label": name,
+        }}
+        for name, listener in listeners.items()
+        if name not in forgotten
+    }}
+    # Published before anything accepts, so the client cannot describe()
+    # its way to an empty map by connecting between the bind and the say.
+    instrument.publish_endpoints(endpoints)
+    for name, listener in listeners.items():
+        threading.Thread(
             target=serve_target,
             args=(listener, targets[name], stop_event),
             daemon=True,
-        )
-        thread.start()
-        threads.append(thread)
+        ).start()
     stop_event.wait()
 
 
@@ -387,6 +418,32 @@ def test_a_vendor_serving_fewer_targets_is_handled(vendor_server_module):
         assert list(description["targets"]) == ["ronchigram_camera", "scanner"]
         assert microscope.eels_camera is None
         assert description["controls"] == []
+
+
+def test_a_target_served_without_an_endpoint_is_named_rather_than_a_key_error(
+    vendor_server_module,
+):
+    """
+    A server must say where every target it claims is listening.
+
+    There is no fallback left: the client allocates one port, so a
+    target it is told about and given no port for is unreachable, full
+    stop. That is a fault in the adapter rather than something an
+    operator can retry, so the diagnostic names the target and the
+    server — the alternative, which this replaces, was a bare KeyError
+    from inside the connect loop.
+    """
+    with (
+        pytest.raises(
+            DeviceServerStartupError,
+            match=r"reports serving scanner but published no endpoint for it",
+        ),
+        remote_instrument(
+            server_module=vendor_server_module,
+            plugin_names=["ronchigram_camera", "scanner", "forget:scanner"],
+        ),
+    ):
+        pass  # pragma: no cover - the context manager must not open
 
 
 def test_an_unimportable_server_module_fails_rather_than_hanging(monkeypatch):

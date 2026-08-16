@@ -118,9 +118,17 @@ from miainwoodpecker.devices.rpc import (
     DEVICE_TARGET_NAMES as _DEVICE_TARGET_NAMES,
 )
 from miainwoodpecker.devices.rpc import (
-    TARGET_NAMES as _TARGET_NAMES,
+    INSTRUMENT_TARGET as _INSTRUMENT_TARGET,
 )
-from miainwoodpecker.devices.serving import accept_loop as _accept_loop
+from miainwoodpecker.devices.serving import (
+    accept_loop as _accept_loop,
+)
+from miainwoodpecker.devices.serving import (
+    bind_targets as _bind_targets,
+)
+from miainwoodpecker.devices.serving import (
+    endpoint_map as _endpoint_map,
+)
 from miainwoodpecker.devices.shared_frame import SharedFrameWriter
 from miainwoodpecker.storage import calibration as _calibration
 
@@ -1351,7 +1359,9 @@ class NionInstrument:
         -------
         dict[str, object]
             ``backend``, ``targets`` (device target names), ``controls``
-            (neutral control names), and ``stage_size_nm``.
+            (neutral control names), ``stage_size_nm``, and
+            ``endpoints`` — the last naming the port and kind of every
+            target, which is how the client reaches them.
         """
         session = self._session
         targets = (
@@ -1364,6 +1374,7 @@ class NionInstrument:
             "targets": targets,
             "controls": list(self.available_controls()),
             "stage_size_nm": self.stage_size_nm(),
+            "endpoints": session.endpoints if session is not None else {},
         }
 
     def health(self) -> dict[str, object]:
@@ -1866,6 +1877,10 @@ class _ServerSession:
         self._connection_change = threading.Event()
         self._report: dict[str, object] | None = None
         self._started_monotonic = time.monotonic()
+        # Where each target ended up listening, filled in by serve() once
+        # the listeners are bound. Empty until then, because a target on
+        # an OS-assigned port does not know its own port before it has one.
+        self.endpoints: dict[str, dict[str, object]] = {}
         self.targets: dict[str, object] = {}
         self.writers: dict[str, SharedFrameWriter | None] = {}
         for name, camera in devices.cameras():
@@ -2198,6 +2213,41 @@ def _parking_signal_handlers(session: _ServerSession) -> Iterator[None]:
                 signal.signal(signum, handler)  # type: ignore[arg-type]
 
 
+def _target_labels(targets: typing.Mapping[str, object]) -> dict[str, str]:
+    """
+    Name each target by the device behind it, for the endpoint map.
+
+    A label is what lets a client say "Camera - ronchigram" rather than
+    naming a slot, and it is the device's own identifier rather than
+    anything this server invents. A target that has no identifier —
+    ``instrument`` — is left out, and :func:`endpoint_map` falls back to
+    the target name.
+
+    Read with ``getattr`` rather than by target name, because which
+    identifier a device publishes is the device's business: this is the
+    same reason ``describe()`` reports what the instrument has instead of
+    a fixed list.
+
+    Parameters
+    ----------
+    targets : typing.Mapping[str, object]
+        The served targets, by name.
+
+    Returns
+    -------
+    dict[str, str]
+        Target name to device identifier, for the targets that have one.
+    """
+    labels: dict[str, str] = {}
+    for name, target in targets.items():
+        identifier = getattr(target, "camera_id", None) or getattr(
+            target, "scanner_id", None,
+        )
+        if isinstance(identifier, str):
+            labels[name] = identifier
+    return labels
+
+
 def serve(
     ports: typing.Mapping[str, int],
     authkey: bytes,
@@ -2221,8 +2271,9 @@ def serve(
     Parameters
     ----------
     ports : typing.Mapping[str, int]
-        Port number for each of ``"ronchigram_camera"``, ``"eels_camera"``,
-        ``"scanner"``, and ``"instrument"``.
+        Ports the caller pins, by target name. In practice that is
+        ``instrument`` and nothing else: every other target binds on an
+        OS-assigned port and is reported through ``describe``.
     authkey : bytes
         Shared secret authenticating connections to every Listener.
     backend : str
@@ -2239,8 +2290,6 @@ def serve(
         With :data:`PORT_UNAVAILABLE_EXIT_STATUS` when a listener
         cannot bind, so the client can retry with fresh ports.
     """
-    from multiprocessing.connection import Listener as _Listener  # noqa: PLC0415
-
     _LOGGER.info(
         "starting: pid=%d backend=%s plugins=%s",
         os.getpid(),
@@ -2251,10 +2300,7 @@ def serve(
         session = _ServerSession(devices, backend)
         names = list(session.targets)
         try:
-            listeners = [
-                _Listener(("localhost", ports[name]), authkey=authkey)
-                for name in names
-            ]
+            listeners, bound = _bind_targets(names, ports, authkey)
         except OSError as error:
             _LOGGER.error(  # noqa: TRY400 - a traceback adds nothing here
                 "could not bind a listener (%s); the client will retry with "
@@ -2262,10 +2308,11 @@ def serve(
                 error,
             )
             raise SystemExit(PORT_UNAVAILABLE_EXIT_STATUS) from error
+        session.endpoints = _endpoint_map(bound, _target_labels(session.targets))
         _LOGGER.info(
             "serving %s on ports %s",
             ", ".join(names),
-            ", ".join(str(ports[name]) for name in names),
+            ", ".join(str(bound[name]) for name in names),
         )
         with _parking_signal_handlers(session):
             threading.Thread(
@@ -2341,10 +2388,14 @@ def _parse_args(argv: Sequence[str]) -> argparse.Namespace:
     """
     Parse the server's command line.
 
-    Ports stay positional, in ``_TARGET_NAMES`` order, as they have been
-    since this module gained a serving loop; the backend selector and the
-    plug-in list are flags falling back to the environment, so a launcher
-    can set either one either way, **with the command line winning**.
+    One port is passed, for ``instrument``; everything else this server
+    serves binds on an OS-assigned port and is reported through
+    ``describe()``. Ports used to be positional, one per name in
+    ``_TARGET_NAMES`` order, which is what made that tuple append-only
+    and made a server's device list something the *client* had to know in
+    advance. The backend selector and the plug-in list are flags falling
+    back to the environment, so a launcher can set either one either way,
+    **with the command line winning**.
 
     That last part needs code rather than an argparse ``default`` for
     ``--plugin``, and getting it wrong is silent: ``action="append"``
@@ -2363,18 +2414,22 @@ def _parse_args(argv: Sequence[str]) -> argparse.Namespace:
     Returns
     -------
     argparse.Namespace
-        With ``ports`` (list[int]), ``backend`` (str), ``plugin`` (list[str]).
+        With ``instrument_port`` (int), ``backend`` (str), ``plugin``
+        (list[str]).
     """
     parser = argparse.ArgumentParser(
         prog="python -m miainwoodpecker.devices.nion_server",
         description="Serve Nion devices (simulated or real) over the rpc protocol.",
     )
     parser.add_argument(
-        "ports",
+        "--instrument-port",
         type=int,
-        nargs=len(_TARGET_NAMES),
+        required=True,
         metavar="PORT",
-        help=f"one port per target, in order: {', '.join(_TARGET_NAMES)}",
+        help=(
+            "the one port the client allocates; every other target binds "
+            "an OS-assigned port and is reported through describe()"
+        ),
     )
     parser.add_argument(
         "--backend",
@@ -2488,7 +2543,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         global _TEST_HOOKS_ENABLED  # noqa: PLW0603 - process-wide by nature
         _TEST_HOOKS_ENABLED = True
         _LOGGER.warning("test hooks enabled; this is not a production launch")
-    ports = dict(zip(_TARGET_NAMES, arguments.ports, strict=True))
+    ports = {_INSTRUMENT_TARGET: arguments.instrument_port}
     authkey = bytes.fromhex(os.environ[_AUTHKEY_ENV_VAR])
     try:
         serve(

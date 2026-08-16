@@ -182,9 +182,19 @@ def _hardware_plugins(chosen: list[str] | None) -> tuple[str, ...]:
     )
 
 
-def _choose_camera(microscope: RemoteInstrumentDevices) -> RemoteCamera | None:
+def _ordered_cameras(
+    microscope: RemoteInstrumentDevices,
+) -> dict[str, RemoteCamera]:
     """
-    Pick the camera to offer a live view for.
+    Return every camera the instrument serves, best-known first.
+
+    All of them, because an instrument with a webcam and a USB
+    microscope has two and unplugging one to see the other is not an
+    answer. Ordered rather than arbitrary because the first is the one
+    the analysis buttons run against and the one a call that names no
+    camera acts on: the Ronchigram camera where there is one, which is
+    what the Nion server has always been shown with, and otherwise
+    whatever ``cameras()`` reports first.
 
     Parameters
     ----------
@@ -193,23 +203,17 @@ def _choose_camera(microscope: RemoteInstrumentDevices) -> RemoteCamera | None:
 
     Returns
     -------
-    RemoteCamera | None
-        The camera to show, or None if this server serves none.
-
-    Notes
-    -----
-    The Ronchigram camera wins where there is one, which is what the
-    Nion server has always been shown with. Otherwise this takes
-    whatever ``cameras()`` reports — the neutral ``camera`` target for a
-    commodity or direct detector, or the EELS camera on a Nion
-    instrument configured without a Ronchigram. Asking ``cameras()``
-    rather than naming the two Nion-shaped slots is what lets a server
-    this viewer has never heard of supply the live view.
+    dict[str, RemoteCamera]
+        Target name to camera, empty when this server serves none.
     """
-    if microscope.ronchigram_camera is not None:
-        return microscope.ronchigram_camera
     served = microscope.cameras()
-    return next(iter(served.values()), None)
+    if microscope.ronchigram_camera is None:
+        return served
+    preferred = "ronchigram_camera"
+    return {
+        preferred: microscope.ronchigram_camera,
+        **{name: camera for name, camera in served.items() if name != preferred},
+    }
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -240,8 +244,8 @@ def main(argv: list[str] | None = None) -> None:
         plugin_names=plugins,
         server_module=args.server_module,
     ) as microscope:
-        camera = _choose_camera(microscope)
-        if microscope.scanner is None and camera is None:
+        cameras = _ordered_cameras(microscope)
+        if microscope.scanner is None and not cameras:
             # A server that serves an instrument and no frame source at
             # all is a real configuration - an aberration corrector with
             # its detectors off, say - and there is nothing for this
@@ -257,7 +261,8 @@ def main(argv: list[str] | None = None) -> None:
         widget = LiveInstrumentWidget(
             viewer,
             microscope.scanner,
-            camera=camera,
+            cameras=cameras,
+            instrument=microscope.instrument,
         )
         widget.set_session(session)
         viewer.window.add_dock_widget(widget, area="right", name="Instrument")

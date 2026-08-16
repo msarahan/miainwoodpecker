@@ -78,13 +78,21 @@ from __future__ import annotations
 import argparse
 import datetime
 import os
+import socket
 import sys
 import threading
 import time
 from multiprocessing.connection import Listener
 
 from miainwoodpecker.devices.interface import Frame
-from miainwoodpecker.devices.rpc import TARGET_NAMES, Result
+from miainwoodpecker.devices.rpc import Result, target_kind
+
+
+def unbound_port():
+    """A port nothing is listening on: bound to learn the number, released."""
+    with socket.socket() as probe:
+        probe.bind(("localhost", 0))
+        return probe.getsockname()[1]
 
 PORT_UNAVAILABLE_EXIT_STATUS = {exit_status}
 VENDOR_CAMERA_ID = "{camera_id}"
@@ -140,10 +148,14 @@ class FakeCamera:
 class FakeInstrument:
     """The instrument target: describe, health, shutdown, and no controls."""
 
-    def __init__(self, targets, stop_event, answered=None):
+    def __init__(self, targets, stop_event, answered=None, endpoints=None):
         self._targets = targets
         self._stop = stop_event
         self._answered = answered
+        self._endpoints = endpoints or {{}}
+
+    def publish_endpoints(self, endpoints):
+        self._endpoints = endpoints
 
     def stage_size_nm(self):
         return 1000.0
@@ -160,6 +172,7 @@ class FakeInstrument:
             "targets": list(self._targets),
             "controls": [],
             "stage_size_nm": self.stage_size_nm(),
+            "endpoints": self._endpoints,
         }}
         if self._answered is not None:
             # Answered *after* the value is built but before it is sent,
@@ -234,9 +247,21 @@ def lose_the_ports_after_describing(ports, authkey):
     """
     stop_event = threading.Event()
     answered = threading.Event()
-    # A camera the client will be told about and can never reach, because
-    # that port is the one this server is pretending to have lost.
-    instrument = FakeInstrument(["ronchigram_camera"], stop_event, answered)
+    # A camera the client will be told about and can never reach: the
+    # endpoint names a port nothing is listening on, which is what a
+    # server whose camera listener lost its port looks like from outside.
+    instrument = FakeInstrument(
+        ["ronchigram_camera"],
+        stop_event,
+        answered,
+        {{
+            "ronchigram_camera": {{
+                "port": unbound_port(),
+                "kind": target_kind("ronchigram_camera"),
+                "label": VENDOR_CAMERA_ID,
+            }},
+        }},
+    )
     listener = Listener(("localhost", ports["instrument"]), authkey=authkey)
     threading.Thread(
         target=serve_target,
@@ -250,14 +275,24 @@ def lose_the_ports_after_describing(ports, authkey):
 def serve_everything(ports, authkey):
     """Behave, for the spawn that is meant to succeed."""
     stop_event = threading.Event()
+    instrument = FakeInstrument(["ronchigram_camera"], stop_event)
     targets = {{
         "ronchigram_camera": FakeCamera(),
-        "instrument": FakeInstrument(["ronchigram_camera"], stop_event),
+        "instrument": instrument,
     }}
-    for name, port in ports.items():
-        if name not in targets:
-            continue
-        listener = Listener(("localhost", port), authkey=authkey)
+    listeners = {{
+        name: Listener(("localhost", ports.get(name, 0)), authkey=authkey)
+        for name in targets
+    }}
+    instrument.publish_endpoints({{
+        name: {{
+            "port": listener.address[1],
+            "kind": target_kind(name),
+            "label": name,
+        }}
+        for name, listener in listeners.items()
+    }})
+    for name, listener in listeners.items():
         threading.Thread(
             target=serve_target,
             args=(listener, targets[name], stop_event),
@@ -271,7 +306,7 @@ def main():
     parser.add_argument("--backend", default="simulated")
     parser.add_argument("--plugin", action="append", default=[])
     parser.add_argument("--enable-test-hooks", action="store_true")
-    parser.add_argument("ports", nargs=len(TARGET_NAMES), type=int)
+    parser.add_argument("--instrument-port", type=int, required=True)
     arguments = parser.parse_args()
 
     # --plugin is the protocol's general "server-specific configuration"
@@ -279,7 +314,7 @@ def main():
     # many of them lose their ports, and how they lose them.
     state_path, collisions, mode = arguments.plugin
     authkey = bytes.fromhex(os.environ["MIAINWOODPECKER_AUTHKEY"])
-    ports = dict(zip(TARGET_NAMES, arguments.ports))
+    ports = {{"instrument": arguments.instrument_port}}
 
     if count_this_spawn(state_path) < int(collisions):
         if mode == "after_describing":
@@ -517,5 +552,5 @@ def test_the_spawn_step_does_not_watch_the_child_at_all(monkeypatch):
     ports, authkey, spawned = _start_server("simulated", (), "irrelevant.module")
 
     assert spawned is process
-    assert set(ports) == set(remote_module._TARGET_NAMES)  # noqa: SLF001
+    assert set(ports) == {"instrument"}
     assert len(authkey) == _AUTHKEY_BYTES

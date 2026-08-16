@@ -21,6 +21,7 @@ pytest.importorskip("napari", reason="requires the 'viewer' extra")
 import napari
 from qtpy import QtWidgets
 
+from miainwoodpecker.analysis import remote as analysis_remote
 from miainwoodpecker.devices import Frame, ScanParameters
 from miainwoodpecker.storage.calibration import AxisKind, FrameCalibration
 from miainwoodpecker.storage.nexus import (
@@ -181,6 +182,126 @@ def _finish_analysis(widget: LiveInstrumentWidget) -> None:
         return widget._analysis_job is None  # noqa: SLF001
 
     assert _wait_until(done)
+
+
+def _analysis_extras_summary(widget: LiveInstrumentWidget) -> str | None:
+    """
+    Return the camera group's analysis-extras summary text, if it is shown.
+
+    Found by its content rather than by holding a reference, so the test
+    asserts on what an operator can actually read on the panel.
+
+    Parameters
+    ----------
+    widget : LiveInstrumentWidget
+        The widget to search.
+
+    Returns
+    -------
+    str | None
+        The summary label's text, or None when no summary row was built.
+    """
+    for label in widget.findChildren(QtWidgets.QLabel):
+        if label.text().startswith("enabled:"):
+            return label.text()
+    return None
+
+
+def _widget_with_extras(
+    monkeypatch: pytest.MonkeyPatch,
+    available: set[str],
+) -> LiveInstrumentWidget:
+    """
+    Build a camera-only widget that believes exactly ``available`` is installed.
+
+    Patches the availability check rather than the environment, so the
+    three cases are all reachable from one test run whatever this
+    machine actually has installed — which matters because CI installs
+    all three extras and would otherwise only ever exercise one branch.
+
+    Parameters
+    ----------
+    monkeypatch : pytest.MonkeyPatch
+        The patcher.
+    available : set[str]
+        Analysis target names to report as installed.
+
+    Returns
+    -------
+    LiveInstrumentWidget
+        The built widget; the caller shuts it down.
+    """
+    monkeypatch.setattr(
+        analysis_remote,
+        "target_available",
+        lambda name: name in available,
+    )
+    viewer = napari.Viewer(show=False)
+    return LiveInstrumentWidget(viewer, None, camera=_FakeCamera())
+
+
+def test_analysis_buttons_are_absent_when_no_extra_is_installed(monkeypatch):
+    """
+    With no analysis extra installed, no analysis button is built at all.
+
+    A button for a library that is not installed cannot work, and
+    offering it teaches the operator that this application's buttons
+    sometimes do nothing. The summary row replaces all three and names
+    every extra, so "nothing installed" is distinguishable from "this
+    build has no analysis at all".
+    """
+    widget = _widget_with_extras(monkeypatch, set())
+    try:
+        assert widget._analyze_button is None  # noqa: SLF001
+        assert widget._libertem_button is None  # noqa: SLF001
+        assert widget._py4dstem_button is None  # noqa: SLF001
+
+        summary = _analysis_extras_summary(widget)
+        assert summary is not None
+        assert "enabled: none" in summary
+        assert "available: analysis, libertem, py4dstem" in summary
+        assert 'pip install "miainwoodpecker[analysis,libertem,py4dstem]"' in summary
+    finally:
+        widget.shutdown()
+
+
+def test_only_installed_analysis_buttons_are_built(monkeypatch):
+    """
+    A partly-installed set builds its own buttons and names the rest.
+
+    The case that matters most: the summary has to report both halves,
+    because an operator deciding whether to install anything needs to see
+    what is already there as well as what is missing.
+    """
+    widget = _widget_with_extras(monkeypatch, {"hyperspy"})
+    try:
+        assert widget._analyze_button is not None  # noqa: SLF001
+        assert widget._libertem_button is None  # noqa: SLF001
+        assert widget._py4dstem_button is None  # noqa: SLF001
+
+        summary = _analysis_extras_summary(widget)
+        assert summary is not None
+        assert "enabled: analysis" in summary
+        assert "available: libertem, py4dstem" in summary
+    finally:
+        widget.shutdown()
+
+
+def test_no_extras_summary_when_everything_is_installed(monkeypatch):
+    """
+    With all three installed there is nothing to report, so nothing is shown.
+
+    The summary exists to stand in for missing buttons; with none missing
+    it would be clutter restating what the three buttons already say.
+    """
+    widget = _widget_with_extras(monkeypatch, {"hyperspy", "libertem", "py4dstem"})
+    try:
+        assert widget._analyze_button is not None  # noqa: SLF001
+        assert widget._libertem_button is not None  # noqa: SLF001
+        assert widget._py4dstem_button is not None  # noqa: SLF001
+        assert _analysis_extras_summary(widget) is None
+    finally:
+        widget.shutdown()
 
 
 def _a_frame() -> Frame:
@@ -1405,13 +1526,20 @@ def test_camera_only_instrument_builds_a_window_with_no_scan_group():
     is *missing* from the window rather than present and disabled: a
     greyed-out Scan group would invite an operator to look for the
     scanner that is not there.
+
+    Asserted on the Devices panel's section titles, which is where a
+    device's name now lives — the section header names it, so the group
+    box inside no longer repeats the word.
     """
     viewer = napari.Viewer(show=False)
     camera = _FakeCamera()
     widget = LiveInstrumentWidget(viewer, None, camera=camera)
     try:
+        sections = widget._device_sections  # noqa: SLF001
+        assert set(sections) == {"camera"}
+        titles = [section.title for section in sections.values()]
+        assert not any(title.startswith("Scan") for title in titles)
         titles = {box.title() for box in widget.findChildren(QtWidgets.QGroupBox)}
-        assert "Camera" in titles
         assert "Scan" not in titles
 
         widget.start_camera()
@@ -1505,6 +1633,363 @@ def test_disk_warning_uses_the_camera_shape_when_there_is_no_scanner(
 
         assert "warning" in widget._space_label.text()  # noqa: SLF001
         assert "camera frames need up to" in widget._space_label.text()  # noqa: SLF001
+    finally:
+        widget.shutdown()
+        viewer.close()
+
+
+def test_devices_panel_has_a_section_per_device():
+    """
+    Each device served gets its own foldable section, named after itself.
+
+    The camera section is titled with what the device calls itself
+    rather than with its target name: ``camera`` tells an operator
+    nothing once there is more than one of them.
+    """
+    viewer = napari.Viewer(show=False)
+    widget = LiveInstrumentWidget(viewer, _FakeScanner(), camera=_FakeCamera())
+    try:
+        sections = widget._device_sections  # noqa: SLF001
+        assert list(sections) == ["scanner", "camera"]
+        assert [section.title for section in sections.values()] == [
+            "Scan",
+            "Camera - fake_camera",
+        ]
+    finally:
+        widget.shutdown()
+        viewer.close()
+
+
+def test_the_devices_panel_offers_only_what_is_served():
+    """
+    A detector-only instrument gets no Scan section, and no placeholder.
+
+    Built from what the instrument has rather than from a fixed list,
+    which is the rule ``_build_ui`` already followed for the scan group
+    and which the Devices panel now applies to every device.
+    """
+    viewer = napari.Viewer(show=False)
+    widget = LiveInstrumentWidget(viewer, None, camera=_FakeCamera())
+    try:
+        sections = widget._device_sections  # noqa: SLF001
+        assert list(sections) == ["camera"]
+        assert next(iter(sections.values())).title == "Camera - fake_camera"
+    finally:
+        widget.shutdown()
+        viewer.close()
+
+
+def test_the_first_section_opens_and_the_rest_fold():
+    """
+    A one-device window looks as it always did; a many-device one fits.
+
+    Folding rather than tabs, because several devices open at once is
+    the ordinary case: watching a camera while a scan runs.
+    """
+    viewer = napari.Viewer(show=False)
+    widget = LiveInstrumentWidget(viewer, _FakeScanner(), camera=_FakeCamera())
+    try:
+        sections = list(widget._device_sections.values())  # noqa: SLF001
+        assert [section.is_expanded() for section in sections] == [True, False]
+
+        sections[1].set_expanded(True)
+        assert sections[1].is_expanded()
+        sections[0].set_expanded(False)
+        assert [section.is_expanded() for section in sections] == [False, True]
+    finally:
+        widget.shutdown()
+        viewer.close()
+
+
+class _NamedCamera(_FakeCamera):
+    """A fake camera with its own id and frame shape, to tell two apart."""
+
+    def __init__(self, identifier: str, shape: tuple[int, int]) -> None:
+        super().__init__()
+        self._identifier = identifier
+        self._shape = shape
+
+    @property
+    def camera_id(self) -> str:
+        """Return this camera's own id."""
+        return self._identifier
+
+    def acquire_frame(self) -> Frame:
+        """Return a constant frame of this camera's own shape."""
+        return Frame(
+            data=np.ones(self._shape, dtype=np.float32),
+            timestamp=datetime.datetime.now(tz=datetime.UTC),
+            metadata={},
+        )
+
+
+def _two_camera_widget(
+    viewer,
+) -> tuple[LiveInstrumentWidget, _NamedCamera, _NamedCamera]:
+    """Build a widget serving a webcam and a USB microscope."""
+    webcam = _NamedCamera("webcam", (6, 6))
+    microscope = _NamedCamera("usb_microscope", (8, 8))
+    widget = LiveInstrumentWidget(
+        viewer,
+        None,
+        cameras={"camera": webcam, "camera:2": microscope},
+    )
+    return widget, webcam, microscope
+
+
+def test_each_camera_gets_its_own_section():
+    """
+    Two cameras are two sections, each named after its own device.
+
+    The case the protocol change made reachable: a laptop with a
+    built-in webcam and a USB microscope plugged in.
+    """
+    viewer = napari.Viewer(show=False)
+    widget, _, _ = _two_camera_widget(viewer)
+    try:
+        sections = widget._device_sections  # noqa: SLF001
+        assert list(sections) == ["camera", "camera:2"]
+        assert [section.title for section in sections.values()] == [
+            "Camera - webcam",
+            "Camera - usb_microscope",
+        ]
+    finally:
+        widget.shutdown()
+        viewer.close()
+
+
+def test_starting_one_camera_leaves_the_other_alone():
+    """
+    Each section's controls drive its own device and no other.
+
+    The failure this guards against is the one that makes a
+    multi-device panel worse than useless: pressing Start on the
+    microscope and having the webcam come on instead.
+    """
+    viewer = napari.Viewer(show=False)
+    widget, webcam, microscope = _two_camera_widget(viewer)
+    try:
+        widget.start_camera("camera:2")
+        assert microscope.started
+        assert not webcam.started
+
+        widget.start_camera("camera")
+        assert webcam.started
+        assert microscope.started
+
+        widget.stop_camera("camera:2")
+        assert webcam.started
+        assert not microscope.started
+    finally:
+        widget.shutdown()
+        viewer.close()
+
+
+def test_each_camera_gets_its_own_layer():
+    """
+    Two live cameras do not overwrite each other's image.
+
+    One napari layer per camera, so the shapes stay distinguishable —
+    which is also how an operator tells which window is which.
+    """
+    viewer = napari.Viewer(show=False)
+    widget, _, _ = _two_camera_widget(viewer)
+    try:
+        widget.start_camera("camera")
+        widget.start_camera("camera:2")
+
+        def both_arrived() -> bool:
+            widget.refresh_display()
+            # `in` on a LayerList looks up by name; set() would
+            # iterate layer objects and never match a string.
+            return (
+                "Camera" in viewer.layers
+                and "Camera (camera:2)" in viewer.layers
+            )
+
+        assert _wait_until(both_arrived)
+        assert viewer.layers["Camera"].data.shape == (6, 6)
+        assert viewer.layers["Camera (camera:2)"].data.shape == (8, 8)
+    finally:
+        widget.shutdown()
+        viewer.close()
+
+
+def test_two_cameras_reporting_the_same_id_still_get_distinct_sections():
+    """
+    A device id is not unique, so the section header must not rely on it.
+
+    Two identical webcams — or two simulated cameras — report the same
+    ``camera_id``. Keying the sections by that id silently dropped one
+    of them, and two identically-titled headers would leave an operator
+    unable to tell which was which. The target name disambiguates, and
+    only where it has to.
+    """
+    viewer = napari.Viewer(show=False)
+    widget = LiveInstrumentWidget(
+        viewer,
+        None,
+        cameras={
+            "camera": _NamedCamera("same_id", (6, 6)),
+            "camera:2": _NamedCamera("same_id", (8, 8)),
+        },
+    )
+    try:
+        sections = widget._device_sections  # noqa: SLF001
+        assert list(sections) == ["camera", "camera:2"]
+        assert [section.title for section in sections.values()] == [
+            "Camera - same_id (camera)",
+            "Camera - same_id (camera:2)",
+        ]
+    finally:
+        widget.shutdown()
+        viewer.close()
+
+
+class _FakeInstrument:
+    """A fake instrument publishing a chosen subset of controls."""
+
+    def __init__(self, controls: typing.Sequence[str], *, refuse: bool = False) -> None:
+        self._controls = list(controls)
+        self._refuse = refuse
+        self.defocus = 0.0
+        self.blanked = False
+
+    def describe(self) -> dict[str, object]:
+        """Report a backend and the targets served."""
+        return {"backend": "simulated", "targets": ["camera"]}
+
+    def available_controls(self) -> typing.Sequence[str]:
+        """Return the controls this instrument publishes."""
+        return self._controls
+
+    def defocus_nm(self) -> float:
+        """Return the current defocus."""
+        return self.defocus
+
+    def set_defocus_nm(self, defocus_nm: float) -> None:
+        """Set the defocus, or refuse if this fake was built to."""
+        if self._refuse:
+            msg = "defocus out of range on this column"
+            raise ValueError(msg)
+        self.defocus = defocus_nm
+
+    def energy_offset_ev(self) -> float:
+        """Return the current energy offset."""
+        return 0.0
+
+    def set_energy_offset_ev(self, offset_ev: float) -> None:
+        """Accept an energy offset."""
+
+    def stage_position_nm(self) -> tuple[float, float]:
+        """Return the current stage position."""
+        return (0.0, 0.0)
+
+    def set_stage_position_nm(self, y_nm: float, x_nm: float) -> None:
+        """Accept a stage move."""
+
+    def is_beam_blanked(self) -> bool:
+        """Return whether the beam is blanked."""
+        return self.blanked
+
+    def set_beam_blanked(self, *, blanked: bool) -> None:
+        """Blank or unblank the beam."""
+        self.blanked = blanked
+
+
+_A_DEFOCUS_NM = 250.0
+_A_REFUSED_DEFOCUS_NM = 9e9
+
+
+def _instrument_widget(viewer, instrument) -> LiveInstrumentWidget:
+    """Build a camera-only widget with the given instrument attached."""
+    return LiveInstrumentWidget(
+        viewer, None, camera=_FakeCamera(), instrument=instrument,
+    )
+
+
+def test_only_published_controls_get_a_row():
+    """
+    A control the instrument does not publish is absent, not disabled.
+
+    Same rule as the Devices panel: a dead control invites an operator to
+    go looking for hardware that is not fitted. A microscope with no
+    blanker gets no blanker checkbox.
+    """
+    viewer = napari.Viewer(show=False)
+    widget = _instrument_widget(viewer, _FakeInstrument(["defocus"]))
+    try:
+        assert list(widget._instrument_controls) == ["defocus"]  # noqa: SLF001
+        assert widget._instrument_blanker is None  # noqa: SLF001
+        assert widget._instrument_stage_y is None  # noqa: SLF001
+    finally:
+        widget.shutdown()
+        viewer.close()
+
+
+def test_setting_a_control_writes_to_the_instrument():
+    """Pressing Set sends the field's value through to the hardware."""
+    viewer = napari.Viewer(show=False)
+    instrument = _FakeInstrument(["defocus"])
+    widget = _instrument_widget(viewer, instrument)
+    try:
+        widget._instrument_controls["defocus"].setValue(_A_DEFOCUS_NM)  # noqa: SLF001
+        widget.apply_instrument_control("defocus")
+
+        assert instrument.defocus == _A_DEFOCUS_NM
+        assert widget._instrument_status.text() == "defocus set"  # noqa: SLF001
+    finally:
+        widget.shutdown()
+        viewer.close()
+
+
+def test_a_refused_control_is_reported_and_the_value_is_kept():
+    """
+    The instrument refuses; the viewer says so and keeps what was typed.
+
+    No clamping happens in the viewer on purpose — limits belong behind
+    the setters, where the hardware knows them. So a refusal has to be
+    legible, and the field must keep the operator's number so it can be
+    corrected rather than retyped.
+    """
+    viewer = napari.Viewer(show=False)
+    instrument = _FakeInstrument(["defocus"], refuse=True)
+    widget = _instrument_widget(viewer, instrument)
+    try:
+        widget._instrument_controls["defocus"].setValue(  # noqa: SLF001
+            _A_REFUSED_DEFOCUS_NM,
+        )
+        widget.apply_instrument_control("defocus")
+
+        assert "refused" in widget._instrument_status.text()  # noqa: SLF001
+        assert "out of range" in widget._instrument_status.text()  # noqa: SLF001
+        spin = widget._instrument_controls["defocus"]  # noqa: SLF001
+        assert spin.value() == _A_REFUSED_DEFOCUS_NM
+        assert instrument.defocus == 0.0
+    finally:
+        widget.shutdown()
+        viewer.close()
+
+
+def test_the_blanker_writes_on_click_and_reports_both_directions():
+    """
+    Blanking is an explicit operator action with its own control.
+
+    It is the one control here that turns the beam off, which is why
+    nothing else in this project is allowed to do that as a side effect
+    of a limit.
+    """
+    viewer = napari.Viewer(show=False)
+    instrument = _FakeInstrument(["beam_blanker"])
+    widget = _instrument_widget(viewer, instrument)
+    try:
+        widget.apply_beam_blanker(blanked=True)
+        assert instrument.blanked
+        assert widget._instrument_status.text() == "beam blanked"  # noqa: SLF001
+
+        widget.apply_beam_blanker(blanked=False)
+        assert not instrument.blanked
+        assert widget._instrument_status.text() == "beam unblanked"  # noqa: SLF001
     finally:
         widget.shutdown()
         viewer.close()

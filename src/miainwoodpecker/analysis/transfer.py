@@ -155,12 +155,13 @@ ANALYSIS_TARGETS: dict[str, AnalysisTarget] = {
 """
 Every analysis worker this project can start, by wire name.
 
-Not :data:`~miainwoodpecker.devices.rpc.TARGET_NAMES`, and not appended to
-it. That tuple's order is part of the *device* protocol — the client
-passes one port per name positionally — and an analysis worker binds
-exactly one port for exactly one target, so it needs no such agreement.
-Sharing the tuple would mean a new analysis library shifted a device
-server's argv, which is a coupling with no benefit on either side.
+Not :data:`~miainwoodpecker.devices.rpc.TARGET_NAMES`, and not appended
+to it. That tuple names *device* targets, and an analysis worker is not
+one: it binds exactly one port for exactly one target and needs no
+agreement with a device server about names at all. When that tuple was
+positional argv, sharing it would have meant a new analysis library
+shifting a device server's command line; it no longer is, and the tuple
+is still the wrong home — a coupling with no benefit on either side.
 """
 
 

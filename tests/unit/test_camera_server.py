@@ -209,18 +209,22 @@ def test_a_recording_from_a_commodity_camera_round_trips(camera_microscope, tmp_
 
 def test_the_command_line_matches_the_protocol():
     """
-    One positional port per target name, and ``--plugin`` as configuration.
+    One port, for ``instrument``, and ``--plugin`` as configuration.
 
     The argv shape is the contract every adapter implements; asserting it
-    here is what stops the two servers drifting apart.
+    here is what stops the servers drifting apart. One port rather than
+    one per target is the whole of what let the target list stop being a
+    fixed tuple: everything else binds where the OS says and is reported
+    through ``describe()``.
     """
-    ports = [str(5000 + index) for index in range(len(TARGET_NAMES))]
-    arguments = _parse_args(["--backend", HARDWARE_BACKEND, "--plugin", "2", *ports])
+    arguments = _parse_args(
+        ["--backend", HARDWARE_BACKEND, "--plugin", "2", "--instrument-port", "5000"],
+    )
     assert arguments.backend == HARDWARE_BACKEND
     assert arguments.plugin == ["2"]
-    assert arguments.ports == [int(port) for port in ports]
+    assert arguments.instrument_port == 5000  # noqa: PLR2004 - the port passed above
 
-    default = _parse_args(ports)
+    default = _parse_args(["--instrument-port", "5000"])
     assert default.backend == SIMULATED_BACKEND
     assert default.plugin == []
 
@@ -242,10 +246,9 @@ def test_a_missing_camera_exits_distinctly_and_says_what_to_check(monkeypatch):
     without hardware at all.
     """
     monkeypatch.setenv("MIAINWOODPECKER_AUTHKEY", "00" * 32)
-    ports = [str(5000 + index) for index in range(len(TARGET_NAMES))]
     status = main(
         ["--backend", HARDWARE_BACKEND, "--plugin", "/dev/definitely-not-a-camera",
-         *ports],
+         "--instrument-port", "5000"],
     )
     assert status == NO_CAMERA_EXIT_STATUS
 
@@ -283,3 +286,75 @@ def test_a_projected_readout_is_refused_by_a_camera_with_no_dispersive_axis(
             CameraParameters(exposure_ms=10.0, readout=PROJECTED_READOUT),
         )
     assert camera.parameters().readout == IMAGE_READOUT
+
+
+@pytest.fixture
+def two_camera_microscope():
+    """Spawn the camera server with two simulated cameras and connect."""
+    with remote_instrument(
+        server_module=_SERVER_MODULE,
+        plugin_names=["0", "1"],
+    ) as devices:
+        yield devices
+
+
+def test_every_requested_device_gets_its_own_target(two_camera_microscope):
+    """
+    Two cameras plugged in are two targets, both live at once.
+
+    The case that motivated this: a laptop with a built-in webcam and a
+    USB microscope has two cameras, and an operator wants the microscope
+    without unplugging anything. Serving one and dropping the other used
+    to be the only option, because the target list was a fixed tuple.
+
+    The first keeps the plain ``camera`` name every existing recording
+    uses; the second is numbered from two.
+    """
+    served = two_camera_microscope.instrument.describe()["targets"]
+    assert served == [CAMERA_TARGET, f"{CAMERA_TARGET}:2"]
+
+    cameras = two_camera_microscope.cameras()
+    assert list(cameras) == [CAMERA_TARGET, f"{CAMERA_TARGET}:2"]
+    for camera in cameras.values():
+        assert camera.acquire_frame().data.shape == (480, 640)
+
+
+def test_the_named_camera_slot_still_holds_the_first(two_camera_microscope):
+    """
+    The extra camera does not displace the one the named field points at.
+
+    ``.camera`` is what the viewer and every script reach for, so a
+    second device must not change what a caller written before this
+    existed already gets.
+    """
+    assert two_camera_microscope.camera is not None
+    assert (
+        two_camera_microscope.cameras()[CAMERA_TARGET]
+        is two_camera_microscope.camera
+    )
+    assert set(two_camera_microscope.additional_cameras) == {f"{CAMERA_TARGET}:2"}
+
+
+def test_targets_beyond_the_fixed_tuple_report_their_own_port(
+    two_camera_microscope,
+):
+    """
+    The server says where each target listens, because the client cannot know.
+
+    The client allocates one port, for ``instrument``. Everything else
+    binds where the OS says and is reported through ``describe()``,
+    which is what makes ``camera:2`` — a name that is not in
+    ``TARGET_NAMES`` and that no client could have allocated for —
+    reachable at all.
+    """
+    endpoints = two_camera_microscope.instrument.describe()["endpoints"]
+    extra = endpoints[f"{CAMERA_TARGET}:2"]
+
+    assert extra["kind"] == "camera"
+    assert isinstance(extra["port"], int)
+    assert extra["port"] > 0
+    # Every served target reports an endpoint, with no exception for the
+    # one port the client did allocate, so there is only ever one source
+    # of truth for where a target is.
+    assert set(endpoints) == {CAMERA_TARGET, f"{CAMERA_TARGET}:2", "instrument"}
+    assert f"{CAMERA_TARGET}:2" not in TARGET_NAMES
