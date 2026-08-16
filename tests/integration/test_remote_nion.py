@@ -1454,6 +1454,15 @@ def spawn_details(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, object]]:
     - to prove the server refuses a second one - has to learn them from
     the spawn call.
 
+    ``ports`` carries **only** ``instrument`` now. That is the whole of
+    what the client allocates: every other target binds an OS-assigned
+    port, and where it landed is in ``describe()``'s endpoint map rather
+    than in anything the client passed. :func:`_target_port` is how a
+    test reaches one, and going through ``describe()`` is also how a real
+    client would - so these tests exercise the discovery path rather than
+    a back channel around it. The authkey still has to come from here,
+    because nothing over the wire reveals it.
+
     Parameters
     ----------
     monkeypatch : pytest.MonkeyPatch
@@ -1480,6 +1489,26 @@ def spawn_details(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, object]]:
     return captured
 
 
+def _target_port(devices: object, name: str) -> int:
+    """
+    Return the port a served target is listening on, as a client learns it.
+
+    Parameters
+    ----------
+    devices : object
+        A connected ``RemoteInstrumentDevices``.
+    name : str
+        The target name to look up.
+
+    Returns
+    -------
+    int
+        The port that target's Listener bound.
+    """
+    endpoints = devices.instrument.describe()["endpoints"]
+    return int(endpoints[name]["port"])
+
+
 def test_a_second_connection_to_a_frame_target_is_refused(spawn_details):
     """
     A frame-producing target admits one client at a time, and says so.
@@ -1497,7 +1526,7 @@ def test_a_second_connection_to_a_frame_target_is_refused(spawn_details):
     """
     with remote_instrument() as instrument:
         details = spawn_details[0]
-        port = details["ports"]["scanner"]
+        port = _target_port(instrument, "scanner")
         intruder = Client(("localhost", port), authkey=details["authkey"])
         try:
             intruder.send(Call("scanner", "scanner_id"))
@@ -1515,7 +1544,7 @@ def test_a_refused_connection_releases_the_target_when_it_closes(spawn_details):
     """A rejected client must not permanently hold the exclusivity slot."""
     with remote_instrument() as instrument:
         details = spawn_details[0]
-        port = details["ports"]["scanner"]
+        port = _target_port(instrument, "scanner")
         for _ in range(3):
             intruder = Client(("localhost", port), authkey=details["authkey"])
             intruder.send(Call("scanner", "scanner_id"))
