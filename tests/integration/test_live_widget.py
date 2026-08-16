@@ -1535,9 +1535,10 @@ def test_camera_only_instrument_builds_a_window_with_no_scan_group():
     camera = _FakeCamera()
     widget = LiveInstrumentWidget(viewer, None, camera=camera)
     try:
-        sections = set(widget._device_sections)  # noqa: SLF001
-        assert sections == {"Camera - fake_camera"}
-        assert not any(title.startswith("Scan") for title in sections)
+        sections = widget._device_sections  # noqa: SLF001
+        assert set(sections) == {"camera"}
+        titles = [section.title for section in sections.values()]
+        assert not any(title.startswith("Scan") for title in titles)
         titles = {box.title() for box in widget.findChildren(QtWidgets.QGroupBox)}
         assert "Scan" not in titles
 
@@ -1649,7 +1650,11 @@ def test_devices_panel_has_a_section_per_device():
     widget = LiveInstrumentWidget(viewer, _FakeScanner(), camera=_FakeCamera())
     try:
         sections = widget._device_sections  # noqa: SLF001
-        assert list(sections) == ["Scan", "Camera - fake_camera"]
+        assert list(sections) == ["scanner", "camera"]
+        assert [section.title for section in sections.values()] == [
+            "Scan",
+            "Camera - fake_camera",
+        ]
     finally:
         widget.shutdown()
         viewer.close()
@@ -1666,7 +1671,9 @@ def test_the_devices_panel_offers_only_what_is_served():
     viewer = napari.Viewer(show=False)
     widget = LiveInstrumentWidget(viewer, None, camera=_FakeCamera())
     try:
-        assert list(widget._device_sections) == ["Camera - fake_camera"]  # noqa: SLF001
+        sections = widget._device_sections  # noqa: SLF001
+        assert list(sections) == ["camera"]
+        assert next(iter(sections.values())).title == "Camera - fake_camera"
     finally:
         widget.shutdown()
         viewer.close()
@@ -1689,6 +1696,151 @@ def test_the_first_section_opens_and_the_rest_fold():
         assert sections[1].is_expanded()
         sections[0].set_expanded(False)
         assert [section.is_expanded() for section in sections] == [False, True]
+    finally:
+        widget.shutdown()
+        viewer.close()
+
+
+class _NamedCamera(_FakeCamera):
+    """A fake camera with its own id and frame shape, to tell two apart."""
+
+    def __init__(self, identifier: str, shape: tuple[int, int]) -> None:
+        super().__init__()
+        self._identifier = identifier
+        self._shape = shape
+
+    @property
+    def camera_id(self) -> str:
+        """Return this camera's own id."""
+        return self._identifier
+
+    def acquire_frame(self) -> Frame:
+        """Return a constant frame of this camera's own shape."""
+        return Frame(
+            data=np.ones(self._shape, dtype=np.float32),
+            timestamp=datetime.datetime.now(tz=datetime.UTC),
+            metadata={},
+        )
+
+
+def _two_camera_widget(
+    viewer,
+) -> tuple[LiveInstrumentWidget, _NamedCamera, _NamedCamera]:
+    """Build a widget serving a webcam and a USB microscope."""
+    webcam = _NamedCamera("webcam", (6, 6))
+    microscope = _NamedCamera("usb_microscope", (8, 8))
+    widget = LiveInstrumentWidget(
+        viewer,
+        None,
+        cameras={"camera": webcam, "camera:2": microscope},
+    )
+    return widget, webcam, microscope
+
+
+def test_each_camera_gets_its_own_section():
+    """
+    Two cameras are two sections, each named after its own device.
+
+    The case the protocol change made reachable: a laptop with a
+    built-in webcam and a USB microscope plugged in.
+    """
+    viewer = napari.Viewer(show=False)
+    widget, _, _ = _two_camera_widget(viewer)
+    try:
+        sections = widget._device_sections  # noqa: SLF001
+        assert list(sections) == ["camera", "camera:2"]
+        assert [section.title for section in sections.values()] == [
+            "Camera - webcam",
+            "Camera - usb_microscope",
+        ]
+    finally:
+        widget.shutdown()
+        viewer.close()
+
+
+def test_starting_one_camera_leaves_the_other_alone():
+    """
+    Each section's controls drive its own device and no other.
+
+    The failure this guards against is the one that makes a
+    multi-device panel worse than useless: pressing Start on the
+    microscope and having the webcam come on instead.
+    """
+    viewer = napari.Viewer(show=False)
+    widget, webcam, microscope = _two_camera_widget(viewer)
+    try:
+        widget.start_camera("camera:2")
+        assert microscope.started
+        assert not webcam.started
+
+        widget.start_camera("camera")
+        assert webcam.started
+        assert microscope.started
+
+        widget.stop_camera("camera:2")
+        assert webcam.started
+        assert not microscope.started
+    finally:
+        widget.shutdown()
+        viewer.close()
+
+
+def test_each_camera_gets_its_own_layer():
+    """
+    Two live cameras do not overwrite each other's image.
+
+    One napari layer per camera, so the shapes stay distinguishable —
+    which is also how an operator tells which window is which.
+    """
+    viewer = napari.Viewer(show=False)
+    widget, _, _ = _two_camera_widget(viewer)
+    try:
+        widget.start_camera("camera")
+        widget.start_camera("camera:2")
+
+        def both_arrived() -> bool:
+            widget.refresh_display()
+            # `in` on a LayerList looks up by name; set() would
+            # iterate layer objects and never match a string.
+            return (
+                "Camera" in viewer.layers
+                and "Camera (camera:2)" in viewer.layers
+            )
+
+        assert _wait_until(both_arrived)
+        assert viewer.layers["Camera"].data.shape == (6, 6)
+        assert viewer.layers["Camera (camera:2)"].data.shape == (8, 8)
+    finally:
+        widget.shutdown()
+        viewer.close()
+
+
+def test_two_cameras_reporting_the_same_id_still_get_distinct_sections():
+    """
+    A device id is not unique, so the section header must not rely on it.
+
+    Two identical webcams — or two simulated cameras — report the same
+    ``camera_id``. Keying the sections by that id silently dropped one
+    of them, and two identically-titled headers would leave an operator
+    unable to tell which was which. The target name disambiguates, and
+    only where it has to.
+    """
+    viewer = napari.Viewer(show=False)
+    widget = LiveInstrumentWidget(
+        viewer,
+        None,
+        cameras={
+            "camera": _NamedCamera("same_id", (6, 6)),
+            "camera:2": _NamedCamera("same_id", (8, 8)),
+        },
+    )
+    try:
+        sections = widget._device_sections  # noqa: SLF001
+        assert list(sections) == ["camera", "camera:2"]
+        assert [section.title for section in sections.values()] == [
+            "Camera - same_id (camera)",
+            "Camera - same_id (camera:2)",
+        ]
     finally:
         widget.shutdown()
         viewer.close()

@@ -66,7 +66,15 @@ of view, then **Start scan**. The image updates continuously; changing
 any setting takes effect on the next frame, while a scan is running. The
 status line shows the acquisition rate.
 
-**Camera section** — **Start camera** runs the camera continuously.
+**Camera section** — **Start camera** runs that camera continuously.
+**Each camera gets its own section, and its own controls.** Start the USB
+microscope and the webcam beside it stays off; both can run at once, each
+into its own napari layer (`Camera`, `Camera (camera:2)`), so they never
+overwrite each other's image.
+
+The analysis buttons sit in the *first* camera's section and run against
+that camera. Repeating them in every section would offer three buttons
+per camera with no way to tell which burst you were about to take.
 
 The display never slows the instrument down: if the scan is faster than
 the screen, frames are skipped on screen but acquisition is unaffected.

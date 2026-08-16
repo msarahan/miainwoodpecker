@@ -129,6 +129,51 @@ _CAMERA_BUSY_MESSAGE = "camera still busy - live loop did not stop, try again"
 _NEXUS_FILE_FILTER = "NeXus recordings (*.nxs *.h5 *.hdf5);;All files (*)"
 
 
+@dataclasses.dataclass
+class _CameraBinding:
+    """
+    One camera, with the controls and the live loop that drive it.
+
+    An instrument can serve several cameras — a webcam and a USB
+    microscope, a Ronchigram camera and an EELS camera — and each needs
+    its own start/stop state, its own frame counter and its own napari
+    layer. Grouping them here rather than in parallel dictionaries keeps
+    "which loop belongs to which button" impossible to get wrong.
+
+    Attributes
+    ----------
+    name : str
+        The target name the server serves this camera on.
+    camera : Camera
+        The device itself.
+    layer_name : str
+        The napari layer its frames are pushed into. One layer per
+        camera, so two live cameras do not overwrite each other.
+    loop : LiveAcquisition | None
+        Its live-acquisition loop while running, None otherwise.
+    button : QtWidgets.QPushButton | None
+        Start/stop, or None before the panel is built.
+    status : QtWidgets.QLabel | None
+        Its status line.
+    count_spin : QtWidgets.QSpinBox | None
+        How many frames its Record button records.
+    save_button : QtWidgets.QPushButton | None
+        Save the displayed frame.
+    record_button : QtWidgets.QPushButton | None
+        Record a series.
+    """
+
+    name: str
+    camera: Camera
+    layer_name: str
+    loop: LiveAcquisition | None = None
+    button: QtWidgets.QPushButton | None = None
+    status: QtWidgets.QLabel | None = None
+    count_spin: QtWidgets.QSpinBox | None = None
+    save_button: QtWidgets.QPushButton | None = None
+    record_button: QtWidgets.QPushButton | None = None
+
+
 @dataclasses.dataclass(frozen=True)
 class _AnalysisInput:
     """
@@ -298,7 +343,14 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         The scan device to drive, or None for a detector-only instrument.
     camera : Camera | None
         An optional camera to offer a live view for (e.g. Ronchigram, or
-        a commodity USB camera).
+        a commodity USB camera). The one-entry case of ``cameras``, kept
+        because the viewer, the scripts and every existing test use it.
+    cameras : typing.Mapping[str, Camera] | None
+        Every camera the instrument serves, by target name — a webcam
+        *and* a USB microscope, or a Ronchigram *and* an EELS camera.
+        Each gets its own section, its own live loop and its own napari
+        layer, so two can run at once. The first is what a call that
+        names no camera acts on.
     display_interval_ms : int
         How often the display polls for new frames.
     parent : QtWidgets.QWidget | None
@@ -313,16 +365,23 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         opening empty.
     """
 
-    def __init__(
+    def __init__(  # noqa: PLR0913 - all but viewer/scanner are keyword-only
         self,
         viewer: napari.Viewer,
         scanner: Scanner | None,
         *,
         camera: Camera | None = None,
+        cameras: typing.Mapping[str, Camera] | None = None,
         display_interval_ms: int = _DEFAULT_DISPLAY_INTERVAL_MS,
         parent: QtWidgets.QWidget | None = None,
     ) -> None:
-        if scanner is None and camera is None:
+        served = dict(cameras) if cameras else {}
+        if camera is not None and camera not in served.values():
+            # The single-camera keyword stays, because the viewer, the
+            # scripts and every existing test use it. It is the one-entry
+            # case of the mapping rather than a separate path.
+            served = {"camera": camera, **served}
+        if scanner is None and not served:
             msg = (
                 "LiveInstrumentWidget needs a scanner, a camera, or both - "
                 "an instrument with neither has nothing to display"
@@ -331,9 +390,15 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         super().__init__(parent)
         self._viewer = viewer
         self._scanner = scanner
-        self._camera = camera
+        self._camera_bindings: dict[str, _CameraBinding] = {
+            name: _CameraBinding(
+                name=name,
+                camera=device,
+                layer_name="Camera" if index == 0 else f"Camera ({name})",
+            )
+            for index, (name, device) in enumerate(served.items())
+        }
         self._scan_loop: LiveAcquisition | None = None
-        self._camera_loop: LiveAcquisition | None = None
         # Newest frame already pushed into each napari layer, so a display
         # tick that finds nothing new can skip the upload entirely. Holds
         # a reference for identity comparison only; the array itself is
@@ -381,6 +446,81 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         self._timer.setInterval(display_interval_ms)
         self._timer.timeout.connect(self.refresh_display)
 
+
+    @property
+    def _camera(self) -> Camera | None:
+        """The first camera served, which is what ``camera=`` used to mean."""
+        binding = self._first_binding()
+        return binding.camera if binding is not None else None
+
+    @property
+    def _camera_loop(self) -> LiveAcquisition | None:
+        """The first camera's live loop, kept for callers written before N."""
+        binding = self._first_binding()
+        return binding.loop if binding is not None else None
+
+    @property
+    def _camera_status(self) -> QtWidgets.QLabel | None:
+        """The first camera's status line, kept for callers written before N."""
+        binding = self._first_binding()
+        return binding.status if binding is not None else None
+
+    @property
+    def _camera_button(self) -> QtWidgets.QPushButton | None:
+        """The first camera's start/stop button, kept for pre-N callers."""
+        binding = self._first_binding()
+        return binding.button if binding is not None else None
+
+    @property
+    def _camera_count_spin(self) -> QtWidgets.QSpinBox | None:
+        """The first camera's frame count, kept for pre-N callers."""
+        binding = self._first_binding()
+        return binding.count_spin if binding is not None else None
+
+    @property
+    def _camera_save_button(self) -> QtWidgets.QPushButton | None:
+        """The first camera's save button, kept for pre-N callers."""
+        binding = self._first_binding()
+        return binding.save_button if binding is not None else None
+
+    @property
+    def _camera_record_button(self) -> QtWidgets.QPushButton | None:
+        """The first camera's record button, kept for pre-N callers."""
+        binding = self._first_binding()
+        return binding.record_button if binding is not None else None
+
+    def _first_binding(self) -> _CameraBinding | None:
+        """
+        Return the camera a call that names none should act on.
+
+        The first served, which on a one-camera instrument is the only
+        one and is exactly what every existing caller meant.
+
+        Returns
+        -------
+        _CameraBinding | None
+            The first binding, or None on a scanner-only instrument.
+        """
+        return next(iter(self._camera_bindings.values()), None)
+
+    def _binding(self, name: str | None) -> _CameraBinding | None:
+        """
+        Resolve a camera by target name, defaulting to the first.
+
+        Parameters
+        ----------
+        name : str | None
+            The target name, or None for the first camera.
+
+        Returns
+        -------
+        _CameraBinding | None
+            The binding, or None when there is no such camera.
+        """
+        if name is None:
+            return self._first_binding()
+        return self._camera_bindings.get(name)
+
     def _build_ui(self) -> None:
         layout = QtWidgets.QVBoxLayout(self)
         layout.addWidget(session_panel.build_session_group(self))
@@ -414,11 +554,14 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         else:
             self.start_scan()
 
-    def _toggle_camera(self) -> None:
-        if self._camera_loop is not None and self._camera_loop.is_running:
-            self.stop_camera()
+    def _toggle_camera(self, name: str | None = None) -> None:
+        binding = self._binding(name)
+        if binding is None:
+            return
+        if binding.loop is not None and binding.loop.is_running:
+            self.stop_camera(binding.name)
         else:
-            self.start_camera()
+            self.start_camera(binding.name)
 
     def start_scan(self) -> None:
         """Start the live scan loop and the display timer. No-op with no scanner."""
@@ -458,22 +601,38 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
             self._scan_status.setText("still finishing a scan - try again")
         return stopped
 
-    def start_camera(self) -> None:
-        """Start the camera and its live loop and the display timer."""
-        if self._camera is None:
+    def start_camera(self, name: str | None = None) -> None:
+        """
+        Start a camera, its live loop, and the display timer.
+
+        Parameters
+        ----------
+        name : str | None
+            Which camera, by target name. None means the first served,
+            which is what a one-camera instrument has always meant.
+        """
+        binding = self._binding(name)
+        if binding is None:
             return
-        if self._camera_loop is not None and self._camera_loop.is_running:
+        if binding.loop is not None and binding.loop.is_running:
             return
-        self._camera.start()
-        self._camera_loop = LiveAcquisition(self._camera.acquire_frame)
-        self._camera_loop.start()
-        self._camera_button.setText("Stop camera")
-        self._camera_status.setText("running")
+        binding.camera.start()
+        binding.loop = LiveAcquisition(binding.camera.acquire_frame)
+        binding.loop.start()
+        if binding.button is not None:
+            binding.button.setText("Stop camera")
+        if binding.status is not None:
+            binding.status.setText("running")
         self._timer.start()
 
-    def stop_camera(self) -> bool:
+    def stop_camera(self, name: str | None = None) -> bool:
         """
-        Stop the camera's live loop and pause the camera.
+        Stop a camera's live loop and pause the camera.
+
+        Parameters
+        ----------
+        name : str | None
+            Which camera, by target name. None means the first served.
 
         Returns
         -------
@@ -482,16 +641,21 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
             is still in flight and the camera is still in use; the camera
             is left running rather than stopped underneath it.
         """
+        binding = self._binding(name)
+        if binding is None:
+            return True
         stopped = True
-        if self._camera_loop is not None:
-            stopped = self._camera_loop.stop()
+        if binding.loop is not None:
+            stopped = binding.loop.stop()
         if not stopped:
-            self._camera_status.setText("still finishing an exposure - try again")
+            if binding.status is not None:
+                binding.status.setText("still finishing an exposure - try again")
             return False
-        if self._camera is not None:
-            self._camera.stop()
-            self._camera_button.setText("Start camera")
-            self._camera_status.setText("stopped")
+        binding.camera.stop()
+        if binding.button is not None:
+            binding.button.setText("Start camera")
+        if binding.status is not None:
+            binding.status.setText("stopped")
         self._maybe_stop_timer()
         return True
 
@@ -738,7 +902,10 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         frame = self._camera_loop.latest() if self._camera_loop is not None else None
         if frame is None:
             return None
-        frames = self._camera_count_spin.value()
+        binding = self._first_binding()
+        if binding is None or binding.count_spin is None:
+            return None
+        frames = binding.count_spin.value()
         return frames, estimate_size(frame.data.shape, frames), "camera"
 
     def save_scan_frame(self) -> None:
@@ -748,11 +915,19 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         label = f"scan-{self._scan_request[2]}-frame"
         self._save_displayed_frame(self._scan_loop, label)
 
-    def save_camera_frame(self) -> None:
-        """Save the camera frame currently on screen into the session."""
-        if self._camera is None:
+    def save_camera_frame(self, name: str | None = None) -> None:
+        """
+        Save the camera frame currently on screen into the session.
+
+        Parameters
+        ----------
+        name : str | None
+            Which camera, by target name. None means the first served.
+        """
+        binding = self._binding(name)
+        if binding is None:
             return
-        self._save_displayed_frame(self._camera_loop, "camera-frame")
+        self._save_displayed_frame(binding.loop, "camera-frame")
 
     def _save_displayed_frame(self, loop: LiveAcquisition | None, label: str) -> None:
         """
@@ -796,20 +971,29 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
             f"scan-{channel_name}",
         )
 
-    def record_camera_frames(self) -> None:
-        """Record the requested number of camera frames into the session."""
-        if self._camera is None:
+    def record_camera_frames(self, name: str | None = None) -> None:
+        """
+        Record the requested number of camera frames into the session.
+
+        Parameters
+        ----------
+        name : str | None
+            Which camera, by target name. None means the first served.
+        """
+        binding = self._binding(name)
+        if binding is None or binding.count_spin is None:
             return
         if self._session is None:
             self._recording_status.setText(_NO_SESSION_MESSAGE)
             return
+        count = binding.count_spin.value()
         # Same one-driver-per-device rule as record_scan_frames; camera_series
         # starts and stops the camera around the series itself.
-        if not self.stop_camera():
+        if not self.stop_camera(binding.name):
             self._recording_status.setText(_CAMERA_BUSY_MESSAGE)
             return
         self._start_recording(
-            camera_series(self._camera, self._camera_count_spin.value()), "camera"
+            camera_series(binding.camera, count), "camera"
         )
 
     def _start_recording(self, frames: Iterable[Frame], label: str) -> None:
@@ -1191,10 +1375,12 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         if self._analysis_job is not None and self._analysis_job.is_running:
             status.setText("another analysis is running")
             return
+        binding = self._first_binding()
         if (
-            self._camera_loop is not None
-            and self._camera_loop.is_running
-            and not self.stop_camera()
+            binding is not None
+            and binding.loop is not None
+            and binding.loop.is_running
+            and not self.stop_camera(binding.name)
         ):
             # Refusing is the point rather than pessimism: an exposure
             # still in flight means the live loop has not released the
@@ -1496,7 +1682,10 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
 
     def _maybe_stop_timer(self) -> None:
         scan_running = self._scan_loop is not None and self._scan_loop.is_running
-        camera_running = self._camera_loop is not None and self._camera_loop.is_running
+        camera_running = any(
+            binding.loop is not None and binding.loop.is_running
+            for binding in self._camera_bindings.values()
+        )
         recording = self._recording_job is not None and self._recording_job.is_running
         loading = self._load_job is not None and self._load_job.is_running
         analyzing = self._analysis_job is not None
@@ -1521,13 +1710,14 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
                 status_label=self._scan_status,
                 autocontrast_every_frame=True,
             )
-        if self._camera_loop is not None:
-            self._refresh_source(
-                self._camera_loop,
-                layer_name="Camera",
-                status_label=self._camera_status,
-                autocontrast_every_frame=False,
-            )
+        for binding in self._camera_bindings.values():
+            if binding.loop is not None and binding.status is not None:
+                self._refresh_source(
+                    binding.loop,
+                    layer_name=binding.layer_name,
+                    status_label=binding.status,
+                    autocontrast_every_frame=False,
+                )
 
     def _refresh_source(
         self,

@@ -119,7 +119,10 @@ def build_record_controls(
     return count_spin, save_button, record_button
 
 
-def build_camera_group(widget: LiveInstrumentWidget) -> QtWidgets.QGroupBox:
+def build_camera_group(
+    widget: LiveInstrumentWidget,
+    binding: object = None,
+) -> QtWidgets.QGroupBox:
     """
     Build the Camera group: live control, recording and the analysis rows.
 
@@ -128,6 +131,10 @@ def build_camera_group(widget: LiveInstrumentWidget) -> QtWidgets.QGroupBox:
     widget : LiveInstrumentWidget
         The widget that owns the resulting controls; every
         ``_``-prefixed attribute set here belongs to it.
+    binding : object
+        The camera this group drives. Its ``button``, ``status``,
+        ``count_spin``, ``save_button`` and ``record_button`` are filled
+        in here, so each camera's controls act on **its own** device.
 
     Returns
     -------
@@ -136,20 +143,26 @@ def build_camera_group(widget: LiveInstrumentWidget) -> QtWidgets.QGroupBox:
     """
     camera_group = QtWidgets.QGroupBox("Camera", widget)
     camera_form = QtWidgets.QFormLayout(camera_group)
-    widget._camera_button = QtWidgets.QPushButton("Start camera", camera_group)
-    camera_form.addRow(widget._camera_button)
-    widget._camera_status = QtWidgets.QLabel("stopped", camera_group)
-    camera_form.addRow("Status", widget._camera_status)
+    name = binding.name
+    binding.button = QtWidgets.QPushButton("Start camera", camera_group)
+    camera_form.addRow(binding.button)
+    binding.status = QtWidgets.QLabel("stopped", camera_group)
+    camera_form.addRow("Status", binding.status)
     (
-        widget._camera_count_spin,
-        widget._camera_save_button,
-        widget._camera_record_button,
+        binding.count_spin,
+        binding.save_button,
+        binding.record_button,
     ) = build_record_controls(camera_group, camera_form)
-    build_analysis_rows(widget, camera_group, camera_form)
 
-    widget._camera_button.clicked.connect(widget._toggle_camera)
-    widget._camera_save_button.clicked.connect(widget.save_camera_frame)
-    widget._camera_record_button.clicked.connect(widget.record_camera_frames)
+    # Each camera's controls name their own target, so the second
+    # camera's Record button cannot start the first one's series.
+    binding.button.clicked.connect(lambda *_, n=name: widget._toggle_camera(n))
+    binding.save_button.clicked.connect(
+        lambda *_, n=name: widget.save_camera_frame(n),
+    )
+    binding.record_button.clicked.connect(
+        lambda *_, n=name: widget.record_camera_frames(n),
+    )
     return camera_group
 
 def build_analysis_rows(
@@ -382,42 +395,67 @@ def build_devices_panel(widget: LiveInstrumentWidget) -> QtWidgets.QGroupBox:
     """
     panel = QtWidgets.QGroupBox("Devices", widget)
     layout = QtWidgets.QVBoxLayout(panel)
-    built: list[tuple[str, QtWidgets.QWidget]] = []
+    built: list[tuple[str, str, QtWidgets.QWidget]] = []
     if widget._scanner is not None:
-        built.append(("Scan", build_scan_group(widget)))
-    if widget._camera is not None:
-        built.append((_camera_section_title(widget), build_camera_group(widget)))
+        built.append(("scanner", "Scan", build_scan_group(widget)))
+    titles = _camera_section_titles(widget._camera_bindings.values())
+    for index, binding in enumerate(widget._camera_bindings.values()):
+        group = build_camera_group(widget, binding)
+        if index == 0:
+            # The analysis buttons run against one camera - the first -
+            # so they live in its section rather than being repeated in
+            # every camera's, which would offer three buttons per camera
+            # and no way to tell which burst you were about to take.
+            build_analysis_rows(widget, group, group.layout())
+        built.append((binding.name, titles[binding.name], group))
 
     widget._device_sections = {}
-    for index, (title, content) in enumerate(built):
+    for index, (key, title, content) in enumerate(built):
         # The section header names the device now, so the group box
         # inside it would otherwise say the same word twice.
         if isinstance(content, QtWidgets.QGroupBox):
             content.setTitle("")
         section = CollapsibleSection(title, content, panel, expanded=index == 0)
-        widget._device_sections[title] = section
+        widget._device_sections[key] = section
         layout.addWidget(section)
     return panel
 
 
-def _camera_section_title(widget: LiveInstrumentWidget) -> str:
+def _camera_section_titles(bindings: typing.Iterable[object]) -> dict[str, str]:
     """
-    Name the camera section after the device, not after the slot.
+    Name each camera section after its device, keeping the names distinct.
 
-    ``camera`` tells an operator nothing when there are two of them, so
-    the section is titled with what the device calls itself and falls
-    back to the target name when it will not say.
+    ``camera`` tells an operator nothing when there are two of them, so a
+    section is titled with what the device calls itself. But an id is not
+    guaranteed unique — two identical webcams, or two simulated cameras,
+    report the same one — and two sections with the same header are worse
+    than a slot number, because the operator cannot tell which is which.
+    So a repeated id gets its target name appended, and a unique one is
+    left clean.
 
     Parameters
     ----------
-    widget : LiveInstrumentWidget
-        The widget holding the camera.
+    bindings : typing.Iterable[object]
+        The camera bindings to name.
 
     Returns
     -------
-    str
-        A human-readable section title.
+    dict[str, str]
+        Target name to section title.
     """
-    camera = widget._camera
-    identifier = getattr(camera, "camera_id", None)
-    return f"Camera - {identifier}" if identifier else "Camera"
+    listed = list(bindings)
+    identifiers = {
+        binding.name: getattr(binding.camera, "camera_id", None) or binding.name
+        for binding in listed
+    }
+    counts: dict[str, int] = {}
+    for identifier in identifiers.values():
+        counts[identifier] = counts.get(identifier, 0) + 1
+    return {
+        name: (
+            f"Camera - {identifier} ({name})"
+            if counts[identifier] > 1
+            else f"Camera - {identifier}"
+        )
+        for name, identifier in identifiers.items()
+    }
