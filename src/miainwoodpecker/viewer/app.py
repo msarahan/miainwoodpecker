@@ -262,6 +262,7 @@ def main(argv: list[str] | None = None) -> None:
             viewer,
             microscope.scanner,
             cameras=cameras,
+            instrument=microscope.instrument,
         )
         widget.set_session(session)
         viewer.window.add_dock_widget(widget, area="right", name="Instrument")

@@ -1844,3 +1844,152 @@ def test_two_cameras_reporting_the_same_id_still_get_distinct_sections():
     finally:
         widget.shutdown()
         viewer.close()
+
+
+class _FakeInstrument:
+    """A fake instrument publishing a chosen subset of controls."""
+
+    def __init__(self, controls: typing.Sequence[str], *, refuse: bool = False) -> None:
+        self._controls = list(controls)
+        self._refuse = refuse
+        self.defocus = 0.0
+        self.blanked = False
+
+    def describe(self) -> dict[str, object]:
+        """Report a backend and the targets served."""
+        return {"backend": "simulated", "targets": ["camera"]}
+
+    def available_controls(self) -> typing.Sequence[str]:
+        """Return the controls this instrument publishes."""
+        return self._controls
+
+    def defocus_nm(self) -> float:
+        """Return the current defocus."""
+        return self.defocus
+
+    def set_defocus_nm(self, defocus_nm: float) -> None:
+        """Set the defocus, or refuse if this fake was built to."""
+        if self._refuse:
+            msg = "defocus out of range on this column"
+            raise ValueError(msg)
+        self.defocus = defocus_nm
+
+    def energy_offset_ev(self) -> float:
+        """Return the current energy offset."""
+        return 0.0
+
+    def set_energy_offset_ev(self, offset_ev: float) -> None:
+        """Accept an energy offset."""
+
+    def stage_position_nm(self) -> tuple[float, float]:
+        """Return the current stage position."""
+        return (0.0, 0.0)
+
+    def set_stage_position_nm(self, y_nm: float, x_nm: float) -> None:
+        """Accept a stage move."""
+
+    def is_beam_blanked(self) -> bool:
+        """Return whether the beam is blanked."""
+        return self.blanked
+
+    def set_beam_blanked(self, *, blanked: bool) -> None:
+        """Blank or unblank the beam."""
+        self.blanked = blanked
+
+
+_A_DEFOCUS_NM = 250.0
+_A_REFUSED_DEFOCUS_NM = 9e9
+
+
+def _instrument_widget(viewer, instrument) -> LiveInstrumentWidget:
+    """Build a camera-only widget with the given instrument attached."""
+    return LiveInstrumentWidget(
+        viewer, None, camera=_FakeCamera(), instrument=instrument,
+    )
+
+
+def test_only_published_controls_get_a_row():
+    """
+    A control the instrument does not publish is absent, not disabled.
+
+    Same rule as the Devices panel: a dead control invites an operator to
+    go looking for hardware that is not fitted. A microscope with no
+    blanker gets no blanker checkbox.
+    """
+    viewer = napari.Viewer(show=False)
+    widget = _instrument_widget(viewer, _FakeInstrument(["defocus"]))
+    try:
+        assert list(widget._instrument_controls) == ["defocus"]  # noqa: SLF001
+        assert widget._instrument_blanker is None  # noqa: SLF001
+        assert widget._instrument_stage_y is None  # noqa: SLF001
+    finally:
+        widget.shutdown()
+        viewer.close()
+
+
+def test_setting_a_control_writes_to_the_instrument():
+    """Pressing Set sends the field's value through to the hardware."""
+    viewer = napari.Viewer(show=False)
+    instrument = _FakeInstrument(["defocus"])
+    widget = _instrument_widget(viewer, instrument)
+    try:
+        widget._instrument_controls["defocus"].setValue(_A_DEFOCUS_NM)  # noqa: SLF001
+        widget.apply_instrument_control("defocus")
+
+        assert instrument.defocus == _A_DEFOCUS_NM
+        assert widget._instrument_status.text() == "defocus set"  # noqa: SLF001
+    finally:
+        widget.shutdown()
+        viewer.close()
+
+
+def test_a_refused_control_is_reported_and_the_value_is_kept():
+    """
+    The instrument refuses; the viewer says so and keeps what was typed.
+
+    No clamping happens in the viewer on purpose — limits belong behind
+    the setters, where the hardware knows them. So a refusal has to be
+    legible, and the field must keep the operator's number so it can be
+    corrected rather than retyped.
+    """
+    viewer = napari.Viewer(show=False)
+    instrument = _FakeInstrument(["defocus"], refuse=True)
+    widget = _instrument_widget(viewer, instrument)
+    try:
+        widget._instrument_controls["defocus"].setValue(  # noqa: SLF001
+            _A_REFUSED_DEFOCUS_NM,
+        )
+        widget.apply_instrument_control("defocus")
+
+        assert "refused" in widget._instrument_status.text()  # noqa: SLF001
+        assert "out of range" in widget._instrument_status.text()  # noqa: SLF001
+        spin = widget._instrument_controls["defocus"]  # noqa: SLF001
+        assert spin.value() == _A_REFUSED_DEFOCUS_NM
+        assert instrument.defocus == 0.0
+    finally:
+        widget.shutdown()
+        viewer.close()
+
+
+def test_the_blanker_writes_on_click_and_reports_both_directions():
+    """
+    Blanking is an explicit operator action with its own control.
+
+    It is the one control here that turns the beam off, which is why
+    nothing else in this project is allowed to do that as a side effect
+    of a limit.
+    """
+    viewer = napari.Viewer(show=False)
+    instrument = _FakeInstrument(["beam_blanker"])
+    widget = _instrument_widget(viewer, instrument)
+    try:
+        widget.apply_beam_blanker(blanked=True)
+        assert instrument.blanked
+        assert widget._instrument_status.text() == "beam blanked"  # noqa: SLF001
+
+        widget.apply_beam_blanker(blanked=False)
+        assert not instrument.blanked
+        assert widget._instrument_status.text() == "beam unblanked"  # noqa: SLF001
+    finally:
+        widget.shutdown()
+        viewer.close()

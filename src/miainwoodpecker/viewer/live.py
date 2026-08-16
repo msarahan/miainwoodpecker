@@ -96,6 +96,7 @@ from miainwoodpecker.storage.session import (
 )
 from miainwoodpecker.viewer.jobs import AnalysisJob
 from miainwoodpecker.viewer.panels import devices as devices_panel
+from miainwoodpecker.viewer.panels import instrument as instrument_panel
 from miainwoodpecker.viewer.panels import recordings as recordings_panel
 from miainwoodpecker.viewer.panels import session as session_panel
 from miainwoodpecker.viewer.panels.defaults import (
@@ -113,7 +114,12 @@ if typing.TYPE_CHECKING:
 
     from miainwoodpecker.analysis.operations import AnalysisInput
     from miainwoodpecker.analysis.remote import AnalysisRunner
-    from miainwoodpecker.devices.interface import Camera, Frame, Scanner
+    from miainwoodpecker.devices.interface import (
+        Camera,
+        Frame,
+        Instrument,
+        Scanner,
+    )
     from miainwoodpecker.storage.nexus import FrameStack
     from miainwoodpecker.storage.session import LoadedRecording, Recording
 
@@ -351,6 +357,11 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         Each gets its own section, its own live loop and its own napari
         layer, so two can run at once. The first is what a call that
         names no camera acts on.
+    instrument : Instrument | None
+        The instrument itself, for the Instrument panel: what this is
+        connected to, and the controls it publishes. None gives a panel
+        that says what it knows and offers no controls, which is what a
+        caller constructing the widget without one has always had.
     display_interval_ms : int
         How often the display polls for new frames.
     parent : QtWidgets.QWidget | None
@@ -372,6 +383,7 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         *,
         camera: Camera | None = None,
         cameras: typing.Mapping[str, Camera] | None = None,
+        instrument: Instrument | None = None,
         display_interval_ms: int = _DEFAULT_DISPLAY_INTERVAL_MS,
         parent: QtWidgets.QWidget | None = None,
     ) -> None:
@@ -390,6 +402,11 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         super().__init__(parent)
         self._viewer = viewer
         self._scanner = scanner
+        self._instrument = instrument
+        self._instrument_controls: dict[str, QtWidgets.QDoubleSpinBox] = {}
+        self._instrument_stage_y: QtWidgets.QDoubleSpinBox | None = None
+        self._instrument_stage_x: QtWidgets.QDoubleSpinBox | None = None
+        self._instrument_blanker: QtWidgets.QCheckBox | None = None
         self._camera_bindings: dict[str, _CameraBinding] = {
             name: _CameraBinding(
                 name=name,
@@ -521,8 +538,141 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
             return self._first_binding()
         return self._camera_bindings.get(name)
 
+    def refresh_instrument(self) -> None:
+        """
+        Re-read the instrument's identity and control values.
+
+        On demand rather than on the display timer: four control reads
+        every 33 ms would put traffic on the wire to answer a question
+        nobody asked. Called once when the panel is built, and whenever
+        **Refresh** is pressed.
+
+        A control that refuses to be read is reported in the status line
+        and leaves its field alone, because a stale number an operator
+        can see beats a zero they might act on.
+        """
+        from miainwoodpecker.devices.interface import (  # noqa: PLC0415
+            BEAM_BLANKER_CONTROL,
+            DEFOCUS_CONTROL,
+            ENERGY_OFFSET_CONTROL,
+            STAGE_POSITION_CONTROL,
+        )
+
+        if self._instrument is None:
+            return
+        try:
+            description = self._instrument.describe()
+        except Exception as error:  # noqa: BLE001 - any failure is a status line
+            self._instrument_status.setText(f"could not describe: {error}")
+            return
+        self._instrument_backend_label.setText(
+            str(description.get("backend", "unknown")),
+        )
+        targets = description.get("targets") or []
+        self._instrument_targets_label.setText(
+            ", ".join(str(name) for name in targets) or "no devices",
+        )
+
+        readers = {
+            DEFOCUS_CONTROL: self._instrument.defocus_nm,
+            ENERGY_OFFSET_CONTROL: self._instrument.energy_offset_ev,
+        }
+        failures: list[str] = []
+        for name, spin in self._instrument_controls.items():
+            try:
+                spin.setValue(float(readers[name]()))
+            except Exception as error:  # noqa: BLE001 - reported, not raised
+                failures.append(f"{name}: {error}")
+        if self._instrument_stage_y is not None:
+            try:
+                y_nm, x_nm = self._instrument.stage_position_nm()
+                self._instrument_stage_y.setValue(float(y_nm))
+                self._instrument_stage_x.setValue(float(x_nm))
+            except Exception as error:  # noqa: BLE001 - reported, not raised
+                failures.append(f"{STAGE_POSITION_CONTROL}: {error}")
+        if self._instrument_blanker is not None:
+            try:
+                self._instrument_blanker.setChecked(
+                    bool(self._instrument.is_beam_blanked()),
+                )
+            except Exception as error:  # noqa: BLE001 - reported, not raised
+                failures.append(f"{BEAM_BLANKER_CONTROL}: {error}")
+        self._instrument_status.setText(
+            "; ".join(failures) if failures else "read",
+        )
+
+    def apply_instrument_control(self, name: str) -> None:
+        """
+        Send one control's field value to the instrument.
+
+        No range check happens here, deliberately: limits belong behind
+        the setters, where the hardware knows them
+        (:class:`~miainwoodpecker.devices.interface.InstrumentController`).
+        A refusal is shown rather than pre-empted, and the field keeps
+        what the operator typed so it can be corrected rather than
+        retyped.
+
+        Parameters
+        ----------
+        name : str
+            The control to apply, as ``available_controls`` reports it.
+        """
+        from miainwoodpecker.devices.interface import (  # noqa: PLC0415
+            DEFOCUS_CONTROL,
+            ENERGY_OFFSET_CONTROL,
+            STAGE_POSITION_CONTROL,
+        )
+
+        if self._instrument is None:
+            return
+        try:
+            if name == STAGE_POSITION_CONTROL:
+                self._instrument.set_stage_position_nm(
+                    self._instrument_stage_y.value(),
+                    self._instrument_stage_x.value(),
+                )
+            elif name == DEFOCUS_CONTROL:
+                self._instrument.set_defocus_nm(
+                    self._instrument_controls[name].value(),
+                )
+            elif name == ENERGY_OFFSET_CONTROL:
+                self._instrument.set_energy_offset_ev(
+                    self._instrument_controls[name].value(),
+                )
+            else:  # pragma: no cover - only built controls have buttons
+                return
+        except Exception as error:  # noqa: BLE001 - the refusal is the message
+            self._instrument_status.setText(f"{name} refused: {error}")
+            return
+        self._instrument_status.setText(f"{name} set")
+
+    def apply_beam_blanker(self, *, blanked: bool) -> None:
+        """
+        Blank or unblank the beam.
+
+        The one control here that turns the beam off, which is why it is
+        an explicit operator action with its own checkbox rather than
+        something a limit elsewhere does as a side effect.
+
+        Parameters
+        ----------
+        blanked : bool
+            True to blank the beam, False to unblank it.
+        """
+        if self._instrument is None:
+            return
+        try:
+            self._instrument.set_beam_blanked(blanked=blanked)
+        except Exception as error:  # noqa: BLE001 - the refusal is the message
+            self._instrument_status.setText(f"beam blanker refused: {error}")
+            # Put the box back where the hardware actually is.
+            self.refresh_instrument()
+            return
+        self._instrument_status.setText("beam blanked" if blanked else "beam unblanked")
+
     def _build_ui(self) -> None:
         layout = QtWidgets.QVBoxLayout(self)
+        layout.addWidget(instrument_panel.build_instrument_panel(self))
         layout.addWidget(session_panel.build_session_group(self))
         layout.addWidget(recordings_panel.build_recordings_group(self))
         layout.addWidget(devices_panel.build_devices_panel(self))

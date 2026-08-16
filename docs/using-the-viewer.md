@@ -43,6 +43,40 @@ processing chains, on purpose: analysis belongs to the scientific Python
 tools you already use, and the [scripting guide](scripting-and-automation.md)
 shows how recordings load into them in one line.
 
+## The Instrument panel
+
+The top of the dock says **what you are connected to** — the backend and
+the devices the server serves. That question had no answer in the window
+before: if you launched against the wrong backend, you found out from the
+images.
+
+Below it are the instrument's controls — **only the ones it publishes**.
+A microscope with no beam blanker gets no blanker checkbox, for the same
+reason a detector-only instrument gets no Scan section: a dead control
+invites you to go looking for hardware that is not fitted.
+
+- **Defocus (nm)**, **Energy offset (eV)** and **Stage (nm)** each have a
+  **Set** button. Nothing is sent while you type or click the arrows —
+  otherwise a spin box would drive the optics once per click on the way
+  to a value, and typing `150` into an empty field would pass through
+  `1` and `15`.
+- **Beam** blanks or unblanks on click, with no Set button: it is one bit
+  and the click *is* the decision.
+- **Refresh** re-reads everything. Values are not polled — asking the
+  instrument for four controls thirty times a second would put traffic on
+  the wire to answer a question nobody asked.
+
+**The viewer applies no range limits, on purpose.** Limits live behind
+the instrument's own setters, where the hardware knows them; a second set
+of limits in the viewer would be a second source of truth, and one that
+had drifted would silently send a different value than the one on your
+screen. So the instrument refuses what it will not do, the refusal is
+shown in the status line, and **your number stays in the field** to be
+corrected rather than retyped.
+
+Nothing here blanks the beam as a side effect of anything else. Blanking
+is yours, on the Beam checkbox, and nowhere else.
+
 ## Live viewing
 
 Every device the instrument serves gets its own section in the
