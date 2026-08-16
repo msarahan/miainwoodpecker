@@ -25,6 +25,35 @@ Useful launch options:
 | `--session DIR` | Where recordings are saved. Reused if it exists — restarting mid-shift lands you back in the same session. |
 | `--operator`, `--sample`, `--notes` | Pre-fill the session context fields. |
 | `--backend {simulated,hardware}` | Which microscope to talk to. |
+| `--server-module MODULE` | Which device server to launch. Defaults to the Nion one. |
+| `--plugin` | Server-specific: for Nion, a plug-in module; for the camera server, which camera to open. |
+
+### For a USB microscope or a webcam
+
+The default server is the Nion one, which serves no USB camera at all,
+so a plugged-in microscope cannot appear until you say otherwise:
+
+```shell
+uv run --extra camera --extra viewer miainwoodpecker-viewer \
+    --backend hardware \
+    --server-module miainwoodpecker.devices.camera_server
+```
+
+**No `--plugin` is needed.** Every camera that opens and delivers a
+frame is found and served, each in its own section. That is the default
+rather than "open camera 0" because a USB microscope's index is not
+knowable in advance and is usually *not* 0 — a laptop's built-in webcam
+takes that — so a fixed default would show the wrong camera and look
+exactly like a broken device.
+
+Name one with `--plugin` (an index, `/dev/video0`, or a video file to
+replay) and discovery is skipped entirely: `--plugin 1` serves that
+camera and nothing else. Naming beats finding, on purpose — if you say
+which camera to open, nothing else is added behind you.
+
+If nothing shows up, `python scripts/probe_cameras.py` reports what the
+operating system sees, what actually opens, and the command to run for
+what it found.
 
 ## If you are coming from Swift or DigitalMicrograph
 
@@ -104,7 +133,8 @@ status line shows the acquisition rate.
 **Each camera gets its own section, and its own controls.** Start the USB
 microscope and the webcam beside it stays off; both can run at once, each
 into its own napari layer (`Camera`, `Camera (camera:2)`), so they never
-overwrite each other's image.
+overwrite each other's image. On the camera server you get a section per
+camera found, without having named any of them.
 
 The analysis buttons sit in the *first* camera's section and run against
 that camera. Repeating them in every section would offer three buttons

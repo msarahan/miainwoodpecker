@@ -98,7 +98,7 @@ def test_a_device_the_os_saw_but_could_not_be_opened_is_a_permission(probe, caps
     assert expected in printed
 
 
-def test_the_printed_command_names_both_flags_that_default_elsewhere(probe, capsys):
+def test_the_printed_command_carries_the_flag_that_defaults_elsewhere(probe, capsys):
     """
     The command has to carry ``--server-module``, or it cannot possibly work.
 
@@ -112,22 +112,39 @@ def test_the_printed_command_names_both_flags_that_default_elsewhere(probe, caps
 
     assert "--server-module miainwoodpecker.devices.camera_server" in printed
     assert "--backend hardware" in printed
-    assert "--plugin 0" in printed
 
 
-def test_every_working_camera_is_offered_not_only_the_first(probe, capsys):
+def test_the_command_does_not_ask_for_a_plugin_the_server_would_find(probe, capsys):
     """
-    Two cameras produce two ``--plugin`` flags, which is the two-device case.
+    Discovery is the default, so the suggested command carries no ``--plugin``.
+
+    Printing one anyway would be advice that contradicts the server: it
+    would *work*, but it would teach an operator that the index has to
+    be named, which is the belief this whole change exists to remove.
+    """
+    probe["report_probe"]([_working(1)], os_saw_device=True)
+    printed = capsys.readouterr().out
+
+    command = printed.split("miainwoodpecker-viewer", 1)[1]
+    assert "--plugin" not in command.split("That will serve", 1)[0]
+
+
+def test_every_working_camera_is_reported_not_only_the_first(probe, capsys):
+    """
+    Two cameras are both named as what will be served.
 
     A laptop with its own webcam and a microscope plugged in is the
-    ordinary situation rather than an exotic one, and the whole point of
-    the probe is that the microscope is usually *not* index 0.
+    ordinary situation rather than an exotic one, and an operator needs
+    to know the second one is coming — it arrives as ``camera:2``, in
+    its own section.
     """
     probe["report_probe"]([_working(0), _working(2)], os_saw_device=True)
     printed = capsys.readouterr().out
 
-    assert "--plugin 0 --plugin 2" in printed
+    assert "index 0, 2" in printed
     assert "camera:2" in printed
+    # And how to narrow it, since serving both is not always wanted.
+    assert "--plugin 0" in printed
 
 
 def test_a_camera_that_opens_but_delivers_nothing_is_reported_as_such(probe, capsys):

@@ -83,6 +83,35 @@
 
 ### Changed
 
+- **The camera server finds its own cameras.** With no `--plugin`, the
+  hardware backend now probes the capture indices, keeps every one that
+  delivers a frame, and serves all of them — each in its own section,
+  as `camera`, `camera:2`, `camera:3`. It used to open index 0 and
+  nothing else.
+  That default was wrong in the common case rather than merely
+  conservative: a USB microscope's index is not knowable in advance and
+  is usually *not* 0, because a laptop's built-in webcam takes it. So
+  "plug it in and run the viewer" showed the webcam, which looks exactly
+  like a broken microscope and sends an operator after a cable.
+  **Naming still beats finding.** `--plugin` given is taken literally,
+  in order, and nothing is discovered — an operator who says which
+  camera to open has answered the question, and quietly adding a webcam
+  they did not ask for would be worse than useless on an instrument. It
+  also remains the only way to reach a device no probe could find: a
+  path, or a video file replayed as a fixture. The simulated backend
+  never probes, since it has nothing to discover and needs nothing
+  installed.
+  Two details are load-bearing. A frame is the test, not an open — a
+  device that opens and delivers nothing is an ordinary outcome behind
+  an underpowered hub, and serving it would put a section in the viewer
+  that can never show an image. And the scan stops after three
+  *consecutive* misses rather than one, because a laptop whose built-in
+  camera is disabled or already held leaves exactly that hole at index
+  0, and stopping there would miss the microscope at index 1.
+  Finding nothing is its own diagnosis rather than a failure to open
+  `"0"`: the message says what was searched and gives the platform's
+  likely reason, because there is nothing to correct in the command
+  line.
 - **A device server's target list is now the server's to decide.** The
   client used to allocate one localhost port per name in
   `rpc.TARGET_NAMES` and pass them *positionally* on the server's

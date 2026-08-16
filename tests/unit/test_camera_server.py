@@ -14,6 +14,8 @@ device that is not there.
 
 from __future__ import annotations
 
+import typing
+
 import numpy as np
 import pytest
 
@@ -24,13 +26,18 @@ from miainwoodpecker.devices import (
     Camera,
     CameraParameters,
     Instrument,
+    camera_server,
 )
 from miainwoodpecker.devices.camera_server import (
     CAMERA_TARGET,
+    DISCOVERY_MAX_INDEX,
     NO_CAMERA_EXIT_STATUS,
+    CameraOpenError,
     ServerInstrument,
     SimulatedCamera,
+    _devices_to_serve,
     _parse_args,
+    discover_devices,
     main,
     open_camera,
 )
@@ -42,6 +49,9 @@ from miainwoodpecker.devices.remote import (
 )
 from miainwoodpecker.devices.rpc import TARGET_NAMES
 from miainwoodpecker.storage import read_series
+
+if typing.TYPE_CHECKING:
+    from collections.abc import Callable
 
 _SERVER_MODULE = "miainwoodpecker.devices.camera_server"
 _FRAMES = 4
@@ -358,3 +368,261 @@ def test_targets_beyond_the_fixed_tuple_report_their_own_port(
     # of truth for where a target is.
     assert set(endpoints) == {CAMERA_TARGET, f"{CAMERA_TARGET}:2", "instrument"}
     assert f"{CAMERA_TARGET}:2" not in TARGET_NAMES
+
+
+# --------------------------------------------------------------------------
+# Discovery: which cameras get served when nobody says.
+# --------------------------------------------------------------------------
+
+
+def _candidate(index: int, *, delivers: bool = True) -> dict[str, object]:
+    """
+    Return one probe result, in the shape ``probe_capture_devices`` returns.
+
+    Parameters
+    ----------
+    index : int
+        The capture index it was found at.
+    delivers : bool
+        Whether it managed to read a frame.
+
+    Returns
+    -------
+    dict[str, object]
+        One candidate.
+    """
+    return {
+        "index": index,
+        "width": 640,
+        "height": 480,
+        "backend": "TEST",
+        "frame": (480, 640, 3) if delivers else None,
+    }
+
+
+def test_a_camera_that_opens_but_delivers_nothing_is_not_served(monkeypatch):
+    """
+    Discovery keeps only the devices that produced a frame.
+
+    An open is not a working camera on this class of hardware — a
+    microscope behind an underpowered hub opens and then delivers
+    nothing — and serving it would put a section in the viewer that can
+    never show an image, which is the failure this project refuses
+    everywhere else.
+    """
+    monkeypatch.setattr(
+        camera_server,
+        "probe_capture_devices",
+        lambda *_args, **_kwargs: [
+            _candidate(0, delivers=False),
+            _candidate(1),
+        ],
+    )
+
+    assert discover_devices() == ["1"]
+
+
+def test_naming_a_device_skips_discovery_entirely(monkeypatch):
+    """
+    ``--plugin`` is taken literally, and nothing is added to it.
+
+    An operator who names a camera has answered the question. Adding a
+    webcam they did not ask for would be worse than useless on an
+    instrument, so this asserts discovery is not merely overridden but
+    never runs.
+    """
+    def _explode(*_args: object, **_kwargs: object) -> list[dict[str, object]]:
+        message = "discovery ran when a device was named"
+        raise AssertionError(message)
+
+    monkeypatch.setattr(camera_server, "probe_capture_devices", _explode)
+
+    assert _devices_to_serve(HARDWARE_BACKEND, ["1"]) == ["1"]
+    assert _devices_to_serve(HARDWARE_BACKEND, ["/dev/video2", "0"]) == [
+        "/dev/video2",
+        "0",
+    ]
+
+
+def test_the_simulated_backend_never_discovers(monkeypatch):
+    """
+    There is nothing to discover: the simulator synthesises frames.
+
+    It also must not probe, because probing needs OpenCV and the whole
+    point of the simulated backend is that it needs nothing installed —
+    a probe here would make the CI path depend on the ``camera`` extra.
+    """
+    def _explode(*_args: object, **_kwargs: object) -> list[dict[str, object]]:
+        message = "the simulated backend probed for hardware"
+        raise AssertionError(message)
+
+    monkeypatch.setattr(camera_server, "probe_capture_devices", _explode)
+
+    assert _devices_to_serve(SIMULATED_BACKEND, []) == ["0"]
+
+
+def test_discovering_nothing_says_so_rather_than_opening_index_zero(monkeypatch):
+    """
+    "No camera found" is its own diagnosis, not a failure to open "0".
+
+    The distinction matters because the fix differs: there is nothing to
+    correct in the command line, so the message says what was searched
+    and offers the platform's likely reason rather than naming a device
+    the operator never chose.
+    """
+    monkeypatch.setattr(
+        camera_server, "probe_capture_devices", lambda *_a, **_k: [],
+    )
+
+    with pytest.raises(CameraOpenError) as raised:
+        _devices_to_serve(HARDWARE_BACKEND, [])
+
+    message = str(raised.value)
+    assert "no camera was found" in message
+    assert str(DISCOVERY_MAX_INDEX) in message
+    assert "--plugin" in message
+
+
+def test_every_discovered_camera_is_served_in_index_order(monkeypatch):
+    """
+    All of them, not the first: that is the whole point of discovering.
+
+    Order is by index so the mapping from slot to device is at least
+    stable between runs on an unchanged machine — which is not an
+    identity claim, and the metadata still carries ``device_id``.
+    """
+    monkeypatch.setattr(
+        camera_server,
+        "probe_capture_devices",
+        lambda *_a, **_k: [_candidate(0), _candidate(2), _candidate(3)],
+    )
+
+    assert _devices_to_serve(HARDWARE_BACKEND, []) == ["0", "2", "3"]
+
+
+class _FakeCapture:
+    """One capture device, standing in for ``cv2.VideoCapture``."""
+
+    def __init__(self, index: int, present: frozenset[int]) -> None:
+        self._index = index
+        self._present = present
+        self.released = False
+
+    def isOpened(self) -> bool:  # noqa: N802 - OpenCV's spelling
+        """Return whether this index exists on the fake machine."""
+        return self._index in self._present
+
+    def read(self) -> tuple[bool, object]:
+        """Return one frame, as a shaped stand-in."""
+        return True, np.zeros((4, 4), dtype=np.uint8)
+
+    def get(self, _property: int) -> float:
+        """Return a plausible number for any property asked about."""
+        return 640.0
+
+    def getBackendName(self) -> str:  # noqa: N802 - OpenCV's spelling
+        """Return a backend name."""
+        return "FAKE"
+
+    def release(self) -> None:
+        """Record that this device was released."""
+        self.released = True
+
+
+class _FakeCv2:
+    """Enough of ``cv2`` for the probe, and a record of what it opened."""
+
+    CAP_PROP_FRAME_WIDTH = 3
+    CAP_PROP_FRAME_HEIGHT = 4
+
+    def __init__(self, present: frozenset[int]) -> None:
+        self._present = present
+        self.opened: list[int] = []
+        self.captures: list[_FakeCapture] = []
+
+    def VideoCapture(self, index: int) -> _FakeCapture:  # noqa: N802 - OpenCV's
+        """Open a fake capture device and remember the attempt."""
+        self.opened.append(index)
+        capture = _FakeCapture(index, self._present)
+        self.captures.append(capture)
+        return capture
+
+
+@pytest.fixture
+def fake_cv2(monkeypatch: pytest.MonkeyPatch) -> Callable[[set[int]], _FakeCv2]:
+    """
+    Install a stand-in ``cv2`` so the probe's own loop can be tested.
+
+    The loop's stopping rule is the part with a real bug in it, and no
+    machine in CI has the camera layout that would exercise it. A fake
+    module is the only way to ask "what would this do on a laptop whose
+    index 0 is taken?" — which is the ordinary case on macOS.
+
+    Parameters
+    ----------
+    monkeypatch : pytest.MonkeyPatch
+        Used to install the module and restore it afterwards.
+
+    Returns
+    -------
+    Callable[[set[int]], _FakeCv2]
+        Call it with the indices that exist; it returns the fake.
+    """
+    import sys  # noqa: PLC0415 - only this fixture needs it
+
+    def install(present: set[int]) -> _FakeCv2:
+        module = _FakeCv2(frozenset(present))
+        monkeypatch.setitem(sys.modules, "cv2", module)
+        return module
+
+    return install
+
+
+def test_a_hole_at_index_zero_does_not_hide_the_camera_behind_it(fake_cv2):
+    """
+    A laptop whose built-in camera is disabled or held still finds the microscope.
+
+    This is why the stopping rule tolerates a run of misses rather than
+    one. Stopping at the first would report "no camera" on exactly the
+    machine this feature exists for.
+    """
+    fake = fake_cv2({1})
+
+    found = discover_devices()
+
+    assert found == ["1"]
+    assert 0 in fake.opened
+
+
+def test_discovery_stops_after_a_run_of_misses_rather_than_scanning_to_the_end(
+    fake_cv2,
+):
+    """
+    The scan is bounded by consecutive misses, not only by the ceiling.
+
+    Every probe costs a real open attempt, and the client's connect
+    deadline is spent while it happens — so a machine with one camera
+    must not pay for eight tries.
+    """
+    fake = fake_cv2({0})
+
+    assert discover_devices() == ["0"]
+    # 0 hits, then three misses end it: far short of DISCOVERY_MAX_INDEX.
+    assert fake.opened == [0, 1, 2, 3]
+    assert max(fake.opened) < DISCOVERY_MAX_INDEX
+
+
+def test_probing_releases_every_device_it_opened(fake_cv2):
+    """
+    A probe must not leave a camera claimed for the server that follows.
+
+    DirectShow admits one consumer at a time, so a device left open by
+    discovery would be a device the server could not then serve — the
+    probe would have caused the failure it exists to diagnose.
+    """
+    fake = fake_cv2({0, 1})
+
+    discover_devices()
+
+    assert fake.captures
+    assert all(capture.released for capture in fake.captures)
