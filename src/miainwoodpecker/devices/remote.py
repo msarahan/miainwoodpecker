@@ -129,6 +129,9 @@ from miainwoodpecker.devices.rpc import (
     CAMERA_TARGET_NAMES as _CAMERA_TARGET_NAMES,
 )
 from miainwoodpecker.devices.rpc import (
+    INSTRUMENT_TARGET as _INSTRUMENT_TARGET,
+)
+from miainwoodpecker.devices.rpc import (
     SPECTRUM_TARGET_NAMES as _SPECTRUM_TARGET_NAMES,
 )
 from miainwoodpecker.devices.rpc import (
@@ -164,16 +167,24 @@ without forking this project. So the module is a parameter.
 
 The contract such a package implements is the whole of what
 ``nion_server.py`` does on its command line: accept ``--backend``, accept
-one positional port per name in
-:data:`~miainwoodpecker.devices.rpc.TARGET_NAMES`, bind a
-``multiprocessing.connection.Listener`` on each with the authkey from
-``MIAINWOODPECKER_AUTHKEY``, and serve
+``--instrument-port``, bind a ``multiprocessing.connection.Listener`` for
+``instrument`` on that port and one for every other target it serves on
+port 0 — which is the OS choosing — with the authkey from
+``MIAINWOODPECKER_AUTHKEY``, report where each one landed in
+``describe()``'s ``endpoints`` map, and serve
 :class:`~miainwoodpecker.devices.rpc.Call` objects against targets that
 satisfy the protocols in :mod:`miainwoodpecker.devices.interface`. See
-docs/vendor-support.md for what that costs per vendor, and for the one
-part of it that does *not* yet fit an arbitrary instrument: the target
-names are a fixed tuple, so a vendor with a different set of detectors
-has to map onto them.
+docs/vendor-support.md for what that costs per vendor.
+
+**A vendor's device list is its own.** This used to be the one part of
+the contract that did not fit an arbitrary instrument: the client
+allocated one port per name in
+:data:`~miainwoodpecker.devices.rpc.TARGET_NAMES` and passed them
+positionally, so a server could serve only names this client already
+knew, and a vendor with a different set of detectors had to map onto
+them. One port and an endpoint map replaced that. What remains of the
+tuple is which names get a *named attribute* here; anything else is
+reached by name.
 """
 
 if typing.TYPE_CHECKING:
@@ -1752,7 +1763,10 @@ def _start_server(
     server never exits, so the wait always timed out), and a loaded
     machine that took longer than the window to reach its bind turned a
     curable collision into an anonymous startup error — observed once in
-    CI after the target list grew to five ports. Detection now lives
+    CI back when the client allocated a port per target and there were
+    five of them. There is one port now, which shrinks the window rather
+    than closing it: the child still binds seconds after this function
+    releases it. Detection lives
     where the process is already being polled anyway:
     :func:`_connect_with_retry` raises :class:`_PortsLostError` when it
     finds the child dead with
@@ -1781,9 +1795,12 @@ def _start_server(
     Returns
     -------
     tuple[dict[str, int], bytes, subprocess.Popen[bytes]]
-        The chosen ports, the shared authkey, and the running process.
+        The chosen port, the shared authkey, and the running process.
+        A mapping of one entry rather than a bare int, because that is
+        what a server's ``serve()`` takes: a caller pinning a second
+        port for its own reasons is a supported thing to do.
     """
-    ports = {name: _free_port() for name in _TARGET_NAMES}
+    ports = {_INSTRUMENT_TARGET: _free_port()}
     authkey = secrets.token_bytes(32)
     process = _spawn_server(ports, authkey, backend, plugin_names, server_module)
     return ports, authkey, process
@@ -1802,7 +1819,9 @@ def _spawn_server(
     Parameters
     ----------
     ports : typing.Mapping[str, int]
-        Port to bind for each target name.
+        Ports to pin, by target name. Only ``instrument`` is passed on
+        the command line; every other target the server serves binds an
+        OS-assigned port and reports it through ``describe()``.
     authkey : bytes
         Shared secret for every Listener.
     backend : str
@@ -1843,7 +1862,8 @@ def _spawn_server(
             backend,
             *plugin_arguments,
             *hook_arguments,
-            *(str(ports[name]) for name in _TARGET_NAMES),
+            "--instrument-port",
+            str(ports[_INSTRUMENT_TARGET]),
         ],
         env=env,
         # Its own process group, so a Ctrl-C in the launching terminal
@@ -1886,21 +1906,27 @@ def _reported_endpoints(
     description: typing.Mapping[str, object],
 ) -> dict[str, dict[str, object]]:
     """
-    Return the endpoint map a server reported, or an empty one.
+    Return the endpoint map a server reported.
 
-    A server that binds targets on OS-assigned ports has to say where
-    they are, and it says so here — target name to ``port``, ``kind``
-    and ``label``. That is what lets a server offer targets this client
-    could not have allocated a port for, because it did not know their
-    names: a second commodity camera, or a detector list from an adapter
-    written after this client shipped.
+    A server binds every target but ``instrument`` on an OS-assigned
+    port, so this map is the *only* way the client learns where they
+    are — target name to ``port``, ``kind`` and ``label``. It is also
+    what lets a server offer targets this client could not have named in
+    advance: a second commodity camera, or a detector list from an
+    adapter written after this client shipped.
 
-    Absent for a server that serves only the names in
-    :data:`~miainwoodpecker.devices.rpc.TARGET_NAMES`, which are reached
-    on the ports the client allocated and passed on the command line.
-    Returning an empty mapping rather than raising keeps those servers
-    working unchanged, which is what makes this migration one server at
-    a time rather than all of them at once.
+    This used to be optional, with the client falling back to ports it
+    had allocated positionally, so that in-tree servers could migrate one
+    at a time. They have all migrated; the fallback is gone, and with it
+    the argv shape that made
+    :data:`~miainwoodpecker.devices.rpc.TARGET_NAMES` append-only. A
+    server that reports nothing here now serves nothing this client can
+    reach, and :func:`_connect_session` says so rather than dialling a
+    port it invented.
+
+    Malformed entries are dropped rather than raised on, so that one
+    unusable target does not cost the session every usable one; the
+    caller reports what is missing by name.
 
     Parameters
     ----------
@@ -1939,10 +1965,20 @@ def _connect_session(
     within an attempt, and sharing it *across* attempts would make the
     retry a shorter and shorter straw.
 
+    Every connect here can also raise :class:`_PortsLostError`,
+    propagated from :func:`_connect_with_retry` at whatever point the
+    child's port-collision exit becomes visible — before the first
+    connection or between the tenth and the eleventh. Nothing is caught
+    here: the caller owns the respawn, and owns ``connections`` so it
+    can release whatever this attempt opened to a server that is already
+    gone.
+
     Parameters
     ----------
     ports : typing.Mapping[str, int]
-        Port each target's Listener was told to bind.
+        Ports pinned on the server's command line — ``instrument``, and
+        nothing else. Every other target is reached at the port its
+        endpoint reports.
     authkey : bytes
         Shared secret for every connection.
     process : subprocess.Popen[bytes]
@@ -1959,12 +1995,11 @@ def _connect_session(
     _ConnectedSession
         The connected session, ready to yield to the caller.
 
-    Every connect here can raise :class:`_PortsLostError`, propagated
-    from :func:`_connect_with_retry` at whatever point the child's
-    port-collision exit becomes visible — before the first connection or
-    between the tenth and the eleventh. Nothing is caught here: the
-    caller owns the respawn, and owns ``connections`` so it can release
-    whatever this attempt opened to a server that is already gone.
+    Raises
+    ------
+    DeviceServerStartupError
+        If the server reports serving a target but publishes no endpoint
+        for it, so there is no port to dial.
     """
     deadline = time.monotonic() + _CONNECT_TIMEOUT_S
     lifecycle = _SpawnedServer(process)
@@ -1987,41 +2022,50 @@ def _connect_session(
     description = instrument.describe()
     served = typing.cast("Sequence[str]", description["targets"])
     endpoints = _reported_endpoints(description)
+    unreachable = [name for name in served if name not in endpoints]
+    if unreachable:
+        # Naming them beats a KeyError: the server said it serves these
+        # and then did not say where, which is a fault in that server
+        # rather than anything the operator can retry.
+        msg = (
+            f"{server_module} reports serving "
+            f"{', '.join(unreachable)} but published no endpoint for "
+            f"{'them' if len(unreachable) > 1 else 'it'}; a server must "
+            f"report every target's port in describe()['endpoints']"
+        )
+        raise DeviceServerStartupError(msg)
     for name in served:
-        # A server that reports endpoints has told us where each target
-        # is listening, including targets whose names this client could
-        # not allocate a port for. One that does not is served entirely
-        # from the client-allocated ports, exactly as before.
-        port = endpoints[name]["port"] if name in endpoints else ports[name]
         connections[name] = _connect_with_retry(
-            int(typing.cast("int", port)),
+            int(typing.cast("int", endpoints[name]["port"])),
             authkey,
             deadline,
             process,
             server_module,
         )
 
-    camera_names = [
-        name
-        for name in served
-        if name in connections
-        and (
-            endpoints[name].get("kind") == "camera"
-            if name in endpoints
-            else name in _CAMERA_TARGET_NAMES
-        )
-    ]
+    # Which handle a target gets is the server's answer, not a guess from
+    # its name: `kind` is reported alongside the port, so `camera:2` and a
+    # name written after this client shipped are typed correctly too.
+    kinds = {name: endpoints[name].get("kind") for name in served}
     cameras = {
         name: RemoteCamera(connections[name], name, lifecycle)
-        for name in camera_names
+        for name in served
+        if kinds[name] == "camera"
     }
     # Optional for the same reason the cameras are. A detector-only
     # server - a camera driven directly, with no scan unit - used to
     # die here with a KeyError, which made "vendor-neutral" quietly
     # mean "must have a scanner shaped like Nion's".
+    #
+    # The first one, if a server reports several. `scanner` is a single
+    # field here, and no instrument in reach has two scan units; a server
+    # that does would need a `scanners()` accessor the way cameras got
+    # one, which is a change to make against a real second scan unit
+    # rather than on spec.
+    scanner_names = [name for name in served if kinds[name] == "scanner"]
     scanner = (
-        RemoteScanner(connections["scanner"], "scanner", lifecycle)
-        if "scanner" in connections
+        RemoteScanner(connections[scanner_names[0]], scanner_names[0], lifecycle)
+        if scanner_names
         else None
     )
     # Optional in exactly the way the cameras and the scanner are:
@@ -2030,8 +2074,8 @@ def _connect_session(
     # separate analyser entirely.
     spectrum_detectors = {
         name: RemoteSpectrumDetector(connections[name], name, lifecycle)
-        for name in _SPECTRUM_TARGET_NAMES
-        if name in connections
+        for name in served
+        if kinds[name] == "spectrum"
     }
     return _ConnectedSession(
         process=process,

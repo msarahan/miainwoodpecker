@@ -209,18 +209,22 @@ def test_a_recording_from_a_commodity_camera_round_trips(camera_microscope, tmp_
 
 def test_the_command_line_matches_the_protocol():
     """
-    One positional port per target name, and ``--plugin`` as configuration.
+    One port, for ``instrument``, and ``--plugin`` as configuration.
 
     The argv shape is the contract every adapter implements; asserting it
-    here is what stops the two servers drifting apart.
+    here is what stops the servers drifting apart. One port rather than
+    one per target is the whole of what let the target list stop being a
+    fixed tuple: everything else binds where the OS says and is reported
+    through ``describe()``.
     """
-    ports = [str(5000 + index) for index in range(len(TARGET_NAMES))]
-    arguments = _parse_args(["--backend", HARDWARE_BACKEND, "--plugin", "2", *ports])
+    arguments = _parse_args(
+        ["--backend", HARDWARE_BACKEND, "--plugin", "2", "--instrument-port", "5000"],
+    )
     assert arguments.backend == HARDWARE_BACKEND
     assert arguments.plugin == ["2"]
-    assert arguments.ports == [int(port) for port in ports]
+    assert arguments.instrument_port == 5000  # noqa: PLR2004 - the port passed above
 
-    default = _parse_args(ports)
+    default = _parse_args(["--instrument-port", "5000"])
     assert default.backend == SIMULATED_BACKEND
     assert default.plugin == []
 
@@ -242,10 +246,9 @@ def test_a_missing_camera_exits_distinctly_and_says_what_to_check(monkeypatch):
     without hardware at all.
     """
     monkeypatch.setenv("MIAINWOODPECKER_AUTHKEY", "00" * 32)
-    ports = [str(5000 + index) for index in range(len(TARGET_NAMES))]
     status = main(
         ["--backend", HARDWARE_BACKEND, "--plugin", "/dev/definitely-not-a-camera",
-         *ports],
+         "--instrument-port", "5000"],
     )
     assert status == NO_CAMERA_EXIT_STATUS
 
@@ -338,10 +341,11 @@ def test_targets_beyond_the_fixed_tuple_report_their_own_port(
     """
     The server says where each target listens, because the client cannot know.
 
-    ``camera:2`` is not in ``TARGET_NAMES``, so the client allocated no
-    port for it. The server binds it on an OS-assigned port and reports
-    that port through ``describe()``, which is what makes a target name
-    the client has never heard of reachable at all.
+    The client allocates one port, for ``instrument``. Everything else
+    binds where the OS says and is reported through ``describe()``,
+    which is what makes ``camera:2`` — a name that is not in
+    ``TARGET_NAMES`` and that no client could have allocated for —
+    reachable at all.
     """
     endpoints = two_camera_microscope.instrument.describe()["endpoints"]
     extra = endpoints[f"{CAMERA_TARGET}:2"]
@@ -349,7 +353,8 @@ def test_targets_beyond_the_fixed_tuple_report_their_own_port(
     assert extra["kind"] == "camera"
     assert isinstance(extra["port"], int)
     assert extra["port"] > 0
-    # Every served target reports an endpoint, including the ones the
-    # client did allocate, so a client never has to mix the two sources.
+    # Every served target reports an endpoint, with no exception for the
+    # one port the client did allocate, so there is only ever one source
+    # of truth for where a target is.
     assert set(endpoints) == {CAMERA_TARGET, f"{CAMERA_TARGET}:2", "instrument"}
     assert f"{CAMERA_TARGET}:2" not in TARGET_NAMES

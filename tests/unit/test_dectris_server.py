@@ -56,7 +56,6 @@ from miainwoodpecker.devices.remote import (
     SIMULATED_BACKEND,
     remote_instrument,
 )
-from miainwoodpecker.devices.rpc import TARGET_NAMES
 from miainwoodpecker.storage import read_series
 
 _SERVER_MODULE = "miainwoodpecker.devices.dectris_server"
@@ -525,8 +524,16 @@ def test_a_missing_control_unit_exits_distinctly(monkeypatch):
     with socket.socket() as probe:
         probe.bind(("127.0.0.1", 0))
         address = f"127.0.0.1:{probe.getsockname()[1]}"
-    ports = [str(5000 + index) for index in range(len(TARGET_NAMES))]
-    status = main(["--backend", HARDWARE_BACKEND, "--plugin", address, *ports])
+    status = main(
+        [
+            "--backend",
+            HARDWARE_BACKEND,
+            "--plugin",
+            address,
+            "--instrument-port",
+            "5000",
+        ],
+    )
     assert status == NO_DETECTOR_EXIT_STATUS
 
 
@@ -647,21 +654,27 @@ def test_a_recording_from_a_detector_round_trips(dectris_microscope, tmp_path):
 
 def test_the_command_line_matches_the_protocol():
     """
-    One positional port per target name, and ``--plugin`` as configuration.
+    One port, for ``instrument``, and ``--plugin`` as configuration.
 
     Here ``--plugin`` reads as the control unit's address, which is what
     the protocol's server-specific configuration channel is for: the Nion
     server reads it as plug-in module names and nothing requires that.
     """
-    ports = [str(5000 + index) for index in range(len(TARGET_NAMES))]
     arguments = _parse_args(
-        ["--backend", HARDWARE_BACKEND, "--plugin", "10.42.0.10", *ports],
+        [
+            "--backend",
+            HARDWARE_BACKEND,
+            "--plugin",
+            "10.42.0.10",
+            "--instrument-port",
+            "5000",
+        ],
     )
     assert arguments.backend == HARDWARE_BACKEND
     assert arguments.plugin == ["10.42.0.10"]
-    assert arguments.ports == [int(port) for port in ports]
+    assert arguments.instrument_port == 5000  # noqa: PLR2004 - the port passed above
 
-    default = _parse_args(ports)
+    default = _parse_args(["--instrument-port", "5000"])
     assert default.backend == SIMULATED_BACKEND
     assert default.plugin == []
 

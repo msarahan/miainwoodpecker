@@ -59,6 +59,44 @@
 
 ### Changed
 
+- **A device server's target list is now the server's to decide.** The
+  client used to allocate one localhost port per name in
+  `rpc.TARGET_NAMES` and pass them *positionally* on the server's
+  command line, which made that tuple part of the wire protocol: a
+  server could serve only names this client already knew, the tuple was
+  append-only, and a reordering on either side bound the scanner's port
+  to the EELS camera without `strict=True` noticing (the count still
+  agreed). A vendor with three detectors, or a SEM with SE and BSE and
+  no camera, had to map onto Nion's list, so a file's `device_id` was
+  honest while its target name was a fiction.
+  The client now passes **one** port, `--instrument-port`. Every other
+  target binds on port 0 — the OS choosing — and the server reports
+  where each one landed, with its kind and a device label, in
+  `describe()`'s `endpoints` map. The client connects to what it is
+  told. `camera_server` uses that immediately: `--plugin 0 --plugin 1`
+  serves a webcam and a USB microscope at once, as `camera` and
+  `camera:2`, and the second is reachable despite being a name the
+  client could not have allocated a port for.
+  Which handle a target gets is read from the endpoint's `kind` rather
+  than guessed from its name, so a name written after this client
+  shipped still arrives as a camera. `TARGET_NAMES` survives as the list
+  of names that get a *named attribute* on `RemoteInstrumentDevices`;
+  it is no longer append-only and no longer reaches any command line.
+  Binding at port 0 also closes a race rather than only a limitation: a
+  client-allocated port is probed free and bound seconds later, which is
+  what `PORT_UNAVAILABLE_EXIT_STATUS` and the respawn retry exist for.
+  One port instead of six shrinks that window; a port the OS assigns at
+  bind time does not have one at all.
+  **This is a flag day for out-of-tree adapters.** A server written
+  against the positional shape will fail argument parsing against this
+  client, and there is no version negotiation in the protocol to soften
+  it — a real limitation, and the honest reason to do this while there
+  are no adapters in the field rather than after. The migration is about
+  ten lines, and `tests/unit/test_out_of_tree_server.py` makes exactly
+  those edits in a complete vendor-free server. The attach path
+  (`attached_instrument()`, `gatan_bridge`) is unchanged and still
+  carries an explicit port per target: the client is not the end that
+  binds there, so it cannot learn a port the far end chose.
 - **EDX and EELS run together on SuperSTEM 2** — confirmed by the
   facility, and they do not physically block one another. This was an
   open question in `docs/adapters/spectrum-detectors.md` about dose,

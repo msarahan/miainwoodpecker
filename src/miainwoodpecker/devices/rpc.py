@@ -40,35 +40,38 @@ TARGET_NAMES = (
     "instrument",
 )
 """
-Every named target a device server can serve, in **argv order**.
+The target names this client knows how to give a dedicated handle.
 
-The order is part of the protocol, not a presentation choice: the client
-passes one port per target positionally on the server's command line, and
-the server zips them back against this same tuple. Both halves used to
-declare their own copy, so reordering one silently bound the scanner's
-port to the EELS camera — a mismatch ``strict=True`` cannot catch,
-because the *count* still agrees. One definition, on the side of the
-boundary that has no vendor dependency, removes the possibility.
+**Neither the order nor the membership is part of the wire protocol any
+more.** It used to be both: the client allocated one port per name and
+passed them positionally on the server's command line, the server zipped
+them back against this tuple, and reordering either copy silently bound
+the scanner's port to the EELS camera — a mismatch ``strict=True``
+cannot catch, because the *count* still agrees. That is why the tuple
+was append-only, and why adding a name meant touching every server.
 
-**This tuple is append-only, and ``spectrum_detector`` is the first
-thing appended to it.** New names go immediately before ``instrument``,
-which stays last (pinned by ``tests/unit/test_rpc.py``), so every
-existing name keeps its argv position and a server needs no change
-beyond agreeing on this tuple — which every server in this tree does by
-reading it at run time (``nargs=len(TARGET_NAMES)``), never by counting
-for itself. The client allocates one port per name whether or not the
-server serves it, and ``describe()`` decides which are connected, so the
-cost of a name nobody serves is one unused localhost port.
+What replaced it: the client binds and passes **one** port, for
+``instrument``. The server binds everything else on an OS-assigned port
+and reports where each one landed through ``describe()``'s ``endpoints``
+map, and the client dials what it is told. A server can therefore serve
+targets whose names are not in this tuple — ``camera:2`` for a second
+commodity camera, or a detector list from an adapter written after this
+client shipped — and the client reaches them without knowing them in
+advance.
 
-docs/vendor-support.md proposes replacing this whole mechanism — bind
-one well-known port for ``instrument``, let the server choose and report
-the rest — and says the redesign should land *with* a second column
-adapter, against a real device list. Adding a name here rather than
-doing that redesign now is deliberate: an X-ray detector is not a second
-column, and settling a protocol change in the same commit as a new
-device shape would make both harder to review. It does make the case for
-the redesign stronger, since the tuple is now Nion's device list plus a
-detector class Nion does not have.
+What the tuple is still for: these are the names that get a **named
+attribute** on :class:`~miainwoodpecker.devices.remote.RemoteInstrumentDevices`
+(``ronchigram_camera``, ``scanner``, …). Anything else a server serves
+is reached through ``additional_cameras`` or by name, which is the
+difference between a name this client can special-case and a name it can
+merely use. Adding one is now a client-side convenience, with no server
+obliged to agree; removing one would break recordings, which is why
+``ronchigram_camera`` and ``eels_camera`` stay.
+
+``instrument`` stays last (pinned by ``tests/unit/test_rpc.py``) — not
+for argv now, but because it is the one name the client must know before
+it can ask anything, and keeping it at the end keeps the device names
+contiguous.
 """
 
 DEVICE_TARGET_NAMES = (
@@ -110,10 +113,58 @@ recording use them. ``camera`` is the neutral slot: a detector, a webcam,
 or anything else that produces frames and is not one of those two. It
 exists because the alternative was worse — serving a USB microscope as a
 "Ronchigram camera" would put a fiction in every file's target name while
-the frame metadata told the truth. See docs/vendor-support.md for the
-redesign that would remove the fixed list altogether, and why it is
-waiting for a second *column* adapter rather than being done on spec.
+the frame metadata told the truth.
+
+A server is no longer confined to these three: ``camera:2`` and beyond
+are ordinary target names, reported through ``endpoints`` and typed by
+:func:`target_kind`. This tuple is the subset that gets a named
+attribute on the client, not the set a server may serve.
 """
+
+INSTRUMENT_TARGET = "instrument"
+"""The one target name a client must know before it can ask anything."""
+
+SCANNER_TARGET = "scanner"
+"""The scan-unit target name."""
+
+
+def target_kind(name: str) -> str:
+    """
+    Say what sort of device a target name is, for ``endpoints`` to report.
+
+    The client used to answer this from the name alone, against the fixed
+    tuples above — which works only for names it already knows, and the
+    whole point of ``endpoints`` is names it does not. So the *server*
+    answers it, and this is the function every in-tree server uses so
+    that they agree.
+
+    A suffixed name (``camera:2``) is the same kind as its base
+    (``camera``): the suffix distinguishes instances, not types.
+
+    Parameters
+    ----------
+    name : str
+        A target name, with or without an instance suffix.
+
+    Returns
+    -------
+    str
+        ``"instrument"``, ``"camera"``, ``"scanner"``, ``"spectrum"``,
+        or ``"device"`` for a name this module has no opinion about —
+        which an out-of-tree adapter is free to serve, and which the
+        client reaches by name rather than through a typed handle.
+    """
+    base = name.split(":", 1)[0]
+    if base == INSTRUMENT_TARGET:
+        return "instrument"
+    if base in CAMERA_TARGET_NAMES:
+        return "camera"
+    if base in SPECTRUM_TARGET_NAMES:
+        return "spectrum"
+    if base == SCANNER_TARGET:
+        return "scanner"
+    return "device"
+
 
 SIMULATED_BACKEND = "simulated"
 """Backend name selecting the software simulator."""

@@ -140,8 +140,12 @@ from miainwoodpecker.devices.interface import (
     CameraParameters,
     Frame,
 )
-from miainwoodpecker.devices.rpc import BACKENDS, SIMULATED_BACKEND
-from miainwoodpecker.devices.serving import accept_loop
+from miainwoodpecker.devices.rpc import (
+    BACKENDS,
+    INSTRUMENT_TARGET,
+    SIMULATED_BACKEND,
+)
+from miainwoodpecker.devices.serving import accept_loop, bind_targets, endpoint_map
 from miainwoodpecker.devices.shared_frame import SharedFrameWriter
 
 if typing.TYPE_CHECKING:
@@ -1990,6 +1994,22 @@ class ServerInstrument:
         self._stop = stop_event
         self._backend = backend
         self._shutting_down = False
+        self._endpoints: dict[str, dict[str, object]] = {}
+
+    def publish_endpoints(self, endpoints: dict[str, dict[str, object]]) -> None:
+        """
+        Record where each target is listening, for ``describe`` to report.
+
+        Set after the listeners bind rather than passed to ``__init__``,
+        because a target bound on an OS-assigned port does not know its
+        own port until it has one.
+
+        Parameters
+        ----------
+        endpoints : dict[str, dict[str, object]]
+            Target name to its ``port``, ``kind`` and ``label``.
+        """
+        self._endpoints = endpoints
 
     def stage_size_nm(self) -> float:
         """
@@ -2017,13 +2037,16 @@ class ServerInstrument:
         Returns
         -------
         dict[str, object]
-            ``backend``, ``targets``, ``controls`` and ``stage_size_nm``.
+            ``backend``, ``targets``, ``controls``, ``stage_size_nm``
+            and ``endpoints`` — the last naming the port and kind of
+            every target, which is how the client reaches them.
         """
         return {
             "backend": self._backend,
             "targets": [name for name in self._targets if name != "instrument"],
             "controls": [],
             "stage_size_nm": self.stage_size_nm(),
+            "endpoints": self._endpoints,
         }
 
     def health(self) -> dict[str, object]:
@@ -2140,7 +2163,9 @@ def serve(
     Parameters
     ----------
     ports : typing.Mapping[str, int]
-        Port for each target name; only the ones served are bound.
+        Ports the caller pins, by target name. In practice that is
+        ``instrument`` and nothing else: every other target binds on an
+        OS-assigned port and is reported through ``describe``.
     authkey : bytes
         Shared secret for every Listener.
     backend : str
@@ -2154,19 +2179,16 @@ def serve(
         With :data:`PORT_UNAVAILABLE_EXIT_STATUS` when a listener cannot
         bind, so the client retries with fresh ports.
     """
-    from multiprocessing.connection import Listener  # noqa: PLC0415 - see nion_server
-
     camera = open_camera(backend, address)
     stop_event = threading.Event()
     targets: dict[str, object] = {CAMERA_TARGET: camera}
-    targets["instrument"] = ServerInstrument(targets, stop_event, backend)
-    writers = {CAMERA_TARGET: SharedFrameWriter(), "instrument": None}
+    instrument = ServerInstrument(targets, stop_event, backend)
+    targets[INSTRUMENT_TARGET] = instrument
+    writers = {CAMERA_TARGET: SharedFrameWriter(), INSTRUMENT_TARGET: None}
 
     names = list(targets)
     try:
-        listeners = [
-            Listener(("localhost", ports[name]), authkey=authkey) for name in names
-        ]
+        listeners, bound = bind_targets(names, ports, authkey)
     except OSError as error:
         _LOGGER.error(  # noqa: TRY400 - a traceback adds nothing here
             "could not bind a listener (%s); the client will retry",
@@ -2174,6 +2196,9 @@ def serve(
         )
         camera.close()
         raise SystemExit(PORT_UNAVAILABLE_EXIT_STATUS) from error
+    instrument.publish_endpoints(
+        endpoint_map(bound, {CAMERA_TARGET: camera.camera_id}),
+    )
 
     _LOGGER.info("serving %s on backend %s", ", ".join(names), backend)
     for listener, name in zip(listeners, names, strict=True):
@@ -2199,7 +2224,7 @@ def _parse_args(argv: Sequence[str]) -> argparse.Namespace:
     Returns
     -------
     argparse.Namespace
-        With ``backend``, ``plugin`` and ``ports``.
+        With ``backend``, ``plugin`` and ``instrument_port``.
     """
     parser = argparse.ArgumentParser(
         description="Serve a DECTRIS detector over the miainwoodpecker protocol.",
@@ -2215,9 +2240,15 @@ def _parse_args(argv: Sequence[str]) -> argparse.Namespace:
         ),
     )
     parser.add_argument("--enable-test-hooks", action="store_true")
-    from miainwoodpecker.devices.rpc import TARGET_NAMES  # noqa: PLC0415 - argv shape
-
-    parser.add_argument("ports", nargs=len(TARGET_NAMES), type=int)
+    parser.add_argument(
+        "--instrument-port",
+        type=int,
+        required=True,
+        help=(
+            "the one port the client allocates; every other target binds "
+            "an OS-assigned port and is reported through describe()"
+        ),
+    )
     arguments = parser.parse_args(list(argv))
     if arguments.plugin is None:
         arguments.plugin = []
@@ -2238,14 +2269,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     int
         Process exit status.
     """
-    from miainwoodpecker.devices.rpc import TARGET_NAMES  # noqa: PLC0415 - argv shape
-
     logging.basicConfig(
         level=os.environ.get("MIAINWOODPECKER_DEVICE_LOG_LEVEL", "WARNING"),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     arguments = _parse_args(sys.argv[1:] if argv is None else argv)
-    ports = dict(zip(TARGET_NAMES, arguments.ports, strict=True))
+    ports = {INSTRUMENT_TARGET: arguments.instrument_port}
     authkey = bytes.fromhex(os.environ["MIAINWOODPECKER_AUTHKEY"])
     address = arguments.plugin[0] if arguments.plugin else _DEFAULT_ADDRESS
     try:

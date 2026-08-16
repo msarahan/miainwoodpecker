@@ -103,8 +103,12 @@ from miainwoodpecker.devices.interface import (
     CameraParameters,
     Frame,
 )
-from miainwoodpecker.devices.rpc import BACKENDS, SIMULATED_BACKEND
-from miainwoodpecker.devices.serving import accept_loop, bind_targets
+from miainwoodpecker.devices.rpc import (
+    BACKENDS,
+    INSTRUMENT_TARGET,
+    SIMULATED_BACKEND,
+)
+from miainwoodpecker.devices.serving import accept_loop, bind_targets, endpoint_map
 from miainwoodpecker.devices.shared_frame import SharedFrameWriter
 
 if typing.TYPE_CHECKING:
@@ -744,16 +748,7 @@ def serve(
             "could not bind a listener (%s); the client will retry", error,
         )
         raise SystemExit(PORT_UNAVAILABLE_EXIT_STATUS) from error
-    instrument.publish_endpoints(
-        {
-            name: {
-                "port": bound[name],
-                "kind": "instrument" if name == "instrument" else "camera",
-                "label": labels.get(name, "instrument"),
-            }
-            for name in names
-        },
-    )
+    instrument.publish_endpoints(endpoint_map(bound, labels))
 
     _LOGGER.info("serving %s on backend %s", ", ".join(names), backend)
     for listener, name in zip(listeners, names, strict=True):
@@ -779,7 +774,7 @@ def _parse_args(argv: Sequence[str]) -> argparse.Namespace:
     Returns
     -------
     argparse.Namespace
-        With ``backend``, ``plugin`` and ``ports``.
+        With ``backend``, ``plugin`` and ``instrument_port``.
     """
     parser = argparse.ArgumentParser(
         description="Serve a commodity camera over the miainwoodpecker protocol.",
@@ -795,9 +790,15 @@ def _parse_args(argv: Sequence[str]) -> argparse.Namespace:
         ),
     )
     parser.add_argument("--enable-test-hooks", action="store_true")
-    from miainwoodpecker.devices.rpc import TARGET_NAMES  # noqa: PLC0415 - argv shape
-
-    parser.add_argument("ports", nargs=len(TARGET_NAMES), type=int)
+    parser.add_argument(
+        "--instrument-port",
+        type=int,
+        required=True,
+        help=(
+            "the one port the client allocates; every other target binds "
+            "an OS-assigned port and is reported through describe()"
+        ),
+    )
     arguments = parser.parse_args(list(argv))
     if arguments.plugin is None:
         arguments.plugin = []
@@ -818,14 +819,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     int
         Process exit status.
     """
-    from miainwoodpecker.devices.rpc import TARGET_NAMES  # noqa: PLC0415 - argv shape
-
     logging.basicConfig(
         level=os.environ.get("MIAINWOODPECKER_DEVICE_LOG_LEVEL", "WARNING"),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     arguments = _parse_args(sys.argv[1:] if argv is None else argv)
-    ports = dict(zip(TARGET_NAMES, arguments.ports, strict=True))
+    ports = {INSTRUMENT_TARGET: arguments.instrument_port}
     authkey = bytes.fromhex(os.environ["MIAINWOODPECKER_AUTHKEY"])
     devices = list(arguments.plugin) if arguments.plugin else [_DEFAULT_DEVICE]
     try:

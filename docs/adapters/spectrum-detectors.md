@@ -367,6 +367,18 @@ recorded: the tuple is now Nion's device list *plus a detector class Nion
 does not have*, which is the clearest statement yet that a fixed list is
 the wrong mechanism.
 
+**The redesign has since landed, and two sentences above are now false.**
+Servers no longer read `len(TARGET_NAMES)` at run time, because they take
+no positional ports; `TARGET_NAMES` no longer reaches any command line,
+and is no longer append-only. The trigger was not the second column
+adapter this section deferred to, but two USB cameras on a desk —
+see [vendor support](../vendor-support.md), "The target names were a
+fixed tuple, and positional argv". The decision recorded here still
+reads correctly for the time it was made: `spectrum_detector` went in as
+a name, the protocol change came separately, and the two were reviewable
+apart. The cost line is now obsolete too — there is no unused localhost
+port per session, because the client allocates one port in total.
+
 ---
 
 ## 3. Storage: the NeXus layout is real, and where it goes was measured

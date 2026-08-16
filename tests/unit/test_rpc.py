@@ -25,10 +25,12 @@ import pytest
 
 from miainwoodpecker.devices.rpc import (
     BACKENDS,
+    CAMERA_TARGET_NAMES,
     DEVICE_TARGET_NAMES,
     HARDWARE_BACKEND,
     SHARED_MEMORY_THRESHOLD_BYTES,
     SIMULATED_BACKEND,
+    SPECTRUM_TARGET_NAMES,
     TARGET_NAMES,
     Call,
     RemoteCallError,
@@ -37,6 +39,7 @@ from miainwoodpecker.devices.rpc import (
     Result,
     disable_nagle,
     send_call,
+    target_kind,
 )
 
 
@@ -317,12 +320,58 @@ def test_the_protocol_vocabulary_lives_on_the_mit_side():
     The threshold decides whether a client receives a Frame or a
     SharedFrameRef, which makes it a protocol decision; it lived in the
     GPL server module, and the MIT test suite had to import that module
-    to learn a number. The argv ordering of TARGET_NAMES is likewise part
-    of the protocol - the client passes one port per target positionally
-    and the server zips them back against the same tuple, so two copies
-    could disagree in a way strict=True cannot catch.
+    to learn a number. TARGET_NAMES was once part of the protocol in a
+    stronger sense - the client passed one port per target positionally
+    and the server zipped them back against the same tuple, so two copies
+    could disagree in a way strict=True cannot catch. The ports are not
+    positional any more, but the names are still what both sides mean by
+    a target, and `instrument` is still the one the client must know
+    before it can ask anything.
     """
     assert TARGET_NAMES[-1] == "instrument"
     assert set(DEVICE_TARGET_NAMES) == set(TARGET_NAMES) - {"instrument"}
     assert BACKENDS == (SIMULATED_BACKEND, HARDWARE_BACKEND)
     assert SHARED_MEMORY_THRESHOLD_BYTES == 64 * 1024
+
+
+def test_every_known_target_name_has_a_kind():
+    """
+    A server reports each target's kind, so the client need not parse names.
+
+    Checked against the tuples rather than written out, because a name
+    added to one of them and not to ``target_kind`` would arrive at the
+    client as an untyped ``device`` - reachable, but with no handle -
+    and nothing else would notice.
+    """
+    for name in CAMERA_TARGET_NAMES:
+        assert target_kind(name) == "camera"
+    for name in SPECTRUM_TARGET_NAMES:
+        assert target_kind(name) == "spectrum"
+    assert target_kind("scanner") == "scanner"
+    assert target_kind("instrument") == "instrument"
+    assert {target_kind(name) for name in TARGET_NAMES} != {"device"}
+
+
+def test_an_instance_suffix_does_not_change_a_targets_kind():
+    """
+    ``camera:2`` is a camera. The suffix distinguishes instances, not types.
+
+    This is what lets a server serve a second commodity camera on a name
+    the client has never seen and still have it arrive as a camera.
+    """
+    assert target_kind("camera:2") == "camera"
+    assert target_kind("eels_camera:3") == "camera"
+    assert target_kind("spectrum_detector:2") == "spectrum"
+
+
+def test_a_name_this_module_does_not_know_is_still_a_target():
+    """
+    An out-of-tree adapter may serve names nobody here chose.
+
+    It gets ``device`` rather than a guess or an error: the client can
+    reach it by name, and simply has no typed handle to offer for it.
+    That is the whole difference between a name this client
+    special-cases and a name it can merely use.
+    """
+    assert target_kind("acme_backscatter_detector") == "device"
+    assert target_kind("acme_detector:4") == "device"
