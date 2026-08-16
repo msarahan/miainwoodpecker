@@ -295,6 +295,15 @@ exclude = [
     "INP001",  # standalone entry-point scripts, not a package.
     "T201",  # these are diagnostic CLI scripts; print is the interface.
 ]
+"src/miainwoodpecker/viewer/panels/*.py" = [
+    # These modules ARE LiveInstrumentWidget's construction code; they
+    # were methods on it until live.py passed 1900 lines. Building a
+    # widget's own children and binding them to its own attributes is
+    # not reaching into someone else's private state, and the
+    # alternative - making every control public purely to satisfy the
+    # rule - would widen the class's surface to describe a file split.
+    "SLF001",  # 'Private member accessed'
+]
 
 [tool.ruff.lint.isort]
 case-sensitive = true

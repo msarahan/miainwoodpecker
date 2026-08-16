@@ -53,6 +53,19 @@ extra is installed**, with a single row naming the enabled and available
 extras standing in for the ones that are not. A button that cannot work
 is worse than an absent one: it teaches the operator that this
 application's buttons sometimes do nothing.
+
+Where the panels live
+---------------------
+This module assembles the window; each panel is built in its own module
+under :mod:`miainwoodpecker.viewer.panels`, which is where they moved
+when this file passed 1900 lines. They are **builders taking the
+widget**, not methods on it and not widget subclasses, and that is the
+whole point of the arrangement: the construction moved out, the *state*
+did not. Every control is still an attribute of this class, so every
+method here, and every test, reaches for it exactly where it always
+did. A panel that owned its own children would have moved
+``_analyze_status`` to ``_camera_panel._analyze_status`` and made a file
+split into an API change.
 """
 
 from __future__ import annotations
@@ -82,6 +95,16 @@ from miainwoodpecker.storage.session import (
     free_space,
 )
 from miainwoodpecker.viewer.jobs import AnalysisJob
+from miainwoodpecker.viewer.panels import devices as devices_panel
+from miainwoodpecker.viewer.panels import recordings as recordings_panel
+from miainwoodpecker.viewer.panels import session as session_panel
+from miainwoodpecker.viewer.panels.defaults import (
+    _DEFAULT_DWELL_US,
+    _DEFAULT_FOV_NM,
+    _DEFAULT_SCAN_SIZE_INDEX,
+    _NO_SESSION_MESSAGE,
+    _SCAN_SIZES,
+)
 
 if typing.TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Iterator, Sequence
@@ -95,23 +118,14 @@ if typing.TYPE_CHECKING:
     from miainwoodpecker.storage.session import LoadedRecording, Recording
 
 _DEFAULT_DISPLAY_INTERVAL_MS = 33
-_SCAN_SIZES = (128, 256, 512)
-_DEFAULT_SCAN_SIZE_INDEX = 1  # 256
-_DEFAULT_DWELL_US = 1.0
-_DEFAULT_FOV_NM = 15.0
 _ANALYSIS_BURST_FRAME_COUNT = 5
-_DEFAULT_RECORD_FRAME_COUNT = 10
-_MAX_RECORD_FRAME_COUNT = 100000
-_NO_SESSION_MESSAGE = "no session - data is not being kept"
 # Shown when a live loop would not release the device in time. Refusing is
 # deliberate: driving a device from two threads corrupts frames silently
 # rather than raising (docs/architecture-review.md, §1.2).
 _SCANNER_BUSY_MESSAGE = "scanner still busy - live scan did not stop, try again"
 _CAMERA_BUSY_MESSAGE = "camera still busy - live loop did not stop, try again"
-_NOTES_HEIGHT_PX = 64
 # Long enough that typing a sentence writes the sidecar once, short enough
 # that an operator who types and immediately clicks Record has their note.
-_CONTEXT_SAVE_DELAY_MS = 750
 _NEXUS_FILE_FILTER = "NeXus recordings (*.nxs *.h5 *.hdf5);;All files (*)"
 
 
@@ -366,362 +380,13 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
 
     def _build_ui(self) -> None:
         layout = QtWidgets.QVBoxLayout(self)
-        layout.addWidget(self._build_session_group())
-        layout.addWidget(self._build_recordings_group())
+        layout.addWidget(session_panel.build_session_group(self))
+        layout.addWidget(recordings_panel.build_recordings_group(self))
         if self._scanner is not None:
-            layout.addWidget(self._build_scan_group())
+            layout.addWidget(devices_panel.build_scan_group(self))
         if self._camera is not None:
-            layout.addWidget(self._build_camera_group())
+            layout.addWidget(devices_panel.build_camera_group(self))
         layout.addStretch(1)
-
-    def _build_recordings_group(self) -> QtWidgets.QGroupBox:
-        """
-        Build the group for looking at data already on disk.
-
-        The combo lists the current session's recordings; "Open from
-        disk..." reaches any file, including one recorded on another machine
-        or in a session that has since been closed. The checkbox is how the
-        three Phase 4 analysis buttons are pointed at a file instead of a
-        fresh burst — one switch rather than three more buttons, since the
-        choice is "what do I analyze", not "what analysis".
-
-        Returns
-        -------
-        QtWidgets.QGroupBox
-            The assembled group.
-        """
-        group = QtWidgets.QGroupBox("Recordings", self)
-        form = QtWidgets.QFormLayout(group)
-        self._recording_combo = QtWidgets.QComboBox(group)
-        self._recording_combo.setPlaceholderText("no recordings in this session")
-        form.addRow("File", self._recording_combo)
-        self._all_sessions_check = QtWidgets.QCheckBox(
-            "List every session in the parent directory", group
-        )
-        form.addRow(self._all_sessions_check)
-        self._open_recording_button = QtWidgets.QPushButton("Open selected", group)
-        form.addRow(self._open_recording_button)
-        self._open_file_button = QtWidgets.QPushButton("Open from disk...", group)
-        form.addRow(self._open_file_button)
-        self._analyze_from_file_check = QtWidgets.QCheckBox(
-            "Analysis buttons use the opened file, not a fresh burst", group
-        )
-        form.addRow(self._analyze_from_file_check)
-        self._load_status = QtWidgets.QLabel("nothing opened yet", group)
-        self._load_status.setWordWrap(True)
-        form.addRow("Opened", self._load_status)
-        self._annotation_edit = QtWidgets.QLineEdit(group)
-        self._annotation_edit.setPlaceholderText("note to add to the opened recording")
-        form.addRow("Add note", self._annotation_edit)
-        self._annotate_button = QtWidgets.QPushButton("Annotate opened", group)
-        form.addRow(self._annotate_button)
-
-        self._open_recording_button.clicked.connect(self.open_selected_recording)
-        self._open_file_button.clicked.connect(self.choose_and_open_recording)
-        self._all_sessions_check.toggled.connect(self._refresh_session_labels)
-        self._annotate_button.clicked.connect(self.annotate_opened_recording)
-        self._annotation_edit.returnPressed.connect(self.annotate_opened_recording)
-        return group
-
-    def _build_session_group(self) -> QtWidgets.QGroupBox:
-        """Build the group showing where data goes and the session context."""
-        session_group = QtWidgets.QGroupBox("Session", self)
-        session_form = QtWidgets.QFormLayout(session_group)
-        self._session_path_label = QtWidgets.QLabel(_NO_SESSION_MESSAGE, session_group)
-        self._session_path_label.setWordWrap(True)
-        session_form.addRow("Saving to", self._session_path_label)
-        self._change_session_button = QtWidgets.QPushButton(
-            "Change directory...", session_group
-        )
-        session_form.addRow(self._change_session_button)
-        self._build_session_context_rows(session_group, session_form)
-        self._space_label = QtWidgets.QLabel("", session_group)
-        self._space_label.setWordWrap(True)
-        session_form.addRow("Disk", self._space_label)
-        self._recorded_label = QtWidgets.QLabel("nothing recorded yet", session_group)
-        self._recorded_label.setWordWrap(True)
-        session_form.addRow("Recorded", self._recorded_label)
-        self._recording_status = QtWidgets.QLabel("idle", session_group)
-        self._recording_status.setWordWrap(True)
-        session_form.addRow("Recording", self._recording_status)
-        self._cancel_record_button = QtWidgets.QPushButton(
-            "Stop recording", session_group
-        )
-        self._cancel_record_button.setEnabled(False)
-        session_form.addRow(self._cancel_record_button)
-
-        self._change_session_button.clicked.connect(self.change_session_directory)
-        self._cancel_record_button.clicked.connect(self.cancel_recording)
-        return session_group
-
-    def _build_session_context_rows(
-        self,
-        parent: QtWidgets.QWidget,
-        form: QtWidgets.QFormLayout,
-    ) -> None:
-        """
-        Add the operator/sample/notes fields, and the next recording's note.
-
-        Notes are multi-line: a single-line field was enough to prove the
-        wiring and not enough for a shift's worth of observations. Two
-        scopes, because they answer different questions — "Session notes"
-        is the shift's standing context and is written to every subsequent
-        recording, while "Note for next recording" describes the individual
-        file (see :meth:`~miainwoodpecker.storage.session.Session.record`).
-
-        ``QPlainTextEdit`` has no ``editingFinished`` signal, so a
-        single-shot timer debounces ``textChanged`` instead: typing a
-        paragraph should not rewrite ``session.json`` once per keystroke.
-
-        Parameters
-        ----------
-        parent : QtWidgets.QWidget
-            The group box owning the new widgets.
-        form : QtWidgets.QFormLayout
-            The group's layout, appended to.
-        """
-        self._operator_edit = QtWidgets.QLineEdit(parent)
-        self._operator_edit.setPlaceholderText("who is on the instrument")
-        form.addRow("Operator", self._operator_edit)
-        self._sample_edit = QtWidgets.QLineEdit(parent)
-        self._sample_edit.setPlaceholderText("sample identifier")
-        form.addRow("Sample", self._sample_edit)
-        self._notes_edit = QtWidgets.QPlainTextEdit(parent)
-        self._notes_edit.setPlaceholderText("notes for the whole session")
-        self._notes_edit.setMaximumHeight(_NOTES_HEIGHT_PX)
-        form.addRow("Session notes", self._notes_edit)
-        self._recording_note_edit = QtWidgets.QPlainTextEdit(parent)
-        self._recording_note_edit.setPlaceholderText(
-            "what this next recording is - kept until you change it"
-        )
-        self._recording_note_edit.setMaximumHeight(_NOTES_HEIGHT_PX)
-        form.addRow("Note for next recording", self._recording_note_edit)
-
-        self._context_save_timer = QtCore.QTimer(self)
-        self._context_save_timer.setSingleShot(True)
-        self._context_save_timer.setInterval(_CONTEXT_SAVE_DELAY_MS)
-        self._context_save_timer.timeout.connect(self._on_session_context_edited)
-        for edit in (self._operator_edit, self._sample_edit):
-            edit.editingFinished.connect(self._on_session_context_edited)
-        self._notes_edit.textChanged.connect(self._context_save_timer.start)
-
-    def _build_scan_group(self) -> QtWidgets.QGroupBox:
-        # Only reached when there is a scanner: _build_ui skips this group
-        # entirely for a detector-only instrument, so the widgets it
-        # creates (_channel_combo, _scan_count_spin, _scan_status, ...) do
-        # not exist in that case. Every method that touches them checks
-        # _scanner rather than hasattr, because the scanner is the reason
-        # they exist and is the honest thing to ask about.
-        scanner = typing.cast("Scanner", self._scanner)
-        scan_group = QtWidgets.QGroupBox("Scan", self)
-        scan_form = QtWidgets.QFormLayout(scan_group)
-        self._channel_combo = QtWidgets.QComboBox(scan_group)
-        self._channel_combo.addItems(list(scanner.channel_names))
-        scan_form.addRow("Channel", self._channel_combo)
-        self._size_combo = QtWidgets.QComboBox(scan_group)
-        self._size_combo.addItems([str(size) for size in _SCAN_SIZES])
-        self._size_combo.setCurrentIndex(_DEFAULT_SCAN_SIZE_INDEX)
-        scan_form.addRow("Size (px)", self._size_combo)
-        self._dwell_spin = QtWidgets.QDoubleSpinBox(scan_group)
-        self._dwell_spin.setRange(0.1, 1000.0)
-        self._dwell_spin.setValue(_DEFAULT_DWELL_US)
-        self._dwell_spin.setSuffix(" µs")
-        scan_form.addRow("Dwell", self._dwell_spin)
-        self._fov_spin = QtWidgets.QDoubleSpinBox(scan_group)
-        self._fov_spin.setRange(0.1, 100000.0)
-        self._fov_spin.setValue(_DEFAULT_FOV_NM)
-        self._fov_spin.setSuffix(" nm")
-        scan_form.addRow("FOV", self._fov_spin)
-        self._scan_button = QtWidgets.QPushButton("Start scan", scan_group)
-        scan_form.addRow(self._scan_button)
-        self._scan_status = QtWidgets.QLabel("stopped", scan_group)
-        scan_form.addRow("Status", self._scan_status)
-        (
-            self._scan_count_spin,
-            self._scan_save_button,
-            self._scan_record_button,
-        ) = self._build_record_controls(scan_group, scan_form)
-
-        self._channel_combo.currentIndexChanged.connect(self._on_scan_settings_changed)
-        self._size_combo.currentIndexChanged.connect(self._on_scan_settings_changed)
-        self._dwell_spin.valueChanged.connect(self._on_scan_settings_changed)
-        self._fov_spin.valueChanged.connect(self._on_scan_settings_changed)
-        self._scan_button.clicked.connect(self._toggle_scan)
-        self._scan_save_button.clicked.connect(self.save_scan_frame)
-        self._scan_record_button.clicked.connect(self.record_scan_frames)
-        return scan_group
-
-    def _build_record_controls(
-        self,
-        parent: QtWidgets.QWidget,
-        form: QtWidgets.QFormLayout,
-    ) -> tuple[QtWidgets.QSpinBox, QtWidgets.QPushButton, QtWidgets.QPushButton]:
-        """
-        Add "save displayed frame" and "record N frames" controls to a group.
-
-        Shared by the scan and camera groups so both sources get the same
-        two recording affordances without duplicating the widget setup.
-
-        Parameters
-        ----------
-        parent : QtWidgets.QWidget
-            The group box owning the new widgets.
-        form : QtWidgets.QFormLayout
-            The group's layout, appended to.
-
-        Returns
-        -------
-        tuple[QtWidgets.QSpinBox, QtWidgets.QPushButton, QtWidgets.QPushButton]
-            The frame-count spin box, the save button, and the record
-            button, for the caller to connect.
-        """
-        save_button = QtWidgets.QPushButton("Save displayed frame", parent)
-        form.addRow(save_button)
-        count_spin = QtWidgets.QSpinBox(parent)
-        count_spin.setRange(1, _MAX_RECORD_FRAME_COUNT)
-        count_spin.setValue(_DEFAULT_RECORD_FRAME_COUNT)
-        form.addRow("Frames", count_spin)
-        record_button = QtWidgets.QPushButton("Record frames", parent)
-        form.addRow(record_button)
-        return count_spin, save_button, record_button
-
-    def _build_camera_group(self) -> QtWidgets.QGroupBox:
-        camera_group = QtWidgets.QGroupBox("Camera", self)
-        camera_form = QtWidgets.QFormLayout(camera_group)
-        self._camera_button = QtWidgets.QPushButton("Start camera", camera_group)
-        camera_form.addRow(self._camera_button)
-        self._camera_status = QtWidgets.QLabel("stopped", camera_group)
-        camera_form.addRow("Status", self._camera_status)
-        (
-            self._camera_count_spin,
-            self._camera_save_button,
-            self._camera_record_button,
-        ) = self._build_record_controls(camera_group, camera_form)
-        self._build_analysis_rows(camera_group, camera_form)
-
-        self._camera_button.clicked.connect(self._toggle_camera)
-        self._camera_save_button.clicked.connect(self.save_camera_frame)
-        self._camera_record_button.clicked.connect(self.record_camera_frames)
-        return camera_group
-
-    def _build_analysis_rows(
-        self,
-        camera_group: QtWidgets.QGroupBox,
-        camera_form: QtWidgets.QFormLayout,
-    ) -> None:
-        """
-        Add a button per *installed* analysis extra, and name the rest.
-
-        A button for a library that is not installed is a button that
-        cannot work, and offering it teaches the operator that this
-        application's buttons sometimes do nothing. So each one is built
-        only when its extra is importable, and the extras that are not
-        take a single summary row instead — which is more useful than
-        three dead buttons, because it says what is installed as well as
-        what is missing.
-
-        The check is
-        :func:`~miainwoodpecker.analysis.remote.target_available`, which
-        resolves the module *spec* without executing it. Importing
-        py4DSTEM to discover whether py4DSTEM is installed would stall
-        building the window for seconds to answer a question with a cheap
-        answer.
-
-        This is a availability check, not a guarantee: a spec can resolve
-        for a half-installed distribution whose import then fails. Each
-        handler therefore keeps its own ``ImportError`` branch, and that
-        branch is reachable rather than dead code.
-
-        Parameters
-        ----------
-        camera_group : QtWidgets.QGroupBox
-            The group the widgets are parented to.
-        camera_form : QtWidgets.QFormLayout
-            The layout the rows are added to.
-        """
-        from miainwoodpecker.analysis.remote import target_available  # noqa: PLC0415
-        from miainwoodpecker.analysis.transfer import (  # noqa: PLC0415
-            ANALYSIS_TARGETS,
-        )
-
-        specifications = (
-            ("hyperspy", "Analyze in HyperSpy", "Analysis"),
-            ("libertem", "Sum in LiberTEM", "LiberTEM"),
-            ("py4dstem", "Fit central disk (py4DSTEM)", "py4DSTEM"),
-        )
-        handlers = {
-            "hyperspy": self._analyze_camera_in_hyperspy,
-            "libertem": self._analyze_camera_in_libertem,
-            "py4dstem": self._fit_central_disk_in_py4dstem,
-        }
-        attributes = {
-            "hyperspy": ("_analyze_button", "_analyze_status"),
-            "libertem": ("_libertem_button", "_libertem_status"),
-            "py4dstem": ("_py4dstem_button", "_py4dstem_status"),
-        }
-        for button_attribute, status_attribute in attributes.values():
-            setattr(self, button_attribute, None)
-            setattr(self, status_attribute, None)
-
-        enabled: list[str] = []
-        missing: list[str] = []
-        for name, text, row_label in specifications:
-            extra = ANALYSIS_TARGETS[name].extra
-            if not target_available(name):
-                missing.append(extra)
-                continue
-            enabled.append(extra)
-            button_attribute, status_attribute = attributes[name]
-            button = QtWidgets.QPushButton(text, camera_group)
-            camera_form.addRow(button)
-            status = QtWidgets.QLabel("", camera_group)
-            camera_form.addRow(row_label, status)
-            button.clicked.connect(handlers[name])
-            setattr(self, button_attribute, button)
-            setattr(self, status_attribute, status)
-
-        if missing:
-            camera_form.addRow(
-                "Analysis extras",
-                self._build_extras_summary(camera_group, enabled, missing),
-            )
-
-    @staticmethod
-    def _build_extras_summary(
-        camera_group: QtWidgets.QGroupBox,
-        enabled: list[str],
-        missing: list[str],
-    ) -> QtWidgets.QLabel:
-        """
-        Describe which analysis extras are installed and which are not.
-
-        Names both halves rather than only the missing one, because "no
-        analysis buttons" and "analysis is installed but this build has
-        no camera" look identical from the outside, and an operator
-        deciding whether to install anything needs to see the whole set.
-
-        Parameters
-        ----------
-        camera_group : QtWidgets.QGroupBox
-            The group the label is parented to.
-        enabled : list[str]
-            Extras whose libraries are importable.
-        missing : list[str]
-            Extras whose libraries are not.
-
-        Returns
-        -------
-        QtWidgets.QLabel
-            A two-line summary, selectable so the install command can be
-            copied out of it.
-        """
-        lines = [f"enabled: {', '.join(enabled)}" if enabled else "enabled: none"]
-        lines.append(f"available: {', '.join(missing)}")
-        lines.append(f"pip install \"miainwoodpecker[{','.join(missing)}]\"")
-        label = QtWidgets.QLabel("\n".join(lines), camera_group)
-        label.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
-        label.setWordWrap(True)
-        return label
 
     def _on_scan_settings_changed(self) -> None:
         size = int(self._size_combo.currentText())
