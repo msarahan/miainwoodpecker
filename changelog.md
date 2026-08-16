@@ -4,6 +4,30 @@
 
 ### Added
 
+- **A camera probe, so "nothing shows up" names its own cause**
+  (`scripts/probe_cameras.py`). A USB microscope that does not appear in
+  the viewer has four possible reasons, and from the viewer they look
+  identical: the device never enumerated; it enumerated but this process
+  may not open it; it opens fine but is not index 0 (a laptop's built-in
+  webcam usually is); or it opens fine and the viewer was pointed at
+  `nion_server`, which serves no USB camera at all, so no microscope can
+  appear no matter what is plugged in.
+  The script asks the operating system what it sees — per platform,
+  because the three do not agree on what a camera is — and then asks
+  OpenCV to actually open each candidate and read a frame. Opening is
+  the only honest test: a device can be listed and still refuse to open,
+  held by another application or not permitted to this process, and that
+  is exactly the distinction a listing cannot make. It finishes by
+  printing the command that would serve whatever worked, including both
+  flags that default to something else.
+  Two details separate an answer from a red herring. "Nothing opened"
+  branches on whether the operating system saw anything, so a device
+  that never enumerated is not blamed on group membership. And OpenCV's
+  per-index backend warnings are silenced, because probing absent
+  devices is what this does and a wall of them buried the result.
+  Read-only with respect to the instrument, and stdlib-only except for
+  the open-a-frame half — without OpenCV it still runs and says so,
+  since "the operating system can see it" is already worth knowing.
 - **A read-only instrument survey to hand to a facility**
   (`scripts/superstem_survey.py`, with `docs/superstem-survey.md` as its
   runbook). Several design decisions rest on guesses about instruments
