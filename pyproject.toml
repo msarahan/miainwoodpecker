@@ -90,6 +90,14 @@ device = [
 # against ndv before committing further if per-frame overhead is too high.
 viewer = [
     "napari[pyside6]>=0.5",
+    # For the operator preferences that outlive a session
+    # (viewer/preferences.py): which detectors are enabled, and the scan
+    # profiles. Declared rather than leaned on transitively - napari
+    # already pulls it in, but depending on a dependency's dependency is
+    # how an unrelated upgrade removes something out from under you. A
+    # loose bound: this uses only user_config_dir, which is the oldest
+    # and most stable thing the package offers.
+    "platformdirs>=3",
 ]
 # Phase 4 analysis integration - see docs/migration-plan.md section 5.
 # HyperSpy chosen for this extra: it is the lighter, more general option
