@@ -2,6 +2,95 @@
 
 ## Unreleased
 
+### Fixed
+
+- **Closing the preview window no longer ends in a traceback**, and
+  `shutdown()` is now safe to call at any point rather than only the
+  right one. `miainwoodpecker-preview` called `widget.shutdown()` after
+  `napari.run()` returned, which is after Qt has destroyed the widget
+  tree: the call died on `RuntimeError: Internal C++ object (QTimer)
+  already deleted`. `viewer/app.py` had already learned this and carried
+  a comment saying so; the preview entry point diverged from it and has
+  been brought back into line.
+  The traceback was the visible half. The damaging half was that
+  shutdown aborted at its first statement, skipping the teardown that
+  matters — the acquisition loops, the analysis workers, and the
+  recording writer whose `finalize` is what leaves an operator a
+  readable file rather than a truncated one. `shutdown()` is now
+  idempotent, and each teardown step tolerates a widget Qt has already
+  destroyed. Per step rather than around the whole method, so one dead
+  widget cannot skip the steps after it; that is safe because each step
+  stops its machinery before it touches a label. Only the
+  "already deleted" flavour of `RuntimeError` is swallowed — a device
+  refusing to stop raises the same class and is still worth hearing.
+- **Shutdown stops every camera, not just the first.** `stop_camera()`
+  with no argument acts on the first binding, and `shutdown` called it
+  bare, so a two-camera instrument exited with its second camera still
+  running — a device left held by a process on its way out. Found while
+  fixing the crash above, in the same method.
+
+- **The dock's lower sections are reachable again.** The panel was a
+  plain vertical stack of four group boxes, so its *minimum* height was
+  its natural height: measured on a 1409-pixel-high screen, the stack
+  demanded 1499. Qt will not shrink a widget past its minimum, and there
+  was nothing to scroll, so Devices and everything below it ran off the
+  bottom of the display — not merely out of view but unreachable, with
+  no resize, drag or scroll that would bring them back.
+  The stack now lives in a `QScrollArea`, which drops the panel's
+  minimum height from 1499 pixels to 72 and makes reachability
+  independent of what is open. Each of the top-level groups also folds,
+  behind the same disclosure triangle the per-device sections already
+  used — that widget moved to `viewer/panels/sections.py`, since it is
+  no longer a device-only idea.
+  The two are deliberately not the same fix. Folding is for putting away
+  groups you are not using; scrolling is the guarantee. A layout that
+  only fitted when folded would put the same content out of reach the
+  moment an operator opened it, and several groups open at once is the
+  ordinary case — watching a camera while a scan runs.
+
+### Changed
+
+- **Session context moved into a dialog, and a status bar took over the
+  two facts worth watching.** Where data goes, who is on the instrument,
+  what the sample is and the shift's standing notes are set once at the
+  start of a session and then left alone, but they were spending four
+  form rows and two text boxes in the dock to say so — on the panel that
+  did not fit on the screen.
+  They are now behind **Session settings...** at the top of the
+  Recordings group, and the two continuously useful facts — the
+  destination and the free space — moved into the main window's own
+  status bar, to the left of napari's "Ready". That is the line a user
+  already reads for status, rather than a second status line of ours a
+  few hundred pixels above it, and being outside the dock entirely it
+  cannot be scrolled out of view — which is exactly what used to happen
+  to it. The path is elided from the left, because every session under
+  one root shares its leading components, and it takes the bar's spare
+  width so it elides as little as it has to.
+  The fields are divided by vertical rules, drawn with an explicit
+  colour rather than as plain sunken frames — Qt draws those from the
+  palette's shadow colours, which on napari's dark theme sit within a
+  few percent of the bar behind them, so the dividers were present and
+  invisible. A field with nothing to say takes its rule with it: with no
+  session the "Saving to" label disappears and the line reads simply
+  `No session - data is not being kept`, and the free-space field is
+  absent rather than empty, since a divider beside a blank reads as a
+  value that failed to load instead of one that does not apply.
+  Both are labels rather than controls, deliberately: a status bar that
+  quietly doubled as a button would mean the session directory could be
+  changed from two places, one of them invisible until someone happened
+  to click the text. `insertWidget(0, ...)` rather than `addWidget` puts
+  them left of "Ready"; that area is normally a poor place for anything
+  lasting, since `showMessage` hides widgets added to it, but napari
+  draws "Ready" with its own `StatusBarWidget` and never calls it. They
+  are removed again on `shutdown`, or a second widget docked into one
+  viewer would stack a second copy of every label.
+  Two things stayed behind, for the same reason the rest moved. The
+  **note for the next recording** is answered per burst rather than per
+  shift, so it sits with the recording controls; and the live recording
+  state (running, stop, what has been written) joined the **Recordings**
+  group, which was already named for recordings — the alternative was a
+  second group whose name differed from that one's by a letter.
+
 ### Added
 
 - **An in-process preview instrument, so the UI can be iterated on

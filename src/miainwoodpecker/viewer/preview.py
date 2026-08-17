@@ -1032,6 +1032,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.session is not None:
         widget.set_session(Session(args.session))
     viewer.window.add_dock_widget(widget, area="right", name="Instrument")
+    # No explicit widget.shutdown() after this, matching
+    # miainwoodpecker.viewer.app: closeEvent already calls it as part of
+    # Qt's app-quit teardown, and calling it again here reaches a widget
+    # whose C++ side has already been destroyed.
     napari.run()
-    widget.shutdown()
     return 0

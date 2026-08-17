@@ -30,7 +30,12 @@ _NATIVE_WINDOW_SERVER_PLATFORMS = ("darwin", "win32")
 # the guard below checks for. Listed rather than detected: a module that
 # forgets to add itself fails loudly on a headless machine, which is the
 # safe direction for a guard whose other failure mode is silence.
-_VIEWER_TEST_MODULES = ("test_live_widget", "test_preview_window")
+_VIEWER_TEST_MODULES = (
+    "test_live_widget",
+    "test_preview_window",
+    "test_panel_layout",
+    "test_widget_shutdown",
+)
 
 
 def _has_display() -> bool:

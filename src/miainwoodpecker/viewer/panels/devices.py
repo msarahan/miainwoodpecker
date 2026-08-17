@@ -20,6 +20,11 @@ from miainwoodpecker.viewer.panels.defaults import (
     _SCAN_SIZES,
 )
 
+# Re-exported: this module used to define it, and the dock's top-level
+# groups now fold with the same widget. See
+# :mod:`miainwoodpecker.viewer.panels.sections`.
+from miainwoodpecker.viewer.panels.sections import CollapsibleSection
+
 if typing.TYPE_CHECKING:
     from miainwoodpecker.devices.interface import Scanner
     from miainwoodpecker.viewer.live import LiveInstrumentWidget
@@ -285,88 +290,6 @@ def build_extras_summary(
     label.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
     label.setWordWrap(True)
     return label
-
-
-class CollapsibleSection(QtWidgets.QWidget):
-    """
-    One device's controls, behind a header that folds them away.
-
-    An instrument with a scan unit, three cameras and a spectrometer has
-    more controls than fit on a screen, and an operator aligning one
-    detector does not want the other four in the way. Folding is the
-    cheapest answer that keeps *several* open at once, which tabs would
-    not: watching a camera while a scan runs is the ordinary case.
-
-    A disclosure triangle rather than ``QGroupBox.setCheckable``, which
-    would put a checkbox in the title. On an instrument panel a checkbox
-    beside a device name reads as "switch this device off", and a
-    control that looks like it turns hardware off had better turn
-    hardware off.
-    """
-
-    def __init__(
-        self,
-        title: str,
-        content: QtWidgets.QWidget,
-        parent: QtWidgets.QWidget | None = None,
-        *,
-        expanded: bool = True,
-    ) -> None:
-        super().__init__(parent)
-        self._toggle = QtWidgets.QToolButton(self)
-        self._toggle.setText(title)
-        self._toggle.setCheckable(True)
-        self._toggle.setChecked(expanded)
-        self._toggle.setStyleSheet("QToolButton { border: none; font-weight: 600; }")
-        self._toggle.setToolButtonStyle(QtCore.Qt.ToolButtonTextBesideIcon)
-        self._toggle.setArrowType(
-            QtCore.Qt.DownArrow if expanded else QtCore.Qt.RightArrow,
-        )
-        self._content = content
-        content.setParent(self)
-        content.setVisible(expanded)
-
-        layout = QtWidgets.QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.addWidget(self._toggle)
-        layout.addWidget(content)
-        self._toggle.toggled.connect(self.set_expanded)
-
-    @property
-    def title(self) -> str:
-        """Return the header text, which names the device."""
-        return self._toggle.text()
-
-    def is_expanded(self) -> bool:
-        """
-        Report whether this section's controls are showing.
-
-        Returns
-        -------
-        bool
-            True when the content is visible.
-        """
-        return self._toggle.isChecked()
-
-    def set_expanded(self, expanded: bool) -> None:  # noqa: FBT001
-        """
-        Show or fold this section's controls.
-
-        Positionally typed ``bool`` because this is a Qt slot: it is
-        connected to ``QToolButton.toggled``, which calls it with the
-        new state as the one positional argument.
-
-        Parameters
-        ----------
-        expanded : bool
-            True to show the content, False to fold it away.
-        """
-        if self._toggle.isChecked() != expanded:
-            self._toggle.setChecked(expanded)
-        self._toggle.setArrowType(
-            QtCore.Qt.DownArrow if expanded else QtCore.Qt.RightArrow,
-        )
-        self._content.setVisible(expanded)
 
 
 def build_devices_panel(widget: LiveInstrumentWidget) -> QtWidgets.QGroupBox:

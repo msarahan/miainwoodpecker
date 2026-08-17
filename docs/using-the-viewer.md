@@ -77,6 +77,18 @@ processing chains, on purpose: analysis belongs to the scientific Python
 tools you already use, and the [scripting guide](scripting-and-automation.md)
 shows how recordings load into them in one line.
 
+## The dock
+
+The panel on the right holds three groups — **Instrument**,
+**Recordings** and **Devices**. Click any group's header to fold it
+away; the disclosure triangle shows which way it will go.
+
+The groups **scroll**, so nothing is ever out of reach no matter how
+many devices your instrument serves or how many groups you have open.
+Folding is for tidiness, not for making the panel fit: watching a camera
+while a scan runs means having several groups open at once, and that has
+to keep working.
+
 ## The Instrument panel
 
 The top of the dock says **what you are connected to** — the backend and
@@ -148,10 +160,25 @@ per camera with no way to tell which burst you were about to take.
 The display never slows the instrument down: if the scan is faster than
 the screen, frames are skipped on screen but acquisition is unaffected.
 
-## Keeping data: the Session group
+## Keeping data: the status bar and Session settings
 
-Nothing is saved until you ask, and the **Saving to** line always tells
-you where data will go — or warns `no session - data is not being kept`.
+Nothing is saved until you ask. Along the very bottom of the window, to
+the left of napari's **Ready**, two facts sit where you can always see
+them:
+
+- **Saving to** — the destination, shortened from the left so the part
+  that differs between sessions stays readable; hover for the full path.
+  With no session the label goes away and the line reads simply
+  `No session - data is not being kept`.
+- **Free space** — an absolute figure, with a warning if the recording
+  you are set up to take would not fit. With no session there is no
+  figure to give, so the field is not there at all.
+
+Both are **read-only**. They tell you where you stand; they are not
+where you change it, so the setting has one home rather than two.
+
+That home is **Session settings...**, at the top of the Recordings
+group — the things you set once a shift and then leave alone:
 
 - **Change directory...** points recordings somewhere else, e.g. a new
   folder per sample. An existing folder is *reused, never cleared*:
@@ -160,10 +187,11 @@ you where data will go — or warns `no session - data is not being kept`.
 - **Operator / Sample / Session notes** describe the whole shift, are
   saved as you type, and are written into every recording — into real
   NeXus fields other tools can read, not a private sidecar.
-- **Note for next recording** describes the *next file specifically*
-  ("hole 4, after tilting") and is kept until you change it.
-- **Disk** shows free space and roughly how many frames it holds at the
-  current scan settings.
+
+**Note for next recording** deliberately did *not* move into that
+dialog. It describes the *next file specifically* ("hole 4, after
+tilting"), changes with every burst, and so stays in the Recordings
+group next to the buttons that start one.
 
 To record: set **Frames**, press **Record frames** in the Scan or Camera
 section. Recording streams to disk in the background — the window stays
@@ -176,7 +204,11 @@ the instrument at a time — and you restart it afterwards. **Save
 displayed frame** is the exception: it needs no instrument access, so
 the live view keeps running.
 
-## Opening recordings: the Recordings group
+## Recording and opening: the Recordings group
+
+**Recording** says whether one is running, **Stop recording** ends it
+keeping everything captured so far, and **Recorded** lists what this
+session has written.
 
 The **File** list shows this session's recordings with their state
 ("12 frames", "empty", "damaged"). Tick **List every session in the

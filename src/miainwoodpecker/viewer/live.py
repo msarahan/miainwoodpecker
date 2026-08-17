@@ -98,7 +98,9 @@ from miainwoodpecker.viewer.jobs import AnalysisJob
 from miainwoodpecker.viewer.panels import devices as devices_panel
 from miainwoodpecker.viewer.panels import instrument as instrument_panel
 from miainwoodpecker.viewer.panels import recordings as recordings_panel
+from miainwoodpecker.viewer.panels import sections as sections_panel
 from miainwoodpecker.viewer.panels import session as session_panel
+from miainwoodpecker.viewer.panels import statusbar as statusbar_panel
 from miainwoodpecker.viewer.panels.defaults import (
     _DEFAULT_DWELL_US,
     _DEFAULT_FOV_NM,
@@ -424,6 +426,9 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         # Section title to section, so a caller - and a test - can ask
         # which devices the window offered and whether each is folded.
         self._device_sections: dict[str, devices_panel.CollapsibleSection] = {}
+        # The dock's four top-level groups, by key, so a caller - and a
+        # test - can ask which are folded. Same idea one level up.
+        self._panel_sections: dict[str, sections_panel.CollapsibleSection] = {}
         self._session: Session | None = None
         self._recording_job: RecordingJob | None = None
         self._load_job: LoadJob | None = None
@@ -456,6 +461,9 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
             0,
             scanner.channel_names[0] if scanner is not None else "",
         )
+        # Before _build_ui: a failure part-way through building the UI
+        # still leaves a widget whose shutdown() may be called.
+        self._shutdown_done = False
         self._build_ui()
         if scanner is not None:
             self._on_scan_settings_changed()
@@ -670,13 +678,111 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
             return
         self._instrument_status.setText("beam blanked" if blanked else "beam unblanked")
 
+    @property
+    def panel_sections(self) -> dict[str, sections_panel.CollapsibleSection]:
+        """
+        Return the dock's top-level folding sections, by key.
+
+        Returns
+        -------
+        dict[str, sections_panel.CollapsibleSection]
+            ``instrument``, ``recordings`` and ``devices``. Session
+            context is a dialog rather than a section - see
+            :meth:`open_session_settings`.
+        """
+        return self._panel_sections
+
+    @property
+    def session_dialog(self) -> QtWidgets.QDialog:
+        """
+        Return the Session settings dialog, whether or not it is showing.
+
+        Returns
+        -------
+        QtWidgets.QDialog
+            The dialog holding the session directory, operator, sample
+            and standing notes.
+        """
+        return self._session_dialog
+
+    def open_session_settings(self) -> None:
+        """
+        Show the Session settings dialog, raising it if already open.
+
+        ``show`` rather than ``exec``: the dialog is application-modal
+        either way, but ``exec`` would run a nested event loop and not
+        return until it closed, blocking this method's caller.
+        """
+        self._session_dialog.show()
+        self._session_dialog.raise_()
+        self._session_dialog.activateWindow()
+
     def _build_ui(self) -> None:
+        """
+        Build the dock: four folding groups in a scroll area.
+
+        Both halves of that are load-bearing, and neither substitutes
+        for the other.
+
+        The **scroll area** is the fix for a panel that could not be
+        reached. The groups were a plain vertical stack whose minimum
+        height was its natural height, so a stack wanting 1499 pixels on
+        a 1409-pixel screen could not be shrunk, had nothing to scroll,
+        and simply ran off the bottom - the lower sections were not just
+        out of view but unreachable by any gesture.
+
+        The **folding** is what an operator asked for and is a different
+        job: putting away the groups they are not using. It is
+        deliberately not relied on to make the panel fit, because
+        several groups open at once is the ordinary case (watching a
+        camera while a scan runs), and a layout that only fits when
+        folded would put the same content out of reach again the moment
+        someone opened it.
+        """
+        container = QtWidgets.QWidget(self)
+        stack = QtWidgets.QVBoxLayout(container)
+        stack.setContentsMargins(0, 0, 0, 0)
+        # The session dialog is built first and kept hidden: the
+        # recordings group's note field and half of live.py reach for
+        # widgets it owns, so they have to exist before anything else
+        # is assembled. See panels/session.py.
+        self._session_dialog = session_panel.build_session_dialog(self)
+        built = (
+            ("instrument", instrument_panel.build_instrument_panel(self)),
+            ("recordings", recordings_panel.build_recordings_group(self)),
+            ("devices", devices_panel.build_devices_panel(self)),
+        )
+        for key, content in built:
+            # The section header carries the title now, so the box
+            # inside it would otherwise say the same word twice - the
+            # same trick the per-device sections already use.
+            title = content.title() if isinstance(content, QtWidgets.QGroupBox) else key
+            if isinstance(content, QtWidgets.QGroupBox):
+                content.setTitle("")
+            section = sections_panel.CollapsibleSection(title, content, container)
+            self._panel_sections[key] = section
+            stack.addWidget(section)
+        stack.addStretch(1)
+
+        scroll = QtWidgets.QScrollArea(self)
+        scroll.setWidget(container)
+        scroll.setWidgetResizable(True)
+        # No frame: inside a dock the border reads as a second panel
+        # edge a few pixels in from the real one.
+        scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+
         layout = QtWidgets.QVBoxLayout(self)
-        layout.addWidget(instrument_panel.build_instrument_panel(self))
-        layout.addWidget(session_panel.build_session_group(self))
-        layout.addWidget(recordings_panel.build_recordings_group(self))
-        layout.addWidget(devices_panel.build_devices_panel(self))
-        layout.addStretch(1)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(scroll)
+
+        # Not in this layout at all: where data is going and how much
+        # room is left go into the main window's own status bar, beside
+        # napari's "Ready", rather than into a second status line of
+        # ours a few hundred pixels above it.
+        self._status_widgets = statusbar_panel.build_status_widgets(self)
+        self._status_bar_installed = statusbar_panel.install_status_bar(
+            self, self._viewer,
+        )
 
     def _on_scan_settings_changed(self) -> None:
         size = int(self._size_combo.currentText())
@@ -903,13 +1009,24 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         return note or None
 
     def _refresh_session_labels(self) -> None:
-        """Show where data is going and what has been recorded so far."""
+        """
+        Show where data is going and what has been recorded so far.
+
+        The destination is written twice, to the dialog's label and to
+        the status bar's button, because the two are read at different
+        moments: the button is the answer to "am I recording anywhere?"
+        at a glance, and the label is what someone reads when they have
+        opened the settings to change it.
+        """
         if self._session is None:
             self._session_path_label.setText(_NO_SESSION_MESSAGE)
+            statusbar_panel.set_destination(self, None)
             self._recorded_label.setText("nothing recorded yet")
             self._refresh_recording_choices([])
+            self._refresh_space_label()
             return
         self._session_path_label.setText(str(self._session.root))
+        statusbar_panel.set_destination(self, str(self._session.root))
         recordings = self._session.recordings()
         # The combo can show either scope; the labels below always describe
         # this session, because that is where the next recording goes.
@@ -1004,7 +1121,7 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
     def _refresh_space_label(self) -> None:
         """Report free space where recordings are being written."""
         if self._session is None:
-            self._space_label.setText("")
+            statusbar_panel.set_free_space(self, "")
             return
         free = free_space(self._session.root)
         text = f"{format_bytes(free)} free"
@@ -1020,7 +1137,7 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
                     f" - warning: {frames} {source} frames need up to "
                     f"{format_bytes(planned)}"
                 )
-        self._space_label.setText(text)
+        statusbar_panel.set_free_space(self, text)
 
     def _planned_recording_size(self) -> tuple[int, int, str] | None:
         """
@@ -1931,9 +2048,23 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
             status_label.setText(text)
 
     def shutdown(self) -> None:
-        """Stop all loops, the camera, the display timer, and any recording."""
-        self._timer.stop()
-        self._context_save_timer.stop()
+        """
+        Stop all loops, the camera, the display timer, and any recording.
+
+        Safe to call more than once, and safe to call after Qt has
+        already destroyed this widget. Both matter because there are two
+        callers that cannot see each other: ``closeEvent``, which Qt
+        fires during app-quit teardown, and any entry point that tidies
+        up after ``napari.run()`` returns. The second one runs *after*
+        the widget tree has been destroyed, so it used to die with
+        "Internal C++ object already deleted" — an ugly traceback on a
+        clean exit, and one that skipped the device and thread teardown
+        that had not run yet.
+        """
+        if self._shutdown_done:
+            return
+        self._shutdown_done = True
+        self._shutdown_qt_parts()
         load_job = self._load_job
         if load_job is not None and load_job.is_running:
             # Reading holds no device and writes nothing, so waiting for it
@@ -1948,13 +2079,73 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
             # is what produces an unreadable one.
             job.cancel()
             job.join()
-        self.stop_scan()
-        self.stop_camera()
+        self._quietly(self.stop_scan)
+        # Every camera by name, not one bare stop_camera(): with no
+        # argument it acts on the *first* binding, so a two-camera
+        # instrument left its second camera running after the window
+        # closed - a device held by a process on its way out.
+        for name in list(self._camera_bindings):
+            self._quietly(lambda bound=name: self.stop_camera(bound))
         # After the devices, and deliberately: a worker holds no hardware,
         # so nothing about the column depends on it going first, while
         # stopping the camera can take an exposure's worth of time and an
         # idle worker costs nothing to leave running for it.
-        self._close_analysis_runners()
+        self._quietly(self._close_analysis_runners)
+
+    @staticmethod
+    def _quietly(step: Callable[[], object]) -> None:
+        """
+        Run one teardown step, tolerating widgets Qt has already destroyed.
+
+        Per step rather than around the whole of ``shutdown`` so that one
+        dead widget cannot skip the steps after it. That is safe to do
+        here because each of these stops its machinery *before* it
+        touches a label or a button — ``stop_camera`` pauses the camera
+        and then renames the button — so a step that dies on the Qt half
+        has already done the half that matters.
+
+        Only the "already deleted" flavour of ``RuntimeError`` is
+        swallowed. A device refusing to stop raises the same class, and
+        that is worth hearing about even on the way out.
+
+        Parameters
+        ----------
+        step : Callable[[], object]
+            The teardown step to run.
+        """
+        try:
+            step()
+        except RuntimeError as error:
+            if "deleted" not in str(error):
+                raise
+
+    def _shutdown_qt_parts(self) -> None:
+        """
+        Stop the timers and take back the status bar, tolerating teardown.
+
+        Separated from the rest of ``shutdown`` so that one dead Qt
+        object cannot skip the device and thread teardown that follows
+        it. That part is pure Python: the acquisition loops, the worker
+        threads and the recording writers do not care that a widget has
+        been destroyed, and they are the half that matters — an
+        abandoned writer is what leaves an operator an unreadable file.
+        """
+        try:
+            self._timer.stop()
+            self._context_save_timer.stop()
+            if self._status_bar_installed:
+                # These labels live in a window this widget does not
+                # own, so leaving them behind would describe a session
+                # nothing is writing to any more, and docking a second
+                # widget would stack a second copy of each.
+                statusbar_panel.remove_status_bar(self, self._viewer)
+        except RuntimeError:
+            # "Internal C++ object already deleted": Qt destroyed the
+            # widget tree before this ran. The timers went with it, so
+            # there is nothing left to stop.
+            pass
+        finally:
+            self._status_bar_installed = False
 
     def closeEvent(self, event: typing.Any) -> None:  # noqa: N802, ANN401 - Qt override
         """Shut down cleanly when the widget is closed."""
