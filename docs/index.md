@@ -66,6 +66,9 @@ measurements included:
 - [Gatan](adapters/gatan.md) — the one adapter that cannot be a
   subprocess, the inbound transport built for it, and why the facility
   that prompted it probably does not need it.
+- [Developing the UI](developing-the-ui.md) — the in-process preview
+  instrument for iterating on the viewer's window without a device
+  server, how to open it in a given shape, and running the widget tests.
 - [Development docs](documentation/index.md) — environments, linting,
   publishing.
 
@@ -83,6 +86,7 @@ Work before hardware <pre-hardware-work>
 Other vendors <vendor-support>
 Analysis parity <analysis-parity>
 Analysis isolation <analysis-isolation>
+Developing the UI <developing-the-ui>
 Hitachi SU9000II <adapters/hitachi>
 DECTRIS detectors <adapters/dectris>
 Gatan <adapters/gatan>

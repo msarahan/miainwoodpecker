@@ -4,6 +4,37 @@
 
 ### Added
 
+- **An in-process preview instrument, so the UI can be iterated on
+  without a device server** (`miainwoodpecker-preview`, implemented in
+  `src/miainwoodpecker/viewer/preview.py`). The viewer could already open
+  against synthesised frames via `--server-module camera_server`, and
+  that path stays the honest end-to-end exercise: real frames over a real
+  socket from a real subprocess, proving the IPC, the handshake and the
+  shutdown. This one deliberately gives all of that up. The scanner,
+  cameras and instrument are ordinary Python objects in the viewer's own
+  process, which buys three things the subprocess path cannot.
+  Startup is an import — no server to spawn, no port to bind, no
+  handshake to wait out — so the edit-run loop on a panel's layout is as
+  long as napari takes to draw. The window is reachable in whatever shape
+  is needed: `--no-scan`, `--no-camera`, `--cameras 2`, and `--controls`
+  to publish a subset, so the Instrument and Devices panels' "an
+  unpublished control gets no row" branches are reachable without owning
+  a microscope that lacks a blanker. And with no transport underneath, a
+  widget that misbehaves here misbehaves in code that was just edited.
+  The controls are wired to the image on purpose: blanking collapses the
+  signal, defocus damps the contrast, and moving the stage moves the
+  field of view. A preview whose dials did nothing would let a broken
+  Instrument panel — a signal never connected, a setter called on the
+  wrong object — look exactly like a working one, which is the panel this
+  exists to iterate on. The specimen is an atomic-scale lattice
+  (0.3 nm columns, ~50 across the panel's default 15 nm field of view)
+  rather than a smooth gradient, because judging a colormap or an
+  autocontrast pass against two grey blobs proves nothing.
+  It reports its backend as `preview`, never `simulated`. The panel's top
+  line shows that verbatim, so a screenshot taken from this window cannot
+  be mistaken for one taken from the microscope simulator, let alone from
+  an instrument. Requires the `viewer` extra and nothing else — no vendor
+  SDK, no `device` extra.
 - **A camera probe, so "nothing shows up" names its own cause**
   (`scripts/probe_cameras.py`). A USB microscope that does not appear in
   the viewer has four possible reasons, and from the viewer they look
@@ -736,6 +767,21 @@
   a shape would put a number on screen that no acquisition would produce.
 
 ### Fixed
+
+- **The viewer's integration tests no longer skip themselves on macOS and
+  Windows.** The display guard in `tests/integration/conftest.py` asked
+  only whether `$DISPLAY` or `$WAYLAND_DISPLAY` was set. Those are X11
+  and Wayland variables; on macOS Qt uses the cocoa platform plugin and
+  on Windows the windows one, and neither sets either. So on both, all
+  69 `test_live_widget` tests were quietly marked skipped — not failing,
+  not passing, simply not running, which is the one outcome a guard
+  should never produce silently, and the reason it went unnoticed. The
+  guard now treats a platform with its own window server as having a
+  display, and asks the environment only where the answer is actually in
+  the environment. All 46 runnable widget tests pass on macOS unchanged;
+  the remaining skips are the analysis-extra ones, which are a different
+  guard. The `xvfb-run` instruction still stands for Linux, where it is
+  still needed.
 
 - **The instrument runtime check no longer demands controls an
   instrument does not serve.** The `isinstance` question every call site

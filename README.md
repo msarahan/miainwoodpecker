@@ -45,6 +45,16 @@ The project is early. What exists today:
 uv run --extra device --extra viewer miainwoodpecker-viewer
 ```
 
+To work on the window itself, there is a lighter way in — the same
+panels against an in-process synthetic instrument, no device server and
+no extras beyond `viewer`:
+
+```shell
+uv run --extra viewer miainwoodpecker-preview
+```
+
+See [`docs/developing-the-ui.md`](docs/developing-the-ui.md).
+
 ### Use the device layer directly
 
 ```python

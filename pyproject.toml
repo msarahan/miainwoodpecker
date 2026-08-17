@@ -41,6 +41,10 @@ dependencies = [
 [project.scripts]
 # Requires the "device" and "viewer" extras.
 miainwoodpecker-viewer = "miainwoodpecker.viewer.app:main"
+# Requires only the "viewer" extra: the devices it opens against are
+# in-process synthetic ones, not a device server. For UI development -
+# see src/miainwoodpecker/viewer/preview.py.
+miainwoodpecker-preview = "miainwoodpecker.viewer.preview:main"
 
 [project.urls]
 Homepage = "https://github.com/msarahan/miainwoodpecker"

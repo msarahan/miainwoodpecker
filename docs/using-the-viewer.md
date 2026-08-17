@@ -28,6 +28,11 @@ Useful launch options:
 | `--server-module MODULE` | Which device server to launch. Defaults to the Nion one. |
 | `--plugin` | Server-specific: for Nion, a plug-in module; for the camera server, which camera to open. |
 
+If you are working on the window itself rather than using it, there is a
+lighter way in: `miainwoodpecker-preview` opens the same panels against
+an in-process synthetic instrument, with no device server and no extras
+beyond `viewer`. See [Developing the UI](developing-the-ui.md).
+
 ### For a USB microscope or a webcam
 
 The default server is the Nion one, which serves no USB camera at all,
