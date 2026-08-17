@@ -56,6 +56,23 @@ def _open(tmp_path, **kwargs: object) -> tuple:
     return viewer, widget, devices
 
 
+def _enable_all_channels(widget: LiveInstrumentWidget) -> None:
+    """
+    Tick every detector checkbox.
+
+    An acquisition reads out what the operator enabled, and only the
+    first detector is enabled on a fresh preferences file - so a test
+    about "every channel" has to say which channels it means.
+
+    Parameters
+    ----------
+    widget : LiveInstrumentWidget
+        The widget whose detectors are enabled.
+    """
+    for check in widget._channel_checks.values():  # noqa: SLF001
+        check.setChecked(True)
+
+
 def _finish_recording(widget: LiveInstrumentWidget) -> None:
     """
     Drive the widget's poll path until its recording job completes.
@@ -108,6 +125,7 @@ def test_a_scan_image_reads_every_channel_out_of_one_pass(tmp_path):
     """
     viewer, widget, _ = _open(tmp_path)
     try:
+        _enable_all_channels(widget)
         widget.acquire_scan_image()
         _finish_recording(widget)
 
@@ -128,6 +146,7 @@ def test_a_scan_images_channels_share_one_pass(tmp_path):
     """
     viewer, widget, _ = _open(tmp_path)
     try:
+        _enable_all_channels(widget)
         widget.acquire_scan_image()
         _finish_recording(widget)
 
@@ -155,6 +174,7 @@ def test_a_scan_image_is_one_acquisition_not_a_burst(tmp_path):
     """
     viewer, widget, _ = _open(tmp_path)
     try:
+        _enable_all_channels(widget)
         widget._scan_count_spin.setValue(7)  # noqa: SLF001
         widget.acquire_scan_image()
         _finish_recording(widget)

@@ -37,6 +37,7 @@ _VIEWER_TEST_MODULES = (
     "test_widget_shutdown",
     "test_acquire_images",
     "test_spectrum_image",
+    "test_scan_panel",
 )
 
 

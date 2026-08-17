@@ -78,6 +78,7 @@ from qtpy import QtWidgets
 from miainwoodpecker.devices.interface import ScanParameters
 from miainwoodpecker.devices.remote import remote_simulated_instrument
 from miainwoodpecker.viewer.live import LiveInstrumentWidget
+from miainwoodpecker.viewer.profiles import VIEW
 
 if typing.TYPE_CHECKING:
     from miainwoodpecker.acquisition import LiveAcquisition
@@ -294,8 +295,11 @@ def main() -> None:
             camera=microscope.ronchigram_camera,
         )
         try:
-            widget._size_combo.setCurrentText(str(args.size))  # noqa: SLF001
-            widget._dwell_spin.setValue(args.dwell_us)  # noqa: SLF001
+            # The View profile: the one the live loop runs at, which is
+            # what this benchmark measures.
+            dwell, size = widget._profile_controls[VIEW]  # noqa: SLF001
+            size.setCurrentText(str(args.size))
+            dwell.setValue(args.dwell_us)
             if args.source == "camera":
                 widget.start_camera()
                 loop = widget._camera_loop  # noqa: SLF001

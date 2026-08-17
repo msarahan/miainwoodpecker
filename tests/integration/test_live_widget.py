@@ -31,6 +31,7 @@ from miainwoodpecker.storage.nexus import (
     write_frames,
 )
 from miainwoodpecker.storage.session import Session, read_session_context
+from miainwoodpecker.viewer import profiles
 from miainwoodpecker.viewer.live import LiveInstrumentWidget
 
 _DEADLINE_S = 10.0
@@ -55,7 +56,16 @@ def _analysis_stays_in_this_process(monkeypatch) -> None:
 
 
 class _FakeScanner:
-    """Fake scanner returning zero frames of the requested shape."""
+    """
+    Fake scanner returning zero frames of the requested shape.
+
+    Implements ``scan_frames`` as well as ``scan_frame``, which the
+    ``Scanner`` protocol has required since simultaneous multi-channel
+    scanning landed. This fake went without it for as long as nothing
+    in the widget called it; the multi-channel live view does, and an
+    incomplete double that works only until someone uses the rest of
+    the interface is a test passing for the wrong reason.
+    """
 
     @property
     def scanner_id(self) -> str:
@@ -74,6 +84,39 @@ class _FakeScanner:
             timestamp=datetime.datetime.now(tz=datetime.UTC),
             metadata={"channel_index": channel},
         )
+
+    def scan_frames(
+        self,
+        parameters: ScanParameters,
+        channels: typing.Sequence[int],
+    ) -> list[Frame]:
+        """
+        Return one pass's frames, sharing a per-pass identity.
+
+        Built on this class's own ``scan_frame`` so a subclass that
+        overrides that one - ``_GradientScanner`` - gets its images here
+        too, rather than silently reverting to zeros.
+
+        Parameters
+        ----------
+        parameters : ScanParameters
+            Scan geometry, shared by every returned frame.
+        channels : typing.Sequence[int]
+            Channel indices to read out during the pass.
+
+        Returns
+        -------
+        list[Frame]
+            One frame per requested channel, in request order.
+        """
+        pass_id = f"{self.scanner_id}-pass-{id(parameters)}"
+        frames = []
+        for channel in channels:
+            frame = self.scan_frame(parameters, channel)
+            frame.metadata["scan_pass_id"] = pass_id
+            frame.metadata["simultaneous_channels"] = list(channels)
+            frames.append(frame)
+        return frames
 
     def close(self) -> None:
         """Release nothing; the fake owns no resources."""
@@ -159,6 +202,23 @@ class _FakeCamera:
 
     def close(self) -> None:
         """Release nothing; the fake owns no resources."""
+
+
+def _set_view_size(widget: LiveInstrumentWidget, index: int) -> None:
+    """
+    Set the View profile's scan size, as an operator would.
+
+    The size now belongs to a profile rather than to the panel as a
+    whole, and the *View* profile is the one the live loop runs at.
+
+    Parameters
+    ----------
+    widget : LiveInstrumentWidget
+        The widget to change.
+    index : int
+        Index into the size combo.
+    """
+    widget._profile_controls[profiles.VIEW][1].setCurrentIndex(index)  # noqa: SLF001
 
 
 def _wait_until(condition, deadline_s: float = _DEADLINE_S) -> bool:
@@ -600,7 +660,7 @@ def test_scan_settings_change_takes_effect_on_next_frames():
     viewer = napari.Viewer(show=False)
     widget = LiveInstrumentWidget(viewer, _FakeScanner())
     try:
-        widget._size_combo.setCurrentIndex(0)  # noqa: SLF001 - simulating user input
+        _set_view_size(widget, 0)
         widget.start_scan()
         assert _wait_until(
             lambda: widget._scan_loop.latest() is not None  # noqa: SLF001
@@ -798,7 +858,14 @@ def test_opening_a_recording_from_the_session_shows_it_as_a_stack(tmp_path):
 
         layer_name = f"File: {recording.path.name}"
         assert layer_name in viewer.layers
-        assert viewer.layers[layer_name].data.shape == (expected_count, 256, 256)
+        # The Acquire profile's size, not the live view's: a kept
+        # series is worth the dwell and resolution of a kept image.
+        acquired = int(widget._profile_controls[profiles.ACQUIRE][1].currentText())  # noqa: SLF001
+        assert viewer.layers[layer_name].data.shape == (
+            expected_count,
+            acquired,
+            acquired,
+        )
         assert f"{expected_count} frames" in widget._load_status.text()  # noqa: SLF001
     finally:
         widget.shutdown()
@@ -1475,7 +1542,7 @@ def test_a_new_frame_is_still_drawn_after_a_skipped_tick():
     viewer = napari.Viewer(show=False)
     widget = LiveInstrumentWidget(viewer, _FakeScanner())
     try:
-        widget._size_combo.setCurrentIndex(0)  # noqa: SLF001 - simulating user input
+        _set_view_size(widget, 0)
         widget.start_scan()
         assert _wait_until(
             lambda: widget._scan_loop.latest() is not None  # noqa: SLF001
@@ -1486,7 +1553,7 @@ def test_a_new_frame_is_still_drawn_after_a_skipped_tick():
         assert viewer.layers["Scan (HAADF)"].data.shape == small_shape
 
         # Change the scan size; the next frames differ, so they must draw.
-        widget._size_combo.setCurrentIndex(1)  # noqa: SLF001 - simulating user input
+        _set_view_size(widget, 1)
         larger = (256, 256)
         assert _wait_until(
             lambda: widget._scan_loop.latest().data.shape == larger  # noqa: SLF001

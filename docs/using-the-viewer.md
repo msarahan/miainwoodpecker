@@ -130,6 +130,44 @@ Every device the instrument serves gets its own section in the
 `Camera - usb_microscope`, not `camera`, which tells you nothing once
 there are two of them. Click a section header to fold it away.
 
+### Detectors
+
+The Scan section lists your detectors as **checkboxes**, not a
+drop-down, because a scanned instrument reads several of them out of one
+pass as a matter of course — HAADF and MAADF arrive together, and on an
+EDX-fitted column the X-ray spectra come with them. Serial acquisition
+is the special case.
+
+Every checked detector gets its own napari layer and they are all fed
+from the **same pass**, so you can difference them per pixel — DPC,
+ratios — without wondering whether the probe moved in between. Enabling
+a second detector costs no extra dose and no extra time.
+
+At least one has to stay checked; a scan with none reads nothing out.
+Your selection is remembered between launches — it follows you and the
+instrument, not the shift, so it lives in your config directory rather
+than in the session.
+
+### Scan profiles
+
+Dwell and resolution belong to a **profile**, and all three are visible
+at once:
+
+| Profile | What it is for |
+|---|---|
+| **View** | The continuous live loop. Short dwell so the display keeps up. |
+| **Preview** | A single scan at higher signal-to-noise, for judging focus and astigmatism *by eye*. **Shown, not saved** — a focus check that littered the session with files would stop being used. |
+| **Acquire** | The scan that is kept: long dwell, full resolution. Used by **Acquire scan image** and **Record frames**. |
+
+**FOV is shared and deliberately outside the profiles.** It is the
+region you navigated to, and switching from checking focus to taking the
+picture must not move the specimen out from under you at the moment you
+were happiest with it.
+
+Profiles are remembered between launches too. Changing Preview or
+Acquire never disturbs a running live view — each is read when its own
+action is taken.
+
 Several sections can be open at once, which is the point of folding
 rather than tabs: watching a camera while a scan runs is the ordinary
 case. The first section starts open and the rest folded, so a
@@ -196,8 +234,8 @@ group next to the buttons that start one.
 ### Acquiring an image
 
 **Acquire scan image** takes one pass of the probe and reads out
-**every detector channel** the scanner has — HAADF and MAADF together,
-not just the one on display. The pass happens either way, so the second
+**every detector you have checked** — HAADF and MAADF together, not just
+the one on display. The pass happens either way, so the second
 detector costs no extra dose and no extra time, and the two images are
 registered to each other by construction. The alternative is scanning
 the same area twice to get the channel you wish you had kept. The

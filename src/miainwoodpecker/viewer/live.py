@@ -79,12 +79,14 @@ from pathlib import Path
 import numpy as np
 from qtpy import QtCore, QtWidgets
 
-from miainwoodpecker.acquisition.live import LiveAcquisition
+from miainwoodpecker.acquisition.live import (
+    LiveAcquisition,
+    MultiChannelLiveAcquisition,
+)
 from miainwoodpecker.acquisition.sequence import (
     camera_image,
     camera_series,
     multichannel_scan_series,
-    scan_series,
 )
 from miainwoodpecker.devices.interface import CameraParameters, ScanParameters
 from miainwoodpecker.storage.nexus import write_frames
@@ -100,6 +102,7 @@ from miainwoodpecker.storage.session import (
     format_bytes,
     free_space,
 )
+from miainwoodpecker.viewer import preferences, profiles
 from miainwoodpecker.viewer.jobs import AnalysisJob
 from miainwoodpecker.viewer.panels import devices as devices_panel
 from miainwoodpecker.viewer.panels import instrument as instrument_panel
@@ -470,19 +473,30 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         # read on the GUI thread only, and handed to the worker as plain
         # data by _start_analysis, exactly as _opened_file already is.
         self._opened_frames: FrameStack | None = None
-        self._scan_request: tuple[ScanParameters, int, str] = (
+        # Parameters, the enabled channel indices, and their names. A
+        # tuple of channels rather than one, because a scanned
+        # instrument reads several detectors out of a single pass and
+        # the panel now says so.
+        self._scan_request: tuple[ScanParameters, tuple[int, ...], tuple[str, ...]] = (
             ScanParameters(
                 height=_SCAN_SIZES[_DEFAULT_SCAN_SIZE_INDEX],
                 width=_SCAN_SIZES[_DEFAULT_SCAN_SIZE_INDEX],
                 pixel_time_us=_DEFAULT_DWELL_US,
                 fov_nm=_DEFAULT_FOV_NM,
             ),
-            0,
+            (0,),
             scanner.channel_names[0] if scanner is not None else "",
         )
         # Before _build_ui: a failure part-way through building the UI
         # still leaves a widget whose shutdown() may be called.
         self._shutdown_done = False
+        # Read once, before the panel is built, so the controls come
+        # up already showing what the operator last chose.
+        self._preferences = preferences.load()
+        self._channel_checks: dict[str, QtWidgets.QCheckBox] = {}
+        self._profile_controls: dict[
+            str, tuple[QtWidgets.QDoubleSpinBox, QtWidgets.QComboBox]
+        ] = {}
         self._build_ui()
         if scanner is not None:
             self._on_scan_settings_changed()
@@ -804,24 +818,143 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         )
 
     def _on_scan_settings_changed(self) -> None:
-        size = int(self._size_combo.currentText())
-        channel_index = self._channel_combo.currentIndex()
+        """
+        Rebuild the live request from the View profile and the checkboxes.
+
+        The *View* profile specifically: this is what the continuous
+        loop runs at. Preview and Acquire are read at the moment their
+        own action is taken, so changing them never disturbs a running
+        live view.
+        """
         self._scan_request = (
-            ScanParameters(
-                height=size,
-                width=size,
-                pixel_time_us=self._dwell_spin.value(),
-                fov_nm=self._fov_spin.value(),
-            ),
-            channel_index,
-            self._channel_combo.currentText(),
+            self.scan_parameters(profiles.VIEW),
+            tuple(self.enabled_channels()),
+            tuple(self.enabled_channel_names()),
+        )
+        self._save_scan_preferences()
+
+    def scan_parameters(self, profile: str) -> ScanParameters:
+        """
+        Return the scan geometry for one profile over the shared field of view.
+
+        The field of view is read from its own control rather than from
+        the profile, which is the point of profiles: switching from
+        checking focus to taking the picture must not move the region
+        the operator navigated to.
+
+        Parameters
+        ----------
+        profile : str
+            One of :data:`~miainwoodpecker.viewer.profiles.PROFILE_NAMES`.
+
+        Returns
+        -------
+        ScanParameters
+            Geometry for that profile.
+        """
+        settings = self._profile_settings(profile)
+        return ScanParameters(
+            height=settings.size_px,
+            width=settings.size_px,
+            pixel_time_us=settings.dwell_us,
+            fov_nm=self._fov_spin.value(),
         )
 
-    def _grab_scan(self) -> Frame:
-        # Runs on the worker thread: reads the request tuple, never Qt state.
-        parameters, channel_index, _ = self._scan_request
+    def _profile_settings(self, profile: str) -> profiles.ScanProfile:
+        """
+        Read one profile's dwell and size off the panel.
+
+        Parameters
+        ----------
+        profile : str
+            The profile name.
+
+        Returns
+        -------
+        profiles.ScanProfile
+            What the panel currently says.
+        """
+        dwell_spin, size_combo = self._profile_controls[profile]
+        return profiles.ScanProfile(
+            dwell_us=dwell_spin.value(),
+            size_px=int(size_combo.currentText()),
+        )
+
+    def enabled_channels(self) -> list[int]:
+        """
+        Return the indices of every detector the operator has enabled.
+
+        Returns
+        -------
+        list[int]
+            Channel indices, in the scanner's own order. Never empty
+            while a scanner exists - see :meth:`_on_channel_toggled`.
+        """
         scanner = typing.cast("Scanner", self._scanner)
-        return scanner.scan_frame(parameters, channel_index)
+        names = list(scanner.channel_names)
+        return [
+            index
+            for index, name in enumerate(names)
+            if self._channel_checks[name].isChecked()
+        ]
+
+    def enabled_channel_names(self) -> list[str]:
+        """
+        Return the names of every detector the operator has enabled.
+
+        Returns
+        -------
+        list[str]
+            Channel names, in the scanner's own order.
+        """
+        scanner = typing.cast("Scanner", self._scanner)
+        names = list(scanner.channel_names)
+        return [names[index] for index in self.enabled_channels()]
+
+    def _on_channel_toggled(self, name: str) -> None:
+        """
+        Keep at least one detector enabled, then rebuild the request.
+
+        Unchecking the last box is refused rather than allowed: a scan
+        with no detector produces no data at all, so the state is not a
+        preference an operator could mean. The box goes back on and the
+        status line says why, which is more use than a silently dead
+        Start button.
+
+        Parameters
+        ----------
+        name : str
+            The channel whose checkbox changed.
+        """
+        if not self.enabled_channels():
+            self._channel_checks[name].setChecked(True)
+            self._scan_status.setText(
+                "at least one detector has to stay enabled - a scan with "
+                "none reads nothing out",
+            )
+            return
+        self._on_scan_settings_changed()
+        self._rename_scan_layers()
+
+    def _save_scan_preferences(self) -> None:
+        """Remember the detector selection and profiles for the next launch."""
+        if self._scanner is None:
+            return
+        stored = dict(self._preferences)
+        stored["scan_channels"] = self.enabled_channel_names()
+        stored["scan_profiles"] = profiles.as_stored(
+            {name: self._profile_settings(name) for name in profiles.PROFILE_NAMES},
+        )
+        self._preferences = stored
+        preferences.save(stored)
+
+    def _grab_scan(self) -> Sequence[Frame]:
+        # Runs on the worker thread: reads the request tuple, never Qt state.
+        # One scan_frames call, so every enabled detector comes from the
+        # same traversal - one pass of dose, no drift between channels.
+        parameters, channels, _ = self._scan_request
+        scanner = typing.cast("Scanner", self._scanner)
+        return scanner.scan_frames(parameters, list(channels))
 
     def _toggle_scan(self) -> None:
         if self._scan_loop is not None and self._scan_loop.is_running:
@@ -844,7 +977,7 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
             return
         if self._scan_loop is not None and self._scan_loop.is_running:
             return
-        self._scan_loop = LiveAcquisition(self._grab_scan)
+        self._scan_loop = MultiChannelLiveAcquisition(self._grab_scan)
         self._scan_loop.start()
         self._scan_button.setText("Stop scan")
         self._scan_status.setText("running")
@@ -1198,7 +1331,7 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         """Save the scan frame currently on screen into the session."""
         if self._scanner is None:
             return
-        label = f"scan-{self._scan_request[2]}-frame"
+        label = f"scan-{self._scan_request[2][0]}-frame"
         self._save_displayed_frame(self._scan_loop, label)
 
     def save_camera_frame(self, name: str | None = None) -> None:
@@ -1246,15 +1379,21 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         if not self.stop_scan():
             self._recording_status.setText(_SCANNER_BUSY_MESSAGE)
             return
-        parameters, channel_index, channel_name = self._scan_request
+        # Acquire settings, not the live view's: a kept series is worth
+        # the dwell of a kept image. Every enabled channel, one pass per
+        # repeat, so the series is multichannel for the same reason a
+        # scan image is.
+        parameters = self.scan_parameters(profiles.ACQUIRE)
+        channels = self._scan_request[1]
+        names = self._scan_request[2]
         self._start_recording(
-            scan_series(
+            multichannel_scan_series(
                 typing.cast("Scanner", self._scanner),
                 parameters,
                 self._scan_count_spin.value(),
-                channel=channel_index,
+                channels=list(channels),
             ),
-            f"scan-{channel_name}",
+            f"scan-{'-'.join(names)}",
         )
 
     def record_camera_frames(self, name: str | None = None) -> None:
@@ -1280,6 +1419,45 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
             return
         self._start_recording(
             camera_series(binding.camera, count), "camera"
+        )
+
+    def preview_scan(self) -> None:
+        """
+        Take one scan at the Preview profile and show it, saving nothing.
+
+        The focus check. Preview sits between the live view and an
+        acquisition precisely so an operator can judge focus and
+        astigmatism by eye at a signal-to-noise the live view cannot
+        reach, without paying for a kept image — and it records nothing
+        on purpose, because a focus check that littered the session with
+        files would stop being used.
+
+        Every enabled detector, from one pass, like everything else here.
+        """
+        if self._scanner is None:
+            return
+        if not self.stop_scan():
+            self._scan_status.setText(_SCANNER_BUSY_MESSAGE)
+            return
+        parameters = self.scan_parameters(profiles.PREVIEW)
+        channels = list(self._scan_request[1])
+        names = self._scan_request[2]
+        scanner = typing.cast("Scanner", self._scanner)
+        self._scan_status.setText("previewing...")
+        try:
+            frames = scanner.scan_frames(parameters, channels)
+        except Exception as error:  # noqa: BLE001 - the refusal is the message
+            self._scan_status.setText(f"preview failed: {error}")
+            return
+        for frame, name in zip(frames, names, strict=False):
+            self._show_frame(
+                frame,
+                layer_name=self._scan_layer_name(name),
+                autocontrast_every_frame=True,
+            )
+        self._scan_status.setText(
+            f"preview: {parameters.width} px at {parameters.pixel_time_us:g} us "
+            "(not saved)",
         )
 
     def acquire_scan_image(self) -> None:
@@ -1309,13 +1487,15 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
             self._recording_status.setText(_SCANNER_BUSY_MESSAGE)
             return
         scanner = typing.cast("Scanner", self._scanner)
-        parameters = self._scan_request[0]
+        # The Acquire profile, not the live view's settings: this is the
+        # image that gets kept, and it is worth the longer dwell.
+        parameters = self.scan_parameters(profiles.ACQUIRE)
         self._start_recording(
             multichannel_scan_series(
                 scanner,
                 parameters,
                 1,
-                channels=list(range(len(scanner.channel_names))),
+                channels=list(self._scan_request[1]),
             ),
             "scan-image",
         )
@@ -1459,7 +1639,7 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         parameters = ScanParameters(
             height=positions,
             width=positions,
-            pixel_time_us=self._dwell_spin.value(),
+            pixel_time_us=self._profile_settings(profiles.ACQUIRE).dwell_us,
             fov_nm=self._fov_spin.value(),
         )
         binding = self._binding(target)
@@ -2229,12 +2409,7 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         self._poll_load()
         self._poll_analysis()
         if self._scan_loop is not None:
-            self._refresh_source(
-                self._scan_loop,
-                layer_name=f"Scan ({self._scan_request[2]})",
-                status_label=self._scan_status,
-                autocontrast_every_frame=True,
-            )
+            self._refresh_scan()
         for binding in self._camera_bindings.values():
             if binding.loop is not None and binding.status is not None:
                 self._refresh_source(
@@ -2243,6 +2418,68 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
                     status_label=binding.status,
                     autocontrast_every_frame=False,
                 )
+
+    def _refresh_scan(self) -> None:
+        """
+        Push the newest pass into one napari layer per enabled detector.
+
+        Every layer updated from the *same* ``latest_frames`` snapshot,
+        so the images on screen are always from one traversal. Refreshing
+        them from separate reads would let HAADF advance a pass ahead of
+        MAADF, and an operator differencing what they see would be
+        differencing two probe positions.
+        """
+        loop = self._scan_loop
+        if loop is None:
+            return
+        if loop.error is not None:
+            self._scan_status.setText(f"error: {loop.error}")
+            self._maybe_stop_timer()
+            return
+        frames = loop.latest_frames()
+        if not frames:
+            return
+        names = self._scan_request[2]
+        for frame, name in zip(frames, names, strict=False):
+            self._show_frame(
+                frame,
+                layer_name=self._scan_layer_name(name),
+                autocontrast_every_frame=True,
+            )
+        stats = loop.stats
+        self._scan_status.setText(f"running - {stats.fps:.1f} fps")
+
+    @staticmethod
+    def _scan_layer_name(channel: str) -> str:
+        """
+        Return the napari layer name for one detector channel.
+
+        Parameters
+        ----------
+        channel : str
+            The detector's name.
+
+        Returns
+        -------
+        str
+            The layer name.
+        """
+        return f"Scan ({channel})"
+
+    def _rename_scan_layers(self) -> None:
+        """
+        Drop layers for detectors that are no longer enabled.
+
+        A layer left behind after its checkbox is cleared keeps showing
+        the last image that detector produced, which reads as a live
+        feed that has silently stopped.
+        """
+        wanted = {self._scan_layer_name(name) for name in self._scan_request[2]}
+        for layer_name in list(self._displayed):
+            if layer_name.startswith("Scan (") and layer_name not in wanted:
+                self._displayed.pop(layer_name, None)
+                if layer_name in self._viewer.layers:
+                    del self._viewer.layers[layer_name]
 
     def _refresh_source(
         self,
@@ -2262,6 +2499,36 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         frame = loop.latest()
         if frame is None:
             return
+        self._show_frame(
+            frame,
+            layer_name=layer_name,
+            autocontrast_every_frame=autocontrast_every_frame,
+        )
+        self._refresh_rate_label(loop, status_label)
+
+    def _show_frame(
+        self,
+        frame: Frame,
+        *,
+        layer_name: str,
+        autocontrast_every_frame: bool,
+    ) -> None:
+        """
+        Put one frame into its napari layer, skipping an unchanged redraw.
+
+        Split out of :meth:`_refresh_source` so the scan can drive it
+        once per enabled detector from a single pass, rather than each
+        detector polling its own loop.
+
+        Parameters
+        ----------
+        frame : Frame
+            The frame to display.
+        layer_name : str
+            The layer it belongs in.
+        autocontrast_every_frame : bool
+            Whether to restretch the contrast limits to this frame.
+        """
         if frame is self._displayed.get(layer_name) and layer_name in (
             self._viewer.layers
         ):
@@ -2272,7 +2539,6 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
             # autocontrast pass walks the whole array twice, both for
             # pixels that did not change. Identity is the right test -
             # the loop hands out the same object until it grabs another.
-            self._refresh_rate_label(loop, status_label)
             return
         if layer_name in self._viewer.layers:
             layer = self._viewer.layers[layer_name]
@@ -2285,7 +2551,6 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         else:
             self._viewer.add_image(frame.data, name=layer_name, colormap="gray")
         self._displayed[layer_name] = frame
-        self._refresh_rate_label(loop, status_label)
 
     def _refresh_rate_label(
         self,

@@ -2,6 +2,53 @@
 
 ## Unreleased
 
+### Changed
+
+- **Several detectors can be live at once, and the panel says so.** The
+  Scan group offered a drop-down: a choice of *one* detector. That
+  describes serial acquisition, which on a scanned instrument is the
+  special case — one pass of the probe reads out every fitted detector,
+  and HAADF and MAADF arrive together. It also disagreed with what the
+  application already did, since `acquire_scan_image` had been reading
+  every channel out of one pass since it landed.
+  Checkboxes replace it, and every checked detector gets its own napari
+  layer fed from the **same** `scan_frames` call. `MultiChannelLiveAcquisition`
+  is what makes that true: one loop whose grab returns a whole pass,
+  published under the lock as a set. The obvious alternative — one
+  single-channel loop per detector — would have looked identical on
+  screen while costing twice the dose, letting the specimen drift
+  between the two images, and making a per-pixel difference of them
+  meaningless. Unchecking the last detector is refused with an
+  explanation rather than allowed: a scan with none reads nothing out,
+  so it is not a state an operator could mean.
+- **Dwell and resolution belong to a profile now.** View, Preview and
+  Acquire each carry their own, and all three are visible at once
+  because "what will Preview do" is asked as often as "change Preview".
+  Preview is the one whose purpose is least obvious from its numbers: it
+  sits between the other two so focus and astigmatism can be judged *by
+  eye* at a signal-to-noise the live view cannot reach, and its action
+  shows a scan and records nothing — a focus check that littered the
+  session with files would stop being used.
+  **The field of view is shared and deliberately outside the profiles.**
+  It is the region the operator navigated to, and a profile carrying its
+  own would move the specimen out from under them at the moment they
+  were happiest with it. `Acquire scan image` and `Record frames` use
+  the Acquire profile rather than whatever the live view happened to be
+  running at; changing Preview or Acquire never disturbs a running live
+  view, since each is read when its own action is taken.
+  Both the detector selection and the profiles persist between launches.
+  Two under-specified test doubles surfaced on the way, the same shape
+  of problem as `_FakeCamera` earlier: `_FakeScanner` never implemented
+  `scan_frames`, though the `Scanner` protocol has required it since
+  simultaneous multi-channel scanning landed. It was completed rather
+  than worked around.
+  And a fixture was added that the suite should have had already: tests
+  now write preferences to a temporary file. Without it the suite
+  mutated the developer's own config — a test that reaches outside its
+  `tmp_path` is a test with a side effect, whatever it asserts — and one
+  test's checkboxes leaked into the next, which is how the problem was
+  found.
+
 ### Added
 
 - **A scan pass can be stored, and acquired from the window.**
