@@ -21,8 +21,11 @@ STEM"](https://www.youtube.com/watch?v=Tf_oR3L1ans) (57 min) and
 eaSI"](https://www.youtube.com/watch?v=GaNe-x4sydY) (61 min), suggested
 by @msarahan 2026-08-17.
 **Examined:** auto-caption transcripts of both, read by keyword rather
-than end to end. No slides were viewed, so figures, numbers on plots and
-anything said only visually are *not* captured here.
+than end to end, plus the slides of the first — extracted by ffmpeg
+scene detection (51 unique slides over 57 minutes) and read where the
+transcript said something interesting was on screen. The second talk's
+slides have *not* been looked at, so anything shown only visually there
+is still missing.
 
 The first talk is a direct survey of the gap this project already has.
 Conventional raster scanning — across a row, then fly back — is
@@ -37,6 +40,25 @@ compared are:
 - **sequential** variants described as "low-end" and "high-end" by probe
   jump distance,
 - **interleaved multipass**, visiting different subsets per pass.
+
+Its own taxonomy slide ("Smart Scanning", 14:56) is worth adopting
+wholesale, because it splits the space along the axis that matters for
+an interface rather than by name:
+
+- **Continuous scans** — spiral, serpentine — whose point is avoiding
+  flyback line times. The trajectory is a path.
+- **Pixel jumps** — random, sequential — whose point is *dose
+  time-distribution* and controlling probe effects on neighbouring
+  areas. The trajectory is a visiting order over a grid.
+
+and lists what the trajectory actually changes: dose and damage, probe
+settling times, flyback, drift artefacts, reconstruction stability, and
+beam-induced artefacts. Its stated raster limitations are line flyback,
+**uneven temporal distribution**, and **probe overlap (4D-STEM)** — that
+last one being specific to the acquisition this project just built. The
+slide's thumbnails are dose-time maps: the same field coloured by *when*
+each part was visited, which is the quantity the pixel-jump family
+exists to control.
 
 The comparison is on **drift** and on artefacts: spirals and small-jump
 sequential orderings showed better drift behaviour, while random
@@ -61,6 +83,19 @@ The eaSI talk adds two things this project has no vocabulary for:
   a single low-dose experiment but far higher total dose. Dual EELS is
   described as near-mandatory for the ultra-low-dose case.
 
+One slide (22:00, "STEM-SI Custom Scan" on DyScO₃) is the intersection
+of everything above and everything this branch just built: a **spectrum
+image acquired on a non-raster trajectory**, spiral and scripted side by
+side, each yielding simultaneous ADF and EELS. Its parameters are worth
+recording because they are the shape a real call would take —
+K3 single EELS at 0.9 eV/channel, 48 pA at 300 kV, ~3000 spectra/s
+(340 µs per SI pixel), **scripted = 2 passes, spiral = 5 passes**, no
+drift correction and no sub-scanning. Two details follow from it:
+the pass count is a property of the *pattern*, not a global setting; and
+the spiral's usable spectrum image is a small square inset in the
+scanned field, because a spiral inscribes in a circle and a rectangular
+SI has to fit inside it.
+
 ### What this means here, concretely
 
 `ScanParameters` is a height, a width, a dwell and a field of view, and
@@ -71,6 +106,14 @@ pass count and an accumulation rule. Closing this is not a matter of
 adding a `pattern="spiral"` enum either — the visiting *order* has to
 reach the device, and the storage layer has to record which order was
 used or a reader cannot undo it.
+
+The taxonomy also suggests the interface split. A *continuous* scan
+needs a path the device follows; a *pixel jump* scan needs an ordering
+over the existing grid. Those are different enough that one
+`pattern=` enum covering both would be a name standing in for two
+unrelated things — and the vendor's own answer, that custom patterns are
+reached by scripting, is evidence that the set should not be closed at
+all.
 
 Multipass is the nearer of the two, and interacts with something already
 built: a `ScanPass` is one traversal, so a hundred accumulated passes
