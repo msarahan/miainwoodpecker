@@ -193,8 +193,35 @@ dialog. It describes the *next file specifically* ("hole 4, after
 tilting"), changes with every burst, and so stays in the Recordings
 group next to the buttons that start one.
 
-To record: set **Frames**, press **Record frames** in the Scan or Camera
-section. Recording streams to disk in the background — the window stays
+### Acquiring an image
+
+**Acquire scan image** takes one pass of the probe and reads out
+**every detector channel** the scanner has — HAADF and MAADF together,
+not just the one on display. The pass happens either way, so the second
+detector costs no extra dose and no extra time, and the two images are
+registered to each other by construction. The alternative is scanning
+the same area twice to get the channel you wish you had kept. The
+frames carry a shared `scan_pass_id`, so a reader can do per-pixel
+arithmetic between the channels — DPC, ratios — without guessing from
+timestamps whether the probe moved in between.
+
+**Acquire image** in a Camera section takes one exposure at that
+section's own **Image exposure** and **Image binning**, which are
+deliberately separate from whatever the live view is running. The two
+are different jobs: the feed stays short and often binned so it keeps up
+at thirty frames a second, while the image you keep is worth a long
+unbinned exposure. The live settings are put back afterwards, so one
+long acquisition does not leave the feed crawling. The binning choices
+are the camera's own — a detector that only does 1× does not offer a 4×
+it would refuse.
+
+Neither is affected by the **Frames** count beside it: an image is one
+acquisition, whatever that says.
+
+### Recording a series
+
+To record a time series: set **Frames**, press **Record frames** in the
+Scan or Camera section. Recording streams to disk in the background — the window stays
 responsive — and **Stop recording** keeps everything captured so far as
 a complete, valid file. Filenames are automatic and collision-proof:
 `0001-scan-haadf-20260810T182524Z.nxs`.

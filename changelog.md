@@ -2,6 +2,50 @@
 
 ## Unreleased
 
+### Added
+
+- **Acquiring an image is now its own thing, separate from recording a
+  series.** Until now the window could make exactly one kind of
+  recording: a burst of N repeats from one device — a *time* series.
+  That is a real acquisition, but it is not the everyday one, and it was
+  standing in for two that the application could not express at all.
+  **Acquire scan image** takes one pass of the probe and reads out every
+  detector channel the scanner has, rather than the one currently on
+  display. The pass happens either way, so the second detector costs no
+  extra dose and no extra time, and the channels come out registered to
+  each other by construction; the alternative is scanning the same area
+  twice to get the channel you wish you had kept. The frames carry the
+  shared `scan_pass_id` that `scan_frames` already established, so a
+  reader can do per-pixel arithmetic between channels without inferring
+  from timestamps whether the probe moved.
+  **Acquire image** on a camera takes one exposure at that camera's own
+  image exposure and binning, kept apart from the live view's. The two
+  are different jobs — the feed runs short and often binned to stay
+  responsive at thirty frames a second, and a kept image is worth a long
+  unbinned exposure — and one shared pair of settings would force a
+  choice between a usable live view and a usable acquisition. The new
+  `acquisition.camera_image` generator restores the live settings
+  afterwards, including when the consumer abandons it early, so one long
+  acquisition cannot leave the feed crawling. Binning is offered from
+  the camera's own `binning_values`, so a detector that only does 1×
+  does not show a 4× it would refuse.
+  Neither reads the "Frames" count beside it: an image is one
+  acquisition whatever that says, or the two controls would silently
+  interact.
+  Building the exposure controls also surfaced an under-specified test
+  double: `test_live_widget.py`'s `_FakeCamera` never implemented
+  `binning_values`, `parameters` or `configure`, though the `Camera`
+  protocol requires all three. It got away with it while nothing in the
+  widget asked at build time. The fake was completed rather than the
+  panel made defensive — a fallback for a camera missing half its
+  interface would be shipping around a protocol violation.
+  This is the first of three steps. Spectrum imaging and 4D-STEM — a
+  scan combined with a camera or spectrometer readout at each beam
+  position — remain unbuilt, and are blocked below this layer rather
+  than by it: `analysis/py4dstem_bridge.py` records the measurement
+  showing that the Nion simulator cannot produce scan-position-varying
+  diffraction without the `HardwareSource` layer Phase 0 rejected.
+
 ### Fixed
 
 - **Closing the preview window no longer ends in a traceback**, and

@@ -2,6 +2,7 @@
 
 from miainwoodpecker.acquisition.live import LiveAcquisition, LiveStats
 from miainwoodpecker.acquisition.sequence import (
+    camera_image,
     camera_series,
     energy_offset_series,
     focal_series,
@@ -13,6 +14,7 @@ from miainwoodpecker.acquisition.sequence import (
 __all__ = [
     "LiveAcquisition",
     "LiveStats",
+    "camera_image",
     "camera_series",
     "energy_offset_series",
     "focal_series",

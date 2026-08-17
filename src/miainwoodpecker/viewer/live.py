@@ -79,8 +79,13 @@ from pathlib import Path
 from qtpy import QtCore, QtWidgets
 
 from miainwoodpecker.acquisition.live import LiveAcquisition
-from miainwoodpecker.acquisition.sequence import camera_series, scan_series
-from miainwoodpecker.devices.interface import ScanParameters
+from miainwoodpecker.acquisition.sequence import (
+    camera_image,
+    camera_series,
+    multichannel_scan_series,
+    scan_series,
+)
+from miainwoodpecker.devices.interface import CameraParameters, ScanParameters
 from miainwoodpecker.storage.nexus import write_frames
 from miainwoodpecker.storage.session import (
     LoadJob,
@@ -169,6 +174,16 @@ class _CameraBinding:
         Save the displayed frame.
     record_button : QtWidgets.QPushButton | None
         Record a series.
+    exposure_spin : QtWidgets.QDoubleSpinBox | None
+        Exposure for an *acquired image*, kept apart from whatever the
+        live view is running at. The two are different jobs: the feed
+        stays short to be responsive, and the image an operator keeps is
+        worth waiting for.
+    binning_combo : QtWidgets.QComboBox | None
+        Binning for an acquired image, same reasoning as the exposure —
+        a live view can afford to be binned where a kept image cannot.
+    acquire_button : QtWidgets.QPushButton | None
+        Take one image with those settings.
     """
 
     name: str
@@ -180,6 +195,9 @@ class _CameraBinding:
     count_spin: QtWidgets.QSpinBox | None = None
     save_button: QtWidgets.QPushButton | None = None
     record_button: QtWidgets.QPushButton | None = None
+    exposure_spin: QtWidgets.QDoubleSpinBox | None = None
+    binning_combo: QtWidgets.QComboBox | None = None
+    acquire_button: QtWidgets.QPushButton | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1261,6 +1279,105 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
             return
         self._start_recording(
             camera_series(binding.camera, count), "camera"
+        )
+
+    def acquire_scan_image(self) -> None:
+        """
+        Acquire one scan image: a single pass, every channel at once.
+
+        The everyday scan acquisition, and a different thing from
+        "record N frames" beside it. That one is a *time* series — the
+        same channel scanned repeatedly, for drift or for averaging.
+        This is one pass of the probe, with every detector the scanner
+        has read out of it.
+
+        Every channel rather than the one on display, because the pass
+        happens either way: reading ADF while you were going to scan for
+        HAADF anyway costs no extra dose and no extra time, and the two
+        images are then registered to each other by construction. The
+        cost of *not* doing it is a second pass over the same area to
+        get the channel you wish you had kept.
+        """
+        if self._scanner is None:
+            return
+        if self._session is None:
+            self._recording_status.setText(_NO_SESSION_MESSAGE)
+            return
+        # Same one-driver-per-device rule as record_scan_frames.
+        if not self.stop_scan():
+            self._recording_status.setText(_SCANNER_BUSY_MESSAGE)
+            return
+        scanner = typing.cast("Scanner", self._scanner)
+        parameters = self._scan_request[0]
+        self._start_recording(
+            multichannel_scan_series(
+                scanner,
+                parameters,
+                1,
+                channels=list(range(len(scanner.channel_names))),
+            ),
+            "scan-image",
+        )
+
+    def acquire_camera_image(self, name: str | None = None) -> None:
+        """
+        Acquire one camera image, with its own exposure and binning.
+
+        The snapshot an operator keeps — a Ronchigram for the record, a
+        diffraction pattern to measure — taken at settings chosen for
+        the image rather than the ones the live view happens to be
+        running. The live settings are restored afterwards by
+        :func:`~miainwoodpecker.acquisition.camera_image`, so taking one
+        long exposure does not leave the feed crawling.
+
+        Parameters
+        ----------
+        name : str | None
+            Which camera, by target name. None means the first served.
+        """
+        binding = self._binding(name)
+        if binding is None or binding.exposure_spin is None:
+            return
+        if self._session is None:
+            self._recording_status.setText(_NO_SESSION_MESSAGE)
+            return
+        # Same one-driver-per-device rule as record_camera_frames.
+        if not self.stop_camera(binding.name):
+            self._recording_status.setText(_CAMERA_BUSY_MESSAGE)
+            return
+        self._start_recording(
+            camera_image(binding.camera, self._image_parameters(binding)),
+            "camera-image",
+        )
+
+    @staticmethod
+    def _image_parameters(binding: _CameraBinding) -> CameraParameters:
+        """
+        Return the settings an acquired image should be taken with.
+
+        Read off the panel at the moment of acquisition rather than
+        cached, so what an operator typed is what the exposure uses.
+
+        Parameters
+        ----------
+        binding : _CameraBinding
+            The camera and its controls.
+
+        Returns
+        -------
+        CameraParameters
+            Exposure and binning for one acquired image, keeping the
+            camera's current readout mode.
+        """
+        exposure_spin = typing.cast("QtWidgets.QDoubleSpinBox", binding.exposure_spin)
+        binning_combo = typing.cast("QtWidgets.QComboBox", binding.binning_combo)
+        return CameraParameters(
+            exposure_ms=exposure_spin.value(),
+            binning=int(binning_combo.currentText()),
+            # Not from the panel: readout is what the *camera* is set to
+            # do, and an image acquisition is not the place to switch a
+            # spectrometer between imaging and projecting.
+            readout=binding.camera.parameters().readout,
         )
 
     def _start_recording(self, frames: Iterable[Frame], label: str) -> None:

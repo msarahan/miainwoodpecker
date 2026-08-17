@@ -35,6 +35,7 @@ _VIEWER_TEST_MODULES = (
     "test_preview_window",
     "test_panel_layout",
     "test_widget_shutdown",
+    "test_acquire_images",
 )
 
 

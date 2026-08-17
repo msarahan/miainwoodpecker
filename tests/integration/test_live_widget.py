@@ -22,7 +22,7 @@ import napari
 from qtpy import QtWidgets
 
 from miainwoodpecker.analysis import remote as analysis_remote
-from miainwoodpecker.devices import Frame, ScanParameters
+from miainwoodpecker.devices import CameraParameters, Frame, ScanParameters
 from miainwoodpecker.storage.calibration import AxisKind, FrameCalibration
 from miainwoodpecker.storage.nexus import (
     NexusWriter,
@@ -94,15 +94,52 @@ class _GradientScanner(_FakeScanner):
 
 
 class _FakeCamera:
-    """Fake camera returning constant 8x8 frames."""
+    """
+    Fake camera returning constant 8x8 frames.
+
+    Implements the whole ``Camera`` protocol, including the settings
+    half (``binning_values``/``parameters``/``configure``) that this
+    fake went without for several phases. It got away with it while
+    nothing in the widget asked at build time; the Camera section's
+    image-exposure controls do, and an incomplete double that only
+    works until someone calls the rest of the interface is a test that
+    passes for the wrong reason.
+    """
 
     def __init__(self) -> None:
         self.started = False
+        self._parameters = CameraParameters(exposure_ms=10.0)
 
     @property
     def camera_id(self) -> str:
         """Return the fake camera's id."""
         return "fake_camera"
+
+    @property
+    def binning_values(self) -> typing.Sequence[int]:
+        """Return the binning factors this fake supports."""
+        return (1, 2)
+
+    def parameters(self) -> CameraParameters:
+        """Return the settings the next frame would be acquired with."""
+        return self._parameters
+
+    def configure(self, parameters: CameraParameters) -> CameraParameters:
+        """
+        Apply new settings and report them back.
+
+        Parameters
+        ----------
+        parameters : CameraParameters
+            The requested exposure and binning.
+
+        Returns
+        -------
+        CameraParameters
+            The same settings; this fake rounds nothing.
+        """
+        self._parameters = parameters
+        return self._parameters
 
     def start(self) -> None:
         """Mark acquisition as running."""
