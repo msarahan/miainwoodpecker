@@ -4,13 +4,18 @@ Guards that apply to the whole test suite.
 Currently one: keep tests out of the developer's real config file.
 """
 
+import pathlib
+
 import pytest
 
 from miainwoodpecker.viewer import preferences
 
 
 @pytest.fixture(autouse=True)
-def _isolated_preferences(tmp_path, monkeypatch) -> None:
+def _isolated_preferences(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """
     Point operator preferences at a temporary file for every test.
 

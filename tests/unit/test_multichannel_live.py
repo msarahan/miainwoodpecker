@@ -11,6 +11,7 @@ once and publishing its frames together.
 import datetime
 import threading
 import time
+from collections.abc import Callable
 
 import numpy as np
 import pytest
@@ -68,7 +69,10 @@ class _PassCountingScanner:
         return [_frame(number, channel) for channel in range(self._channels)]
 
 
-def _wait_for(condition, deadline_s: float = _DEADLINE_S) -> bool:
+def _wait_for(
+    condition: Callable[[], bool],
+    deadline_s: float = _DEADLINE_S,
+) -> bool:
     """
     Poll a condition until it holds or the deadline passes.
 

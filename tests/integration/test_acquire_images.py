@@ -10,6 +10,7 @@ Skipped without a display (see conftest.py).
 """
 
 import json
+import pathlib
 import time
 
 import pytest
@@ -28,7 +29,7 @@ _AN_IMAGE_EXPOSURE_MS = 250.0
 _BOTH_CHANNELS = 2
 
 
-def _open(tmp_path, **kwargs: object) -> tuple:
+def _open(tmp_path: pathlib.Path, **kwargs: object) -> tuple:
     """
     Open a widget with a session attached.
 
@@ -85,6 +86,11 @@ def _finish_recording(widget: LiveInstrumentWidget) -> None:
     ----------
     widget : LiveInstrumentWidget
         The widget to drive.
+
+    Raises
+    ------
+    AssertionError
+        If the recording does not finish before the deadline.
     """
     deadline = time.monotonic() + _DEADLINE_S
     while time.monotonic() < deadline:

@@ -10,6 +10,8 @@ from it would be computed against a position nothing established.
 Skipped without a display (see conftest.py).
 """
 
+import pathlib
+
 import pytest
 
 pytest.importorskip("napari", reason="requires the 'viewer' extra")
@@ -61,7 +63,12 @@ class _UnsynchronisedScanner:
         self._inner.close()
 
 
-def _open(tmp_path, *, scanner: object = None, session: bool = True) -> tuple:
+def _open(
+    tmp_path: pathlib.Path,
+    *,
+    scanner: object = None,
+    session: bool = True,
+) -> tuple:
     """
     Open a widget over preview devices, optionally with a given scanner.
 
@@ -69,8 +76,8 @@ def _open(tmp_path, *, scanner: object = None, session: bool = True) -> tuple:
     ----------
     tmp_path : pathlib.Path
         Where the session is written.
-    scanner : object | None
-        Scanner to use instead of the preview's own.
+    scanner : object
+        Scanner to use instead of the preview's own, or None.
     session : bool
         Whether to attach a session.
 

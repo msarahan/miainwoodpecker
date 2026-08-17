@@ -102,14 +102,14 @@ class ElidingLabel(QtWidgets.QLabel):
         self.setToolTip(text)
         self._apply_elision()
 
-    def resizeEvent(self, event) -> None:  # noqa: N802 - Qt override
+    def resizeEvent(self, event: object) -> None:  # noqa: N802 - Qt override
         """
         Re-elide the text for the new width.
 
         Parameters
         ----------
-        event : QtGui.QResizeEvent
-            The resize event, passed to the base class.
+        event : object
+            The Qt resize event, passed to the base class.
         """
         super().resizeEvent(event)
         self._apply_elision()

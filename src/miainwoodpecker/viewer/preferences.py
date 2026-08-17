@@ -25,33 +25,43 @@ from __future__ import annotations
 
 import json
 import logging
+import pathlib
 import typing
-
-import platformdirs
-
-if typing.TYPE_CHECKING:
-    from collections.abc import Sequence
 
 _APP_NAME = "miainwoodpecker"
 _FILENAME = "viewer-preferences.json"
 _LOG = logging.getLogger(__name__)
 
 
-def preferences_path() -> object:
+def preferences_path() -> pathlib.Path:
     """
     Return the file preferences are stored in.
+
+    ``platformdirs`` is imported here rather than at module scope, and
+    that is load-bearing rather than tidy. It ships with the ``viewer``
+    extra, but the base test environment installs no extras — and this
+    module is imported by the suite's own ``conftest``, so a top-level
+    import made *every* test in the repository fail to collect,
+    including the several hundred that never touch a config directory.
+    Locating the directory is the only thing here that needs the
+    dependency, so it is the only thing that asks for it.
 
     Returns
     -------
     pathlib.Path
-        The path, whether or not it exists.
+        The path, whether or not it exists. Without ``platformdirs``
+        this falls back to ``~/.config/miainwoodpecker`` — correct on
+        Linux, serviceable elsewhere, and a much smaller loss than
+        refusing to start.
     """
-    import pathlib  # noqa: PLC0415
-
+    try:
+        import platformdirs  # noqa: PLC0415
+    except ImportError:
+        return pathlib.Path.home() / ".config" / _APP_NAME / _FILENAME
     return pathlib.Path(platformdirs.user_config_dir(_APP_NAME)) / _FILENAME
 
 
-def load(path: object = None) -> dict[str, object]:
+def load(path: pathlib.Path | None = None) -> dict[str, object]:
     """
     Read stored preferences, returning an empty mapping if there are none.
 
@@ -82,7 +92,10 @@ def load(path: object = None) -> dict[str, object]:
     return stored
 
 
-def save(values: dict[str, object], path: object = None) -> bool:
+def save(
+    values: dict[str, object],
+    path: pathlib.Path | None = None,
+) -> bool:
     """
     Write preferences, creating the config directory if needed.
 
@@ -113,7 +126,7 @@ def save(values: dict[str, object], path: object = None) -> bool:
 
 def stored_channels(
     values: dict[str, object],
-    available: Sequence[str],
+    available: typing.Sequence[str],
 ) -> list[str]:
     """
     Return the remembered detector selection, filtered to what exists.

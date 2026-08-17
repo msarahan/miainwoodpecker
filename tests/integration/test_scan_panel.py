@@ -10,6 +10,7 @@ Skipped without a display (see conftest.py).
 """
 
 import time
+from collections.abc import Callable
 
 import pytest
 
@@ -46,7 +47,7 @@ def _open() -> tuple:
     return viewer, widget, devices
 
 
-def _wait_until(condition) -> bool:
+def _wait_until(condition: Callable[[], bool]) -> bool:
     """
     Drive the display and poll a condition until it holds.
 

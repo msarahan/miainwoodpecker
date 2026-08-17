@@ -29,7 +29,7 @@ def _open(**kwargs: object) -> tuple[napari.Viewer, LiveInstrumentWidget]:
 
     Parameters
     ----------
-    **kwargs
+    **kwargs : object
         Passed through to :func:`build_preview_devices`.
 
     Returns

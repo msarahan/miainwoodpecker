@@ -1060,6 +1060,11 @@ class ScanPass:
         stamped into their metadata, so a stored dataset says which
         signals came from one probe position rather than leaving a
         reader to infer it from timestamps.
+    parameters : ScanParameters
+        The geometry every output shares: the beam-position grid the
+        probe was driven over. For a spectrum image or a 4D-STEM
+        acquisition this is the *acquisition* grid, which is usually
+        coarser than the reference scan the operator drew the region on.
     scan_sync : str
         **Which device was master**, from :data:`SCAN_SYNC_MODES`. The
         same question ``metadata["scan_sync"]`` already asks of a
@@ -1071,11 +1076,6 @@ class ScanPass:
         values differ per instrument: a detector-mastered acquisition and
         an unsynchronised one produce datasets of identical shape, and
         only this field distinguishes them afterwards.
-    parameters : ScanParameters
-        The geometry every output shares: the beam-position grid the
-        probe was driven over. For a spectrum image or a 4D-STEM
-        acquisition this is the *acquisition* grid, which is usually
-        coarser than the reference scan the operator drew the region on.
     images : typing.Sequence[Frame]
         One 2D frame per intensity channel read out during the pass —
         ADF, BF, HAADF, a segmented detector's segments. Empty is legal:
@@ -1255,6 +1255,13 @@ class SynchronisedScanner(typing.Protocol):
         the next position's exposure instead of following the whole
         acquisition.
 
+        **Refusals.** Implementations raise ``ValueError`` if nothing was
+        asked for, a channel is named twice, or a target is not one this
+        scanner can synchronise — refused rather than downgraded to a
+        serial acquisition, because a caller cannot tell those apart from
+        the data. A channel index this scanner does not have is an
+        ``IndexError``, matching :meth:`Scanner.scan_frames`.
+
         Parameters
         ----------
         parameters : ScanParameters
@@ -1285,17 +1292,6 @@ class SynchronisedScanner(typing.Protocol):
         -------
         ScanPass
             The pass and everything read out of it.
-
-        Raises
-        ------
-        ValueError
-            If nothing was asked for, if a channel is named twice, or if
-            a target is not one this scanner can synchronise. Refused
-            rather than downgraded to a serial acquisition, because a
-            caller cannot tell those apart from the data.
-        IndexError
-            If a channel index this scanner does not have is requested,
-            matching :meth:`Scanner.scan_frames`.
         """
         ...
 

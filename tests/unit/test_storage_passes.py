@@ -7,6 +7,8 @@ rather than acquired into memory and copied. A test comparing only
 values would pass either way, so identity is asserted directly.
 """
 
+import pathlib
+
 import h5py
 import numpy as np
 import pytest
@@ -29,7 +31,7 @@ _A_DETECTOR = (_CAMERA_PIXELS // _A_BINNING, _CAMERA_PIXELS // _A_BINNING)
 _FOUR_AXES = 4
 
 
-def _text(value) -> str:
+def _text(value: object) -> str:
     """
     Return an HDF5 string as ``str``, whatever h5py handed back.
 
@@ -50,7 +52,7 @@ def _text(value) -> str:
 _TWO_CHANNELS = 2
 
 
-def _acquire(path, **kwargs: object) -> object:
+def _acquire(path: pathlib.Path, **kwargs: object) -> object:
     """
     Acquire a pass straight into a file, the way the writer intends.
 

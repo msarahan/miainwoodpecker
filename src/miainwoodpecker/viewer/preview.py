@@ -146,13 +146,13 @@ class PreviewInstrument:
 
     Parameters
     ----------
-    controls : typing.Iterable[str] | None
+    controls : Iterable[str] | None
         Which of :data:`PREVIEW_CONTROLS` to publish from
         ``available_controls``, or None for all of them. Publishing a
         subset is how the panel's "an unpublished control gets no row"
         rule is exercised without owning a microscope that lacks a
         blanker.
-    targets : typing.Iterable[str]
+    targets : Iterable[str]
         Device target names to report from :meth:`describe`. Normally
         set by :func:`build_preview_devices`, which knows what it built.
 
@@ -418,6 +418,9 @@ class PreviewScanner(_SyntheticSource):
     instrument : PreviewInstrument | None
         The instrument supplying defocus, stage position, and blanker
         state, or None to own a private one.
+    cameras : Mapping[str, PreviewCamera] | None
+        Cameras wired to this column, readable during a synchronised
+        pass. None for a scan unit with nothing attached to it.
     """
 
     def __init__(
@@ -493,7 +496,7 @@ class PreviewScanner(_SyntheticSource):
         ----------
         parameters : ScanParameters
             Scan geometry and timing, shared by every returned frame.
-        channels : typing.Sequence[int]
+        channels : Sequence[int]
             Detector channel indices to read out during the pass.
 
         Returns
@@ -588,7 +591,7 @@ class PreviewScanner(_SyntheticSource):
 
         Parameters
         ----------
-        lattice : numpy.ndarray
+        lattice : np.ndarray
             The pass's sampled specimen modulation.
         parameters : ScanParameters
             The pass's scan geometry.
@@ -596,7 +599,7 @@ class PreviewScanner(_SyntheticSource):
             Which channel to read out.
         pass_id : str
             Identifier shared by every frame from this pass.
-        simultaneous : typing.Sequence[int]
+        simultaneous : Sequence[int]
             Every channel read out during this pass.
         timestamp : datetime.datetime
             The pass's acquisition time.
@@ -676,11 +679,11 @@ class PreviewScanner(_SyntheticSource):
         ----------
         parameters : ScanParameters
             The beam-position grid.
-        channels : typing.Sequence[int]
+        channels : Sequence[int]
             Intensity channels to read out during the pass.
-        targets : typing.Sequence[str]
+        targets : Sequence[str]
             Camera targets to read out at each position.
-        into : typing.Mapping[str, numpy.ndarray] | None
+        into : Mapping[str, np.ndarray] | None
             Pre-allocated destination cubes by target name, filled in
             place. None allocates. A preview that allocated the wrong
             way would be a poor model of the acquisition it exists to
@@ -778,14 +781,14 @@ class PreviewScanner(_SyntheticSource):
         ----------
         name : str
             The camera's target name.
-        lattice : numpy.ndarray
+        lattice : np.ndarray
             The pass's sampled specimen modulation, one value per beam
             position.
         pass_id : str
             Identifier shared by every output of this pass.
         timestamp : datetime.datetime
             The pass's acquisition time.
-        destination : numpy.ndarray | None
+        destination : np.ndarray | None
             A pre-allocated cube to fill, or None to allocate one.
 
         Returns
@@ -1083,7 +1086,7 @@ class PreviewDevices:
     ----------
     scanner : PreviewScanner | None
         The scan unit, or None for a detector-only instrument.
-    cameras : typing.Mapping[str, PreviewCamera]
+    cameras : Mapping[str, PreviewCamera]
         Every camera served, by target name. Empty for a scan-only
         instrument.
     instrument : PreviewInstrument
@@ -1118,7 +1121,7 @@ def build_preview_devices(
         How many cameras to serve when ``camera`` is true. More than one
         opens the multi-camera layout, which otherwise needs two
         detectors on a bench.
-    controls : typing.Iterable[str] | None
+    controls : Iterable[str] | None
         Which controls the instrument publishes, or None for all.
 
     Returns

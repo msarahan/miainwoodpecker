@@ -1679,8 +1679,8 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
 
         Parameters
         ----------
-        camera : Camera | None
-            The camera that will be read out.
+        camera : object
+            The camera that will be read out, or None.
 
         Returns
         -------
@@ -2635,6 +2635,12 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         ----------
         step : Callable[[], object]
             The teardown step to run.
+
+        Raises
+        ------
+        RuntimeError
+            Re-raised when it is not the "already deleted" kind - a
+            device refusing to stop is worth hearing about even here.
         """
         try:
             step()

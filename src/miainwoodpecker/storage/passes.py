@@ -58,6 +58,7 @@ if typing.TYPE_CHECKING:
     from collections.abc import Mapping
 
     from miainwoodpecker.devices.interface import ScanPass
+    from miainwoodpecker.storage.calibration import AxisCalibration
 
 _NAVIGATION_AXES = ("scan_y", "scan_x")
 _DETECTOR_AXES = ("det_y", "det_x")
@@ -119,9 +120,10 @@ class PassWriter:
     ----------
     path : os.PathLike[str] | str
         Where to write.
-    parameters : ScanParameters
-        The beam-position grid, which calibrates every navigation axis.
-    cubes : typing.Mapping[str, tuple[int, int]]
+    parameters : object
+        The beam-position grid (a ``ScanParameters``), which calibrates
+        every navigation axis.
+    cubes : Mapping[str, tuple[int, int]] | None
         Detector shape per camera target, so the datasets can be
         allocated before the acquisition starts. Empty for a pass with
         no diffraction.
@@ -354,8 +356,8 @@ class PassWriter:
         ----------
         index : int
             Position in the pass's image list, the fallback name.
-        frame : Frame
-            The channel's frame.
+        frame : object
+            The channel's ``Frame``.
         """
         channel = frame.metadata.get("channel_name") or f"channel{index}"
         group = self._data_group(f"data_{channel}")
@@ -377,7 +379,7 @@ class PassWriter:
         group: h5py.Group,
         name: str,
         length: int,
-        axis: object,
+        axis: AxisCalibration,
     ) -> None:
         """
         Write one axis of an ``NXdata`` group from its calibration.
