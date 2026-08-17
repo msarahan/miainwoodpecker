@@ -76,6 +76,7 @@ import tempfile
 import typing
 from pathlib import Path
 
+import numpy as np
 from qtpy import QtCore, QtWidgets
 
 from miainwoodpecker.acquisition.live import LiveAcquisition
@@ -1379,6 +1380,146 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
             # spectrometer between imaging and projecting.
             readout=binding.camera.parameters().readout,
         )
+
+    def acquire_spectrum_image(self) -> None:
+        """
+        Acquire a 4D-STEM pass over the current field of view.
+
+        One traversal of the probe over a grid of beam positions, with a
+        full camera image kept at each — see
+        :class:`~miainwoodpecker.devices.interface.ScanPass`.
+
+        **Most of this method is the refusal, and that is the point.**
+        Synchronised acquisition is a hardware fact, not a software
+        feature: the column has to drive the detector's trigger or the
+        detector has to advance the scan. A backend without that wiring
+        cannot do it, and the nionswift-usim simulator is exactly such a
+        backend — measured, in
+        :mod:`miainwoodpecker.analysis.py4dstem_bridge`, which found that
+        moving the simulator's own probe position changes nothing beyond
+        shot noise. Producing a plausible cube anyway would be the worst
+        available outcome: it is the same shape as a real one, and every
+        number computed per pixel from it would be computed against a
+        position nothing established.
+
+        Blocking, for now. The whole pass runs on the GUI thread, which
+        is tolerable for the preview's small grids and is not what a real
+        acquisition needs; moving it behind a job like
+        :class:`~miainwoodpecker.storage.session.RecordingJob` is the
+        next step, and is why the grid offered here is deliberately small.
+        """
+        from miainwoodpecker.devices.interface import (  # noqa: PLC0415
+            SynchronisedScanner,
+        )
+        from miainwoodpecker.storage.passes import PassWriter  # noqa: PLC0415
+
+        if self._scanner is None:
+            return
+        if self._session is None:
+            self._recording_status.setText(_NO_SESSION_MESSAGE)
+            return
+        if not isinstance(self._scanner, SynchronisedScanner):
+            self._recording_status.setText(
+                "this backend cannot acquire a spectrum image: it has no "
+                "synchronised scan/camera mode, so there is no way to tie a "
+                "camera frame to a probe position",
+            )
+            return
+        targets = list(self._scanner.synchronised_targets())
+        if not targets:
+            self._recording_status.setText(
+                "no camera is wired to the scan unit, so nothing can be read "
+                "out at each beam position",
+            )
+            return
+        if not self.stop_scan():
+            self._recording_status.setText(_SCANNER_BUSY_MESSAGE)
+            return
+        target = targets[0]
+        if not self.stop_camera(target):
+            self._recording_status.setText(_CAMERA_BUSY_MESSAGE)
+            return
+        self._run_spectrum_image(PassWriter, target)
+
+    def _run_spectrum_image(self, writer_class: type, target: str) -> None:
+        """
+        Drive one synchronised pass into a file in the session.
+
+        Split out so :meth:`acquire_spectrum_image` reads as the list of
+        refusals it mostly is.
+
+        Parameters
+        ----------
+        writer_class : type
+            The pass writer to use, imported by the caller.
+        target : str
+            The camera target to read out at each beam position.
+        """
+        positions = self._positions_spin.value()
+        parameters = ScanParameters(
+            height=positions,
+            width=positions,
+            pixel_time_us=self._dwell_spin.value(),
+            fov_nm=self._fov_spin.value(),
+        )
+        binding = self._binding(target)
+        camera = binding.camera if binding is not None else None
+        detector = self._detector_shape(camera)
+        path, index, slug, started_at = self._session.reserve("spectrum-image")
+        self._recording_status.setText(f"acquiring {positions}x{positions} pass...")
+        try:
+            with writer_class(
+                path, parameters, cubes={target: detector},
+            ) as writer:
+                result = self._scanner.scan_synchronised(
+                    parameters,
+                    channels=list(range(len(self._scanner.channel_names))),
+                    targets=[target],
+                    into=writer.destinations(),
+                )
+                writer.finish(result)
+        except Exception as error:  # noqa: BLE001 - the refusal is the message
+            self._recording_status.setText(f"spectrum image failed: {error}")
+            return
+        self._recording_status.setText(
+            f"spectrum image saved: {path.name} "
+            f"({positions}x{positions} positions, sync={result.scan_sync})",
+        )
+        self._refresh_session_labels()
+        del index, slug, started_at
+
+    @staticmethod
+    def _detector_shape(camera: object) -> tuple[int, int]:
+        """
+        Return the per-position detector shape a pass will produce.
+
+        Asked of the camera rather than assumed, because the destination
+        has to be allocated before the acquisition starts and an
+        allocation of the wrong size is refused rather than reshaped.
+
+        Parameters
+        ----------
+        camera : Camera | None
+            The camera that will be read out.
+
+        Returns
+        -------
+        tuple[int, int]
+            The detector image shape.
+
+        Raises
+        ------
+        RuntimeError
+            If the camera cannot say what shape it produces.
+        """
+        if camera is None:
+            msg = "no camera binding for the synchronised target"
+            raise RuntimeError(msg)
+        camera.start()
+        try:
+            return tuple(np.asarray(camera.acquire_frame().data).shape)
+        finally:
+            camera.stop()
 
     def _start_recording(self, frames: Iterable[Frame], label: str) -> None:
         """

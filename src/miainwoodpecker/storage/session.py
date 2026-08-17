@@ -504,6 +504,34 @@ class Session:
                 continue
             return candidate, index, slug, started_at
 
+    def reserve(self, label: str) -> tuple[Path, int, str, datetime.datetime]:
+        """
+        Claim a filename in this session for a caller that writes it itself.
+
+        :meth:`record` is the path for anything that streams *frames*; a
+        scan pass does not, because it writes several correlated signals
+        and streams its cubes into datasets it allocated up front (see
+        :mod:`miainwoodpecker.storage.passes`). Rather than teach this
+        class to drive that, the naming is exposed: the session stays the
+        one place that decides what a recording is called and what index
+        it gets, and the caller owns the writing.
+
+        The returned file is **created empty**, which is what makes the
+        name a reservation rather than a suggestion — two acquisitions
+        started in the same second cannot pick it twice.
+
+        Parameters
+        ----------
+        label : str
+            What is being recorded; slugified into the filename.
+
+        Returns
+        -------
+        tuple[Path, int, str, datetime.datetime]
+            The reserved path, its index, the slug, and the start time.
+        """
+        return self._reserve(label)
+
     def record(
         self,
         frames: Iterable[Frame],

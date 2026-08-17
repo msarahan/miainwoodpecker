@@ -218,6 +218,35 @@ it would refuse.
 Neither is affected by the **Frames** count beside it: an image is one
 acquisition, whatever that says.
 
+### Acquiring a spectrum image (4D-STEM)
+
+**Acquire spectrum image (4D)** drives the probe over a grid of
+**Positions** beam positions across the current field of view, keeping a
+full camera image at every one. The result is a 4D dataset —
+`(scan_y, scan_x, det_y, det_x)` — written straight to disk as it is
+acquired rather than assembled in memory first, so its size is bounded
+by the disk rather than by RAM.
+
+**Most instruments will refuse, and the refusal is the point.** A
+spectrum image needs the scan and the detector synchronised in
+*hardware* — the column driving the detector's trigger, or the detector
+advancing the scan. A backend without that wiring cannot tie a camera
+frame to a probe position, and producing a plausible cube anyway would
+be worse than refusing: it has the same shape as a real one, and every
+number computed per pixel from it would be computed against a position
+nothing established. So the button says what is missing instead.
+
+Today only the [preview instrument](developing-the-ui.md) can do it. The
+`nionswift-usim` simulator cannot, and that is measured rather than
+assumed — moving the simulator's own probe position changes nothing
+beyond shot noise.
+
+Known limits, while this is being built out: the grid is square (the
+target-area UI that would take its aspect ratio from a region you draw
+is not built yet), the acquisition blocks the window while it runs, and
+a saved pass appears in the **File** list as `0 frames` because that
+list only understands frame stacks.
+
 ### Recording a series
 
 To record a time series: set **Frames**, press **Record frames** in the

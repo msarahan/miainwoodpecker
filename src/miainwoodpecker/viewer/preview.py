@@ -806,17 +806,22 @@ class PreviewScanner(_SyntheticSource):
         # sampled region rather than of the grid's resolution.
         gradient_y, gradient_x = np.gradient(lattice)
         scale = _DEFLECTION_PER_UNIT_SLOPE
+        detector = _CAMERA_PIXELS // camera.parameters().binning
+        expected = (*lattice.shape, detector, detector)
         cube = destination
         if cube is None:
-            detector = _CAMERA_PIXELS // camera.parameters().binning
-            cube = np.empty(
-                (*lattice.shape, detector, detector),
-                dtype=np.float32,
-            )
-        elif cube.shape[:2] != lattice.shape:
+            cube = np.empty(expected, dtype=np.float32)
+        elif tuple(cube.shape) != expected:
+            # The whole shape, not just the navigation axes. Checking half
+            # of it let a wrong detector size through to the write loop,
+            # where it surfaced as an h5py broadcast TypeError naming
+            # neither the target nor the acquisition - and a caller
+            # pre-allocating gigabytes deserves to be told which of the
+            # two numbers it got wrong.
             msg = (
                 f"destination for {name} has navigation shape "
-                f"{cube.shape[:2]}, but the pass covers {lattice.shape}"
+                f"{tuple(cube.shape)}, but the pass produces {expected} "
+                f"({lattice.shape} beam positions of {detector}x{detector})"
             )
             raise ValueError(msg)
         # Written into the cube position by position rather than built as

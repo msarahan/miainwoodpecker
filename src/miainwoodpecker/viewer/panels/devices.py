@@ -14,12 +14,15 @@ from qtpy import QtCore, QtWidgets
 from miainwoodpecker.viewer.panels.defaults import (
     _DEFAULT_DWELL_US,
     _DEFAULT_FOV_NM,
+    _DEFAULT_POSITIONS,
     _DEFAULT_RECORD_FRAME_COUNT,
     _DEFAULT_SCAN_SIZE_INDEX,
     _EXPOSURE_DECIMALS,
     _MAX_EXPOSURE_MS,
+    _MAX_POSITIONS,
     _MAX_RECORD_FRAME_COUNT,
     _MIN_EXPOSURE_MS,
+    _MIN_POSITIONS,
     _SCAN_SIZES,
 )
 
@@ -87,6 +90,7 @@ def build_scan_group(widget: LiveInstrumentWidget) -> QtWidgets.QGroupBox:
         "it - the channels are registered to each other by construction",
     )
     scan_form.addRow(widget._scan_image_button)
+    build_spectrum_image_controls(widget, scan_group, scan_form)
     (
         widget._scan_count_spin,
         widget._scan_save_button,
@@ -99,9 +103,59 @@ def build_scan_group(widget: LiveInstrumentWidget) -> QtWidgets.QGroupBox:
     widget._fov_spin.valueChanged.connect(widget._on_scan_settings_changed)
     widget._scan_button.clicked.connect(widget._toggle_scan)
     widget._scan_image_button.clicked.connect(widget.acquire_scan_image)
+    widget._spectrum_image_button.clicked.connect(widget.acquire_spectrum_image)
     widget._scan_save_button.clicked.connect(widget.save_scan_frame)
     widget._scan_record_button.clicked.connect(widget.record_scan_frames)
     return scan_group
+
+def build_spectrum_image_controls(
+    widget: LiveInstrumentWidget,
+    scan_group: QtWidgets.QGroupBox,
+    scan_form: QtWidgets.QFormLayout,
+) -> None:
+    """
+    Add the beam-position count and the spectrum-image button.
+
+    Built unconditionally, even on a backend that cannot synchronise —
+    which today is every backend but the preview. A button that is
+    absent teaches an operator the feature does not exist; a button that
+    explains *why* this instrument cannot do it teaches them something
+    true, and it is the same explanation whether they are on usim or on
+    a column whose trigger is not wired.
+
+    Positions are square, and the count is small. Both are placeholders
+    for the target-area UI: the aspect ratio should come from a region
+    drawn on the reference scan rather than be assumed, and the grid
+    should be as large as the operator's patience rather than as small
+    as a blocking call can afford.
+
+    Parameters
+    ----------
+    widget : LiveInstrumentWidget
+        The widget that owns the resulting controls.
+    scan_group : QtWidgets.QGroupBox
+        The group box owning the new widgets.
+    scan_form : QtWidgets.QFormLayout
+        The group's layout, appended to.
+    """
+    widget._positions_spin = QtWidgets.QSpinBox(scan_group)
+    widget._positions_spin.setRange(_MIN_POSITIONS, _MAX_POSITIONS)
+    widget._positions_spin.setValue(_DEFAULT_POSITIONS)
+    widget._positions_spin.setPrefix("")
+    widget._positions_spin.setToolTip(
+        "Beam positions per side. A full camera image is kept at each, so "
+        "the dataset grows with the square of this number",
+    )
+    scan_form.addRow("Positions", widget._positions_spin)
+    widget._spectrum_image_button = QtWidgets.QPushButton(
+        "Acquire spectrum image (4D)", scan_group,
+    )
+    widget._spectrum_image_button.setToolTip(
+        "One pass of the probe keeping a full camera image at every beam "
+        "position. Needs a backend with synchronised scan/camera hardware",
+    )
+    scan_form.addRow(widget._spectrum_image_button)
+
 
 def build_record_controls(
     parent: QtWidgets.QWidget,

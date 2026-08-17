@@ -4,6 +4,50 @@
 
 ### Added
 
+- **A scan pass can be stored, and acquired from the window.**
+  `storage/passes.py` writes one `NXentry` per pass holding one `NXdata`
+  per signal — `entry/data` the default and plottable one, the rest
+  `entry/data_<name>`. NeXus allows an entry many `NXdata` groups and
+  uses `default` to name the one to plot, so this is the vocabulary's
+  own answer to "where does a second signal go" rather than a private
+  convention.
+  `NXem`'s `measurement/eventID*` hierarchy is designed for exactly this
+  and was **not** adopted, for a costed reason rather than a lazy one:
+  reaching it additionally requires an `NXem_instrument` carrying
+  `ebeam_column` and `fabrication` under a `measurement` group, i.e.
+  restructuring the entry every reader in this package and every file
+  already written depends on. That is a migration, and it should be made
+  once when the hierarchy is needed for its own sake — not smuggled in
+  behind the first feature that could use it.
+  **Streaming is structural.** `PassWriter` creates the file and its
+  datasets first and hands them out through `destinations()`, to be
+  passed as `scan_synchronised(into=...)`. The device fills the final
+  on-disk datasets as it acquires, chunked one beam position per chunk
+  so each write lands as a single chunk write. A test asserts the pass's
+  array *is* the file's dataset, because a version that filled a buffer
+  and then copied it in would pass any value-based check while doing
+  exactly the work this avoids.
+  `Session.reserve` exposes the naming so a caller that writes its own
+  file still gets the session's index and slug; the file is created
+  empty, which makes the name a reservation rather than a suggestion.
+  **Acquire spectrum image (4D)** in the Scan group drives it, and most
+  of that method is refusals: no session, no synchronised mode, no
+  camera wired to the column, scanner or camera busy. That is the
+  feature on every backend but the preview — a fabricated cube has the
+  same shape as a real one, so naming the missing capability is the only
+  outcome an operator can act on.
+  Fixed while building it: the preview's `into` shape check validated
+  only the navigation axes, so a wrong detector size reached the write
+  loop and surfaced as an h5py broadcast `TypeError` naming neither the
+  target nor the acquisition. It now checks the whole shape and says
+  which of the two numbers is wrong.
+  Known limits, stated rather than papered over: the grid is square and
+  the acquisition blocks the GUI thread (both wait on the target-area UI
+  and a job boundary), and a stored pass appears in the Recordings list
+  as `0 frames` because that list only understands frame stacks — a test
+  pins that it does not *break* the list, which is the part that matters
+  meanwhile.
+
 - **The cross-device pass, and one device that really performs it.**
   `docs/adapters/spectrum-detectors.md` §2.3 named the missing concept
   and said it was "one missing concept, not three": a spectrum image
