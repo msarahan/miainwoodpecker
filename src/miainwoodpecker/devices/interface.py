@@ -994,6 +994,312 @@ class SpectrumDetector(typing.Protocol):
 _MAX_SPECTRUM_RANK = 3
 
 
+SCAN_SYNC_DETECTOR = "detector"
+"""
+Synchronisation: the detector was master, driving the column's scan input.
+
+The camera or analyser signals that it has finished a readout and the
+scan advances to the next pre-programmed position. This is the common
+arrangement for a fast spectrum image — the detector sets the rate, and
+the scan follows it — and it is what Gatan's GMS and Nion's Swift each
+expose through their own synchronised-acquisition APIs.
+"""
+
+SCAN_SYNC_SCANNER = "scanner"
+"""
+Synchronisation: the column was master, and the detector followed.
+
+The scan advances on its own dwell clock and the detector bins on a
+pixel-advance line from the column.
+"""
+
+SCAN_SYNC_NONE = "none"
+"""
+Synchronisation: none, and the pixel-to-readout correspondence is assumed.
+
+Not a failure and not always wrong — a slow, stable acquisition can be
+good enough — but everything computed per pixel from such a dataset is
+computed against a position nothing guaranteed, so it must be recorded
+rather than left to be inferred.
+"""
+
+SCAN_SYNC_MODES = (SCAN_SYNC_DETECTOR, SCAN_SYNC_SCANNER, SCAN_SYNC_NONE)
+"""Every synchronisation a :class:`ScanPass` may report."""
+
+
+@dataclass(frozen=True)
+class ScanPass:
+    """
+    One traversal of the probe, and every signal read out of it.
+
+    The unit of acquisition this interface was missing, named in
+    docs/adapters/spectrum-detectors.md §2.3 as "one missing concept, not
+    three": a spectrum image collected alongside HAADF, multi-detector
+    scanning, and 4D-STEM are the same absence seen from three sides. On
+    a scanned instrument, simultaneity is the ordinary case — one pass of
+    the probe reads out every fitted detector — and serial acquisition is
+    the special case. :meth:`Scanner.scan_frames` already says this
+    *within* one scan unit; this says it across devices.
+
+    **What makes the correlation real, and not a claim.** The same
+    document rejected adding a bare ``pass_id`` to :class:`Frame` and
+    :class:`Spectrum` as a correlation hint, because an identifier that
+    nothing establishes is a claim that two results share a pass — the
+    shape of mistake ``probe_position`` already made here, accepting a
+    value, echoing it back, and being silently ignored. So this type is
+    produced *only* by :meth:`SynchronisedScanner.scan_synchronised`,
+    which is one call to one device that really did traverse once. An
+    adapter that cannot guarantee that must not build one; it should
+    refuse, and the caller falls back to acquiring serially and knowing
+    that is what it got.
+
+    Attributes
+    ----------
+    pass_id : str
+        Identifies this traversal. Shared by every output below and
+        stamped into their metadata, so a stored dataset says which
+        signals came from one probe position rather than leaving a
+        reader to infer it from timestamps.
+    scan_sync : str
+        **Which device was master**, from :data:`SCAN_SYNC_MODES`. The
+        same question ``metadata["scan_sync"]`` already asks of a
+        spectrum map, promoted to a field here because a pass exists to
+        assert that its outputs share probe positions, and *how* that was
+        arranged is the whole evidence for the assertion.
+        Required, with no default, deliberately. A default would be a
+        guess about hardware wiring made by this module, and the honest
+        values differ per instrument: a detector-mastered acquisition and
+        an unsynchronised one produce datasets of identical shape, and
+        only this field distinguishes them afterwards.
+    parameters : ScanParameters
+        The geometry every output shares: the beam-position grid the
+        probe was driven over. For a spectrum image or a 4D-STEM
+        acquisition this is the *acquisition* grid, which is usually
+        coarser than the reference scan the operator drew the region on.
+    images : typing.Sequence[Frame]
+        One 2D frame per intensity channel read out during the pass —
+        ADF, BF, HAADF, a segmented detector's segments. Empty is legal:
+        a 4D-STEM acquisition on a column with no fitted intensity
+        detector is a real, if unusual, configuration.
+    diffraction : typing.Mapping[str, DiffractionStack]
+        Per-camera 4D data, by target name: a full detector image at
+        every beam position.
+    spectra : typing.Mapping[str, Spectrum]
+        Per-detector spectrum images, by target name: a spectrum at
+        every beam position, so rank 3.
+    """
+
+    pass_id: str
+    parameters: ScanParameters
+    scan_sync: str
+    images: typing.Sequence[Frame] = ()
+    diffraction: typing.Mapping[str, DiffractionStack] = field(default_factory=dict)
+    spectra: typing.Mapping[str, Spectrum] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        """Reject a pass that carries nothing, or says nothing about itself."""
+        if not self.pass_id:
+            msg = "a scan pass must be identified; pass_id is empty"
+            raise ValueError(msg)
+        if self.scan_sync not in SCAN_SYNC_MODES:
+            msg = (
+                f"scan_sync must be one of {SCAN_SYNC_MODES}, got "
+                f"{self.scan_sync!r} - a pass has to say which device was "
+                "master, because an unsynchronised acquisition is the same "
+                "shape as a synchronised one"
+            )
+            raise ValueError(msg)
+        if not (self.images or self.diffraction or self.spectra):
+            msg = (
+                "a scan pass read nothing out - it must carry at least one "
+                "image channel, diffraction stack or spectrum image"
+            )
+            raise ValueError(msg)
+
+
+@dataclass(frozen=True)
+class DiffractionStack:
+    """
+    A camera image at every beam position: the 4D-STEM datacube.
+
+    Its own type rather than a bare array because the array alone does
+    not say which two axes are which, and a caller that guesses wrong
+    silently transposes a dataset. The shape is
+    ``(scan_y, scan_x, detector_y, detector_x)`` — navigation axes
+    first, matching :attr:`Spectrum.navigation_shape` on the spectrum
+    side and py4DSTEM's ``DataCube`` on the analysis side, so neither
+    needs a transpose to read what this produces.
+
+    Attributes
+    ----------
+    data : typing.Any
+        The 4D array, navigation axes first.
+    camera_id : str
+        Which detector produced it.
+    parameters : CameraParameters
+        The settings every frame in the stack was taken with. One value
+        for the whole stack, not per frame: a camera reconfigured
+        mid-pass would make the stack's own axes untrue, so an adapter
+        that cannot hold the settings for a pass must refuse the pass.
+    metadata : dict[str, typing.Any]
+        The frame vocabulary of :class:`Frame`, minus what varies per
+        beam position. Carries ``scan_pass_id``.
+    """
+
+    data: typing.Any
+    camera_id: str
+    parameters: CameraParameters
+    metadata: dict[str, typing.Any] = field(default_factory=dict)
+
+    @property
+    def navigation_shape(self) -> tuple[int, ...]:
+        """
+        Return the beam-position grid shape, ``(scan_y, scan_x)``.
+
+        Returns
+        -------
+        tuple[int, ...]
+            The two navigation axes.
+        """
+        return tuple(self.data.shape[:2])
+
+    @property
+    def detector_shape(self) -> tuple[int, ...]:
+        """
+        Return the per-position detector image shape.
+
+        Returns
+        -------
+        tuple[int, ...]
+            The two signal axes.
+        """
+        return tuple(self.data.shape[2:])
+
+
+@typing.runtime_checkable
+class SynchronisedScanner(typing.Protocol):
+    """
+    A scan unit that can read other devices out at each beam position.
+
+    A **separate** protocol rather than two more methods on
+    :class:`Scanner`, and the reason is the one :class:`Instrument`
+    already records: a ``runtime_checkable`` protocol's ``isinstance`` is
+    all-or-nothing, so widening ``Scanner`` would make every existing
+    adapter that cannot do synchronised acquisition fail the check it
+    passes today — testing for a capability instead of for conformance.
+    Here the check and the capability are the same question, which is
+    what makes ``isinstance(scanner, SynchronisedScanner)`` an honest
+    thing to ask.
+
+    Not every scan unit can do this, and the ones that cannot are not
+    broken. Real synchronisation is a hardware fact — the column drives
+    the detector's external trigger, or the detector advances the scan on
+    a pixel clock — and an adapter with no such wiring must simply not
+    implement this protocol. The nionswift-usim simulator is exactly that
+    case, measured rather than assumed: see
+    :mod:`miainwoodpecker.analysis.py4dstem_bridge`, which found that
+    setting the simulator's own ``probe_position`` and re-acquiring
+    changes nothing beyond shot noise, because the aberration model only
+    reads it when a ``ScanHardwareSource`` is registered by the
+    application layer this project does not stand up.
+    """
+
+    def synchronised_targets(self) -> typing.Sequence[str]:
+        """
+        Return the target names this scanner can read out during a pass.
+
+        The capability list, asked before driving rather than discovered
+        from a failure — the same rule
+        :attr:`SpectrumDetector.acquisition_modes` follows. A scanner
+        that can synchronise a Ronchigram camera but not the EELS
+        spectrometer says so here, and a caller that asks for the latter
+        gets a refusal rather than a cube of unsynchronised data.
+        """
+        ...
+
+    def scan_synchronised(
+        self,
+        parameters: ScanParameters,
+        *,
+        channels: typing.Sequence[int] = (),
+        targets: typing.Sequence[str] = (),
+        into: typing.Mapping[str, typing.Any] | None = None,
+    ) -> ScanPass:
+        """
+        Traverse the probe once, reading every named signal out per position.
+
+        **On pre-allocation.** A spectrum image or 4D-STEM acquisition is
+        the one case in this interface where allocation is not free: a
+        64x64 grid on a 512x512 detector is four gigabytes, and building
+        it as per-position arrays that are then copied into a cube costs
+        a second full traversal of that memory. It is also not how the
+        vendor APIs work — Gatan's GMS and Nion's Swift both take a
+        destination the caller owns and fill it as the acquisition runs,
+        precisely so the data never moves twice. ``into`` is that shape:
+        the caller allocates, the adapter hands the buffer down to the
+        SDK, and the returned :class:`ScanPass` views the same memory
+        rather than a copy of it.
+
+        **And this is also how a large pass streams to disk**, which
+        looks like a second, conflicting requirement and is not. A cube
+        too large to hold in memory still wants a caller-owned
+        destination handed to the device; both are possible only if the
+        destination does not have to *be* memory. So ``into`` is defined
+        by what it supports — a shape, and assignment at a beam position
+        — rather than as ``numpy.ndarray``, and an ``h5py`` dataset
+        satisfies it. Chunked one beam position per chunk, the device's
+        per-position writes land as single chunk writes and the cube is
+        on disk as it is acquired, never whole in RAM. An adapter should
+        therefore write *through* this buffer as it goes rather than
+        filling it and returning, which is what makes the write overlap
+        the next position's exposure instead of following the whole
+        acquisition.
+
+        Parameters
+        ----------
+        parameters : ScanParameters
+            The beam-position grid. Its
+            :attr:`~ScanParameters.shape` is the number of positions,
+            *not* a display resolution: a 32x32 spectrum image over the
+            same field of view as a 512x512 survey scan is the ordinary
+            case, and the aspect ratio is the caller's to match to the
+            region it drew.
+        channels : typing.Sequence[int]
+            Intensity channels to read out, as :meth:`Scanner.scan_frames`
+            takes them. May be empty.
+        targets : typing.Sequence[str]
+            Camera and spectrum-detector target names to read out at each
+            position. Every one must appear in
+            :meth:`synchronised_targets`.
+        into : typing.Mapping[str, typing.Any] | None
+            Pre-allocated destination arrays by target name, already the
+            shape the acquisition will produce. The adapter fills them in
+            place; the returned pass carries these arrays rather than
+            copies. None asks the adapter to allocate.
+            An array of the wrong shape is a ``ValueError`` rather than
+            something to reshape around: the caller allocated it from its
+            own idea of the grid, and a mismatch means one of the two is
+            wrong about what is being acquired.
+
+        Returns
+        -------
+        ScanPass
+            The pass and everything read out of it.
+
+        Raises
+        ------
+        ValueError
+            If nothing was asked for, if a channel is named twice, or if
+            a target is not one this scanner can synchronise. Refused
+            rather than downgraded to a serial acquisition, because a
+            caller cannot tell those apart from the data.
+        IndexError
+            If a channel index this scanner does not have is requested,
+            matching :meth:`Scanner.scan_frames`.
+        """
+        ...
+
+
 # Neutral names for the controls an InstrumentController may report through
 # available_controls(). Strings rather than an enum so the value survives the
 # device-server IPC boundary as plain data (see devices/rpc.py).

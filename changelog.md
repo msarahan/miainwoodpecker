@@ -4,6 +4,80 @@
 
 ### Added
 
+- **The cross-device pass, and one device that really performs it.**
+  `docs/adapters/spectrum-detectors.md` §2.3 named the missing concept
+  and said it was "one missing concept, not three": a spectrum image
+  collected alongside HAADF, multi-detector scanning, and 4D-STEM are
+  the same absence seen from three sides. The unit that was absent is a
+  **pass** — one traversal of the probe yielding a *set* of correlated
+  outputs sharing one geometry and one identifier.
+  `ScanPass` and `DiffractionStack` are that unit. A pass carries its
+  image channels, its per-camera 4D datacubes and its spectrum images,
+  and refuses to exist without an identity or without anything to
+  identify. `DiffractionStack` is a type rather than a bare array
+  because the array alone does not say which axes are which, and a
+  caller that guesses wrong silently transposes a dataset that still
+  analyses; its shape is navigation-first, matching both
+  `Spectrum.navigation_shape` and py4DSTEM's `DataCube`.
+  `SynchronisedScanner` is a **separate** protocol rather than two more
+  methods on `Scanner`, for the reason `Instrument` already records: a
+  `runtime_checkable` protocol's `isinstance` is all-or-nothing, so
+  widening `Scanner` would make every adapter that cannot synchronise
+  fail a check it passes today — testing for a capability instead of
+  for conformance. Here the check and the capability are the same
+  question, which is what makes `isinstance` honest.
+  The same document rejected adding a bare `pass_id` to `Frame` and
+  `Spectrum` as a correlation hint, because an identifier nothing
+  establishes is a *claim* that two results share a pass — the shape of
+  mistake `probe_position` already made here. So a `ScanPass` is
+  produced only by `scan_synchronised`, one call to one device that
+  really did traverse once; an adapter that cannot guarantee that must
+  refuse rather than build one.
+  The preview instrument implements it for real, which is the point of
+  having built it: the diffraction pattern at each beam position is
+  deflected by the local gradient of the specimen field, so a
+  centre-of-mass across the datacube reconstructs that gradient. A test
+  asserts the correlation, which means a centre-of-mass or DPC
+  implementation run against this fixture can be *wrong* — where a cube
+  of identical patterns would let any analysis "succeed". The
+  nionswift-usim backend implements none of it, and that is not an
+  oversight: `analysis/py4dstem_bridge.py` records the measurement
+  showing it cannot produce scan-position-varying diffraction without
+  the `HardwareSource` layer Phase 0 rejected.
+  **Synchronisation is recorded, not assumed.** `ScanPass.scan_sync` is
+  required with no default, from `SCAN_SYNC_MODES` — `detector` when the
+  camera or analyser drove the column's scan input (the usual
+  arrangement for a fast spectrum image, and what Gatan's GMS and Nion's
+  Swift each expose), `scanner` when the column drove, `none` when
+  nothing did. It is the same question `metadata["scan_sync"]` already
+  asked of a spectrum map, promoted to a field because a pass exists to
+  assert its outputs share probe positions and *how* that was arranged
+  is the whole evidence. A default would have been this module guessing
+  about hardware wiring; a detector-mastered acquisition and an
+  unsynchronised one produce datasets of identical shape, and only this
+  field tells them apart afterwards.
+  **Pre-allocation and streaming are one mechanism, not two.**
+  `scan_synchronised` takes `into`: destination arrays the caller owns,
+  filled in place, so the data never moves twice — which is how the
+  vendor SDKs work and the only sane shape for a cube measured in
+  gigabytes. That looks like it conflicts with streaming a large pass to
+  disk, and does not: `into` is defined by what it supports (a shape,
+  and assignment at a beam position) rather than as `numpy.ndarray`, so
+  an `h5py` dataset satisfies it. Chunked one beam position per chunk,
+  the per-position writes land as single chunk writes and the cube is on
+  disk as it is acquired, never whole in RAM. A test pins this by
+  acquiring into a real HDF5 dataset and asserting the pass carries that
+  dataset rather than a copy.
+  Not yet done, and the next steps: the NeXus layout for a stored pass
+  (the test above writes a bare cube, not a calibrated `NXdata`), an
+  adapter that writes *through* the buffer so the write overlaps the
+  next exposure rather than following the acquisition, and the
+  target-area UI. The vendor specifics — which GMS and Swift calls take
+  a caller-owned destination, and what each requires of the trigger
+  wiring — are recorded here as the shape to look for, not as verified
+  fact: neither has been exercised, and both need hardware or a vendor
+  conversation.
+
 - **Acquiring an image is now its own thing, separate from recording a
   series.** Until now the window could make exactly one kind of
   recording: a burst of N repeats from one device — a *time* series.

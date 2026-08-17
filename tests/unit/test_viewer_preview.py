@@ -7,6 +7,7 @@ objects, so the parts of it worth testing are testable the cheap way.
 The window it opens is covered by the integration suite instead.
 """
 
+import h5py
 import numpy as np
 import pytest
 
@@ -14,15 +15,18 @@ from miainwoodpecker.devices.interface import (
     BEAM_BLANKER_CONTROL,
     DEFOCUS_CONTROL,
     ENERGY_OFFSET_CONTROL,
+    SCAN_SYNC_SCANNER,
     STAGE_POSITION_CONTROL,
     Camera,
     CameraParameters,
     ScanParameters,
     Scanner,
+    SynchronisedScanner,
 )
 from miainwoodpecker.devices.rpc import SCANNER_TARGET
 from miainwoodpecker.viewer.preview import (
     PREVIEW_BACKEND,
+    _CAMERA_PIXELS,
     PreviewCamera,
     PreviewInstrument,
     PreviewScanner,
@@ -35,6 +39,12 @@ _A_BIG_DEFOCUS_NM = 4000.0
 _A_STAGE_STEP_NM = 5000.0
 _AN_ENERGY_OFFSET_EV = 12.5
 _TWO_CAMERAS = 2
+_TWO_CHANNELS = 2
+# Small on purpose: a synchronised pass renders a full detector image per
+# beam position, so an 8x8 grid is already 8*8*128*128 floats.
+_A_SYNC_GRID = ScanParameters(height=8, width=8, pixel_time_us=1.0, fov_nm=3.0)
+_NOISE_TOLERANCE = 0.05
+_STRONG_CORRELATION = 0.8
 
 
 def _scan_once(scanner: PreviewScanner) -> np.ndarray:
@@ -348,6 +358,243 @@ class TestSelectableCapabilities:
             camera.start()
             frames.append(camera.acquire_frame().data)
         assert not np.array_equal(frames[0], frames[1])
+
+
+class TestSynchronisedPass:
+    """
+    The preview really performs a synchronised pass, and that is the point.
+
+    The nionswift-usim backend cannot — measured, not assumed, in
+    ``analysis/py4dstem_bridge.py`` — so the preview is the only device
+    in this project against which spectrum-imaging and 4D-STEM work can
+    be built and tested at all.
+    """
+
+    def test_the_scanner_declares_the_capability(self):
+        """
+        ``isinstance`` is the honest question here, unlike on Scanner.
+
+        The protocol has exactly the methods the capability needs, so an
+        adapter either implements synchronised acquisition or does not —
+        no all-or-nothing problem to work around.
+        """
+        devices = build_preview_devices(scan=True, camera=True)
+        assert isinstance(devices.scanner, SynchronisedScanner)
+
+    def test_a_scanner_with_no_camera_synchronises_nothing(self):
+        """A column with nothing wired to it says so rather than pretending."""
+        devices = build_preview_devices(scan=True, camera=False)
+        assert list(devices.scanner.synchronised_targets()) == []
+
+    def test_one_pass_yields_images_and_diffraction_together(self):
+        """
+        The whole concept: several signals, one traversal, one identity.
+
+        The shared ``scan_pass_id`` is what makes the correlation a fact
+        rather than a claim, and it is only stamped because one call to
+        one device really did traverse once.
+        """
+        devices = build_preview_devices(scan=True, camera=True)
+        result = devices.scanner.scan_synchronised(
+            _A_SYNC_GRID, channels=[0, 1], targets=["camera"],
+        )
+
+        assert len(result.images) == _TWO_CHANNELS
+        stack = result.diffraction["camera"]
+        assert result.images[0].metadata["scan_pass_id"] == result.pass_id
+        assert stack.metadata["scan_pass_id"] == result.pass_id
+
+    def test_the_datacube_is_beam_positions_by_detector(self):
+        """The cube's navigation axes are the grid that was asked for."""
+        devices = build_preview_devices(scan=True, camera=True)
+        stack = devices.scanner.scan_synchronised(
+            _A_SYNC_GRID, targets=["camera"],
+        ).diffraction["camera"]
+
+        assert stack.navigation_shape == _A_SYNC_GRID.shape
+        assert len(stack.detector_shape) == _TWO_CHANNELS
+
+    def test_binning_shrinks_the_detector_axes_only(self):
+        """
+        Binning is the camera's, so it changes the signal axes and not the grid.
+
+        The beam-position count is the scan's business; confusing the two
+        is how a 4D dataset ends up with the wrong axes.
+        """
+        devices = build_preview_devices(scan=True, camera=True)
+        devices.cameras["camera"].configure(
+            CameraParameters(exposure_ms=10.0, binning=2),
+        )
+        stack = devices.scanner.scan_synchronised(
+            _A_SYNC_GRID, targets=["camera"],
+        ).diffraction["camera"]
+
+        assert stack.navigation_shape == _A_SYNC_GRID.shape
+        assert stack.detector_shape == (_CAMERA_PIXELS // 2, _CAMERA_PIXELS // 2)
+
+    def test_the_diffraction_actually_varies_with_probe_position(self):
+        """
+        Every pattern identical would make any 4D analysis "succeed".
+
+        This is the property that separates a real implementation from a
+        stack of copies, and the reason usim cannot stand in: there,
+        patterns at different probe positions differ only by shot noise.
+        """
+        devices = build_preview_devices(scan=True, camera=True)
+        cube = devices.scanner.scan_synchronised(
+            _A_SYNC_GRID, targets=["camera"],
+        ).diffraction["camera"].data
+
+        first = cube[0, 0]
+        last = cube[-1, -1]
+        assert not np.allclose(first, last, atol=_NOISE_TOLERANCE)
+
+    def test_centre_of_mass_reconstructs_the_specimen_gradient(self):
+        """
+        The deflection model has a right answer, so a DPC map can be checked.
+
+        The disc is pushed off axis by the local slope of the specimen
+        field, which is what a real phase gradient does. So the centre of
+        mass across the cube should track that slope — and a
+        centre-of-mass implementation run against this data can be
+        *wrong*, which is what makes the fixture worth having.
+        """
+        devices = build_preview_devices(scan=True, camera=True)
+        result = devices.scanner.scan_synchronised(
+            _A_SYNC_GRID, channels=[0], targets=["camera"],
+        )
+        cube = result.diffraction["camera"].data
+
+        _, columns = np.indices(cube.shape[2:])
+        totals = cube.sum(axis=(2, 3))
+        centre_x = (cube * columns).sum(axis=(2, 3)) / totals
+
+        # The same slope the deflection was built from, recovered from
+        # the images the pass also produced rather than from the model.
+        _, expected = np.gradient(np.asarray(result.images[0].data))
+        correlation = np.corrcoef(centre_x.ravel(), expected.ravel())[0, 1]
+        assert correlation > _STRONG_CORRELATION
+
+    def test_a_pass_reports_which_device_was_master(self):
+        """
+        A pass says how it synchronised, because the shape cannot.
+
+        A detector-mastered acquisition and an unsynchronised one produce
+        identically shaped datasets. The preview's loop is the scan
+        driving and the camera following, so it says so.
+        """
+        devices = build_preview_devices(scan=True, camera=True)
+        result = devices.scanner.scan_synchronised(
+            _A_SYNC_GRID, targets=["camera"],
+        )
+        assert result.scan_sync == SCAN_SYNC_SCANNER
+
+    def test_a_pre_allocated_cube_is_filled_rather_than_copied(self):
+        """
+        The caller's array *is* the pass's array, not a copy of it.
+
+        This is the whole point of ``into``: a 64x64 grid on a 512x512
+        detector is four gigabytes, and the vendor APIs fill a
+        caller-owned destination precisely so the data never moves
+        twice. Asserted by identity, because a version that filled the
+        buffer and then returned a copy would pass any value-based
+        check while doing exactly the work this avoids.
+        """
+        devices = build_preview_devices(scan=True, camera=True)
+        detector = _CAMERA_PIXELS
+        destination = np.zeros(
+            (*_A_SYNC_GRID.shape, detector, detector), dtype=np.float32,
+        )
+
+        stack = devices.scanner.scan_synchronised(
+            _A_SYNC_GRID, targets=["camera"], into={"camera": destination},
+        ).diffraction["camera"]
+
+        assert stack.data is destination
+        assert destination.any(), "the destination was filled, not left zeroed"
+
+    def test_the_destination_can_be_an_on_disk_dataset(self, tmp_path):
+        """
+        Streaming and pre-allocation are the same mechanism, not rival ones.
+
+        A 64x64 grid on a 512x512 detector is four gigabytes: it cannot
+        be held in RAM *and* it wants a caller-owned buffer handed to the
+        device. Both at once is only possible if the buffer does not have
+        to be memory — so ``into`` is defined by what it supports
+        (shape, and ``__setitem__`` per beam position) rather than as
+        ``numpy.ndarray``, and an HDF5 dataset satisfies it. The cube is
+        then written to disk as it is acquired and never exists whole in
+        memory.
+
+        Chunked one beam position per chunk, which is what makes the
+        per-position writes land as single chunk writes rather than
+        read-modify-write of a larger block.
+        """
+        devices = build_preview_devices(scan=True, camera=True)
+        path = tmp_path / "cube.h5"
+        detector = _CAMERA_PIXELS
+
+        with h5py.File(path, "w") as handle:
+            dataset = handle.create_dataset(
+                "cube",
+                shape=(*_A_SYNC_GRID.shape, detector, detector),
+                dtype="float32",
+                chunks=(1, 1, detector, detector),
+            )
+            stack = devices.scanner.scan_synchronised(
+                _A_SYNC_GRID, targets=["camera"], into={"camera": dataset},
+            ).diffraction["camera"]
+
+            assert stack.data is dataset
+            assert stack.navigation_shape == _A_SYNC_GRID.shape
+            assert np.asarray(dataset[0, 0]).any()
+
+        assert path.stat().st_size > 0
+
+    def test_a_destination_of_the_wrong_shape_is_refused(self):
+        """
+        A mismatch means one of the two is wrong about what is being acquired.
+
+        Refused rather than reshaped around: the caller allocated from
+        its own idea of the grid, and quietly ignoring that would hand
+        back a dataset whose axes are not what was asked for.
+        """
+        devices = build_preview_devices(scan=True, camera=True)
+        wrong = np.zeros((2, 2, _CAMERA_PIXELS, _CAMERA_PIXELS), dtype=np.float32)
+
+        with pytest.raises(ValueError, match="navigation shape"):
+            devices.scanner.scan_synchronised(
+                _A_SYNC_GRID, targets=["camera"], into={"camera": wrong},
+            )
+
+    def test_a_pass_reading_nothing_out_is_refused(self):
+        """Naming no channel and no target is a traversal for nothing."""
+        devices = build_preview_devices(scan=True, camera=True)
+        with pytest.raises(ValueError, match="must read something out"):
+            devices.scanner.scan_synchronised(_A_SYNC_GRID)
+
+    def test_an_unsynchronisable_target_is_refused(self):
+        """
+        Refused rather than quietly acquired serially.
+
+        A caller cannot tell a synchronised cube from an unsynchronised
+        one by looking at it, so the refusal has to happen here.
+        """
+        devices = build_preview_devices(scan=True, camera=True)
+        with pytest.raises(ValueError, match="cannot synchronise"):
+            devices.scanner.scan_synchronised(_A_SYNC_GRID, targets=["eels_camera"])
+
+    def test_a_repeated_channel_is_refused(self):
+        """Same vocabulary as ``scan_frames``: one pass cannot read one twice."""
+        devices = build_preview_devices(scan=True, camera=True)
+        with pytest.raises(ValueError, match="twice"):
+            devices.scanner.scan_synchronised(_A_SYNC_GRID, channels=[0, 0])
+
+    def test_an_unknown_channel_is_an_index_error(self):
+        """Same vocabulary as ``scan_frames`` for a channel that is not fitted."""
+        devices = build_preview_devices(scan=True, camera=True)
+        with pytest.raises(IndexError):
+            devices.scanner.scan_synchronised(_A_SYNC_GRID, channels=[99])
 
 
 class TestArgumentParsing:

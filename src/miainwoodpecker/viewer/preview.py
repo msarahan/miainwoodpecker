@@ -57,10 +57,13 @@ from miainwoodpecker.devices.interface import (
     DEFOCUS_CONTROL,
     ENERGY_OFFSET_CONTROL,
     PROJECTED_READOUT,
+    SCAN_SYNC_SCANNER,
     STAGE_POSITION_CONTROL,
     CameraParameters,
+    DiffractionStack,
     Frame,
     ScanParameters,
+    ScanPass,
 )
 from miainwoodpecker.devices.rpc import CAMERA_TARGET_NAMES, SCANNER_TARGET
 
@@ -108,6 +111,12 @@ _DEFAULT_EXPOSURE_MS = 20.0
 _RONCHIGRAM_RADIUS = 0.55
 _RONCHIGRAM_RINGS = 9.0
 _MAX_PREVIEW_CAMERAS = len(CAMERA_TARGET_NAMES)
+# How far the bright-field disc is pushed off axis per unit of local
+# specimen slope, in detector half-widths. Sized so an ordinary lattice
+# gradient moves the disc a visible fraction of the detector without
+# ever walking it off the edge, where a centre-of-mass would saturate
+# and stop reconstructing anything.
+_DEFLECTION_PER_UNIT_SLOPE = 0.35
 _RNG_SEED = 20260816
 _CAMERA_SEED = _RNG_SEED + 1
 
@@ -411,9 +420,19 @@ class PreviewScanner(_SyntheticSource):
         state, or None to own a private one.
     """
 
-    def __init__(self, instrument: PreviewInstrument | None = None) -> None:
+    def __init__(
+        self,
+        instrument: PreviewInstrument | None = None,
+        cameras: Mapping[str, PreviewCamera] | None = None,
+    ) -> None:
         super().__init__(instrument, _RNG_SEED)
         self._pass_index = 0
+        # The cameras this scanner can read out *during* a pass. Held by
+        # the scanner because that is where the capability lives: a
+        # synchronised acquisition is the scan unit driving the detector
+        # trigger, so a camera nothing has wired to the column is not
+        # synchronisable however reachable it is otherwise.
+        self._cameras: dict[str, PreviewCamera] = dict(cameras or {})
 
     @property
     def scanner_id(self) -> str:
@@ -618,6 +637,214 @@ class PreviewScanner(_SyntheticSource):
             },
         )
 
+    def synchronised_targets(self) -> Sequence[str]:
+        """
+        Return the camera targets this scanner can read out during a pass.
+
+        Returns
+        -------
+        typing.Sequence[str]
+            Target names, or empty if no camera is wired to the column.
+        """
+        return list(self._cameras)
+
+    def scan_synchronised(
+        self,
+        parameters: ScanParameters,
+        *,
+        channels: Sequence[int] = (),
+        targets: Sequence[str] = (),
+        into: Mapping[str, np.ndarray] | None = None,
+    ) -> ScanPass:
+        """
+        Traverse the probe once, reading every named signal out per position.
+
+        The preview's implementation is a real one, which is the whole
+        reason it exists: the diffraction pattern at each beam position
+        is deflected by the **local gradient** of the specimen field, so
+        the centre of mass across the datacube reconstructs that
+        gradient. That makes the output something a 4D-STEM analysis can
+        be tested against — a centre-of-mass or DPC map computed from it
+        has a right answer — rather than a cube of identical patterns
+        that any analysis would "succeed" on.
+
+        The nionswift-usim backend implements none of this, on purpose;
+        see :class:`~miainwoodpecker.devices.interface.SynchronisedScanner`
+        for the measurement showing it cannot.
+
+        Parameters
+        ----------
+        parameters : ScanParameters
+            The beam-position grid.
+        channels : typing.Sequence[int]
+            Intensity channels to read out during the pass.
+        targets : typing.Sequence[str]
+            Camera targets to read out at each position.
+        into : typing.Mapping[str, numpy.ndarray] | None
+            Pre-allocated destination cubes by target name, filled in
+            place. None allocates. A preview that allocated the wrong
+            way would be a poor model of the acquisition it exists to
+            prototype, so this path is the same one the real adapters
+            will take.
+
+        Returns
+        -------
+        ScanPass
+            The pass and everything read out of it.
+
+        Raises
+        ------
+        ValueError
+            If nothing was asked for, a channel is repeated, or a target
+            is not one this scanner can synchronise.
+        IndexError
+            If a channel this scanner does not have is requested.
+        """
+        requested = list(channels)
+        wanted = list(targets)
+        if not requested and not wanted:
+            msg = (
+                "a synchronised pass must read something out - name at "
+                "least one channel or one target"
+            )
+            raise ValueError(msg)
+        if len(set(requested)) != len(requested):
+            msg = f"channels {requested} names a detector twice"
+            raise ValueError(msg)
+        for index in requested:
+            if not 0 <= index < len(_CHANNEL_NAMES):
+                msg = (
+                    f"channel {index} does not exist on {self.scanner_id}; "
+                    f"it has {len(_CHANNEL_NAMES)}"
+                )
+                raise IndexError(msg)
+        unknown = [name for name in wanted if name not in self._cameras]
+        if unknown:
+            msg = (
+                f"cannot synchronise {unknown}; {self.scanner_id} can "
+                f"synchronise {list(self._cameras)}"
+            )
+            raise ValueError(msg)
+
+        pass_id = f"{self.scanner_id}-sync-{self._pass_index}"
+        drift_nm = self._pass_index * _DRIFT_NM_PER_PASS
+        self._pass_index += 1
+        lattice = self._sample_specimen(parameters, drift_nm)
+        timestamp = _now()
+        images = [
+            self._read_out(
+                lattice,
+                parameters=parameters,
+                channel=index,
+                pass_id=pass_id,
+                simultaneous=requested,
+                timestamp=timestamp,
+            )
+            for index in requested
+        ]
+        return ScanPass(
+            pass_id=pass_id,
+            parameters=parameters,
+            images=images,
+            # Every synthetic signal here comes from one loop over one
+            # sampled region, so the correlation is a fact about how it
+            # was produced. Reported as scanner-mastered because that is
+            # what this loop is: the scan drives and the camera follows.
+            scan_sync=SCAN_SYNC_SCANNER,
+            diffraction={
+                name: self._diffraction_stack(
+                    name,
+                    lattice,
+                    pass_id,
+                    timestamp,
+                    (into or {}).get(name),
+                )
+                for name in wanted
+            },
+        )
+
+    def _diffraction_stack(
+        self,
+        name: str,
+        lattice: np.ndarray,
+        pass_id: str,
+        timestamp: datetime.datetime,
+        destination: np.ndarray | None,
+    ) -> DiffractionStack:
+        """
+        Build one camera's datacube for an already-traversed pass.
+
+        Parameters
+        ----------
+        name : str
+            The camera's target name.
+        lattice : numpy.ndarray
+            The pass's sampled specimen modulation, one value per beam
+            position.
+        pass_id : str
+            Identifier shared by every output of this pass.
+        timestamp : datetime.datetime
+            The pass's acquisition time.
+        destination : numpy.ndarray | None
+            A pre-allocated cube to fill, or None to allocate one.
+
+        Returns
+        -------
+        DiffractionStack
+            The 4D data, navigation axes first.
+
+        Raises
+        ------
+        ValueError
+            If ``destination`` does not cover the pass's beam positions.
+        """
+        camera = self._cameras[name]
+        # The deflection model: the probe is pushed off axis by the local
+        # slope of the specimen field, which is what a real phase
+        # gradient does to the bright-field disc. np.gradient over the
+        # beam-position grid, so the deflection is a property of the
+        # sampled region rather than of the grid's resolution.
+        gradient_y, gradient_x = np.gradient(lattice)
+        scale = _DEFLECTION_PER_UNIT_SLOPE
+        cube = destination
+        if cube is None:
+            detector = _CAMERA_PIXELS // camera.parameters().binning
+            cube = np.empty(
+                (*lattice.shape, detector, detector),
+                dtype=np.float32,
+            )
+        elif cube.shape[:2] != lattice.shape:
+            msg = (
+                f"destination for {name} has navigation shape "
+                f"{cube.shape[:2]}, but the pass covers {lattice.shape}"
+            )
+            raise ValueError(msg)
+        # Written into the cube position by position rather than built as
+        # a list of arrays and stacked. The stacking version allocated
+        # every pattern twice and moved the whole dataset a second time,
+        # which is the cost this interface's `into` exists to avoid - and
+        # a preview that allocated the wrong way would be a poor model of
+        # the acquisition it exists to prototype.
+        for row in range(lattice.shape[0]):
+            for column in range(lattice.shape[1]):
+                cube[row, column] = camera.diffraction_at(
+                    (
+                        float(gradient_y[row, column]) * scale,
+                        float(gradient_x[row, column]) * scale,
+                    ),
+                )
+        return DiffractionStack(
+            data=cube,
+            camera_id=camera.camera_id,
+            parameters=camera.parameters(),
+            metadata={
+                "scan_pass_id": pass_id,
+                "device_id": camera.camera_id,
+                "timestamp": timestamp.isoformat(),
+                "defocus_nm": self._instrument.defocus_nm(),
+            },
+        )
+
     def close(self) -> None:
         """Release nothing; this scanner owns no resources."""
 
@@ -769,7 +996,11 @@ class PreviewCamera(_SyntheticSource):
             },
         )
 
-    def _ronchigram(self, pixels: int) -> np.ndarray:
+    def _ronchigram(
+        self,
+        pixels: int,
+        deflection: tuple[float, float] = (0.0, 0.0),
+    ) -> np.ndarray:
         """
         Return a synthetic Ronchigram of the given size.
 
@@ -781,6 +1012,11 @@ class PreviewCamera(_SyntheticSource):
         ----------
         pixels : int
             Frame side length.
+        deflection : tuple[float, float]
+            How far the disc is pushed off centre, in detector half-widths,
+            as ``(y, x)``. Zero for a live view, and set per beam position
+            during a synchronised pass — see
+            :meth:`PreviewScanner.scan_synchronised`.
 
         Returns
         -------
@@ -791,7 +1027,8 @@ class PreviewCamera(_SyntheticSource):
         if self._instrument.is_beam_blanked():
             return self._noise(shape)
         axis = np.linspace(-1.0, 1.0, pixels, dtype=np.float32)
-        radius = np.hypot(*np.meshgrid(axis, axis, indexing="ij"))
+        grid_y, grid_x = np.meshgrid(axis, axis, indexing="ij")
+        radius = np.hypot(grid_y - deflection[0], grid_x - deflection[1])
         disc = (radius < _RONCHIGRAM_RADIUS).astype(np.float32)
         rings = np.cos(radius * _RONCHIGRAM_RINGS * np.pi)
         envelope = self._instrument.contrast_envelope()
@@ -800,6 +1037,28 @@ class PreviewCamera(_SyntheticSource):
             + _SPECIMEN_CONTRAST * envelope * disc * rings
             + self._noise(shape)
         )
+
+    def diffraction_at(self, deflection: tuple[float, float]) -> np.ndarray:
+        """
+        Return one diffraction pattern for a probe at a deflected position.
+
+        The per-beam-position half of a synchronised pass. Deliberately
+        does **not** go through :meth:`acquire_frame`: that one advances
+        the frame counter and honours the start/stop contract, neither of
+        which applies to a readout the scan unit is driving.
+
+        Parameters
+        ----------
+        deflection : tuple[float, float]
+            Disc displacement in detector half-widths, ``(y, x)``.
+
+        Returns
+        -------
+        numpy.ndarray
+            The pattern, float32, at the camera's current binning.
+        """
+        pixels = _CAMERA_PIXELS // self._parameters.binning
+        return np.asarray(self._ronchigram(pixels, deflection), dtype=np.float32)
 
     def close(self) -> None:
         """Release nothing; this camera owns no resources."""
@@ -887,16 +1146,23 @@ def build_preview_devices(
     names = _camera_target_names(served_cameras)
     targets = ([SCANNER_TARGET] if scan else []) + list(names)
     instrument = PreviewInstrument(controls=controls, targets=targets)
+    cameras = {
+        name: PreviewCamera(
+            instrument=instrument,
+            camera_id=name,
+            seed=_CAMERA_SEED + offset,
+        )
+        for offset, name in enumerate(names)
+    }
     return PreviewDevices(
-        scanner=PreviewScanner(instrument=instrument) if scan else None,
-        cameras={
-            name: PreviewCamera(
-                instrument=instrument,
-                camera_id=name,
-                seed=_CAMERA_SEED + offset,
-            )
-            for offset, name in enumerate(names)
-        },
+        # The cameras go to the scanner as well as into the mapping: a
+        # synchronised pass is the scan unit reading them out per beam
+        # position, so it has to hold them. Built after them for that
+        # reason, rather than beside them.
+        scanner=PreviewScanner(instrument=instrument, cameras=cameras)
+        if scan
+        else None,
+        cameras=cameras,
         instrument=instrument,
         stage_size_nm=instrument.stage_size_nm(),
     )
