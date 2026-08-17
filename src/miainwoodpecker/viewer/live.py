@@ -76,11 +76,19 @@ import tempfile
 import typing
 from pathlib import Path
 
+import numpy as np
 from qtpy import QtCore, QtWidgets
 
-from miainwoodpecker.acquisition.live import LiveAcquisition
-from miainwoodpecker.acquisition.sequence import camera_series, scan_series
-from miainwoodpecker.devices.interface import ScanParameters
+from miainwoodpecker.acquisition.live import (
+    LiveAcquisition,
+    MultiChannelLiveAcquisition,
+)
+from miainwoodpecker.acquisition.sequence import (
+    camera_image,
+    camera_series,
+    multichannel_scan_series,
+)
+from miainwoodpecker.devices.interface import CameraParameters, ScanParameters
 from miainwoodpecker.storage.nexus import write_frames
 from miainwoodpecker.storage.session import (
     LoadJob,
@@ -94,11 +102,14 @@ from miainwoodpecker.storage.session import (
     format_bytes,
     free_space,
 )
+from miainwoodpecker.viewer import preferences, profiles
 from miainwoodpecker.viewer.jobs import AnalysisJob
 from miainwoodpecker.viewer.panels import devices as devices_panel
 from miainwoodpecker.viewer.panels import instrument as instrument_panel
 from miainwoodpecker.viewer.panels import recordings as recordings_panel
+from miainwoodpecker.viewer.panels import sections as sections_panel
 from miainwoodpecker.viewer.panels import session as session_panel
+from miainwoodpecker.viewer.panels import statusbar as statusbar_panel
 from miainwoodpecker.viewer.panels.defaults import (
     _DEFAULT_DWELL_US,
     _DEFAULT_FOV_NM,
@@ -167,6 +178,16 @@ class _CameraBinding:
         Save the displayed frame.
     record_button : QtWidgets.QPushButton | None
         Record a series.
+    exposure_spin : QtWidgets.QDoubleSpinBox | None
+        Exposure for an *acquired image*, kept apart from whatever the
+        live view is running at. The two are different jobs: the feed
+        stays short to be responsive, and the image an operator keeps is
+        worth waiting for.
+    binning_combo : QtWidgets.QComboBox | None
+        Binning for an acquired image, same reasoning as the exposure —
+        a live view can afford to be binned where a kept image cannot.
+    acquire_button : QtWidgets.QPushButton | None
+        Take one image with those settings.
     """
 
     name: str
@@ -178,6 +199,9 @@ class _CameraBinding:
     count_spin: QtWidgets.QSpinBox | None = None
     save_button: QtWidgets.QPushButton | None = None
     record_button: QtWidgets.QPushButton | None = None
+    exposure_spin: QtWidgets.QDoubleSpinBox | None = None
+    binning_combo: QtWidgets.QComboBox | None = None
+    acquire_button: QtWidgets.QPushButton | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -424,6 +448,9 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         # Section title to section, so a caller - and a test - can ask
         # which devices the window offered and whether each is folded.
         self._device_sections: dict[str, devices_panel.CollapsibleSection] = {}
+        # The dock's four top-level groups, by key, so a caller - and a
+        # test - can ask which are folded. Same idea one level up.
+        self._panel_sections: dict[str, sections_panel.CollapsibleSection] = {}
         self._session: Session | None = None
         self._recording_job: RecordingJob | None = None
         self._load_job: LoadJob | None = None
@@ -446,16 +473,30 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         # read on the GUI thread only, and handed to the worker as plain
         # data by _start_analysis, exactly as _opened_file already is.
         self._opened_frames: FrameStack | None = None
-        self._scan_request: tuple[ScanParameters, int, str] = (
+        # Parameters, the enabled channel indices, and their names. A
+        # tuple of channels rather than one, because a scanned
+        # instrument reads several detectors out of a single pass and
+        # the panel now says so.
+        self._scan_request: tuple[ScanParameters, tuple[int, ...], tuple[str, ...]] = (
             ScanParameters(
                 height=_SCAN_SIZES[_DEFAULT_SCAN_SIZE_INDEX],
                 width=_SCAN_SIZES[_DEFAULT_SCAN_SIZE_INDEX],
                 pixel_time_us=_DEFAULT_DWELL_US,
                 fov_nm=_DEFAULT_FOV_NM,
             ),
-            0,
+            (0,),
             scanner.channel_names[0] if scanner is not None else "",
         )
+        # Before _build_ui: a failure part-way through building the UI
+        # still leaves a widget whose shutdown() may be called.
+        self._shutdown_done = False
+        # Read once, before the panel is built, so the controls come
+        # up already showing what the operator last chose.
+        self._preferences = preferences.load()
+        self._channel_checks: dict[str, QtWidgets.QCheckBox] = {}
+        self._profile_controls: dict[
+            str, tuple[QtWidgets.QDoubleSpinBox, QtWidgets.QComboBox]
+        ] = {}
         self._build_ui()
         if scanner is not None:
             self._on_scan_settings_changed()
@@ -670,33 +711,250 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
             return
         self._instrument_status.setText("beam blanked" if blanked else "beam unblanked")
 
-    def _build_ui(self) -> None:
-        layout = QtWidgets.QVBoxLayout(self)
-        layout.addWidget(instrument_panel.build_instrument_panel(self))
-        layout.addWidget(session_panel.build_session_group(self))
-        layout.addWidget(recordings_panel.build_recordings_group(self))
-        layout.addWidget(devices_panel.build_devices_panel(self))
-        layout.addStretch(1)
+    @property
+    def panel_sections(self) -> dict[str, sections_panel.CollapsibleSection]:
+        """
+        Return the dock's top-level folding sections, by key.
 
-    def _on_scan_settings_changed(self) -> None:
-        size = int(self._size_combo.currentText())
-        channel_index = self._channel_combo.currentIndex()
-        self._scan_request = (
-            ScanParameters(
-                height=size,
-                width=size,
-                pixel_time_us=self._dwell_spin.value(),
-                fov_nm=self._fov_spin.value(),
-            ),
-            channel_index,
-            self._channel_combo.currentText(),
+        Returns
+        -------
+        dict[str, sections_panel.CollapsibleSection]
+            ``instrument``, ``recordings`` and ``devices``. Session
+            context is a dialog rather than a section - see
+            :meth:`open_session_settings`.
+        """
+        return self._panel_sections
+
+    @property
+    def session_dialog(self) -> QtWidgets.QDialog:
+        """
+        Return the Session settings dialog, whether or not it is showing.
+
+        Returns
+        -------
+        QtWidgets.QDialog
+            The dialog holding the session directory, operator, sample
+            and standing notes.
+        """
+        return self._session_dialog
+
+    def open_session_settings(self) -> None:
+        """
+        Show the Session settings dialog, raising it if already open.
+
+        ``show`` rather than ``exec``: the dialog is application-modal
+        either way, but ``exec`` would run a nested event loop and not
+        return until it closed, blocking this method's caller.
+        """
+        self._session_dialog.show()
+        self._session_dialog.raise_()
+        self._session_dialog.activateWindow()
+
+    def _build_ui(self) -> None:
+        """
+        Build the dock: four folding groups in a scroll area.
+
+        Both halves of that are load-bearing, and neither substitutes
+        for the other.
+
+        The **scroll area** is the fix for a panel that could not be
+        reached. The groups were a plain vertical stack whose minimum
+        height was its natural height, so a stack wanting 1499 pixels on
+        a 1409-pixel screen could not be shrunk, had nothing to scroll,
+        and simply ran off the bottom - the lower sections were not just
+        out of view but unreachable by any gesture.
+
+        The **folding** is what an operator asked for and is a different
+        job: putting away the groups they are not using. It is
+        deliberately not relied on to make the panel fit, because
+        several groups open at once is the ordinary case (watching a
+        camera while a scan runs), and a layout that only fits when
+        folded would put the same content out of reach again the moment
+        someone opened it.
+        """
+        container = QtWidgets.QWidget(self)
+        stack = QtWidgets.QVBoxLayout(container)
+        stack.setContentsMargins(0, 0, 0, 0)
+        # The session dialog is built first and kept hidden: the
+        # recordings group's note field and half of live.py reach for
+        # widgets it owns, so they have to exist before anything else
+        # is assembled. See panels/session.py.
+        self._session_dialog = session_panel.build_session_dialog(self)
+        built = (
+            ("instrument", instrument_panel.build_instrument_panel(self)),
+            ("recordings", recordings_panel.build_recordings_group(self)),
+            ("devices", devices_panel.build_devices_panel(self)),
+        )
+        for key, content in built:
+            # The section header carries the title now, so the box
+            # inside it would otherwise say the same word twice - the
+            # same trick the per-device sections already use.
+            title = content.title() if isinstance(content, QtWidgets.QGroupBox) else key
+            if isinstance(content, QtWidgets.QGroupBox):
+                content.setTitle("")
+            section = sections_panel.CollapsibleSection(title, content, container)
+            self._panel_sections[key] = section
+            stack.addWidget(section)
+        stack.addStretch(1)
+
+        scroll = QtWidgets.QScrollArea(self)
+        scroll.setWidget(container)
+        scroll.setWidgetResizable(True)
+        # No frame: inside a dock the border reads as a second panel
+        # edge a few pixels in from the real one.
+        scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(scroll)
+
+        # Not in this layout at all: where data is going and how much
+        # room is left go into the main window's own status bar, beside
+        # napari's "Ready", rather than into a second status line of
+        # ours a few hundred pixels above it.
+        self._status_widgets = statusbar_panel.build_status_widgets(self)
+        self._status_bar_installed = statusbar_panel.install_status_bar(
+            self, self._viewer,
         )
 
-    def _grab_scan(self) -> Frame:
-        # Runs on the worker thread: reads the request tuple, never Qt state.
-        parameters, channel_index, _ = self._scan_request
+    def _on_scan_settings_changed(self) -> None:
+        """
+        Rebuild the live request from the View profile and the checkboxes.
+
+        The *View* profile specifically: this is what the continuous
+        loop runs at. Preview and Acquire are read at the moment their
+        own action is taken, so changing them never disturbs a running
+        live view.
+        """
+        self._scan_request = (
+            self.scan_parameters(profiles.VIEW),
+            tuple(self.enabled_channels()),
+            tuple(self.enabled_channel_names()),
+        )
+        self._save_scan_preferences()
+
+    def scan_parameters(self, profile: str) -> ScanParameters:
+        """
+        Return the scan geometry for one profile over the shared field of view.
+
+        The field of view is read from its own control rather than from
+        the profile, which is the point of profiles: switching from
+        checking focus to taking the picture must not move the region
+        the operator navigated to.
+
+        Parameters
+        ----------
+        profile : str
+            One of :data:`~miainwoodpecker.viewer.profiles.PROFILE_NAMES`.
+
+        Returns
+        -------
+        ScanParameters
+            Geometry for that profile.
+        """
+        settings = self._profile_settings(profile)
+        return ScanParameters(
+            height=settings.size_px,
+            width=settings.size_px,
+            pixel_time_us=settings.dwell_us,
+            fov_nm=self._fov_spin.value(),
+        )
+
+    def _profile_settings(self, profile: str) -> profiles.ScanProfile:
+        """
+        Read one profile's dwell and size off the panel.
+
+        Parameters
+        ----------
+        profile : str
+            The profile name.
+
+        Returns
+        -------
+        profiles.ScanProfile
+            What the panel currently says.
+        """
+        dwell_spin, size_combo = self._profile_controls[profile]
+        return profiles.ScanProfile(
+            dwell_us=dwell_spin.value(),
+            size_px=int(size_combo.currentText()),
+        )
+
+    def enabled_channels(self) -> list[int]:
+        """
+        Return the indices of every detector the operator has enabled.
+
+        Returns
+        -------
+        list[int]
+            Channel indices, in the scanner's own order. Never empty
+            while a scanner exists - see :meth:`_on_channel_toggled`.
+        """
         scanner = typing.cast("Scanner", self._scanner)
-        return scanner.scan_frame(parameters, channel_index)
+        names = list(scanner.channel_names)
+        return [
+            index
+            for index, name in enumerate(names)
+            if self._channel_checks[name].isChecked()
+        ]
+
+    def enabled_channel_names(self) -> list[str]:
+        """
+        Return the names of every detector the operator has enabled.
+
+        Returns
+        -------
+        list[str]
+            Channel names, in the scanner's own order.
+        """
+        scanner = typing.cast("Scanner", self._scanner)
+        names = list(scanner.channel_names)
+        return [names[index] for index in self.enabled_channels()]
+
+    def _on_channel_toggled(self, name: str) -> None:
+        """
+        Keep at least one detector enabled, then rebuild the request.
+
+        Unchecking the last box is refused rather than allowed: a scan
+        with no detector produces no data at all, so the state is not a
+        preference an operator could mean. The box goes back on and the
+        status line says why, which is more use than a silently dead
+        Start button.
+
+        Parameters
+        ----------
+        name : str
+            The channel whose checkbox changed.
+        """
+        if not self.enabled_channels():
+            self._channel_checks[name].setChecked(True)
+            self._scan_status.setText(
+                "at least one detector has to stay enabled - a scan with "
+                "none reads nothing out",
+            )
+            return
+        self._on_scan_settings_changed()
+        self._rename_scan_layers()
+
+    def _save_scan_preferences(self) -> None:
+        """Remember the detector selection and profiles for the next launch."""
+        if self._scanner is None:
+            return
+        stored = dict(self._preferences)
+        stored["scan_channels"] = self.enabled_channel_names()
+        stored["scan_profiles"] = profiles.as_stored(
+            {name: self._profile_settings(name) for name in profiles.PROFILE_NAMES},
+        )
+        self._preferences = stored
+        preferences.save(stored)
+
+    def _grab_scan(self) -> Sequence[Frame]:
+        # Runs on the worker thread: reads the request tuple, never Qt state.
+        # One scan_frames call, so every enabled detector comes from the
+        # same traversal - one pass of dose, no drift between channels.
+        parameters, channels, _ = self._scan_request
+        scanner = typing.cast("Scanner", self._scanner)
+        return scanner.scan_frames(parameters, list(channels))
 
     def _toggle_scan(self) -> None:
         if self._scan_loop is not None and self._scan_loop.is_running:
@@ -719,7 +977,7 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
             return
         if self._scan_loop is not None and self._scan_loop.is_running:
             return
-        self._scan_loop = LiveAcquisition(self._grab_scan)
+        self._scan_loop = MultiChannelLiveAcquisition(self._grab_scan)
         self._scan_loop.start()
         self._scan_button.setText("Stop scan")
         self._scan_status.setText("running")
@@ -903,13 +1161,24 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         return note or None
 
     def _refresh_session_labels(self) -> None:
-        """Show where data is going and what has been recorded so far."""
+        """
+        Show where data is going and what has been recorded so far.
+
+        The destination is written twice, to the dialog's label and to
+        the status bar's button, because the two are read at different
+        moments: the button is the answer to "am I recording anywhere?"
+        at a glance, and the label is what someone reads when they have
+        opened the settings to change it.
+        """
         if self._session is None:
             self._session_path_label.setText(_NO_SESSION_MESSAGE)
+            statusbar_panel.set_destination(self, None)
             self._recorded_label.setText("nothing recorded yet")
             self._refresh_recording_choices([])
+            self._refresh_space_label()
             return
         self._session_path_label.setText(str(self._session.root))
+        statusbar_panel.set_destination(self, str(self._session.root))
         recordings = self._session.recordings()
         # The combo can show either scope; the labels below always describe
         # this session, because that is where the next recording goes.
@@ -1004,7 +1273,7 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
     def _refresh_space_label(self) -> None:
         """Report free space where recordings are being written."""
         if self._session is None:
-            self._space_label.setText("")
+            statusbar_panel.set_free_space(self, "")
             return
         free = free_space(self._session.root)
         text = f"{format_bytes(free)} free"
@@ -1020,7 +1289,7 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
                     f" - warning: {frames} {source} frames need up to "
                     f"{format_bytes(planned)}"
                 )
-        self._space_label.setText(text)
+        statusbar_panel.set_free_space(self, text)
 
     def _planned_recording_size(self) -> tuple[int, int, str] | None:
         """
@@ -1062,7 +1331,7 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         """Save the scan frame currently on screen into the session."""
         if self._scanner is None:
             return
-        label = f"scan-{self._scan_request[2]}-frame"
+        label = f"scan-{self._scan_request[2][0]}-frame"
         self._save_displayed_frame(self._scan_loop, label)
 
     def save_camera_frame(self, name: str | None = None) -> None:
@@ -1110,15 +1379,21 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         if not self.stop_scan():
             self._recording_status.setText(_SCANNER_BUSY_MESSAGE)
             return
-        parameters, channel_index, channel_name = self._scan_request
+        # Acquire settings, not the live view's: a kept series is worth
+        # the dwell of a kept image. Every enabled channel, one pass per
+        # repeat, so the series is multichannel for the same reason a
+        # scan image is.
+        parameters = self.scan_parameters(profiles.ACQUIRE)
+        channels = self._scan_request[1]
+        names = self._scan_request[2]
         self._start_recording(
-            scan_series(
+            multichannel_scan_series(
                 typing.cast("Scanner", self._scanner),
                 parameters,
                 self._scan_count_spin.value(),
-                channel=channel_index,
+                channels=list(channels),
             ),
-            f"scan-{channel_name}",
+            f"scan-{'-'.join(names)}",
         )
 
     def record_camera_frames(self, name: str | None = None) -> None:
@@ -1145,6 +1420,286 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         self._start_recording(
             camera_series(binding.camera, count), "camera"
         )
+
+    def preview_scan(self) -> None:
+        """
+        Take one scan at the Preview profile and show it, saving nothing.
+
+        The focus check. Preview sits between the live view and an
+        acquisition precisely so an operator can judge focus and
+        astigmatism by eye at a signal-to-noise the live view cannot
+        reach, without paying for a kept image — and it records nothing
+        on purpose, because a focus check that littered the session with
+        files would stop being used.
+
+        Every enabled detector, from one pass, like everything else here.
+        """
+        if self._scanner is None:
+            return
+        if not self.stop_scan():
+            self._scan_status.setText(_SCANNER_BUSY_MESSAGE)
+            return
+        parameters = self.scan_parameters(profiles.PREVIEW)
+        channels = list(self._scan_request[1])
+        names = self._scan_request[2]
+        scanner = typing.cast("Scanner", self._scanner)
+        self._scan_status.setText("previewing...")
+        try:
+            frames = scanner.scan_frames(parameters, channels)
+        except Exception as error:  # noqa: BLE001 - the refusal is the message
+            self._scan_status.setText(f"preview failed: {error}")
+            return
+        for frame, name in zip(frames, names, strict=False):
+            self._show_frame(
+                frame,
+                layer_name=self._scan_layer_name(name),
+                autocontrast_every_frame=True,
+            )
+        self._scan_status.setText(
+            f"preview: {parameters.width} px at {parameters.pixel_time_us:g} us "
+            "(not saved)",
+        )
+
+    def acquire_scan_image(self) -> None:
+        """
+        Acquire one scan image: a single pass, every channel at once.
+
+        The everyday scan acquisition, and a different thing from
+        "record N frames" beside it. That one is a *time* series — the
+        same channel scanned repeatedly, for drift or for averaging.
+        This is one pass of the probe, with every detector the scanner
+        has read out of it.
+
+        Every channel rather than the one on display, because the pass
+        happens either way: reading ADF while you were going to scan for
+        HAADF anyway costs no extra dose and no extra time, and the two
+        images are then registered to each other by construction. The
+        cost of *not* doing it is a second pass over the same area to
+        get the channel you wish you had kept.
+        """
+        if self._scanner is None:
+            return
+        if self._session is None:
+            self._recording_status.setText(_NO_SESSION_MESSAGE)
+            return
+        # Same one-driver-per-device rule as record_scan_frames.
+        if not self.stop_scan():
+            self._recording_status.setText(_SCANNER_BUSY_MESSAGE)
+            return
+        scanner = typing.cast("Scanner", self._scanner)
+        # The Acquire profile, not the live view's settings: this is the
+        # image that gets kept, and it is worth the longer dwell.
+        parameters = self.scan_parameters(profiles.ACQUIRE)
+        self._start_recording(
+            multichannel_scan_series(
+                scanner,
+                parameters,
+                1,
+                channels=list(self._scan_request[1]),
+            ),
+            "scan-image",
+        )
+
+    def acquire_camera_image(self, name: str | None = None) -> None:
+        """
+        Acquire one camera image, with its own exposure and binning.
+
+        The snapshot an operator keeps — a Ronchigram for the record, a
+        diffraction pattern to measure — taken at settings chosen for
+        the image rather than the ones the live view happens to be
+        running. The live settings are restored afterwards by
+        :func:`~miainwoodpecker.acquisition.camera_image`, so taking one
+        long exposure does not leave the feed crawling.
+
+        Parameters
+        ----------
+        name : str | None
+            Which camera, by target name. None means the first served.
+        """
+        binding = self._binding(name)
+        if binding is None or binding.exposure_spin is None:
+            return
+        if self._session is None:
+            self._recording_status.setText(_NO_SESSION_MESSAGE)
+            return
+        # Same one-driver-per-device rule as record_camera_frames.
+        if not self.stop_camera(binding.name):
+            self._recording_status.setText(_CAMERA_BUSY_MESSAGE)
+            return
+        self._start_recording(
+            camera_image(binding.camera, self._image_parameters(binding)),
+            "camera-image",
+        )
+
+    @staticmethod
+    def _image_parameters(binding: _CameraBinding) -> CameraParameters:
+        """
+        Return the settings an acquired image should be taken with.
+
+        Read off the panel at the moment of acquisition rather than
+        cached, so what an operator typed is what the exposure uses.
+
+        Parameters
+        ----------
+        binding : _CameraBinding
+            The camera and its controls.
+
+        Returns
+        -------
+        CameraParameters
+            Exposure and binning for one acquired image, keeping the
+            camera's current readout mode.
+        """
+        exposure_spin = typing.cast("QtWidgets.QDoubleSpinBox", binding.exposure_spin)
+        binning_combo = typing.cast("QtWidgets.QComboBox", binding.binning_combo)
+        return CameraParameters(
+            exposure_ms=exposure_spin.value(),
+            binning=int(binning_combo.currentText()),
+            # Not from the panel: readout is what the *camera* is set to
+            # do, and an image acquisition is not the place to switch a
+            # spectrometer between imaging and projecting.
+            readout=binding.camera.parameters().readout,
+        )
+
+    def acquire_spectrum_image(self) -> None:
+        """
+        Acquire a 4D-STEM pass over the current field of view.
+
+        One traversal of the probe over a grid of beam positions, with a
+        full camera image kept at each — see
+        :class:`~miainwoodpecker.devices.interface.ScanPass`.
+
+        **Most of this method is the refusal, and that is the point.**
+        Synchronised acquisition is a hardware fact, not a software
+        feature: the column has to drive the detector's trigger or the
+        detector has to advance the scan. A backend without that wiring
+        cannot do it, and the nionswift-usim simulator is exactly such a
+        backend — measured, in
+        :mod:`miainwoodpecker.analysis.py4dstem_bridge`, which found that
+        moving the simulator's own probe position changes nothing beyond
+        shot noise. Producing a plausible cube anyway would be the worst
+        available outcome: it is the same shape as a real one, and every
+        number computed per pixel from it would be computed against a
+        position nothing established.
+
+        Blocking, for now. The whole pass runs on the GUI thread, which
+        is tolerable for the preview's small grids and is not what a real
+        acquisition needs; moving it behind a job like
+        :class:`~miainwoodpecker.storage.session.RecordingJob` is the
+        next step, and is why the grid offered here is deliberately small.
+        """
+        from miainwoodpecker.devices.interface import (  # noqa: PLC0415
+            SynchronisedScanner,
+        )
+        from miainwoodpecker.storage.passes import PassWriter  # noqa: PLC0415
+
+        if self._scanner is None:
+            return
+        if self._session is None:
+            self._recording_status.setText(_NO_SESSION_MESSAGE)
+            return
+        if not isinstance(self._scanner, SynchronisedScanner):
+            self._recording_status.setText(
+                "this backend cannot acquire a spectrum image: it has no "
+                "synchronised scan/camera mode, so there is no way to tie a "
+                "camera frame to a probe position",
+            )
+            return
+        targets = list(self._scanner.synchronised_targets())
+        if not targets:
+            self._recording_status.setText(
+                "no camera is wired to the scan unit, so nothing can be read "
+                "out at each beam position",
+            )
+            return
+        if not self.stop_scan():
+            self._recording_status.setText(_SCANNER_BUSY_MESSAGE)
+            return
+        target = targets[0]
+        if not self.stop_camera(target):
+            self._recording_status.setText(_CAMERA_BUSY_MESSAGE)
+            return
+        self._run_spectrum_image(PassWriter, target)
+
+    def _run_spectrum_image(self, writer_class: type, target: str) -> None:
+        """
+        Drive one synchronised pass into a file in the session.
+
+        Split out so :meth:`acquire_spectrum_image` reads as the list of
+        refusals it mostly is.
+
+        Parameters
+        ----------
+        writer_class : type
+            The pass writer to use, imported by the caller.
+        target : str
+            The camera target to read out at each beam position.
+        """
+        positions = self._positions_spin.value()
+        parameters = ScanParameters(
+            height=positions,
+            width=positions,
+            pixel_time_us=self._profile_settings(profiles.ACQUIRE).dwell_us,
+            fov_nm=self._fov_spin.value(),
+        )
+        binding = self._binding(target)
+        camera = binding.camera if binding is not None else None
+        detector = self._detector_shape(camera)
+        path, index, slug, started_at = self._session.reserve("spectrum-image")
+        self._recording_status.setText(f"acquiring {positions}x{positions} pass...")
+        try:
+            with writer_class(
+                path, parameters, cubes={target: detector},
+            ) as writer:
+                result = self._scanner.scan_synchronised(
+                    parameters,
+                    channels=list(range(len(self._scanner.channel_names))),
+                    targets=[target],
+                    into=writer.destinations(),
+                )
+                writer.finish(result)
+        except Exception as error:  # noqa: BLE001 - the refusal is the message
+            self._recording_status.setText(f"spectrum image failed: {error}")
+            return
+        self._recording_status.setText(
+            f"spectrum image saved: {path.name} "
+            f"({positions}x{positions} positions, sync={result.scan_sync})",
+        )
+        self._refresh_session_labels()
+        del index, slug, started_at
+
+    @staticmethod
+    def _detector_shape(camera: object) -> tuple[int, int]:
+        """
+        Return the per-position detector shape a pass will produce.
+
+        Asked of the camera rather than assumed, because the destination
+        has to be allocated before the acquisition starts and an
+        allocation of the wrong size is refused rather than reshaped.
+
+        Parameters
+        ----------
+        camera : object
+            The camera that will be read out, or None.
+
+        Returns
+        -------
+        tuple[int, int]
+            The detector image shape.
+
+        Raises
+        ------
+        RuntimeError
+            If the camera cannot say what shape it produces.
+        """
+        if camera is None:
+            msg = "no camera binding for the synchronised target"
+            raise RuntimeError(msg)
+        camera.start()
+        try:
+            return tuple(np.asarray(camera.acquire_frame().data).shape)
+        finally:
+            camera.stop()
 
     def _start_recording(self, frames: Iterable[Frame], label: str) -> None:
         """
@@ -1854,12 +2409,7 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         self._poll_load()
         self._poll_analysis()
         if self._scan_loop is not None:
-            self._refresh_source(
-                self._scan_loop,
-                layer_name=f"Scan ({self._scan_request[2]})",
-                status_label=self._scan_status,
-                autocontrast_every_frame=True,
-            )
+            self._refresh_scan()
         for binding in self._camera_bindings.values():
             if binding.loop is not None and binding.status is not None:
                 self._refresh_source(
@@ -1868,6 +2418,68 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
                     status_label=binding.status,
                     autocontrast_every_frame=False,
                 )
+
+    def _refresh_scan(self) -> None:
+        """
+        Push the newest pass into one napari layer per enabled detector.
+
+        Every layer updated from the *same* ``latest_frames`` snapshot,
+        so the images on screen are always from one traversal. Refreshing
+        them from separate reads would let HAADF advance a pass ahead of
+        MAADF, and an operator differencing what they see would be
+        differencing two probe positions.
+        """
+        loop = self._scan_loop
+        if loop is None:
+            return
+        if loop.error is not None:
+            self._scan_status.setText(f"error: {loop.error}")
+            self._maybe_stop_timer()
+            return
+        frames = loop.latest_frames()
+        if not frames:
+            return
+        names = self._scan_request[2]
+        for frame, name in zip(frames, names, strict=False):
+            self._show_frame(
+                frame,
+                layer_name=self._scan_layer_name(name),
+                autocontrast_every_frame=True,
+            )
+        stats = loop.stats
+        self._scan_status.setText(f"running - {stats.fps:.1f} fps")
+
+    @staticmethod
+    def _scan_layer_name(channel: str) -> str:
+        """
+        Return the napari layer name for one detector channel.
+
+        Parameters
+        ----------
+        channel : str
+            The detector's name.
+
+        Returns
+        -------
+        str
+            The layer name.
+        """
+        return f"Scan ({channel})"
+
+    def _rename_scan_layers(self) -> None:
+        """
+        Drop layers for detectors that are no longer enabled.
+
+        A layer left behind after its checkbox is cleared keeps showing
+        the last image that detector produced, which reads as a live
+        feed that has silently stopped.
+        """
+        wanted = {self._scan_layer_name(name) for name in self._scan_request[2]}
+        for layer_name in list(self._displayed):
+            if layer_name.startswith("Scan (") and layer_name not in wanted:
+                self._displayed.pop(layer_name, None)
+                if layer_name in self._viewer.layers:
+                    del self._viewer.layers[layer_name]
 
     def _refresh_source(
         self,
@@ -1887,6 +2499,36 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         frame = loop.latest()
         if frame is None:
             return
+        self._show_frame(
+            frame,
+            layer_name=layer_name,
+            autocontrast_every_frame=autocontrast_every_frame,
+        )
+        self._refresh_rate_label(loop, status_label)
+
+    def _show_frame(
+        self,
+        frame: Frame,
+        *,
+        layer_name: str,
+        autocontrast_every_frame: bool,
+    ) -> None:
+        """
+        Put one frame into its napari layer, skipping an unchanged redraw.
+
+        Split out of :meth:`_refresh_source` so the scan can drive it
+        once per enabled detector from a single pass, rather than each
+        detector polling its own loop.
+
+        Parameters
+        ----------
+        frame : Frame
+            The frame to display.
+        layer_name : str
+            The layer it belongs in.
+        autocontrast_every_frame : bool
+            Whether to restretch the contrast limits to this frame.
+        """
         if frame is self._displayed.get(layer_name) and layer_name in (
             self._viewer.layers
         ):
@@ -1897,7 +2539,6 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
             # autocontrast pass walks the whole array twice, both for
             # pixels that did not change. Identity is the right test -
             # the loop hands out the same object until it grabs another.
-            self._refresh_rate_label(loop, status_label)
             return
         if layer_name in self._viewer.layers:
             layer = self._viewer.layers[layer_name]
@@ -1910,7 +2551,6 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         else:
             self._viewer.add_image(frame.data, name=layer_name, colormap="gray")
         self._displayed[layer_name] = frame
-        self._refresh_rate_label(loop, status_label)
 
     def _refresh_rate_label(
         self,
@@ -1931,9 +2571,23 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
             status_label.setText(text)
 
     def shutdown(self) -> None:
-        """Stop all loops, the camera, the display timer, and any recording."""
-        self._timer.stop()
-        self._context_save_timer.stop()
+        """
+        Stop all loops, the camera, the display timer, and any recording.
+
+        Safe to call more than once, and safe to call after Qt has
+        already destroyed this widget. Both matter because there are two
+        callers that cannot see each other: ``closeEvent``, which Qt
+        fires during app-quit teardown, and any entry point that tidies
+        up after ``napari.run()`` returns. The second one runs *after*
+        the widget tree has been destroyed, so it used to die with
+        "Internal C++ object already deleted" — an ugly traceback on a
+        clean exit, and one that skipped the device and thread teardown
+        that had not run yet.
+        """
+        if self._shutdown_done:
+            return
+        self._shutdown_done = True
+        self._shutdown_qt_parts()
         load_job = self._load_job
         if load_job is not None and load_job.is_running:
             # Reading holds no device and writes nothing, so waiting for it
@@ -1948,13 +2602,79 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
             # is what produces an unreadable one.
             job.cancel()
             job.join()
-        self.stop_scan()
-        self.stop_camera()
+        self._quietly(self.stop_scan)
+        # Every camera by name, not one bare stop_camera(): with no
+        # argument it acts on the *first* binding, so a two-camera
+        # instrument left its second camera running after the window
+        # closed - a device held by a process on its way out.
+        for name in list(self._camera_bindings):
+            self._quietly(lambda bound=name: self.stop_camera(bound))
         # After the devices, and deliberately: a worker holds no hardware,
         # so nothing about the column depends on it going first, while
         # stopping the camera can take an exposure's worth of time and an
         # idle worker costs nothing to leave running for it.
-        self._close_analysis_runners()
+        self._quietly(self._close_analysis_runners)
+
+    @staticmethod
+    def _quietly(step: Callable[[], object]) -> None:
+        """
+        Run one teardown step, tolerating widgets Qt has already destroyed.
+
+        Per step rather than around the whole of ``shutdown`` so that one
+        dead widget cannot skip the steps after it. That is safe to do
+        here because each of these stops its machinery *before* it
+        touches a label or a button — ``stop_camera`` pauses the camera
+        and then renames the button — so a step that dies on the Qt half
+        has already done the half that matters.
+
+        Only the "already deleted" flavour of ``RuntimeError`` is
+        swallowed. A device refusing to stop raises the same class, and
+        that is worth hearing about even on the way out.
+
+        Parameters
+        ----------
+        step : Callable[[], object]
+            The teardown step to run.
+
+        Raises
+        ------
+        RuntimeError
+            Re-raised when it is not the "already deleted" kind - a
+            device refusing to stop is worth hearing about even here.
+        """
+        try:
+            step()
+        except RuntimeError as error:
+            if "deleted" not in str(error):
+                raise
+
+    def _shutdown_qt_parts(self) -> None:
+        """
+        Stop the timers and take back the status bar, tolerating teardown.
+
+        Separated from the rest of ``shutdown`` so that one dead Qt
+        object cannot skip the device and thread teardown that follows
+        it. That part is pure Python: the acquisition loops, the worker
+        threads and the recording writers do not care that a widget has
+        been destroyed, and they are the half that matters — an
+        abandoned writer is what leaves an operator an unreadable file.
+        """
+        try:
+            self._timer.stop()
+            self._context_save_timer.stop()
+            if self._status_bar_installed:
+                # These labels live in a window this widget does not
+                # own, so leaving them behind would describe a session
+                # nothing is writing to any more, and docking a second
+                # widget would stack a second copy of each.
+                statusbar_panel.remove_status_bar(self, self._viewer)
+        except RuntimeError:
+            # "Internal C++ object already deleted": Qt destroyed the
+            # widget tree before this ran. The timers went with it, so
+            # there is nothing left to stop.
+            pass
+        finally:
+            self._status_bar_installed = False
 
     def closeEvent(self, event: typing.Any) -> None:  # noqa: N802, ANN401 - Qt override
         """Shut down cleanly when the widget is closed."""

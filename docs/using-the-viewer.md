@@ -28,6 +28,11 @@ Useful launch options:
 | `--server-module MODULE` | Which device server to launch. Defaults to the Nion one. |
 | `--plugin` | Server-specific: for Nion, a plug-in module; for the camera server, which camera to open. |
 
+If you are working on the window itself rather than using it, there is a
+lighter way in: `miainwoodpecker-preview` opens the same panels against
+an in-process synthetic instrument, with no device server and no extras
+beyond `viewer`. See [Developing the UI](developing-the-ui.md).
+
 ### For a USB microscope or a webcam
 
 The default server is the Nion one, which serves no USB camera at all,
@@ -72,6 +77,18 @@ processing chains, on purpose: analysis belongs to the scientific Python
 tools you already use, and the [scripting guide](scripting-and-automation.md)
 shows how recordings load into them in one line.
 
+## The dock
+
+The panel on the right holds three groups — **Instrument**,
+**Recordings** and **Devices**. Click any group's header to fold it
+away; the disclosure triangle shows which way it will go.
+
+The groups **scroll**, so nothing is ever out of reach no matter how
+many devices your instrument serves or how many groups you have open.
+Folding is for tidiness, not for making the panel fit: watching a camera
+while a scan runs means having several groups open at once, and that has
+to keep working.
+
 ## The Instrument panel
 
 The top of the dock says **what you are connected to** — the backend and
@@ -113,6 +130,44 @@ Every device the instrument serves gets its own section in the
 `Camera - usb_microscope`, not `camera`, which tells you nothing once
 there are two of them. Click a section header to fold it away.
 
+### Detectors
+
+The Scan section lists your detectors as **checkboxes**, not a
+drop-down, because a scanned instrument reads several of them out of one
+pass as a matter of course — HAADF and MAADF arrive together, and on an
+EDX-fitted column the X-ray spectra come with them. Serial acquisition
+is the special case.
+
+Every checked detector gets its own napari layer and they are all fed
+from the **same pass**, so you can difference them per pixel — DPC,
+ratios — without wondering whether the probe moved in between. Enabling
+a second detector costs no extra dose and no extra time.
+
+At least one has to stay checked; a scan with none reads nothing out.
+Your selection is remembered between launches — it follows you and the
+instrument, not the shift, so it lives in your config directory rather
+than in the session.
+
+### Scan profiles
+
+Dwell and resolution belong to a **profile**, and all three are visible
+at once:
+
+| Profile | What it is for |
+|---|---|
+| **View** | The continuous live loop. Short dwell so the display keeps up. |
+| **Preview** | A single scan at higher signal-to-noise, for judging focus and astigmatism *by eye*. **Shown, not saved** — a focus check that littered the session with files would stop being used. |
+| **Acquire** | The scan that is kept: long dwell, full resolution. Used by **Acquire scan image** and **Record frames**. |
+
+**FOV is shared and deliberately outside the profiles.** It is the
+region you navigated to, and switching from checking focus to taking the
+picture must not move the specimen out from under you at the moment you
+were happiest with it.
+
+Profiles are remembered between launches too. Changing Preview or
+Acquire never disturbs a running live view — each is read when its own
+action is taken.
+
 Several sections can be open at once, which is the point of folding
 rather than tabs: watching a camera while a scan runs is the ordinary
 case. The first section starts open and the rest folded, so a
@@ -143,10 +198,25 @@ per camera with no way to tell which burst you were about to take.
 The display never slows the instrument down: if the scan is faster than
 the screen, frames are skipped on screen but acquisition is unaffected.
 
-## Keeping data: the Session group
+## Keeping data: the status bar and Session settings
 
-Nothing is saved until you ask, and the **Saving to** line always tells
-you where data will go — or warns `no session - data is not being kept`.
+Nothing is saved until you ask. Along the very bottom of the window, to
+the left of napari's **Ready**, two facts sit where you can always see
+them:
+
+- **Saving to** — the destination, shortened from the left so the part
+  that differs between sessions stays readable; hover for the full path.
+  With no session the label goes away and the line reads simply
+  `No session - data is not being kept`.
+- **Free space** — an absolute figure, with a warning if the recording
+  you are set up to take would not fit. With no session there is no
+  figure to give, so the field is not there at all.
+
+Both are **read-only**. They tell you where you stand; they are not
+where you change it, so the setting has one home rather than two.
+
+That home is **Session settings...**, at the top of the Recordings
+group — the things you set once a shift and then leave alone:
 
 - **Change directory...** points recordings somewhere else, e.g. a new
   folder per sample. An existing folder is *reused, never cleared*:
@@ -155,13 +225,70 @@ you where data will go — or warns `no session - data is not being kept`.
 - **Operator / Sample / Session notes** describe the whole shift, are
   saved as you type, and are written into every recording — into real
   NeXus fields other tools can read, not a private sidecar.
-- **Note for next recording** describes the *next file specifically*
-  ("hole 4, after tilting") and is kept until you change it.
-- **Disk** shows free space and roughly how many frames it holds at the
-  current scan settings.
 
-To record: set **Frames**, press **Record frames** in the Scan or Camera
-section. Recording streams to disk in the background — the window stays
+**Note for next recording** deliberately did *not* move into that
+dialog. It describes the *next file specifically* ("hole 4, after
+tilting"), changes with every burst, and so stays in the Recordings
+group next to the buttons that start one.
+
+### Acquiring an image
+
+**Acquire scan image** takes one pass of the probe and reads out
+**every detector you have checked** — HAADF and MAADF together, not just
+the one on display. The pass happens either way, so the second
+detector costs no extra dose and no extra time, and the two images are
+registered to each other by construction. The alternative is scanning
+the same area twice to get the channel you wish you had kept. The
+frames carry a shared `scan_pass_id`, so a reader can do per-pixel
+arithmetic between the channels — DPC, ratios — without guessing from
+timestamps whether the probe moved in between.
+
+**Acquire image** in a Camera section takes one exposure at that
+section's own **Image exposure** and **Image binning**, which are
+deliberately separate from whatever the live view is running. The two
+are different jobs: the feed stays short and often binned so it keeps up
+at thirty frames a second, while the image you keep is worth a long
+unbinned exposure. The live settings are put back afterwards, so one
+long acquisition does not leave the feed crawling. The binning choices
+are the camera's own — a detector that only does 1× does not offer a 4×
+it would refuse.
+
+Neither is affected by the **Frames** count beside it: an image is one
+acquisition, whatever that says.
+
+### Acquiring a spectrum image (4D-STEM)
+
+**Acquire spectrum image (4D)** drives the probe over a grid of
+**Positions** beam positions across the current field of view, keeping a
+full camera image at every one. The result is a 4D dataset —
+`(scan_y, scan_x, det_y, det_x)` — written straight to disk as it is
+acquired rather than assembled in memory first, so its size is bounded
+by the disk rather than by RAM.
+
+**Most instruments will refuse, and the refusal is the point.** A
+spectrum image needs the scan and the detector synchronised in
+*hardware* — the column driving the detector's trigger, or the detector
+advancing the scan. A backend without that wiring cannot tie a camera
+frame to a probe position, and producing a plausible cube anyway would
+be worse than refusing: it has the same shape as a real one, and every
+number computed per pixel from it would be computed against a position
+nothing established. So the button says what is missing instead.
+
+Today only the [preview instrument](developing-the-ui.md) can do it. The
+`nionswift-usim` simulator cannot, and that is measured rather than
+assumed — moving the simulator's own probe position changes nothing
+beyond shot noise.
+
+Known limits, while this is being built out: the grid is square (the
+target-area UI that would take its aspect ratio from a region you draw
+is not built yet), the acquisition blocks the window while it runs, and
+a saved pass appears in the **File** list as `0 frames` because that
+list only understands frame stacks.
+
+### Recording a series
+
+To record a time series: set **Frames**, press **Record frames** in the
+Scan or Camera section. Recording streams to disk in the background — the window stays
 responsive — and **Stop recording** keeps everything captured so far as
 a complete, valid file. Filenames are automatic and collision-proof:
 `0001-scan-haadf-20260810T182524Z.nxs`.
@@ -171,7 +298,11 @@ the instrument at a time — and you restart it afterwards. **Save
 displayed frame** is the exception: it needs no instrument access, so
 the live view keeps running.
 
-## Opening recordings: the Recordings group
+## Recording and opening: the Recordings group
+
+**Recording** says whether one is running, **Stop recording** ends it
+keeping everything captured so far, and **Recorded** lists what this
+session has written.
 
 The **File** list shows this session's recordings with their state
 ("12 frames", "empty", "damaged"). Tick **List every session in the

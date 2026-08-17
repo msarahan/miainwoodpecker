@@ -164,3 +164,78 @@ class LiveAcquisition:
                 self._latest = frame
                 self._frame_count += 1
                 self._frame_times.append(time.perf_counter())
+
+
+class MultiChannelLiveAcquisition(LiveAcquisition):
+    """
+    A live loop whose every grab reads several detectors out of one pass.
+
+    **One loop, not one per detector, and the difference is dose.** Two
+    single-channel loops would drive the scanner twice per displayed
+    frame: twice the dose on the specimen, drift between the two images,
+    and a pair of channels that cannot be differenced per pixel because
+    the probe was not in the same place for both. That is precisely what
+    :meth:`~miainwoodpecker.devices.interface.Scanner.scan_frames`
+    exists to prevent, and a display built out of two loops would undo it
+    while looking fine on screen.
+
+    So the grab returns a *sequence* — the frames of one pass, in the
+    order the channels were requested — and the whole sequence replaces
+    the previous one under the lock. A consumer therefore never sees a
+    half-updated set with HAADF from this pass and MAADF from the last.
+
+    :attr:`stats` counts **passes**, not frames: it is the number the
+    operator reads as "how fast is the scan going", and it does not
+    change when they enable a second detector that costs no extra time.
+
+    Parameters
+    ----------
+    grab : Callable[[], typing.Sequence[Frame]]
+        Called repeatedly on the worker thread; returns one pass's
+        frames. A raised exception stops the loop and is exposed via
+        :attr:`error`.
+    window : int
+        Number of recent pass times used for the rate estimate.
+    """
+
+    def __init__(
+        self,
+        grab: Callable[[], typing.Sequence[Frame]],
+        *,
+        window: int = 30,
+    ) -> None:
+        super().__init__(
+            typing.cast("Callable[[], Frame]", grab),
+            window=window,
+        )
+
+    def latest(self) -> Frame | None:
+        """
+        Return the first frame of the most recent pass, or None.
+
+        The single-frame accessor is kept working, and returns the
+        *first requested channel* rather than an arbitrary one, so code
+        that only wants "a frame from the scan" — a size estimate, a
+        saved snapshot — behaves as it did before this class existed.
+
+        Returns
+        -------
+        Frame | None
+            The pass's first frame, or None before the first pass.
+        """
+        frames = self.latest_frames()
+        return frames[0] if frames else None
+
+    def latest_frames(self) -> tuple[Frame, ...]:
+        """
+        Return every frame of the most recent pass.
+
+        Returns
+        -------
+        tuple[Frame, ...]
+            The pass's frames in channel-request order, empty before the
+            first pass completes.
+        """
+        with self._lock:
+            latest = self._latest
+        return tuple(latest) if latest else ()

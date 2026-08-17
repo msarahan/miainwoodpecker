@@ -41,6 +41,10 @@ dependencies = [
 [project.scripts]
 # Requires the "device" and "viewer" extras.
 miainwoodpecker-viewer = "miainwoodpecker.viewer.app:main"
+# Requires only the "viewer" extra: the devices it opens against are
+# in-process synthetic ones, not a device server. For UI development -
+# see src/miainwoodpecker/viewer/preview.py.
+miainwoodpecker-preview = "miainwoodpecker.viewer.preview:main"
 
 [project.urls]
 Homepage = "https://github.com/msarahan/miainwoodpecker"
@@ -86,6 +90,14 @@ device = [
 # against ndv before committing further if per-frame overhead is too high.
 viewer = [
     "napari[pyside6]>=0.5",
+    # For the operator preferences that outlive a session
+    # (viewer/preferences.py): which detectors are enabled, and the scan
+    # profiles. Declared rather than leaned on transitively - napari
+    # already pulls it in, but depending on a dependency's dependency is
+    # how an unrelated upgrade removes something out from under you. A
+    # loose bound: this uses only user_config_dir, which is the oldest
+    # and most stable thing the package offers.
+    "platformdirs>=3",
 ]
 # Phase 4 analysis integration - see docs/migration-plan.md section 5.
 # HyperSpy chosen for this extra: it is the lighter, more general option

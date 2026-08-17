@@ -1,7 +1,12 @@
 """Acquisition orchestration built on the vendor-neutral device interfaces."""
 
-from miainwoodpecker.acquisition.live import LiveAcquisition, LiveStats
+from miainwoodpecker.acquisition.live import (
+    LiveAcquisition,
+    LiveStats,
+    MultiChannelLiveAcquisition,
+)
 from miainwoodpecker.acquisition.sequence import (
+    camera_image,
     camera_series,
     energy_offset_series,
     focal_series,
@@ -13,6 +18,8 @@ from miainwoodpecker.acquisition.sequence import (
 __all__ = [
     "LiveAcquisition",
     "LiveStats",
+    "MultiChannelLiveAcquisition",
+    "camera_image",
     "camera_series",
     "energy_offset_series",
     "focal_series",

@@ -11,13 +11,29 @@ import typing
 
 from qtpy import QtCore, QtWidgets
 
+from miainwoodpecker.viewer import preferences, profiles
 from miainwoodpecker.viewer.panels.defaults import (
-    _DEFAULT_DWELL_US,
     _DEFAULT_FOV_NM,
+    _DEFAULT_POSITIONS,
     _DEFAULT_RECORD_FRAME_COUNT,
     _DEFAULT_SCAN_SIZE_INDEX,
+    _EXPOSURE_DECIMALS,
+    _MAX_EXPOSURE_MS,
+    _MAX_POSITIONS,
     _MAX_RECORD_FRAME_COUNT,
+    _MIN_EXPOSURE_MS,
+    _MIN_POSITIONS,
     _SCAN_SIZES,
+)
+
+# Re-exported: this module used to define it, and the dock's top-level
+# groups now fold with the same widget. See
+# :mod:`miainwoodpecker.viewer.panels.sections`.
+from miainwoodpecker.viewer.panels.sections import CollapsibleSection
+from miainwoodpecker.viewer.profiles import (
+    PREVIEW,
+    PROFILE_LABELS,
+    PROFILE_TOOLTIPS,
 )
 
 if typing.TYPE_CHECKING:
@@ -46,44 +62,197 @@ def build_scan_group(widget: LiveInstrumentWidget) -> QtWidgets.QGroupBox:
     # not exist in that case. Every method that touches them checks
     # _scanner rather than hasattr, because the scanner is the reason
     # they exist and is the honest thing to ask about.
-    scanner = typing.cast("Scanner", widget._scanner)
     scan_group = QtWidgets.QGroupBox("Scan", widget)
     scan_form = QtWidgets.QFormLayout(scan_group)
-    widget._channel_combo = QtWidgets.QComboBox(scan_group)
-    widget._channel_combo.addItems(list(scanner.channel_names))
-    scan_form.addRow("Channel", widget._channel_combo)
-    widget._size_combo = QtWidgets.QComboBox(scan_group)
-    widget._size_combo.addItems([str(size) for size in _SCAN_SIZES])
-    widget._size_combo.setCurrentIndex(_DEFAULT_SCAN_SIZE_INDEX)
-    scan_form.addRow("Size (px)", widget._size_combo)
-    widget._dwell_spin = QtWidgets.QDoubleSpinBox(scan_group)
-    widget._dwell_spin.setRange(0.1, 1000.0)
-    widget._dwell_spin.setValue(_DEFAULT_DWELL_US)
-    widget._dwell_spin.setSuffix(" µs")
-    scan_form.addRow("Dwell", widget._dwell_spin)
+    build_detector_checks(widget, scan_group, scan_form)
     widget._fov_spin = QtWidgets.QDoubleSpinBox(scan_group)
     widget._fov_spin.setRange(0.1, 100000.0)
     widget._fov_spin.setValue(_DEFAULT_FOV_NM)
     widget._fov_spin.setSuffix(" nm")
-    scan_form.addRow("FOV", widget._fov_spin)
-    widget._scan_button = QtWidgets.QPushButton("Start scan", scan_group)
+    # Above the profiles and outside them, because it is the one setting
+    # they share: switching from checking focus to taking the picture
+    # must not move the region the operator navigated to.
+    scan_form.addRow("FOV (shared)", widget._fov_spin)
+    build_profile_controls(widget, scan_group, scan_form)
+    widget._scan_button = QtWidgets.QPushButton("Start scan (View)", scan_group)
     scan_form.addRow(widget._scan_button)
+    widget._preview_button = QtWidgets.QPushButton("Preview scan", scan_group)
+    widget._preview_button.setToolTip(PROFILE_TOOLTIPS[PREVIEW])
+    scan_form.addRow(widget._preview_button)
     widget._scan_status = QtWidgets.QLabel("stopped", scan_group)
     scan_form.addRow("Status", widget._scan_status)
+    # Above the record controls, because it is the ordinary thing: find
+    # an area on the live view, then keep one image of it. "Record N
+    # frames" below is the less common time series.
+    widget._scan_image_button = QtWidgets.QPushButton(
+        "Acquire scan image", scan_group,
+    )
+    widget._scan_image_button.setToolTip(
+        "One pass of the probe, with every detector channel read out of "
+        "it - the channels are registered to each other by construction",
+    )
+    scan_form.addRow(widget._scan_image_button)
+    build_spectrum_image_controls(widget, scan_group, scan_form)
     (
         widget._scan_count_spin,
         widget._scan_save_button,
         widget._scan_record_button,
     ) = build_record_controls(scan_group, scan_form)
 
-    widget._channel_combo.currentIndexChanged.connect(widget._on_scan_settings_changed)
-    widget._size_combo.currentIndexChanged.connect(widget._on_scan_settings_changed)
-    widget._dwell_spin.valueChanged.connect(widget._on_scan_settings_changed)
     widget._fov_spin.valueChanged.connect(widget._on_scan_settings_changed)
     widget._scan_button.clicked.connect(widget._toggle_scan)
+    widget._preview_button.clicked.connect(widget.preview_scan)
+    widget._scan_image_button.clicked.connect(widget.acquire_scan_image)
+    widget._spectrum_image_button.clicked.connect(widget.acquire_spectrum_image)
     widget._scan_save_button.clicked.connect(widget.save_scan_frame)
     widget._scan_record_button.clicked.connect(widget.record_scan_frames)
     return scan_group
+
+def build_detector_checks(
+    widget: LiveInstrumentWidget,
+    scan_group: QtWidgets.QGroupBox,
+    scan_form: QtWidgets.QFormLayout,
+) -> None:
+    """
+    Add one checkbox per detector, restored from the last launch.
+
+    Checkboxes rather than a combo box because a scanned instrument
+    reads **several** detectors out of one pass as a matter of course —
+    HAADF and MAADF arrive together, and on an EDX-fitted column the
+    X-ray spectra come with them. A control that offers a choice of one
+    describes serial acquisition, which is the special case, and it
+    disagreed with what ``acquire_scan_image`` already did.
+
+    Which are enabled follows the operator and the instrument rather
+    than the shift, so it is remembered in the platform config directory
+    rather than in the session — see
+    :mod:`miainwoodpecker.viewer.preferences`.
+
+    Parameters
+    ----------
+    widget : LiveInstrumentWidget
+        The widget that owns the resulting controls.
+    scan_group : QtWidgets.QGroupBox
+        The group box owning the new widgets.
+    scan_form : QtWidgets.QFormLayout
+        The group's layout, appended to.
+    """
+    scanner = typing.cast("Scanner", widget._scanner)
+    names = list(scanner.channel_names)
+    enabled = set(preferences.stored_channels(widget._preferences, names))
+    row = QtWidgets.QWidget(scan_group)
+    layout = QtWidgets.QVBoxLayout(row)
+    layout.setContentsMargins(0, 0, 0, 0)
+    widget._channel_checks = {}
+    for name in names:
+        check = QtWidgets.QCheckBox(name, row)
+        check.setChecked(name in enabled)
+        check.toggled.connect(
+            lambda _checked, bound=name: widget._on_channel_toggled(bound),
+        )
+        widget._channel_checks[name] = check
+        layout.addWidget(check)
+    scan_form.addRow("Detectors", row)
+
+
+def build_profile_controls(
+    widget: LiveInstrumentWidget,
+    scan_group: QtWidgets.QGroupBox,
+    scan_form: QtWidgets.QFormLayout,
+) -> None:
+    """
+    Add a dwell and size control for each of the three scan profiles.
+
+    All three visible at once rather than behind a selector, because the
+    operator's question is "what will Preview do" as often as it is
+    "change Preview" — and with three profiles a selector costs a click
+    to answer a question a row of numbers answers at a glance.
+
+    Parameters
+    ----------
+    widget : LiveInstrumentWidget
+        The widget that owns the resulting controls.
+    scan_group : QtWidgets.QGroupBox
+        The group box owning the new widgets.
+    scan_form : QtWidgets.QFormLayout
+        The group's layout, appended to.
+    """
+    stored = profiles.stored_profiles(widget._preferences)
+    widget._profile_controls = {}
+    for name in profiles.PROFILE_NAMES:
+        settings = stored[name]
+        row = QtWidgets.QWidget(scan_group)
+        layout = QtWidgets.QHBoxLayout(row)
+        layout.setContentsMargins(0, 0, 0, 0)
+        dwell = QtWidgets.QDoubleSpinBox(row)
+        dwell.setRange(0.1, 1000.0)
+        dwell.setValue(settings.dwell_us)
+        dwell.setSuffix(" µs")
+        layout.addWidget(dwell)
+        size = QtWidgets.QComboBox(row)
+        size.addItems([str(value) for value in _SCAN_SIZES])
+        size.setCurrentText(str(settings.size_px))
+        if size.currentText() != str(settings.size_px):
+            # A remembered size this build no longer offers: keep the
+            # default rather than silently scanning at something the
+            # operator did not choose.
+            size.setCurrentIndex(_DEFAULT_SCAN_SIZE_INDEX)
+        layout.addWidget(size)
+        row.setToolTip(PROFILE_TOOLTIPS[name])
+        scan_form.addRow(PROFILE_LABELS[name], row)
+        widget._profile_controls[name] = (dwell, size)
+        dwell.valueChanged.connect(widget._on_scan_settings_changed)
+        size.currentIndexChanged.connect(widget._on_scan_settings_changed)
+
+
+def build_spectrum_image_controls(
+    widget: LiveInstrumentWidget,
+    scan_group: QtWidgets.QGroupBox,
+    scan_form: QtWidgets.QFormLayout,
+) -> None:
+    """
+    Add the beam-position count and the spectrum-image button.
+
+    Built unconditionally, even on a backend that cannot synchronise —
+    which today is every backend but the preview. A button that is
+    absent teaches an operator the feature does not exist; a button that
+    explains *why* this instrument cannot do it teaches them something
+    true, and it is the same explanation whether they are on usim or on
+    a column whose trigger is not wired.
+
+    Positions are square, and the count is small. Both are placeholders
+    for the target-area UI: the aspect ratio should come from a region
+    drawn on the reference scan rather than be assumed, and the grid
+    should be as large as the operator's patience rather than as small
+    as a blocking call can afford.
+
+    Parameters
+    ----------
+    widget : LiveInstrumentWidget
+        The widget that owns the resulting controls.
+    scan_group : QtWidgets.QGroupBox
+        The group box owning the new widgets.
+    scan_form : QtWidgets.QFormLayout
+        The group's layout, appended to.
+    """
+    widget._positions_spin = QtWidgets.QSpinBox(scan_group)
+    widget._positions_spin.setRange(_MIN_POSITIONS, _MAX_POSITIONS)
+    widget._positions_spin.setValue(_DEFAULT_POSITIONS)
+    widget._positions_spin.setPrefix("")
+    widget._positions_spin.setToolTip(
+        "Beam positions per side. A full camera image is kept at each, so "
+        "the dataset grows with the square of this number",
+    )
+    scan_form.addRow("Positions", widget._positions_spin)
+    widget._spectrum_image_button = QtWidgets.QPushButton(
+        "Acquire spectrum image (4D)", scan_group,
+    )
+    widget._spectrum_image_button.setToolTip(
+        "One pass of the probe keeping a full camera image at every beam "
+        "position. Needs a backend with synchronised scan/camera hardware",
+    )
+    scan_form.addRow(widget._spectrum_image_button)
+
 
 def build_record_controls(
     parent: QtWidgets.QWidget,
@@ -148,6 +317,7 @@ def build_camera_group(
     camera_form.addRow(binding.button)
     binding.status = QtWidgets.QLabel("stopped", camera_group)
     camera_form.addRow("Status", binding.status)
+    build_image_controls(widget, camera_group, camera_form, binding)
     (
         binding.count_spin,
         binding.save_button,
@@ -163,7 +333,67 @@ def build_camera_group(
     binding.record_button.clicked.connect(
         lambda *_, n=name: widget.record_camera_frames(n),
     )
+    binding.acquire_button.clicked.connect(
+        lambda *_, n=name: widget.acquire_camera_image(n),
+    )
     return camera_group
+
+
+def build_image_controls(
+    widget: LiveInstrumentWidget,  # noqa: ARG001 - kept for builder symmetry
+    camera_group: QtWidgets.QGroupBox,
+    camera_form: QtWidgets.QFormLayout,
+    binding: object,
+) -> None:
+    """
+    Add the exposure, binning and "Acquire image" controls for one camera.
+
+    Separate settings from the live view, deliberately. The feed and the
+    kept image are different jobs: the feed runs short and often binned
+    so it stays responsive at thirty frames a second, and the image an
+    operator keeps is worth a long unbinned exposure. One shared pair of
+    settings would force a choice between a usable live view and a
+    usable acquisition.
+
+    Seeded from what the camera currently reports, so the defaults are
+    the device's own rather than a guess this module makes about it.
+
+    Parameters
+    ----------
+    widget : LiveInstrumentWidget
+        The widget these controls belong to.
+    camera_group : QtWidgets.QGroupBox
+        The group box owning the new widgets.
+    camera_form : QtWidgets.QFormLayout
+        The group's layout, appended to.
+    binding : object
+        The camera binding whose ``exposure_spin``, ``binning_combo``
+        and ``acquire_button`` are filled in here.
+    """
+    current = binding.camera.parameters()
+    binding.exposure_spin = QtWidgets.QDoubleSpinBox(camera_group)
+    binding.exposure_spin.setRange(_MIN_EXPOSURE_MS, _MAX_EXPOSURE_MS)
+    binding.exposure_spin.setDecimals(_EXPOSURE_DECIMALS)
+    binding.exposure_spin.setValue(current.exposure_ms)
+    binding.exposure_spin.setSuffix(" ms")
+    camera_form.addRow("Image exposure", binding.exposure_spin)
+
+    binding.binning_combo = QtWidgets.QComboBox(camera_group)
+    # Offered from the camera's own binning_values rather than a fixed
+    # list: a camera that only does 1x has no business showing a 4x it
+    # will refuse.
+    values = list(binding.camera.binning_values) or [1]
+    binding.binning_combo.addItems([str(value) for value in values])
+    if current.binning in values:
+        binding.binning_combo.setCurrentIndex(values.index(current.binning))
+    camera_form.addRow("Image binning", binding.binning_combo)
+
+    binding.acquire_button = QtWidgets.QPushButton("Acquire image", camera_group)
+    binding.acquire_button.setToolTip(
+        "One exposure at the settings above; the live view's own "
+        "settings are put back afterwards",
+    )
+    camera_form.addRow(binding.acquire_button)
 
 def build_analysis_rows(
     widget: LiveInstrumentWidget,
@@ -285,88 +515,6 @@ def build_extras_summary(
     label.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
     label.setWordWrap(True)
     return label
-
-
-class CollapsibleSection(QtWidgets.QWidget):
-    """
-    One device's controls, behind a header that folds them away.
-
-    An instrument with a scan unit, three cameras and a spectrometer has
-    more controls than fit on a screen, and an operator aligning one
-    detector does not want the other four in the way. Folding is the
-    cheapest answer that keeps *several* open at once, which tabs would
-    not: watching a camera while a scan runs is the ordinary case.
-
-    A disclosure triangle rather than ``QGroupBox.setCheckable``, which
-    would put a checkbox in the title. On an instrument panel a checkbox
-    beside a device name reads as "switch this device off", and a
-    control that looks like it turns hardware off had better turn
-    hardware off.
-    """
-
-    def __init__(
-        self,
-        title: str,
-        content: QtWidgets.QWidget,
-        parent: QtWidgets.QWidget | None = None,
-        *,
-        expanded: bool = True,
-    ) -> None:
-        super().__init__(parent)
-        self._toggle = QtWidgets.QToolButton(self)
-        self._toggle.setText(title)
-        self._toggle.setCheckable(True)
-        self._toggle.setChecked(expanded)
-        self._toggle.setStyleSheet("QToolButton { border: none; font-weight: 600; }")
-        self._toggle.setToolButtonStyle(QtCore.Qt.ToolButtonTextBesideIcon)
-        self._toggle.setArrowType(
-            QtCore.Qt.DownArrow if expanded else QtCore.Qt.RightArrow,
-        )
-        self._content = content
-        content.setParent(self)
-        content.setVisible(expanded)
-
-        layout = QtWidgets.QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.addWidget(self._toggle)
-        layout.addWidget(content)
-        self._toggle.toggled.connect(self.set_expanded)
-
-    @property
-    def title(self) -> str:
-        """Return the header text, which names the device."""
-        return self._toggle.text()
-
-    def is_expanded(self) -> bool:
-        """
-        Report whether this section's controls are showing.
-
-        Returns
-        -------
-        bool
-            True when the content is visible.
-        """
-        return self._toggle.isChecked()
-
-    def set_expanded(self, expanded: bool) -> None:  # noqa: FBT001
-        """
-        Show or fold this section's controls.
-
-        Positionally typed ``bool`` because this is a Qt slot: it is
-        connected to ``QToolButton.toggled``, which calls it with the
-        new state as the one positional argument.
-
-        Parameters
-        ----------
-        expanded : bool
-            True to show the content, False to fold it away.
-        """
-        if self._toggle.isChecked() != expanded:
-            self._toggle.setChecked(expanded)
-        self._toggle.setArrowType(
-            QtCore.Qt.DownArrow if expanded else QtCore.Qt.RightArrow,
-        )
-        self._content.setVisible(expanded)
 
 
 def build_devices_panel(widget: LiveInstrumentWidget) -> QtWidgets.QGroupBox:

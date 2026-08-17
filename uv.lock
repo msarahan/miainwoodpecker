@@ -1,5 +1,5 @@
 version = 1
-revision = 3
+revision = 2
 requires-python = ">=3.11"
 resolution-markers = [
     "python_full_version < '3.12' and sys_platform == 'win32'",
@@ -1724,6 +1724,7 @@ tests = [
 ]
 viewer = [
     { name = "napari", extra = ["pyside6"] },
+    { name = "platformdirs" },
 ]
 
 [package.metadata]
@@ -1744,6 +1745,7 @@ requires-dist = [
     { name = "nionutils", marker = "extra == 'device'", specifier = "==4.14.1" },
     { name = "numpy", specifier = ">=2.2.6" },
     { name = "opencv-python-headless", marker = "extra == 'camera'", specifier = ">=4.9" },
+    { name = "platformdirs", marker = "extra == 'viewer'", specifier = ">=3" },
     { name = "pre-commit", marker = "extra == 'dev'" },
     { name = "py4dstem", marker = "extra == 'py4dstem'", specifier = ">=0.14" },
     { name = "pydata-sphinx-theme", marker = "extra == 'docs'", specifier = "~=0.16" },

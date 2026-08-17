@@ -30,6 +30,7 @@ if typing.TYPE_CHECKING:
 
     from miainwoodpecker.devices.interface import (
         Camera,
+        CameraParameters,
         Frame,
         InstrumentController,
         ScanParameters,
@@ -128,6 +129,51 @@ def multichannel_scan_series(
         raise ValueError(msg)
     for _ in range(count):
         yield from scanner.scan_frames(parameters, channels)
+
+
+def camera_image(camera: Camera, parameters: CameraParameters) -> Iterator[Frame]:
+    """
+    Yield one frame taken with its own settings, then restore the live ones.
+
+    The acquisition counterpart to the live view, and the reason it is
+    not ``camera_series(camera, 1)``: an image an operator keeps is
+    usually taken differently from the feed they found it on — a longer
+    exposure for signal, or unbinned for resolution — while the live
+    view runs short and binned to stay responsive. A series deliberately
+    does *not* touch the camera's settings, so this is a separate
+    generator rather than an argument on that one.
+
+    The previous settings are put back even if the consumer abandons the
+    generator early, for the same reason :func:`camera_series` stops the
+    camera in that case: one interrupted acquisition must not leave the
+    live feed crawling at an acquisition exposure afterwards.
+
+    Yielding rather than returning a bare frame so this composes with
+    :func:`record` exactly as the series generators do.
+
+    Parameters
+    ----------
+    camera : Camera
+        The camera to acquire from.
+    parameters : CameraParameters
+        Settings for this acquisition. Applied before the exposure and
+        replaced by the camera's previous settings afterwards.
+
+    Yields
+    ------
+    Frame
+        The single acquired frame.
+    """
+    live = camera.parameters()
+    camera.configure(parameters)
+    camera.start()
+    try:
+        yield camera.acquire_frame()
+    finally:
+        camera.stop()
+        # After the stop, so the restored settings are not applied to an
+        # exposure that is still in flight.
+        camera.configure(live)
 
 
 def camera_series(camera: Camera, count: int) -> Iterator[Frame]:

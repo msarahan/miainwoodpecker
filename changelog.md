@@ -2,8 +2,337 @@
 
 ## Unreleased
 
+### Changed
+
+- **Several detectors can be live at once, and the panel says so.** The
+  Scan group offered a drop-down: a choice of *one* detector. That
+  describes serial acquisition, which on a scanned instrument is the
+  special case — one pass of the probe reads out every fitted detector,
+  and HAADF and MAADF arrive together. It also disagreed with what the
+  application already did, since `acquire_scan_image` had been reading
+  every channel out of one pass since it landed.
+  Checkboxes replace it, and every checked detector gets its own napari
+  layer fed from the **same** `scan_frames` call. `MultiChannelLiveAcquisition`
+  is what makes that true: one loop whose grab returns a whole pass,
+  published under the lock as a set. The obvious alternative — one
+  single-channel loop per detector — would have looked identical on
+  screen while costing twice the dose, letting the specimen drift
+  between the two images, and making a per-pixel difference of them
+  meaningless. Unchecking the last detector is refused with an
+  explanation rather than allowed: a scan with none reads nothing out,
+  so it is not a state an operator could mean.
+- **Dwell and resolution belong to a profile now.** View, Preview and
+  Acquire each carry their own, and all three are visible at once
+  because "what will Preview do" is asked as often as "change Preview".
+  Preview is the one whose purpose is least obvious from its numbers: it
+  sits between the other two so focus and astigmatism can be judged *by
+  eye* at a signal-to-noise the live view cannot reach, and its action
+  shows a scan and records nothing — a focus check that littered the
+  session with files would stop being used.
+  **The field of view is shared and deliberately outside the profiles.**
+  It is the region the operator navigated to, and a profile carrying its
+  own would move the specimen out from under them at the moment they
+  were happiest with it. `Acquire scan image` and `Record frames` use
+  the Acquire profile rather than whatever the live view happened to be
+  running at; changing Preview or Acquire never disturbs a running live
+  view, since each is read when its own action is taken.
+  Both the detector selection and the profiles persist between launches.
+  Two under-specified test doubles surfaced on the way, the same shape
+  of problem as `_FakeCamera` earlier: `_FakeScanner` never implemented
+  `scan_frames`, though the `Scanner` protocol has required it since
+  simultaneous multi-channel scanning landed. It was completed rather
+  than worked around.
+  And a fixture was added that the suite should have had already: tests
+  now write preferences to a temporary file. Without it the suite
+  mutated the developer's own config — a test that reaches outside its
+  `tmp_path` is a test with a side effect, whatever it asserts — and one
+  test's checkboxes leaked into the next, which is how the problem was
+  found.
+
 ### Added
 
+- **A scan pass can be stored, and acquired from the window.**
+  `storage/passes.py` writes one `NXentry` per pass holding one `NXdata`
+  per signal — `entry/data` the default and plottable one, the rest
+  `entry/data_<name>`. NeXus allows an entry many `NXdata` groups and
+  uses `default` to name the one to plot, so this is the vocabulary's
+  own answer to "where does a second signal go" rather than a private
+  convention.
+  `NXem`'s `measurement/eventID*` hierarchy is designed for exactly this
+  and was **not** adopted, for a costed reason rather than a lazy one:
+  reaching it additionally requires an `NXem_instrument` carrying
+  `ebeam_column` and `fabrication` under a `measurement` group, i.e.
+  restructuring the entry every reader in this package and every file
+  already written depends on. That is a migration, and it should be made
+  once when the hierarchy is needed for its own sake — not smuggled in
+  behind the first feature that could use it.
+  **Streaming is structural.** `PassWriter` creates the file and its
+  datasets first and hands them out through `destinations()`, to be
+  passed as `scan_synchronised(into=...)`. The device fills the final
+  on-disk datasets as it acquires, chunked one beam position per chunk
+  so each write lands as a single chunk write. A test asserts the pass's
+  array *is* the file's dataset, because a version that filled a buffer
+  and then copied it in would pass any value-based check while doing
+  exactly the work this avoids.
+  `Session.reserve` exposes the naming so a caller that writes its own
+  file still gets the session's index and slug; the file is created
+  empty, which makes the name a reservation rather than a suggestion.
+  **Acquire spectrum image (4D)** in the Scan group drives it, and most
+  of that method is refusals: no session, no synchronised mode, no
+  camera wired to the column, scanner or camera busy. That is the
+  feature on every backend but the preview — a fabricated cube has the
+  same shape as a real one, so naming the missing capability is the only
+  outcome an operator can act on.
+  Fixed while building it: the preview's `into` shape check validated
+  only the navigation axes, so a wrong detector size reached the write
+  loop and surfaced as an h5py broadcast `TypeError` naming neither the
+  target nor the acquisition. It now checks the whole shape and says
+  which of the two numbers is wrong.
+  Known limits, stated rather than papered over: the grid is square and
+  the acquisition blocks the GUI thread (both wait on the target-area UI
+  and a job boundary), and a stored pass appears in the Recordings list
+  as `0 frames` because that list only understands frame stacks — a test
+  pins that it does not *break* the list, which is the part that matters
+  meanwhile.
+
+- **The cross-device pass, and one device that really performs it.**
+  `docs/adapters/spectrum-detectors.md` §2.3 named the missing concept
+  and said it was "one missing concept, not three": a spectrum image
+  collected alongside HAADF, multi-detector scanning, and 4D-STEM are
+  the same absence seen from three sides. The unit that was absent is a
+  **pass** — one traversal of the probe yielding a *set* of correlated
+  outputs sharing one geometry and one identifier.
+  `ScanPass` and `DiffractionStack` are that unit. A pass carries its
+  image channels, its per-camera 4D datacubes and its spectrum images,
+  and refuses to exist without an identity or without anything to
+  identify. `DiffractionStack` is a type rather than a bare array
+  because the array alone does not say which axes are which, and a
+  caller that guesses wrong silently transposes a dataset that still
+  analyses; its shape is navigation-first, matching both
+  `Spectrum.navigation_shape` and py4DSTEM's `DataCube`.
+  `SynchronisedScanner` is a **separate** protocol rather than two more
+  methods on `Scanner`, for the reason `Instrument` already records: a
+  `runtime_checkable` protocol's `isinstance` is all-or-nothing, so
+  widening `Scanner` would make every adapter that cannot synchronise
+  fail a check it passes today — testing for a capability instead of
+  for conformance. Here the check and the capability are the same
+  question, which is what makes `isinstance` honest.
+  The same document rejected adding a bare `pass_id` to `Frame` and
+  `Spectrum` as a correlation hint, because an identifier nothing
+  establishes is a *claim* that two results share a pass — the shape of
+  mistake `probe_position` already made here. So a `ScanPass` is
+  produced only by `scan_synchronised`, one call to one device that
+  really did traverse once; an adapter that cannot guarantee that must
+  refuse rather than build one.
+  The preview instrument implements it for real, which is the point of
+  having built it: the diffraction pattern at each beam position is
+  deflected by the local gradient of the specimen field, so a
+  centre-of-mass across the datacube reconstructs that gradient. A test
+  asserts the correlation, which means a centre-of-mass or DPC
+  implementation run against this fixture can be *wrong* — where a cube
+  of identical patterns would let any analysis "succeed". The
+  nionswift-usim backend implements none of it, and that is not an
+  oversight: `analysis/py4dstem_bridge.py` records the measurement
+  showing it cannot produce scan-position-varying diffraction without
+  the `HardwareSource` layer Phase 0 rejected.
+  **Synchronisation is recorded, not assumed.** `ScanPass.scan_sync` is
+  required with no default, from `SCAN_SYNC_MODES` — `detector` when the
+  camera or analyser drove the column's scan input (the usual
+  arrangement for a fast spectrum image, and what Gatan's GMS and Nion's
+  Swift each expose), `scanner` when the column drove, `none` when
+  nothing did. It is the same question `metadata["scan_sync"]` already
+  asked of a spectrum map, promoted to a field because a pass exists to
+  assert its outputs share probe positions and *how* that was arranged
+  is the whole evidence. A default would have been this module guessing
+  about hardware wiring; a detector-mastered acquisition and an
+  unsynchronised one produce datasets of identical shape, and only this
+  field tells them apart afterwards.
+  **Pre-allocation and streaming are one mechanism, not two.**
+  `scan_synchronised` takes `into`: destination arrays the caller owns,
+  filled in place, so the data never moves twice — which is how the
+  vendor SDKs work and the only sane shape for a cube measured in
+  gigabytes. That looks like it conflicts with streaming a large pass to
+  disk, and does not: `into` is defined by what it supports (a shape,
+  and assignment at a beam position) rather than as `numpy.ndarray`, so
+  an `h5py` dataset satisfies it. Chunked one beam position per chunk,
+  the per-position writes land as single chunk writes and the cube is on
+  disk as it is acquired, never whole in RAM. A test pins this by
+  acquiring into a real HDF5 dataset and asserting the pass carries that
+  dataset rather than a copy.
+  Not yet done, and the next steps: the NeXus layout for a stored pass
+  (the test above writes a bare cube, not a calibrated `NXdata`), an
+  adapter that writes *through* the buffer so the write overlaps the
+  next exposure rather than following the acquisition, and the
+  target-area UI. The vendor specifics — which GMS and Swift calls take
+  a caller-owned destination, and what each requires of the trigger
+  wiring — are recorded here as the shape to look for, not as verified
+  fact: neither has been exercised, and both need hardware or a vendor
+  conversation.
+
+- **Acquiring an image is now its own thing, separate from recording a
+  series.** Until now the window could make exactly one kind of
+  recording: a burst of N repeats from one device — a *time* series.
+  That is a real acquisition, but it is not the everyday one, and it was
+  standing in for two that the application could not express at all.
+  **Acquire scan image** takes one pass of the probe and reads out every
+  detector channel the scanner has, rather than the one currently on
+  display. The pass happens either way, so the second detector costs no
+  extra dose and no extra time, and the channels come out registered to
+  each other by construction; the alternative is scanning the same area
+  twice to get the channel you wish you had kept. The frames carry the
+  shared `scan_pass_id` that `scan_frames` already established, so a
+  reader can do per-pixel arithmetic between channels without inferring
+  from timestamps whether the probe moved.
+  **Acquire image** on a camera takes one exposure at that camera's own
+  image exposure and binning, kept apart from the live view's. The two
+  are different jobs — the feed runs short and often binned to stay
+  responsive at thirty frames a second, and a kept image is worth a long
+  unbinned exposure — and one shared pair of settings would force a
+  choice between a usable live view and a usable acquisition. The new
+  `acquisition.camera_image` generator restores the live settings
+  afterwards, including when the consumer abandons it early, so one long
+  acquisition cannot leave the feed crawling. Binning is offered from
+  the camera's own `binning_values`, so a detector that only does 1×
+  does not show a 4× it would refuse.
+  Neither reads the "Frames" count beside it: an image is one
+  acquisition whatever that says, or the two controls would silently
+  interact.
+  Building the exposure controls also surfaced an under-specified test
+  double: `test_live_widget.py`'s `_FakeCamera` never implemented
+  `binning_values`, `parameters` or `configure`, though the `Camera`
+  protocol requires all three. It got away with it while nothing in the
+  widget asked at build time. The fake was completed rather than the
+  panel made defensive — a fallback for a camera missing half its
+  interface would be shipping around a protocol violation.
+  This is the first of three steps. Spectrum imaging and 4D-STEM — a
+  scan combined with a camera or spectrometer readout at each beam
+  position — remain unbuilt, and are blocked below this layer rather
+  than by it: `analysis/py4dstem_bridge.py` records the measurement
+  showing that the Nion simulator cannot produce scan-position-varying
+  diffraction without the `HardwareSource` layer Phase 0 rejected.
+
+### Fixed
+
+- **Closing the preview window no longer ends in a traceback**, and
+  `shutdown()` is now safe to call at any point rather than only the
+  right one. `miainwoodpecker-preview` called `widget.shutdown()` after
+  `napari.run()` returned, which is after Qt has destroyed the widget
+  tree: the call died on `RuntimeError: Internal C++ object (QTimer)
+  already deleted`. `viewer/app.py` had already learned this and carried
+  a comment saying so; the preview entry point diverged from it and has
+  been brought back into line.
+  The traceback was the visible half. The damaging half was that
+  shutdown aborted at its first statement, skipping the teardown that
+  matters — the acquisition loops, the analysis workers, and the
+  recording writer whose `finalize` is what leaves an operator a
+  readable file rather than a truncated one. `shutdown()` is now
+  idempotent, and each teardown step tolerates a widget Qt has already
+  destroyed. Per step rather than around the whole method, so one dead
+  widget cannot skip the steps after it; that is safe because each step
+  stops its machinery before it touches a label. Only the
+  "already deleted" flavour of `RuntimeError` is swallowed — a device
+  refusing to stop raises the same class and is still worth hearing.
+- **Shutdown stops every camera, not just the first.** `stop_camera()`
+  with no argument acts on the first binding, and `shutdown` called it
+  bare, so a two-camera instrument exited with its second camera still
+  running — a device left held by a process on its way out. Found while
+  fixing the crash above, in the same method.
+
+- **The dock's lower sections are reachable again.** The panel was a
+  plain vertical stack of four group boxes, so its *minimum* height was
+  its natural height: measured on a 1409-pixel-high screen, the stack
+  demanded 1499. Qt will not shrink a widget past its minimum, and there
+  was nothing to scroll, so Devices and everything below it ran off the
+  bottom of the display — not merely out of view but unreachable, with
+  no resize, drag or scroll that would bring them back.
+  The stack now lives in a `QScrollArea`, which drops the panel's
+  minimum height from 1499 pixels to 72 and makes reachability
+  independent of what is open. Each of the top-level groups also folds,
+  behind the same disclosure triangle the per-device sections already
+  used — that widget moved to `viewer/panels/sections.py`, since it is
+  no longer a device-only idea.
+  The two are deliberately not the same fix. Folding is for putting away
+  groups you are not using; scrolling is the guarantee. A layout that
+  only fitted when folded would put the same content out of reach the
+  moment an operator opened it, and several groups open at once is the
+  ordinary case — watching a camera while a scan runs.
+
+### Changed
+
+- **Session context moved into a dialog, and a status bar took over the
+  two facts worth watching.** Where data goes, who is on the instrument,
+  what the sample is and the shift's standing notes are set once at the
+  start of a session and then left alone, but they were spending four
+  form rows and two text boxes in the dock to say so — on the panel that
+  did not fit on the screen.
+  They are now behind **Session settings...** at the top of the
+  Recordings group, and the two continuously useful facts — the
+  destination and the free space — moved into the main window's own
+  status bar, to the left of napari's "Ready". That is the line a user
+  already reads for status, rather than a second status line of ours a
+  few hundred pixels above it, and being outside the dock entirely it
+  cannot be scrolled out of view — which is exactly what used to happen
+  to it. The path is elided from the left, because every session under
+  one root shares its leading components, and it takes the bar's spare
+  width so it elides as little as it has to.
+  The fields are divided by vertical rules, drawn with an explicit
+  colour rather than as plain sunken frames — Qt draws those from the
+  palette's shadow colours, which on napari's dark theme sit within a
+  few percent of the bar behind them, so the dividers were present and
+  invisible. A field with nothing to say takes its rule with it: with no
+  session the "Saving to" label disappears and the line reads simply
+  `No session - data is not being kept`, and the free-space field is
+  absent rather than empty, since a divider beside a blank reads as a
+  value that failed to load instead of one that does not apply.
+  Both are labels rather than controls, deliberately: a status bar that
+  quietly doubled as a button would mean the session directory could be
+  changed from two places, one of them invisible until someone happened
+  to click the text. `insertWidget(0, ...)` rather than `addWidget` puts
+  them left of "Ready"; that area is normally a poor place for anything
+  lasting, since `showMessage` hides widgets added to it, but napari
+  draws "Ready" with its own `StatusBarWidget` and never calls it. They
+  are removed again on `shutdown`, or a second widget docked into one
+  viewer would stack a second copy of every label.
+  Two things stayed behind, for the same reason the rest moved. The
+  **note for the next recording** is answered per burst rather than per
+  shift, so it sits with the recording controls; and the live recording
+  state (running, stop, what has been written) joined the **Recordings**
+  group, which was already named for recordings — the alternative was a
+  second group whose name differed from that one's by a letter.
+
+### Added
+
+- **An in-process preview instrument, so the UI can be iterated on
+  without a device server** (`miainwoodpecker-preview`, implemented in
+  `src/miainwoodpecker/viewer/preview.py`). The viewer could already open
+  against synthesised frames via `--server-module camera_server`, and
+  that path stays the honest end-to-end exercise: real frames over a real
+  socket from a real subprocess, proving the IPC, the handshake and the
+  shutdown. This one deliberately gives all of that up. The scanner,
+  cameras and instrument are ordinary Python objects in the viewer's own
+  process, which buys three things the subprocess path cannot.
+  Startup is an import — no server to spawn, no port to bind, no
+  handshake to wait out — so the edit-run loop on a panel's layout is as
+  long as napari takes to draw. The window is reachable in whatever shape
+  is needed: `--no-scan`, `--no-camera`, `--cameras 2`, and `--controls`
+  to publish a subset, so the Instrument and Devices panels' "an
+  unpublished control gets no row" branches are reachable without owning
+  a microscope that lacks a blanker. And with no transport underneath, a
+  widget that misbehaves here misbehaves in code that was just edited.
+  The controls are wired to the image on purpose: blanking collapses the
+  signal, defocus damps the contrast, and moving the stage moves the
+  field of view. A preview whose dials did nothing would let a broken
+  Instrument panel — a signal never connected, a setter called on the
+  wrong object — look exactly like a working one, which is the panel this
+  exists to iterate on. The specimen is an atomic-scale lattice
+  (0.3 nm columns, ~50 across the panel's default 15 nm field of view)
+  rather than a smooth gradient, because judging a colormap or an
+  autocontrast pass against two grey blobs proves nothing.
+  It reports its backend as `preview`, never `simulated`. The panel's top
+  line shows that verbatim, so a screenshot taken from this window cannot
+  be mistaken for one taken from the microscope simulator, let alone from
+  an instrument. Requires the `viewer` extra and nothing else — no vendor
+  SDK, no `device` extra.
 - **A camera probe, so "nothing shows up" names its own cause**
   (`scripts/probe_cameras.py`). A USB microscope that does not appear in
   the viewer has four possible reasons, and from the viewer they look
@@ -736,6 +1065,21 @@
   a shape would put a number on screen that no acquisition would produce.
 
 ### Fixed
+
+- **The viewer's integration tests no longer skip themselves on macOS and
+  Windows.** The display guard in `tests/integration/conftest.py` asked
+  only whether `$DISPLAY` or `$WAYLAND_DISPLAY` was set. Those are X11
+  and Wayland variables; on macOS Qt uses the cocoa platform plugin and
+  on Windows the windows one, and neither sets either. So on both, all
+  69 `test_live_widget` tests were quietly marked skipped — not failing,
+  not passing, simply not running, which is the one outcome a guard
+  should never produce silently, and the reason it went unnoticed. The
+  guard now treats a platform with its own window server as having a
+  display, and asks the environment only where the answer is actually in
+  the environment. All 46 runnable widget tests pass on macOS unchanged;
+  the remaining skips are the analysis-extra ones, which are a different
+  guard. The `xvfb-run` instruction still stands for Linux, where it is
+  still needed.
 
 - **The instrument runtime check no longer demands controls an
   instrument does not serve.** The `isinstance` question every call site

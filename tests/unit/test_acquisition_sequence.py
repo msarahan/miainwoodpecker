@@ -10,6 +10,7 @@ import numpy as np
 import pytest
 
 from miainwoodpecker.acquisition import (
+    camera_image,
     camera_series,
     energy_offset_series,
     focal_series,
@@ -375,6 +376,73 @@ def test_camera_series_stops_when_abandoned_early():
     expected = 2
     assert len(taken) == expected
     series.close()  # what `break` out of a for-loop does at GC time
+    assert camera.stop_count == 1
+    assert not camera.running
+
+
+def test_camera_image_yields_exactly_one_frame():
+    """
+    An image is one exposure, not a burst of one.
+
+    Its own function rather than ``camera_series(camera, 1)`` because it
+    also has to change the camera's settings and put them back, which a
+    series must not do.
+    """
+    camera = _CountingCamera()
+    frames = list(camera_image(camera, CameraParameters(exposure_ms=500.0)))
+    assert len(frames) == 1
+
+
+def test_camera_image_acquires_with_its_own_settings():
+    """
+    An acquisition exposure is longer than a live one, and that is the point.
+
+    The live view runs short exposures to stay responsive; the image an
+    operator keeps is worth waiting for. Asserted on what the camera was
+    configured with at the moment the frame was taken.
+    """
+    camera = _CountingCamera()
+    wanted = CameraParameters(exposure_ms=500.0)
+    seen = [camera.parameters() for _ in camera_image(camera, wanted)]
+    assert seen == [wanted]
+
+
+def test_camera_image_restores_the_live_settings():
+    """
+    The live view is running the same camera, so its settings come back.
+
+    Without this, taking one long exposure would silently leave the live
+    feed crawling at the acquisition exposure afterwards.
+    """
+    camera = _CountingCamera()
+    live = camera.parameters()
+    list(camera_image(camera, CameraParameters(exposure_ms=500.0)))
+    assert camera.parameters() == live
+
+
+def test_camera_image_restores_settings_when_abandoned_early():
+    """
+    An interrupted acquisition must not leave the camera reconfigured.
+
+    Same contract ``camera_series`` already keeps for start/stop, for the
+    same reason: the consumer may stop pulling at any point.
+    """
+    camera = _CountingCamera()
+    live = camera.parameters()
+    series = camera_image(camera, CameraParameters(exposure_ms=500.0))
+    next(series)
+    series.close()
+
+    assert camera.parameters() == live
+    assert not camera.running
+    assert camera.stop_count == camera.start_count
+
+
+def test_camera_image_starts_and_always_stops():
+    """The camera is left paused, exactly as ``camera_series`` leaves it."""
+    camera = _CountingCamera()
+    list(camera_image(camera, CameraParameters(exposure_ms=500.0)))
+    assert camera.start_count == 1
     assert camera.stop_count == 1
     assert not camera.running
 
