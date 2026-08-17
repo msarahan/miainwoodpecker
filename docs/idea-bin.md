@@ -24,8 +24,9 @@ by @msarahan 2026-08-17.
 than end to end, plus the slides of the first — extracted by ffmpeg
 scene detection (51 unique slides over 57 minutes) and read where the
 transcript said something interesting was on screen. The second talk's
-slides have *not* been looked at, so anything shown only visually there
-is still missing.
+slides were extracted the same way (35 over 61 minutes) and sampled;
+neither deck was read end to end, so anything on an unvisited slide is
+still missing.
 
 The first talk is a direct survey of the gap this project already has.
 Conventional raster scanning — across a row, then fly back — is
@@ -83,6 +84,28 @@ The eaSI talk adds two things this project has no vocabulary for:
   a single low-dose experiment but far higher total dose. Dual EELS is
   described as near-mandatory for the ultra-low-dose case.
 
+Its "Conventional spectrum imaging with fast DualEELS" slide (26:43)
+is the most concrete statement of an SI acquisition anywhere in the four
+videos, and three things on it bear directly on types this project
+already has:
+
+- **"Define 2D Array ROI. Acquire LL and HL EELS data cubes in a single
+  pass."** Two spectrum images, two detectors' worth of data, one
+  traversal — which is exactly why `ScanPass.spectra` is a *mapping*
+  rather than one cube, and the first outside confirmation that the
+  shape was right.
+- **The pixel dwell decomposes.** SI pixel dwell of 200 µs is EELS
+  low-loss 100 µs plus high-loss 100 µs. So a dwell is a budget divided
+  between readouts within one beam position, not a single number the
+  scan owns — something `ScanParameters.pixel_time_us` currently cannot
+  express.
+- **The survey and the SI are different grids, and by a wide margin.**
+  One example pairs an ADF survey of 688 × 1388 with an SI array of
+  172 × 347, acquired as a 4×4 mosaic of subscans. That is a factor of
+  four, and it is the distinction `ScanPass.parameters` documents as the
+  *acquisition* grid rather than the reference scan's — confirmed as
+  ordinary practice rather than an edge case.
+
 One slide (22:00, "STEM-SI Custom Scan" on DyScO₃) is the intersection
 of everything above and everything this branch just built: a **spectrum
 image acquired on a non-raster trajectory**, spiral and scripted side by
@@ -127,8 +150,9 @@ discovered.
 Tool"](https://www.youtube.com/watch?v=XVggvbaEYCQ) (5 min) and
 ["eaSI EELS"](https://www.youtube.com/watch?v=AZXnFnmCeW0) (57 s),
 suggested by @msarahan 2026-08-17.
-**Examined:** full transcript of the first; the second is silent, so
-four frames were sampled from it and read. Both are DigitalMicrograph.
+**Examined:** full transcript of the first plus three sampled UI frames;
+the second is silent, so four frames were sampled from it and read. Both
+are DigitalMicrograph.
 
 The first demonstrates two tools that are **each other's inverse**, and
 the workflow is the pair used together:
@@ -175,6 +199,35 @@ The linkage is a **named, first-class, persistent object** — it has an
 identity, it survives being broken, and it is re-established rather than
 rebuilt. The views are not redrawn from a shared variable; they are
 bound.
+
+A sampled frame at 4:10 states the whole technique as an on-screen
+caption, which is worth quoting exactly because it is the vendor's own
+one-sentence summary of the loop:
+
+> When there is a notable intensity change, leave the Slice Tool on the
+> desired energy range, then move the SI Picker to the ROI
+
+The same frame's control panel is close to a specification:
+
+- The **SI region is drawn as a rectangle on the survey image**, in a
+  separate window at a different scale (1 µm survey, 0.5 µm SI). This is
+  the target-area interaction this project has not built, and it is
+  drawn on the *reference scan*, exactly where the acquisition grid
+  question arises.
+- A `Control` palette gives the picker's **X, Y, W and H in µm** —
+  calibrated real-space geometry, numerically editable, not pixel
+  indices. Whatever a link is here, it carries a calibrated region.
+- The `Slice` palette reads **Low 760.8 eV, High 865.8 eV, Width
+  105.1 eV**, with a `Display Center` option — an energy window in
+  physical units, with width as a first-class control rather than a
+  derived end point.
+- A `Time Slice` palette sits below it with its own slider, which is
+  presumably the multipass axis the eaSI work produces. A stored dataset
+  therefore has *four* navigable axes here: two spatial, one energy, one
+  time.
+- The dataset is reported as **256 × 308 × 2048** — beam positions by
+  energy channels, the rank-3 shape `Spectrum.navigation_shape` already
+  describes.
 
 ### What this means here, concretely
 
