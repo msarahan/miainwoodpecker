@@ -249,3 +249,10 @@ _version.py
 
 # Claude Code local state (e.g. agent worktrees) — never project content
 .claude/
+
+# Pixi environments. The *lockfile* (pixi.lock) is committed on purpose —
+# it is what lets a colleague resolve nothing — but the solved
+# environments under .pixi/ are machine-specific and large.
+.pixi/*
+# ...except the config, which is project settings rather than build output.
+!.pixi/config.toml

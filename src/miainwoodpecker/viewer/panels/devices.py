@@ -11,6 +11,7 @@ import typing
 
 from qtpy import QtCore, QtWidgets
 
+from miainwoodpecker.devices.interface import READOUT_MODES, SynchronisedScanner
 from miainwoodpecker.viewer import preferences, profiles
 from miainwoodpecker.viewer.panels.defaults import (
     _DEFAULT_FOV_NM,
@@ -240,18 +241,62 @@ def build_spectrum_image_controls(
     widget._positions_spin.setValue(_DEFAULT_POSITIONS)
     widget._positions_spin.setPrefix("")
     widget._positions_spin.setToolTip(
-        "Beam positions per side. A full camera image is kept at each, so "
-        "the dataset grows with the square of this number",
+        "Beam positions per side. A whole detector readout is kept at "
+        "each, so the dataset grows with the square of this number",
     )
     scan_form.addRow("Positions", widget._positions_spin)
+
+    # Which detector is read out at each beam position. A combo box and
+    # not checkboxes, unlike the scan channels above, because those are
+    # channels of *one* device read out together and these are separate
+    # devices with no shared trigger between them - reading two out of
+    # one pass is the cross-device claim `ScanPass` exists to make and
+    # that no adapter here can yet honour for more than one target.
+    widget._sync_target_combo = QtWidgets.QComboBox(scan_group)
+    widget._sync_target_combo.addItems(_synchronisable_targets(widget))
+    widget._sync_target_combo.setToolTip(
+        "The detector read out at every beam position. What it "
+        "contributes depends on the readout mode it is in: an imaging "
+        "detector gives a 4D diffraction cube, a projecting one gives a "
+        "spectrum image",
+    )
+    scan_form.addRow("Per-position detector", widget._sync_target_combo)
+
     widget._spectrum_image_button = QtWidgets.QPushButton(
-        "Acquire spectrum image (4D)", scan_group,
+        "Acquire spectrum image", scan_group,
     )
     widget._spectrum_image_button.setToolTip(
-        "One pass of the probe keeping a full camera image at every beam "
-        "position. Needs a backend with synchronised scan/camera hardware",
+        "One pass of the probe keeping the selected detector's whole "
+        "readout at every beam position, alongside every scan channel. "
+        "Needs a backend with synchronised scan/detector hardware",
     )
     scan_form.addRow(widget._spectrum_image_button)
+
+
+def _synchronisable_targets(widget: LiveInstrumentWidget) -> list[str]:
+    """
+    Return the targets this widget's scan unit can read out during a pass.
+
+    Empty on every backend that cannot synchronise, which is all of them
+    but the preview — and the combo is built empty rather than hidden for
+    the reason the button is built at all: a control that explains why
+    this instrument cannot do something teaches an operator more than a
+    control that is not there.
+
+    Parameters
+    ----------
+    widget : LiveInstrumentWidget
+        The widget whose scanner is asked.
+
+    Returns
+    -------
+    list[str]
+        Target names, in the order the scanner reports them.
+    """
+    scanner = widget._scanner
+    if scanner is None or not isinstance(scanner, SynchronisedScanner):
+        return []
+    return list(scanner.synchronised_targets())
 
 
 def build_record_controls(
@@ -336,6 +381,9 @@ def build_camera_group(
     binding.acquire_button.clicked.connect(
         lambda *_, n=name: widget.acquire_camera_image(n),
     )
+    binding.readout_combo.currentTextChanged.connect(
+        lambda mode, n=name: widget.set_camera_readout(n, mode),
+    )
     return camera_group
 
 
@@ -387,6 +435,28 @@ def build_image_controls(
     if current.binning in values:
         binding.binning_combo.setCurrentIndex(values.index(current.binning))
     camera_form.addRow("Image binning", binding.binning_combo)
+
+    binding.readout_combo = QtWidgets.QComboBox(camera_group)
+    # Offered on every camera, and refused by the ones that cannot do it.
+    # There is no capability question to ask here - `Camera` has no
+    # `readout_modes`, and widening a runtime_checkable protocol would
+    # make every existing adapter fail a check it passes today, which is
+    # the trap `Instrument` already documents. So the modes are offered
+    # and `configure` answers, exactly as it does for a binning factor
+    # the camera does not have.
+    binding.readout_combo.addItems(list(READOUT_MODES))
+    if current.readout in READOUT_MODES:
+        binding.readout_combo.setCurrentIndex(READOUT_MODES.index(current.readout))
+    binding.readout_combo.setToolTip(
+        "'image' keeps the sensor's 2D frame. 'projected' sums the whole "
+        "non-dispersive direction into a 1D spectrum, which is what a "
+        "spectrometer is set to for a spectrum image - a camera with no "
+        "dispersive direction refuses it.\n\n"
+        "Applied to the device as soon as it is changed, unlike the "
+        "exposure and binning above: this is a mode the detector is in, "
+        "not a setting one acquisition uses",
+    )
+    camera_form.addRow("Detector readout", binding.readout_combo)
 
     binding.acquire_button = QtWidgets.QPushButton("Acquire image", camera_group)
     binding.acquire_button.setToolTip(

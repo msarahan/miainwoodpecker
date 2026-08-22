@@ -13,7 +13,8 @@ described here is a thin wrapper over one function call there.
 uv run --extra device --extra viewer miainwoodpecker-viewer
 ```
 
-A napari window opens with an **Instrument** panel docked on the right.
+A window opens with an **Instrument** panel docked on the right and a
+viewing area that gives every dataset a panel of its own.
 By default you are connected to the simulated microscope
 (`nionswift-usim`), so everything on this page can be tried without an
 instrument. On a real system, launch with `--backend hardware`.
@@ -66,7 +67,7 @@ The layout will feel familiar, with a few deliberate differences:
 
 | You are used to | Here |
 |---|---|
-| Swift's live display panels / DM's **View** window | The napari canvas. One layer per source (`Scan (HAADF)`, `Camera`), with napari's own zoom, contrast, and colormap controls. |
+| Swift's live display panels / DM's **View** window | A window per source (`Scan (HAADF)`, `Camera`), tiled in the viewing area. Each is a napari canvas with its own zoom, contrast, and colormap controls. |
 | Swift's **Record** / DM's **Record** | **Record frames** in the Scan or Camera section — writes straight to disk as frames arrive, rather than into memory first. |
 | DM's *Save Display As...* | **Save displayed frame** — keeps exactly the frame on screen, without touching the instrument. |
 | Swift's project/library | A **session**: a plain folder of files. No database, no import step — the folder *is* the library, and you can browse it in a file manager. |
@@ -76,6 +77,48 @@ There is no equivalent of Swift's data-item graph or DM's in-app
 processing chains, on purpose: analysis belongs to the scientific Python
 tools you already use, and the [scripting guide](scripting-and-automation.md)
 shows how recordings load into them in one line.
+
+## The viewing area
+
+Every dataset gets **its own window**, and they are tiled side by side:
+each enabled detector, each running camera, each recording you open, and
+each analysis result. Comparing two detectors read out of the same pass
+is the ordinary case on a scanned instrument, so they are shown next to
+each other rather than stacked on one canvas where the only way to see
+either is to hide the other.
+
+Each window is a full napari canvas, so **zoom, pan, contrast and
+colormap are per panel**. Zooming into one corner of the HAADF image
+does not drag the diffraction pattern beside it out of view.
+
+**Nothing is ever stretched.** A panel whose shape does not match its
+data letterboxes — margin at the sides or top — and the picture keeps
+its geometry. That holds when you resize a window, when panels are
+tiled, and at every window shape in between; it is not a convention but
+a property of how each panel draws, and the test suite measures it
+rather than assuming it.
+
+**Arranging.** Drag a window by its title bar to move it, or its edges
+to resize it. Until you do, the area tiles itself as datasets come and
+go, so a new one never opens hidden underneath something already on
+screen. The first time you place a window yourself the area stops
+rearranging things around you, and new datasets are dropped into
+whatever space is clearest instead. **View → Tile documents**
+(<kbd>Ctrl</kbd>+<kbd>T</kbd>) tidies everything up again and hands
+tiling back; **View → Cascade documents** stacks them offset from one
+corner.
+
+**Closing a panel is not the same as stopping its source.** A closed
+panel stays closed — a running detector would otherwise reopen its
+window on the very next frame, which would make the close button
+useless. Start that detector or camera again and its panel comes back
+and comes to the front. The same is true of a panel that is merely
+buried: being covered while it runs is a legitimate way to arrange the
+area, and starting the source again is what says you want to look at it.
+
+**View → Show layer controls** turns on napari's contrast, colormap and
+gamma sidebar in every panel. It is off by default because at a tile's
+size that sidebar is bigger than the image it belongs to.
 
 ## The dock
 
@@ -138,10 +181,11 @@ pass as a matter of course — HAADF and MAADF arrive together, and on an
 EDX-fitted column the X-ray spectra come with them. Serial acquisition
 is the special case.
 
-Every checked detector gets its own napari layer and they are all fed
-from the **same pass**, so you can difference them per pixel — DPC,
-ratios — without wondering whether the probe moved in between. Enabling
-a second detector costs no extra dose and no extra time.
+Every checked detector gets its own **window** in the viewing area and
+they are all fed from the **same pass**, so you can difference them per
+pixel — DPC, ratios — without wondering whether the probe moved in
+between. Enabling a second detector costs no extra dose and no extra
+time, and puts its image beside the first rather than on top of it.
 
 At least one has to stay checked; a scan with none reads nothing out.
 Your selection is remembered between launches — it follows you and the
@@ -187,7 +231,7 @@ status line shows the acquisition rate.
 **Camera section** — **Start camera** runs that camera continuously.
 **Each camera gets its own section, and its own controls.** Start the USB
 microscope and the webcam beside it stays off; both can run at once, each
-into its own napari layer (`Camera`, `Camera (camera:2)`), so they never
+into its own window (`Camera`, `Camera (camera:2)`), so they never
 overwrite each other's image. On the camera server you get a section per
 camera found, without having named any of them.
 
@@ -256,14 +300,49 @@ it would refuse.
 Neither is affected by the **Frames** count beside it: an image is one
 acquisition, whatever that says.
 
-### Acquiring a spectrum image (4D-STEM)
+### Detector readout: images or spectra
 
-**Acquire spectrum image (4D)** drives the probe over a grid of
-**Positions** beam positions across the current field of view, keeping a
-full camera image at every one. The result is a 4D dataset —
-`(scan_y, scan_x, det_y, det_x)` — written straight to disk as it is
-acquired rather than assembled in memory first, so its size is bounded
-by the disk rather than by RAM.
+**Detector readout** sets what the detector delivers. `image` is the
+sensor's own 2D frame. `projected` sums the whole non-dispersive
+direction into a 1D spectrum, which is what an EEL spectrometer is set
+to for an ordinary spectrum image — vertical binning taken to its limit,
+traded for signal-to-noise.
+
+Unlike the exposure and binning above it, **this one applies to the
+device as soon as you change it.** Those describe an acquisition;
+readout describes the detector, and it decides the rank of every frame
+the detector produces. Stop the camera first — the live layer cannot
+change its number of axes underneath itself, and the control says so
+rather than doing something surprising.
+
+A camera with no dispersive direction refuses `projected` and explains
+why. That is not a bug to work around: summing one axis of a Ronchigram
+gives a line of numbers on an *angular* axis, which is not a spectrum,
+and the file it landed in would be a spectrum recording that is not one.
+
+### Acquiring a spectrum image
+
+**Acquire spectrum image** drives the probe over a grid of
+**Positions** beam positions across the current field of view, keeping
+the whole readout of one detector at every one — and reading every scan
+channel out of the same traversal, so the images you navigate the
+dataset with afterwards share its probe positions by construction.
+
+**Per-position detector** chooses which detector that is. What you get
+depends on the readout mode it is in, not on which button you pressed:
+
+| Detector readout | What lands on disk |
+|---|---|
+| `projected` | A **spectrum image**: `(scan_y, scan_x, energy)`, in NeXus's `NXspectrum` vocabulary — the same layout a standalone spectrum recording uses, so the same readers find it. |
+| `image` | A **4D stack**: `(scan_y, scan_x, det_y, det_x)`. For a Ronchigram camera that is 4D-STEM; for a spectrometer it is a spectrum image that kept its non-dispersive direction, which is a real experiment rather than a mistake. |
+
+The status line names which of the two it actually wrote, so leaving a
+spectrometer imaging by accident is visible immediately rather than at
+analysis time.
+
+Either way the data is written straight to disk as it is acquired rather
+than assembled in memory first, so its size is bounded by the disk rather
+than by RAM.
 
 **Most instruments will refuse, and the refusal is the point.** A
 spectrum image needs the scan and the detector synchronised in
@@ -284,6 +363,40 @@ target-area UI that would take its aspect ratio from a region you draw
 is not built yet), the acquisition blocks the window while it runs, and
 a saved pass appears in the **File** list as `0 frames` because that
 list only understands frame stacks.
+
+### Replaying a recorded session
+
+A **replay** backend serves a session someone already recorded on a
+microscope, through the same devices as everything else. It is the one
+backend whose data is real, and it behaves like an instrument rather
+than like a file: a pass takes as long as it took, one beam position at
+a time.
+
+```shell
+pixi run -e replay replay /path/to/session
+```
+
+Two things about it are different from every other backend, and both are
+deliberate:
+
+**The grid is not yours to choose.** A recording is the region and
+sampling the operator picked at the time, so **Positions** is ignored
+and the status line names the grid that was actually acquired. Asking
+for another one would mean resampling, and a dataset of the requested
+shape whose every pixel was interpolated looks exactly like a real one.
+
+**Nothing about it can be driven.** The exposure, the binning and the
+spectrometer's energy offset are all fixed by what was recorded, and
+setting them is refused with a sentence rather than accepted and
+ignored. That is the same rule the rest of this application follows: a
+control that appears to work and does nothing is worse than one that
+says it cannot.
+
+Recordings you make from a replay are real NeXus files holding real data
+acquired elsewhere. Every frame and every spectrum in them carries the
+`replay` backend name and the path of the file it came from, so they
+cannot be mistaken later for something taken at your instrument — but
+point the session at a directory where that will be obvious anyway.
 
 ### Recording a series
 
@@ -307,7 +420,7 @@ session has written.
 The **File** list shows this session's recordings with their state
 ("12 frames", "empty", "damaged"). Tick **List every session in the
 parent directory** to see the whole day, or **Open from disk...** for
-any path. **Open selected** loads the file into napari as its own layer;
+any path. **Open selected** opens the file in a window of its own;
 a multi-frame recording gets napari's frame slider.
 
 **Add note / Annotate opened** appends a timestamped note to a recording
@@ -323,7 +436,7 @@ process is reported as damaged.
 ## First-look analysis
 
 Three buttons in the Camera section run one real operation each and put
-the result back into napari as a new layer:
+the result into a window of its own:
 
 - **Analyze in HyperSpy** — mean projection over a short burst.
 - **Sum in LiberTEM** — sum over the burst.

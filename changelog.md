@@ -2,6 +2,157 @@
 
 ## Unreleased
 
+### Added
+
+- **A viewing area that shows more than one dataset at a time.** Every
+  source became a napari layer on one shared canvas, and napari puts
+  every layer at the world origin — so a 512x512 HAADF image and a
+  128x1024 EELS readout landed *on top of each other*, and the only way
+  to see either was to switch the other one's visibility off. Comparing
+  two detectors read out of the same pass is the ordinary case on a
+  scanned instrument, not an advanced one. `viewer/documents.py` now
+  gives each dataset its own window in a `QMdiArea`: each enabled
+  detector, each running camera, each opened recording, each analysis
+  result.
+  **A window per dataset rather than tiles on one canvas, because that
+  is what makes zoom and pan per panel.** Each document is a real
+  `napari.Viewer`, so focusing on one corner of the scan image does not
+  drag the diffraction pattern beside it out of view, and every panel
+  keeps napari's own contrast, colormap and gamma controls because it
+  *is* napari rather than a reimplementation of it.
+  **Nothing can be stretched by any of it.** napari's camera is
+  isotropic — one zoom scalar drives both axes — so a panel whose shape
+  does not suit its data letterboxes and the picture keeps its geometry.
+  `tests/integration/test_documents.py` measures drawn aspect against
+  data aspect after resizing panels to deliberately hostile shapes
+  (900x200, 200x700, 1000x120) for square, 64x1024 and 1024x64 data,
+  rather than trusting it.
+  **New datasets are tiled into place; a layout you arranged is yours.**
+  Nothing opens hidden underneath something already on screen, but the
+  first time a window is moved or resized by hand the area stops
+  rearranging things and later documents go wherever is clearest
+  instead. **View → Tile documents** hands tiling back.
+  **Closing a panel means it stays closed**, since a running detector
+  would otherwise reopen its window on the next frame and make the close
+  button useless. Starting that source again brings the panel back and
+  raises it — the same request as raising one that is merely buried,
+  which is a legitimate way to arrange the area while a source runs.
+  `LiveInstrumentWidget` is unchanged in shape: `DocumentBoard` presents
+  the slice of `napari.Viewer` the widget already used and routes each
+  call to a document, so a plain viewer still works everywhere the board
+  does and every existing widget test builds one directly.
+
+- **A device that replays a recorded session, at the speed it was
+  taken.** `devices/replay.py` opens a DigitalMicrograph spectrum-image
+  session and serves it through `Scanner`, `SynchronisedScanner` and
+  `Camera`, so the viewer, `PassWriter` and the NeXus layout run against
+  real data unchanged. It is deliberately a *device* and not a file
+  reader: a reader answers "what is in this file", and the question this
+  answers is "does the acquisition path work" — the synchronisation, the
+  pass, the streaming writer, the refusals, and the timing an operator
+  actually sits through.
+  **The correlation a `ScanPass` asserts is, for the first time,
+  historical fact rather than a property of the adapter.** The HAADF
+  channel in these sets was read out by the instrument *during* the
+  spectrum image's own acquisition, so `scan_sync = "detector"` is a
+  statement about what GMS did in 2011. Measured on the first set:
+  a carbon map integrated above the C-K edge correlates with the HAADF
+  of the same pass at **+0.995**.
+  **What it will not do is resample.** A recording is the grid the
+  operator chose — 22x25 beam positions — and any other geometry is
+  refused rather than interpolated to, because a cube of the requested
+  shape whose every pixel was invented looks exactly like a real one.
+  The viewer therefore asks a device for its geometry before using the
+  panel's: `native_scan_parameters` returns None for every device that
+  has no such constraint, and the square Positions spin box cannot even
+  express 22x25.
+  Everything is read from the file rather than assumed: the energy axis
+  by its *units* (this reader returns an SI as `(energy, y, x)` and a
+  line scan from the same session as `(x, energy)`, so neither the axis
+  order nor the `navigate` flag can be trusted); the dwell from
+  `SI.Acquisition.Pixel time (s)`; the binning by comparing the
+  acquisition's dispersion against the spectrometer's own; the
+  accelerating voltage and drift-tube setting from the microscope tags.
+  Timing is the recording's own unless `--speed` is passed, and a
+  compressed replay says so in the metadata of everything it produces —
+  as does the `replay` backend name, on every frame and every spectrum,
+  because by the time anyone reads a log the session has happened.
+  `pixi run -e replay replay <session> --list` says what a directory
+  holds; without `--list` it opens the viewer against one acquisition.
+  The reader is the new `replay` extra (RosettaSciIO alone, not
+  HyperSpy) and gets its own pixi environment, so a microscope PC does
+  not need the analysis stack to replay a session.
+
+- **A spectrum image can be gathered without hardware.** The preview
+  instrument grows an EEL spectrometer, `PreviewEELSCamera`, and a
+  synchronised pass can now read a detector out *as spectra* at every
+  beam position — so the whole path from device to `NXspectrum` on disk
+  is exercisable on a laptop with no microscope and no vendor SDK.
+  **What makes a detector a spectrometer is that one of its axes is
+  calibrated in energy rather than in space**, and nothing here treats
+  its *rank* as the distinguishing thing. The ordinary readout is the 2D
+  dispersed image, which is what the camera delivers by default and what
+  an operator aligns on; summing the non-dispersive direction to 1D is a
+  mode they choose, and keeping the whole 2D readout per beam position
+  is a real experiment rather than a misconfiguration.
+  So what a pass does with a target follows its **readout mode** and
+  never its type: projecting, it contributes a rank-3 spectrum image;
+  imaging, it contributes a 4D stack of whole detector readouts — the
+  same container a Ronchigram camera fills, because at that point the
+  two are the same shape of data. Which is why the axes now travel with
+  the stack: a `DiffractionStack` carries the detector's own
+  calibration, and `PassWriter` prefers it over its own default, since
+  otherwise the one fact separating a 2D EELS cube from a diffraction
+  cube would be absent from the file.
+  The spectral model encodes something checkable, which is the whole
+  reason it is more than decoration: a zero-loss peak whose *channel*
+  moves when the spectrometer's energy offset is driven while its
+  *energy* stays at zero, silicon and carbon plasmons, the power-law
+  background every quantification subtracts, the Si L2,3 and C K edges
+  at their real onsets with complementary heights, and Poisson noise. A
+  silicon map integrated out of a spectrum image therefore tracks the
+  HAADF channel **of the same pass** — a test asserts it, and a cube of
+  one repeated spectrum would pass a shape check and fail that.
+  The edge heights were sized against the background at their own
+  onsets rather than in isolation; the first attempt buried the silicon
+  edge in its own background, which is a fair model of a *bad*
+  acquisition and no use as the thing a demonstration points at.
+  The energy axis is nionswift-usim's — 0.5 eV per channel, channel 0 at
+  −20 eV — so the preview's spectrometer lands on the same axis as the
+  backend this project validated its calibration path against.
+  **The target name decides the detector**, which is a correction as
+  much as a feature: before this, a preview asked for two cameras served
+  a *Ronchigram* on the `eels_camera` target.
+  `PassWriter` gained `spectra=`, allocating a rank-3 dataset chunked
+  one beam position per chunk — deliberately not `SpectrumWriter`'s row
+  chunking, because that writer receives a finished map and this one is
+  filled position by position as the device acquires. Each signal is
+  spelled in the vocabulary its own kind already has: image channels and
+  cubes keep `data`, spectrum images use `NXspectrum`'s `intensity`,
+  `axis_energy`, `axis_j` and `axis_i`, exactly as a standalone spectrum
+  recording does. `read_pass` therefore asks each `NXdata` group what
+  its signal is called instead of assuming — which is what that
+  attribute is for, and a reader that assumed `data` would silently omit
+  every spectrum image from the list of what a file holds.
+  In the window: a **Detector readout** control per camera, and a
+  **Per-position detector** selector beside the positions count. The
+  readout control configures the device the moment it changes, unlike
+  the exposure and binning beside it — readout decides the rank of every
+  frame the detector produces, so a camera whose live view imaged while
+  its next acquisition projected would be in two states at once. It is
+  offered on every camera and refused by the ones that cannot project,
+  because `Camera` has no capability to ask and widening a
+  `runtime_checkable` protocol would break every adapter that passes its
+  check today; the refusal reaching the operator is the point, since one
+  who never sees it learns nothing about why their Ronchigram camera is
+  not a spectrometer. The target selector is honoured rather than
+  falling back to the first target, which would acquire against a
+  detector nobody chose and store it under that detector's name.
+  Known limits, unchanged and still stated: the grid is square and the
+  acquisition blocks the GUI thread. The second one matters more now
+  than it did — a spectrum image is what an operator will want a large
+  grid of.
+
 ### Changed
 
 - **Several detectors can be live at once, and the panel says so.** The

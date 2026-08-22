@@ -36,10 +36,50 @@ them to a scratch session directory, not to one holding real work.
 The controls are wired to the image, on purpose
 -----------------------------------------------
 Blanking the beam collapses the signal, defocusing damps the contrast,
-and moving the stage moves the field of view. A preview whose dials did
-nothing would let a broken Instrument panel — a signal never connected, a
-setter called on the wrong object — look exactly like a working one, and
-that is the panel this module exists to iterate on.
+moving the stage moves the field of view, and driving the spectrometer's
+energy offset moves the zero-loss peak across the EELS camera's channels.
+A preview whose dials did nothing would let a broken Instrument panel — a
+signal never connected, a setter called on the wrong object — look
+exactly like a working one, and that is the panel this module exists to
+iterate on.
+
+Two detectors, and two kinds of pass
+------------------------------------
+:class:`PreviewCamera` is a Ronchigram camera and
+:class:`PreviewEELSCamera` is an EEL spectrometer; which one a target
+gets is decided by its *name*, so an instrument built with two cameras
+serves a real spectrometer on the ``eels_camera`` target rather than a
+Ronchigram wearing that label.
+
+**What makes it a spectrometer is the axis, not the rank.** A
+spectrometer is a detector one of whose axes is calibrated in energy
+rather than in space; how many axes it has besides that one is the
+device's business. The ordinary EELS readout is 2D — the spectrum
+dispersed across a camera, and this one delivers that by default —
+and summing the non-dispersive direction to 1D is a mode an operator
+*chooses*, not what the word means. Keeping the whole 2D readout is a
+real experiment rather than a misconfiguration: momentum-resolved EELS
+and angle-resolved work need exactly it.
+
+So what a synchronised pass does with a target follows its **readout
+mode** and never its type. Projecting, it contributes a rank-3 spectrum
+image; imaging, it contributes a 4D stack of whole detector readouts —
+the same container a Ronchigram camera fills, because at that point the
+two are the same shape of data and differ only in what their axes mean.
+Which is why the axes travel with it: see :meth:`_diffraction_stack`.
+One method, :meth:`PreviewScanner.scan_synchronised`, therefore covers
+4D-STEM, 2D-readout spectrum imaging and projected spectrum imaging
+without branching on what kind of detector it was handed.
+
+**The synthetic data encodes something checkable**, which is the whole
+reason either model is more than decoration. A diffraction pattern is
+deflected by the specimen's local phase gradient, so a centre-of-mass
+map reconstructs that gradient; a spectrum's silicon and carbon edges
+vary with what the probe is standing on, so a silicon map integrated out
+of a spectrum image rises and falls with the HAADF channel *of the same
+pass*. An analysis run against a cube of identical patterns, or a
+spectrum image of one repeated spectrum, would "succeed" while proving
+nothing.
 """
 
 from __future__ import annotations
@@ -56,6 +96,7 @@ from miainwoodpecker.devices.interface import (
     BEAM_BLANKER_CONTROL,
     DEFOCUS_CONTROL,
     ENERGY_OFFSET_CONTROL,
+    IMAGE_READOUT,
     PROJECTED_READOUT,
     SCAN_SYNC_SCANNER,
     STAGE_POSITION_CONTROL,
@@ -64,8 +105,11 @@ from miainwoodpecker.devices.interface import (
     Frame,
     ScanParameters,
     ScanPass,
+    Spectrum,
 )
 from miainwoodpecker.devices.rpc import CAMERA_TARGET_NAMES, SCANNER_TARGET
+from miainwoodpecker.storage.calibration import METADATA_KEY, FrameCalibration
+from miainwoodpecker.storage.spectra import EELS_TECHNIQUE, TECHNIQUE_KEY
 
 if typing.TYPE_CHECKING:
     from collections.abc import Iterable, Mapping, Sequence
@@ -117,8 +161,88 @@ _MAX_PREVIEW_CAMERAS = len(CAMERA_TARGET_NAMES)
 # ever walking it off the edge, where a centre-of-mass would saturate
 # and stop reconstructing anything.
 _DEFLECTION_PER_UNIT_SLOPE = 0.35
+# The Ronchigram camera's angular scale, in milliradians per unbinned
+# pixel. Attached to its frames so the projected-readout refusal below
+# can say what the axis *is* rather than only that it is not energy —
+# and so the preview's camera frames carry axes at all, which every
+# other adapter's do.
+_RONCHIGRAM_MRAD_PER_PIXEL = 0.4
 _RNG_SEED = 20260816
 _CAMERA_SEED = _RNG_SEED + 1
+
+# --- The EELS spectrometer -------------------------------------------
+#
+# The energy axis is nionswift-usim's, not this module's invention:
+# 0.5 eV per channel with channel 0 at -20 eV, which is what that
+# simulator's EELS camera publishes through its calibration controls and
+# what docs/pre-hardware-work.md §1 measured. The preview's spectrometer
+# therefore lands on the same axis as the backend this project validated
+# its calibration path against, so a spectrum from one is directly
+# comparable with a spectrum from the other.
+#
+# 1024 channels of it spans -20 to 492 eV, which is what makes the model
+# below possible: the zero-loss peak, a plasmon, the silicon L2,3 edge at
+# 99.8 eV and the carbon K edge at 284.2 eV all fit in one acquisition.
+_EELS_CHANNELS = 1024
+_EELS_DISPERSION_EV = 0.5
+_EELS_BASE_OFFSET_EV = -20.0
+# Rows in the unprojected readout. A spectrometer disperses onto a 2D
+# sensor, and what that sensor sees is a horizontal streak a few rows
+# tall rather than an evenly lit rectangle - so the rows exist, carry no
+# information the projection loses, and are few because the interesting
+# direction is the other one.
+_EELS_ROWS = 64
+_EELS_STREAK_ROWS = 6.0
+# Energy resolution as the zero-loss peak's FWHM. A Schottky-source STEM
+# figure; at this dispersion it is two channels wide, which is what real
+# EELS at 0.5 eV/channel looks like rather than a defect of the model.
+_EELS_RESOLUTION_EV = 1.0
+_FWHM_PER_SIGMA = 2.354_820_045
+_EELS_ZLP_COUNTS_PER_MS = 4.0e4
+_EELS_DARK_COUNTS_PER_MS = 2.0
+# Silicon's bulk plasmon and amorphous carbon's, and how much plasmon
+# there is relative to the zero-loss peak - a specimen about a third of
+# an inelastic mean free path thick, which is the range a real EELS
+# operator aims for.
+_SILICON_PLASMON_EV = 16.7
+_CARBON_PLASMON_EV = 25.0
+_PLASMON_FWHM_EV = 4.0
+_PLASMON_RATIO = 0.35
+# The two core-loss edges, at their real onsets. The heights are counts
+# in the first channel above the onset, and they are chosen *relative to
+# the background there* rather than in isolation: the power law below
+# falls as E^-3, so it is about 113 counts per millisecond at the silicon
+# onset and about 5 at the carbon one. Both edges therefore rise clear of
+# it, which is what a spectrum from a thin specimen at a sensible dose
+# looks like. Sizing them without that comparison gave a silicon edge
+# buried in its own background — visible in the data only as a slightly
+# slower decay, which is a fair model of a *bad* acquisition and no use
+# as the thing a demonstration is pointed at.
+_SILICON_L_EDGE_EV = 99.8
+_CARBON_K_EDGE_EV = 284.2
+_SILICON_EDGE_COUNTS_PER_MS = 250.0
+_CARBON_EDGE_COUNTS_PER_MS = 60.0
+# Each edge is a sharp onset decaying as a power law, which is the shape
+# a background-subtracted edge has. The onset width keeps the first
+# channel finite rather than dividing by zero at the edge itself.
+_EDGE_DECAY = 2.5
+_EDGE_ONSET_WIDTH_EV = 5.0
+# The pre-edge background: AE^-r, the power law every EELS quantification
+# fits and subtracts. Referenced at 50 eV so the constant is a count rate
+# somewhere legible rather than an extrapolation to zero energy.
+_BACKGROUND_COUNTS_PER_MS = 900.0
+_BACKGROUND_DECAY = 3.0
+_BACKGROUND_REFERENCE_EV = 50.0
+# What a live EELS view sees with the probe parked: half silicon, half
+# carbon film. A spectrum image varies this per beam position, which is
+# the whole point of one.
+_EELS_LIVE_FRACTION = 0.5
+_EELS_SEED_OFFSET = 7
+# Which served target is the spectrometer. One of
+# `rpc.CAMERA_TARGET_NAMES`, spelled out here because that tuple is a
+# list of every camera target rather than a lookup, and this module needs
+# the one. A test pins that it is still a member.
+_EELS_TARGET = "eels_camera"
 
 
 def _now() -> datetime.datetime:
@@ -418,7 +542,7 @@ class PreviewScanner(_SyntheticSource):
     instrument : PreviewInstrument | None
         The instrument supplying defocus, stage position, and blanker
         state, or None to own a private one.
-    cameras : Mapping[str, PreviewCamera] | None
+    cameras : Mapping[str, _PreviewCameraBase] | None
         Cameras wired to this column, readable during a synchronised
         pass. None for a scan unit with nothing attached to it.
     """
@@ -426,7 +550,7 @@ class PreviewScanner(_SyntheticSource):
     def __init__(
         self,
         instrument: PreviewInstrument | None = None,
-        cameras: Mapping[str, PreviewCamera] | None = None,
+        cameras: Mapping[str, _PreviewCameraBase] | None = None,
     ) -> None:
         super().__init__(instrument, _RNG_SEED)
         self._pass_index = 0
@@ -435,7 +559,7 @@ class PreviewScanner(_SyntheticSource):
         # synchronised acquisition is the scan unit driving the detector
         # trigger, so a camera nothing has wired to the column is not
         # synchronisable however reachable it is otherwise.
-        self._cameras: dict[str, PreviewCamera] = dict(cameras or {})
+        self._cameras: dict[str, _PreviewCameraBase] = dict(cameras or {})
 
     @property
     def scanner_id(self) -> str:
@@ -745,6 +869,43 @@ class PreviewScanner(_SyntheticSource):
             )
             for index in requested
         ]
+        # What a target contributes is decided by the readout mode it is
+        # *in*, not by what kind of detector it is: a spectrometer left
+        # imaging really does produce a full frame per beam position, and
+        # storing that as a 4D stack is the truthful thing to do with it.
+        # The camera's settings are the acquisition's settings, which is
+        # also why `DiffractionStack` carries one `CameraParameters` for
+        # the whole stack rather than one per position.
+        destinations = dict(into or {})
+        # Every device that read this traversal out, named once so a
+        # spectrum image can say what shares its probe positions. The
+        # scanner appears as one id covering all its channels, which is
+        # what it is: one device, several detectors.
+        participants = [
+            *([self.scanner_id] if requested else []),
+            *(self._cameras[name].camera_id for name in wanted),
+        ]
+        diffraction = {}
+        spectra = {}
+        for name in wanted:
+            if self._cameras[name].parameters().readout == PROJECTED_READOUT:
+                spectra[name] = self._spectrum_image(
+                    name,
+                    lattice,
+                    parameters=parameters,
+                    pass_id=pass_id,
+                    timestamp=timestamp,
+                    destination=destinations.get(name),
+                    participants=participants,
+                )
+            else:
+                diffraction[name] = self._diffraction_stack(
+                    name,
+                    lattice,
+                    pass_id=pass_id,
+                    timestamp=timestamp,
+                    destination=destinations.get(name),
+                )
         return ScanPass(
             pass_id=pass_id,
             parameters=parameters,
@@ -754,22 +915,148 @@ class PreviewScanner(_SyntheticSource):
             # was produced. Reported as scanner-mastered because that is
             # what this loop is: the scan drives and the camera follows.
             scan_sync=SCAN_SYNC_SCANNER,
-            diffraction={
-                name: self._diffraction_stack(
-                    name,
-                    lattice,
-                    pass_id,
-                    timestamp,
-                    (into or {}).get(name),
+            diffraction=diffraction,
+            spectra=spectra,
+        )
+
+    def _spectrum_image(  # noqa: PLR0913 - one call site; splitting it would only hide the arity
+        self,
+        name: str,
+        lattice: np.ndarray,
+        *,
+        parameters: ScanParameters,
+        pass_id: str,
+        timestamp: datetime.datetime,
+        destination: np.ndarray | None,
+        participants: Sequence[str],
+    ) -> Spectrum:
+        """
+        Build one spectrometer's spectrum image for an already-traversed pass.
+
+        The spectrum-side twin of :meth:`_diffraction_stack`, and it
+        differs in one thing that matters: a
+        :class:`~miainwoodpecker.devices.interface.Spectrum` **cannot
+        exist without its energy axis**, so a target that is projecting
+        but has no dispersive direction is refused here rather than
+        stored as counts against nothing. Nothing this module assembles
+        can reach that state — a camera with no dispersive axis refuses a
+        projected readout in ``configure`` — but the scanner accepts the
+        cameras it is given, and a detector that lies about its own axes
+        should meet an error rather than produce a spectrum image whose
+        energies are pixel indices.
+
+        The composition under the probe is read from the same sampled
+        specimen field the image channels are read from, which is what
+        makes a silicon map computed from this pass track the HAADF
+        channel of the same pass rather than merely resemble it.
+
+        Parameters
+        ----------
+        name : str
+            The camera's target name.
+        lattice : np.ndarray
+            The pass's sampled specimen modulation, one value per beam
+            position.
+        parameters : ScanParameters
+            The pass's scan geometry, recorded so storage calibrates the
+            navigation axes through the path a scanned frame uses.
+        pass_id : str
+            Identifier shared by every output of this pass.
+        timestamp : datetime.datetime
+            The pass's acquisition time.
+        destination : np.ndarray | None
+            A pre-allocated cube to fill, or None to allocate one.
+        participants : Sequence[str]
+            Every device id read out during this pass, recorded as the
+            spectrum's ``simultaneous_with``.
+
+        Returns
+        -------
+        Spectrum
+            The rank-3 spectrum image, energy on the last axis.
+
+        Raises
+        ------
+        ValueError
+            If the target has no energy axis, or if ``destination`` does
+            not match what the pass will produce.
+        """
+        camera = self._cameras[name]
+        calibration = camera.frame_calibration()
+        energy_name = calibration.energy_axis_name()
+        if energy_name is None:
+            msg = (
+                f"{name} is set to a projected readout but reports no "
+                f"energy-calibrated axis, so its counts are not spectra; a "
+                f"camera with no dispersive direction cannot produce a "
+                f"spectrum image"
+            )
+            raise ValueError(msg)
+        energy = calibration.axis(energy_name).converted_to("eV")
+        channels = camera.channel_count
+        expected = (*lattice.shape, channels)
+        cube = destination
+        if cube is None:
+            cube = np.empty(expected, dtype=np.float32)
+        elif tuple(cube.shape) != expected:
+            msg = (
+                f"destination for {name} has shape {tuple(cube.shape)}, but "
+                f"the pass produces {expected} ({lattice.shape} beam "
+                f"positions of {channels} energy channels)"
+            )
+            raise ValueError(msg)
+        # Written through position by position for the reason the
+        # diffraction cube is: the destination may be an h5py dataset
+        # chunked one beam position per chunk, and then each assignment
+        # is a single chunk write that overlaps the next position's
+        # exposure instead of following the whole acquisition.
+        for row in range(lattice.shape[0]):
+            for column in range(lattice.shape[1]):
+                cube[row, column] = camera.readout_at(
+                    self._probe_state(lattice, row, column),
                 )
-                for name in wanted
-            },
+        settings = camera.parameters()
+        metadata: dict[str, object] = {
+            "device_id": camera.camera_id,
+            "camera_type": camera.camera_type,
+            "scan_pass_id": pass_id,
+            # Which device was master, in the same key a vendor-owned map
+            # job would report it under. The pass carries this as a field
+            # too; it is repeated here so a spectrum image pulled out of
+            # the pass on its own still says how its positions were
+            # guaranteed.
+            "scan_sync": SCAN_SYNC_SCANNER,
+            # Every signal of this pass shares these probe positions, and
+            # this call is what establishes that - so naming them is a
+            # fact about how the data was produced, not the bare
+            # correlation hint docs/adapters/spectrum-detectors.md §2.3
+            # rejected as "an id that nothing establishes".
+            "simultaneous_with": list(participants),
+            "fov_size_nm": list(parameters.fov_size_nm),
+            "pixel_time_us": parameters.pixel_time_us,
+            "exposure_ms": settings.exposure_ms,
+            "binning": settings.binning,
+            "defocus_nm": self._instrument.defocus_nm(),
+        }
+        if camera.camera_type == EELS_TECHNIQUE:
+            # The same rule `spectrum_from_projected_frame` follows, for
+            # the same reason: once a spectrum image lands in the
+            # NXspectrum layout, this string is the only thing on disk
+            # distinguishing electron energy losses from X-ray lines.
+            metadata[TECHNIQUE_KEY] = EELS_TECHNIQUE
+        return Spectrum(
+            data=cube,
+            timestamp=timestamp,
+            energy_offset_ev=energy.offset,
+            energy_scale_ev=energy.scale,
+            metadata=metadata,
         )
 
     def _diffraction_stack(
         self,
         name: str,
         lattice: np.ndarray,
+        *,
         pass_id: str,
         timestamp: datetime.datetime,
         destination: np.ndarray | None,
@@ -802,15 +1089,8 @@ class PreviewScanner(_SyntheticSource):
             If ``destination`` does not cover the pass's beam positions.
         """
         camera = self._cameras[name]
-        # The deflection model: the probe is pushed off axis by the local
-        # slope of the specimen field, which is what a real phase
-        # gradient does to the bright-field disc. np.gradient over the
-        # beam-position grid, so the deflection is a property of the
-        # sampled region rather than of the grid's resolution.
-        gradient_y, gradient_x = np.gradient(lattice)
-        scale = _DEFLECTION_PER_UNIT_SLOPE
-        detector = _CAMERA_PIXELS // camera.parameters().binning
-        expected = (*lattice.shape, detector, detector)
+        detector = camera.readout_shape
+        expected = (*lattice.shape, *detector)
         cube = destination
         if cube is None:
             cube = np.empty(expected, dtype=np.float32)
@@ -822,9 +1102,9 @@ class PreviewScanner(_SyntheticSource):
             # pre-allocating gigabytes deserves to be told which of the
             # two numbers it got wrong.
             msg = (
-                f"destination for {name} has navigation shape "
-                f"{tuple(cube.shape)}, but the pass produces {expected} "
-                f"({lattice.shape} beam positions of {detector}x{detector})"
+                f"destination for {name} has shape {tuple(cube.shape)}, but "
+                f"the pass produces {expected} ({lattice.shape} beam "
+                f"positions of {detector})"
             )
             raise ValueError(msg)
         # Written into the cube position by position rather than built as
@@ -835,11 +1115,8 @@ class PreviewScanner(_SyntheticSource):
         # the acquisition it exists to prototype.
         for row in range(lattice.shape[0]):
             for column in range(lattice.shape[1]):
-                cube[row, column] = camera.diffraction_at(
-                    (
-                        float(gradient_y[row, column]) * scale,
-                        float(gradient_x[row, column]) * scale,
-                    ),
+                cube[row, column] = camera.readout_at(
+                    self._probe_state(lattice, row, column),
                 )
         return DiffractionStack(
             data=cube,
@@ -848,18 +1125,164 @@ class PreviewScanner(_SyntheticSource):
             metadata={
                 "scan_pass_id": pass_id,
                 "device_id": camera.camera_id,
+                "camera_type": camera.camera_type,
                 "timestamp": timestamp.isoformat(),
                 "defocus_nm": self._instrument.defocus_nm(),
+                # The per-position axes, carried rather than left to the
+                # writer's default. This container's name says
+                # "diffraction" and its contents are whatever the
+                # detector delivered per beam position - for a
+                # spectrometer left imaging, that is a spectrum
+                # dispersed across a camera, whose fast axis is energy
+                # and not an angle. Storing those axes as an
+                # uncalibrated `det_x` would lose the one fact that
+                # makes the detector a spectrometer.
+                METADATA_KEY: _calibration_metadata(camera.frame_calibration()),
             },
+        )
+
+    @staticmethod
+    def _probe_state(lattice: np.ndarray, row: int, column: int) -> _ProbeState:
+        """
+        Return what the specimen looks like under the probe at one position.
+
+        **The one place the specimen model reaches the detectors**, and
+        the reason a pass from this instrument is internally consistent:
+        both quantities are read from the *same* sampled field that
+        :meth:`_read_out` turns into detector intensity, so a
+        centre-of-mass map, an elemental map and the HAADF channel of one
+        pass are all descriptions of one specimen rather than three
+        independent inventions.
+
+        The deflection is the local *slope* of that field, which is what
+        a real phase gradient does to the transmitted disc, and the
+        composition is its local *value*. Computing the gradient here
+        rather than once for the whole grid costs a few neighbour lookups
+        per position and keeps the two quantities defined in one place;
+        the alternative had the gradient live in the camera loop, where
+        the spectrometer could not see it.
+
+        Parameters
+        ----------
+        lattice : np.ndarray
+            The pass's sampled specimen modulation.
+        row : int
+            Beam position's slow-axis index.
+        column : int
+            Beam position's fast-axis index.
+
+        Returns
+        -------
+        _ProbeState
+            The local specimen state.
+        """
+        height, width = lattice.shape
+        up = lattice[max(row - 1, 0), column]
+        down = lattice[min(row + 1, height - 1), column]
+        left = lattice[row, max(column - 1, 0)]
+        right = lattice[row, min(column + 1, width - 1)]
+        # Centred differences, halved, which is what np.gradient computes
+        # in the interior and at the edges degrades to the one-sided
+        # difference it uses there.
+        scale = _DEFLECTION_PER_UNIT_SLOPE / 2.0
+        return _ProbeState(
+            deflection=(
+                float(down - up) * scale,
+                float(right - left) * scale,
+            ),
+            silicon_fraction=_silicon_fraction(float(lattice[row, column])),
         )
 
     def close(self) -> None:
         """Release nothing; this scanner owns no resources."""
 
 
-class PreviewCamera(_SyntheticSource):
+def _calibration_metadata(calibration: FrameCalibration) -> dict[str, object]:
     """
-    A camera producing a synthetic Ronchigram.
+    Render a frame calibration as the plain data a frame's metadata holds.
+
+    ``metadata["calibration"]`` accepts a :class:`FrameCalibration`
+    object as well as this mapping, so the object would work in-process
+    — and the preview is in-process. It is rendered anyway, for two
+    reasons that outlive that convenience: it is what every other
+    adapter puts there (``nion_server`` resolves Nion's own controls into
+    exactly this shape, because an object cannot cross the device-server
+    boundary), and a stored pass writes its frame metadata as JSON, where
+    an object degrades to whatever ``str()`` makes of it.
+
+    Parameters
+    ----------
+    calibration : FrameCalibration
+        The calibration to render.
+
+    Returns
+    -------
+    dict[str, object]
+        One ``{kind, scale, offset, units}`` mapping per axis, keyed
+        ``"y"`` and ``"x"``.
+    """
+    return {
+        name: {
+            "kind": axis.kind.value,
+            "scale": axis.scale,
+            "offset": axis.offset,
+            "units": axis.units,
+        }
+        for name, axis in (("y", calibration.y), ("x", calibration.x))
+    }
+
+
+@dataclasses.dataclass(frozen=True)
+class _ProbeState:
+    """
+    What the specimen looks like under the probe at one beam position.
+
+    The scan unit samples the specimen once per pass and every detector
+    reads *that* sample out — which is what makes the outputs of a pass
+    correlated rather than merely simultaneous. This is the sample, in
+    the terms each detector needs it: an angular deflection for a camera
+    watching the transmitted disc, a composition for one dispersing
+    energy losses.
+
+    Both are carried for every position rather than each detector being
+    handed its own kind, because that is the honest shape of the thing:
+    one probe position has one local specimen state, and which parts of
+    it a given detector is sensitive to is the detector's business.
+
+    Attributes
+    ----------
+    deflection : tuple[float, float]
+        How far the local phase gradient pushes the transmitted disc off
+        axis, in detector half-widths, as ``(y, x)``.
+    silicon_fraction : float
+        How much of what the probe stands on is silicon rather than
+        carbon film, in ``[0, 1]``.
+    """
+
+    deflection: tuple[float, float]
+    silicon_fraction: float
+
+
+#: What a *live* view sees, with the probe parked rather than scanning:
+#: an undeflected disc over half silicon, half carbon film.
+_LIVE_PROBE_STATE = _ProbeState(
+    deflection=(0.0, 0.0),
+    silicon_fraction=_EELS_LIVE_FRACTION,
+)
+
+
+class _PreviewCameraBase(_SyntheticSource):
+    """
+    The lifecycle and settings every preview camera shares.
+
+    Factored out when the EELS spectrometer arrived, because the two
+    detectors differ in exactly one thing — what they make of a probe
+    position — and agree on everything else: the start/stop contract, the
+    binning refusal, the settings value object, and the metadata
+    vocabulary a frame carries. A subclass supplies :meth:`readout_at`,
+    :attr:`readout_shape` and :meth:`frame_calibration`; this class
+    supplies the rest, including the live view, which is just
+    :meth:`readout_at` with the probe parked.
 
     Implements :class:`~miainwoodpecker.devices.interface.Camera`,
     including its start/stop contract: acquiring before ``start`` is an
@@ -870,8 +1293,8 @@ class PreviewCamera(_SyntheticSource):
     Parameters
     ----------
     instrument : PreviewInstrument | None
-        The instrument supplying defocus and blanker state, or None to
-        own a private one.
+        The instrument supplying defocus, blanker and energy-offset
+        state, or None to own a private one.
     camera_id : str
         Stable identifier, so two preview cameras are distinguishable.
     seed : int | None
@@ -882,6 +1305,26 @@ class PreviewCamera(_SyntheticSource):
         camera would otherwise look exactly like two working ones.
     """
 
+    #: The vendor's own label for this kind of detector, as
+    #: ``Frame.metadata["camera_type"]``. What
+    #: :func:`~miainwoodpecker.storage.spectra.spectrum_from_projected_frame`
+    #: reads to tell an EELS recording from an EDX one once both wear the
+    #: same 1D shape.
+    _CAMERA_TYPE = "ronchigram"
+
+    #: Whether this detector can deliver
+    #: :data:`~miainwoodpecker.devices.interface.PROJECTED_READOUT`.
+    #: A camera with no dispersive direction cannot, and the interface
+    #: says such a camera refuses in ``configure`` rather than silently
+    #: imaging — so this drives a refusal, not a fallback.
+    _CAN_PROJECT = False
+
+    #: Who summed, on a projected frame. ``"sensor"`` when the detector
+    #: accumulated before readout, ``"server"`` when something above it
+    #: summed a delivered image; see
+    #: :class:`~miainwoodpecker.devices.interface.Frame`.
+    _PROJECTED_BY = "sensor"
+
     def __init__(
         self,
         instrument: PreviewInstrument | None = None,
@@ -891,7 +1334,15 @@ class PreviewCamera(_SyntheticSource):
         super().__init__(instrument, _CAMERA_SEED if seed is None else seed)
         self._camera_id = camera_id
         self._started = False
-        self._parameters = CameraParameters(exposure_ms=_DEFAULT_EXPOSURE_MS)
+        # Every camera starts imaging, including the spectrometer.
+        # A projected readout is what an operator switches a spectrometer
+        # into for a spectrum image, and starting there would mean the
+        # live view of the EELS camera was a line of numbers rather than
+        # the dispersed image an operator actually aligns on.
+        self._parameters = CameraParameters(
+            exposure_ms=_DEFAULT_EXPOSURE_MS,
+            readout=IMAGE_READOUT,
+        )
 
     @property
     def camera_id(self) -> str:
@@ -904,6 +1355,18 @@ class PreviewCamera(_SyntheticSource):
             The camera's id.
         """
         return self._camera_id
+
+    @property
+    def camera_type(self) -> str:
+        """
+        Return the vendor-style label for what kind of detector this is.
+
+        Returns
+        -------
+        str
+            The value frames carry as ``metadata["camera_type"]``.
+        """
+        return self._CAMERA_TYPE
 
     @property
     def binning_values(self) -> Sequence[int]:
@@ -940,19 +1403,27 @@ class PreviewCamera(_SyntheticSource):
         Returns
         -------
         CameraParameters
-            The settings in force, which this camera takes unchanged.
+            The settings in force, which these cameras take unchanged.
 
         Raises
         ------
         ValueError
-            If the requested binning is not one this camera offers.
-            Refused rather than rounded, so the viewer's own handling of a
-            rejected setting is reachable.
+            If the requested binning is not one this camera offers, or if
+            a projected readout is asked of a camera with no dispersive
+            direction. Both refused rather than quietly approximated, so
+            the viewer's own handling of a rejected setting is reachable.
         """
         if parameters.binning not in _BINNING_VALUES:
             msg = (
                 f"binning {parameters.binning} is not supported; "
                 f"{self._camera_id} offers {list(_BINNING_VALUES)}"
+            )
+            raise ValueError(msg)
+        if parameters.readout == PROJECTED_READOUT and not self._CAN_PROJECT:
+            msg = (
+                f"{self._camera_id} cannot project: it has no dispersive "
+                f"direction, so summing one of its axes would produce a "
+                f"line of numbers that is not a spectrum"
             )
             raise ValueError(msg)
         self._parameters = parameters
@@ -973,7 +1444,9 @@ class PreviewCamera(_SyntheticSource):
         Returns
         -------
         Frame
-            A Ronchigram-like image, or a 1D spectrum under
+            Whatever this detector produces at its current settings: 2D
+            under :data:`~miainwoodpecker.devices.interface.IMAGE_READOUT`
+            and 1D under
             :data:`~miainwoodpecker.devices.interface.PROJECTED_READOUT`.
 
         Raises
@@ -987,21 +1460,268 @@ class PreviewCamera(_SyntheticSource):
                 "call start() before acquire_frame()"
             )
             raise RuntimeError(msg)
-        pixels = _CAMERA_PIXELS // self._parameters.binning
-        data = self._ronchigram(pixels)
+        data = self._readout_data()
+        metadata: dict[str, object] = {
+            "device_id": self._camera_id,
+            "frame_index": self._next_frame_index(),
+            "camera_name": self._camera_id,
+            "camera_type": self._CAMERA_TYPE,
+            "exposure_ms": self._parameters.exposure_ms,
+            "binning": self._parameters.binning,
+            "readout": self._parameters.readout,
+            "defocus_nm": self._instrument.defocus_nm(),
+            METADATA_KEY: _calibration_metadata(self.frame_calibration()),
+        }
         if self._parameters.readout == PROJECTED_READOUT:
-            data = data.sum(axis=0)
+            # Present only on a projected frame, as the interface's
+            # vocabulary specifies: on an imaged one there is nobody to
+            # name, and a key saying "sensor" about a frame nothing summed
+            # would be a claim about noise statistics that is not true.
+            metadata["projected_by"] = self._PROJECTED_BY
         return Frame(
             data=np.asarray(data, dtype=np.float32),
             timestamp=_now(),
-            metadata={
-                "device_id": self._camera_id,
-                "frame_index": self._next_frame_index(),
-                "exposure_ms": self._parameters.exposure_ms,
-                "binning": self._parameters.binning,
-                "readout": self._parameters.readout,
-                "defocus_nm": self._instrument.defocus_nm(),
-            },
+            metadata=metadata,
+        )
+
+    def _readout_data(self) -> np.ndarray:
+        """
+        Return the array a live view sees, with the probe parked.
+
+        Returns
+        -------
+        numpy.ndarray
+            The frame data, before it is wrapped and stamped.
+        """
+        return self.readout_at(_LIVE_PROBE_STATE)
+
+    @property
+    def readout_shape(self) -> tuple[int, ...]:
+        """
+        Return the shape of one readout at the current settings.
+
+        Asked of the detector rather than derived from it, because a
+        synchronised pass allocates its whole destination from this
+        answer *before* acquiring anything — and an allocation of the
+        wrong size is refused rather than reshaped around.
+
+        Returns
+        -------
+        tuple[int, ...]
+            The per-position array shape: 2D imaging, 1D projecting.
+
+        Raises
+        ------
+        NotImplementedError
+            If a subclass has not said what it produces.
+        """
+        raise NotImplementedError
+
+    def readout_at(self, state: _ProbeState) -> np.ndarray:
+        """
+        Return one readout for a probe standing on a given specimen state.
+
+        The per-beam-position call a synchronised pass drives, and
+        deliberately **not** :meth:`acquire_frame`: that one advances the
+        frame counter and honours the start/stop contract, neither of
+        which applies to a readout the scan unit is driving.
+
+        One method for both detectors, which is what lets
+        :meth:`PreviewScanner.scan_synchronised` traverse the probe once
+        and read out whatever is wired to the column without knowing what
+        kind of thing it is.
+
+        Parameters
+        ----------
+        state : _ProbeState
+            The local specimen state at this beam position.
+
+        Returns
+        -------
+        numpy.ndarray
+            The readout, of :attr:`readout_shape`.
+
+        Raises
+        ------
+        NotImplementedError
+            If a subclass has not said what it produces.
+        """
+        raise NotImplementedError
+
+    def frame_calibration(self) -> FrameCalibration:
+        """
+        Return the physical axes of the frames this camera produces.
+
+        Not part of :class:`~miainwoodpecker.devices.interface.Camera`,
+        and deliberately: a camera publishes its calibration through
+        ``metadata["calibration"]``, which is plain data and crosses the
+        device-server boundary. This is the preview's *in-process*
+        shortcut to the same fact, and it exists because
+        :meth:`PreviewScanner.scan_synchronised` has to know whether a
+        target's surviving axis is an energy one **before** it acquires
+        anything — a spectrum image is allocated from the answer.
+
+        Returns
+        -------
+        FrameCalibration
+            The per-axis calibration, in the frame's ``(y, x)`` order.
+
+        Raises
+        ------
+        NotImplementedError
+            If a subclass has not said what its axes are.
+        """
+        raise NotImplementedError
+
+    # --- The energy-dispersive contract -------------------------------
+    #
+    # The two things a scan unit needs from a detector it is going to
+    # read out per beam position *as spectra*: how long a spectrum is, so
+    # the destination can be allocated before the acquisition starts, and
+    # how to produce one. Declared here rather than only on the
+    # spectrometer so the contract is visible in one place, and so a
+    # camera with no energy axis fails with a sentence naming that fact
+    # rather than with a bare AttributeError.
+
+    @property
+    def channel_count(self) -> int:
+        """
+        Return the length of this detector's energy-dispersive axis.
+
+        A property of the detector and its binning, not of the readout
+        mode: the dispersive axis is the same length whether or not the
+        other one has been summed away.
+
+        Returns
+        -------
+        int
+            How many energy channels a spectrum from this detector has.
+
+        Raises
+        ------
+        NotImplementedError
+            If this camera has no dispersive direction.
+        """
+        raise NotImplementedError(self._no_projection_message())
+
+    def spectrum_at(self, silicon_fraction: float) -> np.ndarray:
+        """
+        Return one spectrum for a probe standing on a given composition.
+
+        Parameters
+        ----------
+        silicon_fraction : float
+            How much of what the probe is standing on is silicon rather
+            than carbon film, in ``[0, 1]``.
+
+        Returns
+        -------
+        numpy.ndarray
+            Counts per channel.
+
+        Raises
+        ------
+        NotImplementedError
+            If this camera has no dispersive direction.
+        """
+        del silicon_fraction
+        raise NotImplementedError(self._no_projection_message())
+
+    def _no_projection_message(self) -> str:
+        """
+        Return the sentence a non-dispersive camera refuses projection with.
+
+        Returns
+        -------
+        str
+            The refusal, naming the camera.
+        """
+        return (
+            f"{self._camera_id} has no energy-dispersive axis, so it "
+            f"produces no spectra; only a detector with one can be read out "
+            f"as spectra"
+        )
+
+    def close(self) -> None:
+        """Release nothing; these cameras own no resources."""
+
+
+class PreviewCamera(_PreviewCameraBase):
+    """
+    A camera producing a synthetic Ronchigram.
+
+    The detector an operator aligns against: a bright central disc
+    crossed by rings whose visibility falls with defocus, on an angular
+    axis. During a synchronised pass it is the 4D-STEM detector, its disc
+    deflected per beam position by the specimen's local phase gradient
+    (:meth:`PreviewScanner.scan_synchronised`).
+
+    **It refuses to project**, which is not an omission. A projected
+    readout sums the whole non-dispersive direction, and a Ronchigram
+    camera has no dispersive direction for the survivor to be — the
+    result would be a line of numbers with an angular axis, which
+    :func:`~miainwoodpecker.storage.spectra.spectrum_from_projected_frame`
+    would then refuse to store as a spectrum, one layer too late to say
+    anything useful. The interface asks such a camera to refuse in
+    ``configure``, and this one does; the EELS camera below is where a
+    projected readout means something.
+    """
+
+    @property
+    def readout_shape(self) -> tuple[int, ...]:
+        """
+        Return the square frame this camera produces at the current binning.
+
+        Returns
+        -------
+        tuple[int, ...]
+            ``(pixels, pixels)``.
+        """
+        pixels = _CAMERA_PIXELS // self._parameters.binning
+        return (pixels, pixels)
+
+    def readout_at(self, state: _ProbeState) -> np.ndarray:
+        """
+        Return one Ronchigram, its disc pushed off axis by the specimen.
+
+        The deflection is the part of the probe state this detector is
+        sensitive to; the composition beside it means nothing here, which
+        is exactly why the state carries both and lets the detector
+        choose.
+
+        Parameters
+        ----------
+        state : _ProbeState
+            The local specimen state at this beam position.
+
+        Returns
+        -------
+        numpy.ndarray
+            The pattern, float32, at the camera's current binning.
+        """
+        return np.asarray(
+            self._ronchigram(self.readout_shape[0], state.deflection),
+            dtype=np.float32,
+        )
+
+    def frame_calibration(self) -> FrameCalibration:
+        """
+        Return the angular axes a Ronchigram is measured on.
+
+        Centred on the optic axis, which is the convention
+        docs/pre-hardware-work.md §1 found the vendor's own calibration
+        controls already using — the offset that arrives from the
+        instrument is the centred one.
+
+        Returns
+        -------
+        FrameCalibration
+            Milliradians per pixel on both axes, centred.
+        """
+        return FrameCalibration.diffraction(
+            _RONCHIGRAM_MRAD_PER_PIXEL * self._parameters.binning,
+            units="mrad",
+            shape=self.readout_shape,
         )
 
     def _ronchigram(
@@ -1046,30 +1766,424 @@ class PreviewCamera(_SyntheticSource):
             + self._noise(shape)
         )
 
-    def diffraction_at(self, deflection: tuple[float, float]) -> np.ndarray:
+
+class PreviewEELSCamera(_PreviewCameraBase):
+    """
+    An EEL spectrometer camera, and the preview's second kind of signal.
+
+    A spectrometer disperses electrons that have lost energy in the
+    specimen across a sensor, so what this produces under
+    :data:`~miainwoodpecker.devices.interface.IMAGE_READOUT` is a 2D
+    frame in which the fast axis is energy and the slow one is not —
+    exactly the case
+    :meth:`~miainwoodpecker.storage.calibration.FrameCalibration.spectrum`
+    describes — and under
+    :data:`~miainwoodpecker.devices.interface.PROJECTED_READOUT` the same
+    spectrum with that direction summed away.
+
+    **Neither rank is the "real" one.** What makes this a spectrometer is
+    that one axis is calibrated in energy rather than in space; the rest
+    of its shape is a fact about the detector behind it, and this one
+    happens to have rows. Projecting is a *choice* an operator makes to
+    trade the non-dispersive direction for signal-to-noise, and it is
+    what an ordinary EELS spectrum image is acquired with — but keeping
+    the whole 2D readout per beam position is a real experiment too, not
+    a mistake, and this camera supports being read out either way.
+    Defaulting to the 2D image is what a spectrometer's live view shows,
+    and it is what an operator aligns the spectrum on the detector with.
+
+    **What is modelled, and why each part is there.** The point of a
+    synthetic spectrum is that something computed from it has a right
+    answer; a plausible-looking curve that encodes nothing would let a
+    broken spectrum-image path look exactly like a working one.
+
+    * a **zero-loss peak** at 0 eV, whose position on the *channel* axis
+      moves when the spectrometer's energy offset does — that control is
+      wired end to end already
+      (:func:`~miainwoodpecker.acquisition.sequence.energy_offset_series`),
+      and this is the detector on which its effect is visible;
+    * a **plasmon**, at silicon's 16.7 eV or amorphous carbon's 25 eV in
+      proportion to what the probe is standing on, so the low-loss region
+      carries composition too;
+    * a **power-law background**, the ``AE^-r`` every EELS
+      quantification fits and subtracts — without it, an edge integral
+      taken naively would be right, and on real data it is not;
+    * the **silicon L2,3 edge** at 99.8 eV and the **carbon K edge** at
+      284.2 eV, with heights that are complementary across the specimen.
+      That is the checkable answer: a silicon map made from a spectrum
+      image tracks the HAADF channel of the same pass, and a carbon map
+      is its negative.
+    * **Poisson noise**, because counting statistics are what a real
+      acquisition trades exposure against.
+
+    What is deliberately **not** modelled: multiple scattering (so
+    thickness is a single-scattering fiction and a log-ratio thickness
+    measurement from this would be meaningless), the fine structure at
+    each edge onset, and any relationship between beam current and count
+    rate. The rule
+    :mod:`~miainwoodpecker.devices.spectrum_server` sets applies here
+    too — a simulator that faked those would invite trusting numbers from
+    it.
+
+    The specimen is silicon on a carbon film, which is not an arbitrary
+    choice either: the preview's lattice spacing is already silicon's
+    projected ``<110>`` separation, so the two halves of the preview
+    describe one specimen rather than two.
+    """
+
+    _CAMERA_TYPE = "eels"
+    _CAN_PROJECT = True
+    # The spectrometer accumulates the non-dispersive direction before
+    # readout, which is what Nion's `processing = "sum_project"` asks the
+    # device to do. One readout's noise, therefore, and the projected
+    # frame is generated as such rather than by summing a frame that was
+    # itself already noisy.
+    _PROJECTED_BY = "sensor"
+
+    def __init__(
+        self,
+        instrument: PreviewInstrument | None = None,
+        camera_id: str = "preview_eels_camera",
+        seed: int | None = None,
+    ) -> None:
+        super().__init__(
+            instrument,
+            camera_id,
+            _CAMERA_SEED + _EELS_SEED_OFFSET if seed is None else seed,
+        )
+
+    @property
+    def channel_count(self) -> int:
         """
-        Return one diffraction pattern for a probe at a deflected position.
+        Return how many energy channels a frame has at the current binning.
 
-        The per-beam-position half of a synchronised pass. Deliberately
-        does **not** go through :meth:`acquire_frame`: that one advances
-        the frame counter and honours the start/stop contract, neither of
-        which applies to a readout the scan unit is driving.
+        Returns
+        -------
+        int
+            The dispersive axis's length.
+        """
+        return _EELS_CHANNELS // self._parameters.binning
 
-        Parameters
-        ----------
-        deflection : tuple[float, float]
-            Disc displacement in detector half-widths, ``(y, x)``.
+    def frame_calibration(self) -> FrameCalibration:
+        """
+        Return the energy axis, and the uncalibrated direction beside it.
+
+        Binning multiplies the dispersion, because a binned channel spans
+        proportionally more of the axis — the same arithmetic Nion's
+        ``build_calibration`` does with its ``relative_scale``, and the
+        reason :class:`~miainwoodpecker.devices.interface.CameraParameters`
+        holds binning and exposure together as one value.
+
+        The offset moves with the spectrometer's energy offset, so the
+        zero-loss peak sits at a different *channel* when the control is
+        driven while staying at 0 eV — which is the whole point of a
+        calibrated axis, and what makes
+        :func:`~miainwoodpecker.acquisition.sequence.energy_offset_series`
+        demonstrable here.
+
+        Returns
+        -------
+        FrameCalibration
+            An energy ``x`` axis and an uncalibrated ``y`` axis.
+        """
+        return FrameCalibration.spectrum(
+            _EELS_DISPERSION_EV * self._parameters.binning,
+            offset=self._offset_ev(),
+            dispersive_axis="x",
+        )
+
+    def _offset_ev(self) -> float:
+        """
+        Return the energy at channel 0, in electronvolts.
+
+        Returns
+        -------
+        float
+            The spectrometer's base offset, shifted by its energy-offset
+            control.
+        """
+        return _EELS_BASE_OFFSET_EV + self._instrument.energy_offset_ev()
+
+    def _energy_axis(self) -> np.ndarray:
+        """
+        Return the energy of every channel, in electronvolts.
 
         Returns
         -------
         numpy.ndarray
-            The pattern, float32, at the camera's current binning.
+            One energy per channel, at the current binning.
         """
-        pixels = _CAMERA_PIXELS // self._parameters.binning
-        return np.asarray(self._ronchigram(pixels, deflection), dtype=np.float32)
+        axis = self.frame_calibration().x
+        return np.asarray(axis.values(self.channel_count), dtype=np.float64)
 
-    def close(self) -> None:
-        """Release nothing; this camera owns no resources."""
+    def spectrum_at(self, silicon_fraction: float) -> np.ndarray:
+        """
+        Return one projected spectrum for a given composition.
+
+        The spectrum on its own, whatever readout mode the camera is in —
+        which is what makes it worth having beside :meth:`readout_at`:
+        the model can be examined without first putting the device into a
+        mode, and a caller that wants counts against energy is not asking
+        about the detector's rows.
+
+        Parameters
+        ----------
+        silicon_fraction : float
+            How much of what the probe is standing on is silicon rather
+            than carbon film, in ``[0, 1]``.
+
+        Returns
+        -------
+        numpy.ndarray
+            Counts per channel, float32, at the camera's current settings.
+        """
+        return np.asarray(
+            self._counts(float(silicon_fraction)),
+            dtype=np.float32,
+        )
+
+    @property
+    def readout_shape(self) -> tuple[int, ...]:
+        """
+        Return the shape of one readout at the current settings.
+
+        Returns
+        -------
+        tuple[int, ...]
+            ``(channels,)`` projecting, ``(rows, channels)`` imaging.
+        """
+        if self._parameters.readout == PROJECTED_READOUT:
+            return (self.channel_count,)
+        return (self._rows, self.channel_count)
+
+    def readout_at(self, state: _ProbeState) -> np.ndarray:
+        """
+        Return one readout for a probe standing on a given composition.
+
+        The composition is the part of the probe state this detector is
+        sensitive to; the deflection beside it belongs to the camera
+        watching the transmitted disc.
+
+        Parameters
+        ----------
+        state : _ProbeState
+            The local specimen state at this beam position.
+
+        Returns
+        -------
+        numpy.ndarray
+            1D counts under a projected readout; the 2D dispersed image
+            otherwise.
+        """
+        if self._parameters.readout == PROJECTED_READOUT:
+            return self._counts(state.silicon_fraction)
+        return self._dispersed_image(state.silicon_fraction)
+
+    @property
+    def _rows(self) -> int:
+        """
+        Return how many rows the unprojected readout has.
+
+        Returns
+        -------
+        int
+            The non-dispersive direction's length, at least one.
+        """
+        return max(1, _EELS_ROWS // self._parameters.binning)
+
+    def _dispersed_image(self, silicon_fraction: float) -> np.ndarray:
+        """
+        Return the 2D frame the sensor sees before anything projects it.
+
+        The spectrum spread over the non-dispersive direction as a
+        streak a few rows tall, which is what a spectrometer image
+        actually looks like. The spread is a *split* of the same expected
+        counts rather than a copy of them, so summing the rows recovers
+        the projected spectrum's statistics exactly — the two readout
+        modes then differ in what they discard, not in how much signal
+        there was.
+
+        Parameters
+        ----------
+        silicon_fraction : float
+            The composition under the probe.
+
+        Returns
+        -------
+        numpy.ndarray
+            Counts, ``(rows, channels)``.
+        """
+        rows = self._rows
+        expected = self._expected_counts(silicon_fraction)
+        if rows == 1:
+            return self._rng.poisson(expected).astype(np.float32)
+        centre = (rows - 1) / 2.0
+        sigma = max(_EELS_STREAK_ROWS / self._parameters.binning, 1.0)
+        offsets = np.arange(rows, dtype=np.float64) - centre
+        profile = np.exp(-0.5 * (offsets / sigma) ** 2)
+        profile /= profile.sum()
+        return self._rng.poisson(np.outer(profile, expected)).astype(np.float32)
+
+    def _counts(self, silicon_fraction: float) -> np.ndarray:
+        """
+        Return one projected spectrum, with counting noise.
+
+        Parameters
+        ----------
+        silicon_fraction : float
+            The composition under the probe.
+
+        Returns
+        -------
+        numpy.ndarray
+            Counts per channel.
+        """
+        expected = self._expected_counts(silicon_fraction)
+        return self._rng.poisson(expected).astype(np.float32)
+
+    def _expected_counts(self, silicon_fraction: float) -> np.ndarray:
+        """
+        Return the noiseless spectrum: the model, before counting statistics.
+
+        Separate from :meth:`_counts` because it is the thing a test can
+        reason about — the noise is what makes two acquisitions of the
+        same specimen differ, and asserting on a model plus noise means
+        asserting on the noise.
+
+        Parameters
+        ----------
+        silicon_fraction : float
+            How much silicon rather than carbon film the probe stands on.
+
+        Returns
+        -------
+        numpy.ndarray
+            Expected counts per channel, non-negative.
+        """
+        energy_ev = self._energy_axis()
+        exposure_ms = self._parameters.exposure_ms
+        # A binned channel spans proportionally more of the energy axis,
+        # so it collects proportionally more of everything in it.
+        gain = exposure_ms * self._parameters.binning
+        if self._instrument.is_beam_blanked():
+            # No beam, no losses: the dark level and nothing else. The
+            # same collapse the scan and the Ronchigram show, so the
+            # blanker reads as one instrument state rather than three
+            # unrelated behaviours.
+            return np.full_like(energy_ev, _EELS_DARK_COUNTS_PER_MS * gain)
+
+        silicon = min(max(silicon_fraction, 0.0), 1.0)
+        zlp_scale = _EELS_ZLP_COUNTS_PER_MS * gain
+        counts = zlp_scale * _gaussian(
+            energy_ev, 0.0, _EELS_RESOLUTION_EV,
+        )
+        counts += (
+            zlp_scale
+            * _PLASMON_RATIO
+            * (
+                silicon * _gaussian(energy_ev, _SILICON_PLASMON_EV, _PLASMON_FWHM_EV)
+                + (1.0 - silicon)
+                * _gaussian(energy_ev, _CARBON_PLASMON_EV, _PLASMON_FWHM_EV)
+            )
+        )
+        above = energy_ev > _BACKGROUND_REFERENCE_EV
+        counts[above] += (
+            _BACKGROUND_COUNTS_PER_MS
+            * gain
+            * (energy_ev[above] / _BACKGROUND_REFERENCE_EV) ** -_BACKGROUND_DECAY
+        )
+        counts += _edge(
+            energy_ev,
+            _SILICON_L_EDGE_EV,
+            _SILICON_EDGE_COUNTS_PER_MS * gain * silicon,
+        )
+        counts += _edge(
+            energy_ev,
+            _CARBON_K_EDGE_EV,
+            _CARBON_EDGE_COUNTS_PER_MS * gain * (1.0 - silicon),
+        )
+        return counts + _EELS_DARK_COUNTS_PER_MS * gain
+
+
+def _silicon_fraction(lattice_value: float) -> float:
+    """
+    Return how much silicon the probe stands on at one specimen value.
+
+    The single place the preview's *image* model and its *spectrum*
+    model are tied together, and the tie is what gives a spectrum image
+    from this instrument a checkable answer: the same normalised
+    specimen value that :meth:`PreviewScanner._read_out` turns into
+    detector intensity is what becomes composition here. So a silicon map
+    integrated out of a spectrum image rises and falls with the HAADF
+    channel of the same pass — monotonically, not identically, since the
+    high-angle channel squares its signal and this one does not.
+
+    Parameters
+    ----------
+    lattice_value : float
+        The sampled specimen modulation at one beam position, in
+        ``[-1, 1]``.
+
+    Returns
+    -------
+    float
+        The silicon fraction, in ``[0, 1]``; the rest is carbon film.
+    """
+    return (lattice_value + 1.0) / 2.0
+
+
+def _gaussian(energy_ev: np.ndarray, centre_ev: float, fwhm_ev: float) -> np.ndarray:
+    """
+    Return a unit-height Gaussian sampled on an energy axis.
+
+    Parameters
+    ----------
+    energy_ev : np.ndarray
+        Where to sample, in electronvolts.
+    centre_ev : float
+        The peak's position.
+    fwhm_ev : float
+        Its full width at half maximum, which is how every spectroscopy
+        instrument quotes a width — converted once, here, rather than
+        leaving a factor of 2.35 loose in the caller.
+
+    Returns
+    -------
+    numpy.ndarray
+        The sampled peak, 1 at the centre.
+    """
+    sigma = fwhm_ev / _FWHM_PER_SIGMA
+    return np.exp(-0.5 * ((energy_ev - centre_ev) / sigma) ** 2)
+
+
+def _edge(energy_ev: np.ndarray, onset_ev: float, height: float) -> np.ndarray:
+    """
+    Return one core-loss edge: a sharp onset decaying as a power law.
+
+    The shape a background-subtracted ionisation edge has, and the reason
+    an EELS elemental map is made by integrating a window *after* the
+    onset rather than by fitting a peak: there is no peak, only a step
+    that decays.
+
+    Parameters
+    ----------
+    energy_ev : np.ndarray
+        Where to sample, in electronvolts.
+    onset_ev : float
+        The ionisation threshold.
+    height : float
+        Counts in the first channel above the onset.
+
+    Returns
+    -------
+    numpy.ndarray
+        The edge, zero everywhere below the onset.
+    """
+    shape = np.zeros_like(energy_ev)
+    above = energy_ev >= onset_ev
+    width = _EDGE_ONSET_WIDTH_EV
+    shape[above] = ((energy_ev[above] - onset_ev + width) / width) ** -_EDGE_DECAY
+    return height * shape
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1086,9 +2200,10 @@ class PreviewDevices:
     ----------
     scanner : PreviewScanner | None
         The scan unit, or None for a detector-only instrument.
-    cameras : Mapping[str, PreviewCamera]
-        Every camera served, by target name. Empty for a scan-only
-        instrument.
+    cameras : Mapping[str, _PreviewCameraBase]
+        Every camera served, by target name — a Ronchigram camera or an
+        EEL spectrometer, decided by the name (see
+        :func:`_build_camera`). Empty for a scan-only instrument.
     instrument : PreviewInstrument
         The instrument controls, shared by every device above.
     stage_size_nm : float
@@ -1096,7 +2211,7 @@ class PreviewDevices:
     """
 
     scanner: PreviewScanner | None
-    cameras: Mapping[str, PreviewCamera]
+    cameras: Mapping[str, _PreviewCameraBase]
     instrument: PreviewInstrument
     stage_size_nm: float
 
@@ -1155,11 +2270,7 @@ def build_preview_devices(
     targets = ([SCANNER_TARGET] if scan else []) + list(names)
     instrument = PreviewInstrument(controls=controls, targets=targets)
     cameras = {
-        name: PreviewCamera(
-            instrument=instrument,
-            camera_id=name,
-            seed=_CAMERA_SEED + offset,
-        )
+        name: _build_camera(name, instrument, _CAMERA_SEED + offset)
         for offset, name in enumerate(names)
     }
     return PreviewDevices(
@@ -1174,6 +2285,43 @@ def build_preview_devices(
         instrument=instrument,
         stage_size_nm=instrument.stage_size_nm(),
     )
+
+
+def _build_camera(
+    name: str,
+    instrument: PreviewInstrument,
+    seed: int,
+) -> _PreviewCameraBase:
+    """
+    Build the kind of camera a target name promises.
+
+    **The name decides the detector**, which is a correction as much as a
+    feature: the served names come from
+    :data:`~miainwoodpecker.devices.rpc.CAMERA_TARGET_NAMES`, which is
+    Nion's own device list showing through, and until the spectrometer
+    existed a preview asked for two cameras served a *Ronchigram* on the
+    ``eels_camera`` target. That is the shape of quiet lie this module
+    exists to avoid — a window that looks right against a device that is
+    not what it says it is.
+
+    Parameters
+    ----------
+    name : str
+        The target name this camera is served under.
+    instrument : PreviewInstrument
+        The instrument whose controls shape its frames.
+    seed : int
+        Seed for its noise.
+
+    Returns
+    -------
+    _PreviewCameraBase
+        A spectrometer for the EELS target, a Ronchigram camera
+        otherwise.
+    """
+    if name == _EELS_TARGET:
+        return PreviewEELSCamera(instrument=instrument, camera_id=name, seed=seed)
+    return PreviewCamera(instrument=instrument, camera_id=name, seed=seed)
 
 
 def _camera_target_names(count: int) -> tuple[str, ...]:
@@ -1238,7 +2386,11 @@ def parse_preview_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=int,
         default=1,
         metavar="N",
-        help=f"how many cameras to serve, 1 to {_MAX_PREVIEW_CAMERAS}",
+        help=(
+            f"how many cameras to serve, 1 to {_MAX_PREVIEW_CAMERAS}. Two or "
+            f"more includes an EEL spectrometer on the {_EELS_TARGET!r} "
+            f"target, which is what a spectrum image is acquired from"
+        ),
     )
     parser.add_argument(
         "--controls",
@@ -1287,6 +2439,7 @@ def main(argv: list[str] | None = None) -> int:
     import napari  # noqa: PLC0415 - the CLI needs the viewer extra; the devices above do not
 
     from miainwoodpecker.storage.session import Session  # noqa: PLC0415
+    from miainwoodpecker.viewer import documents  # noqa: PLC0415
     from miainwoodpecker.viewer.live import LiveInstrumentWidget  # noqa: PLC0415
 
     args = parse_preview_args(argv)
@@ -1296,19 +2449,21 @@ def main(argv: list[str] | None = None) -> int:
         camera_count=args.cameras,
         controls=args.controls,
     )
-    viewer = napari.Viewer(title=f"miainwoodpecker ({PREVIEW_BACKEND})")
+    window = documents.open_window(f"miainwoodpecker ({PREVIEW_BACKEND})")
     widget = LiveInstrumentWidget(
-        viewer,
+        window.board,
         devices.scanner,
         cameras=devices.cameras,
         instrument=devices.instrument,
     )
     if args.session is not None:
         widget.set_session(Session(args.session))
-    viewer.window.add_dock_widget(widget, area="right", name="Instrument")
+    window.set_panel(widget)
+    window.show()
     # No explicit widget.shutdown() after this, matching
-    # miainwoodpecker.viewer.app: closeEvent already calls it as part of
-    # Qt's app-quit teardown, and calling it again here reaches a widget
-    # whose C++ side has already been destroyed.
-    napari.run()
+    # miainwoodpecker.viewer.app: DocumentWindow.closeEvent calls it as
+    # the window closes, and calling it again here reaches a widget whose
+    # C++ side has already been destroyed. force=True for the same reason
+    # as there - no viewer exists until a document opens.
+    napari.run(force=True)
     return 0

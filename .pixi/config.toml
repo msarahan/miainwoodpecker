@@ -1,0 +1,19 @@
+# Keep solved environments out of this directory.
+#
+# This repository lives inside a OneDrive folder, and OneDrive indexes and
+# locks files as they appear. A pixi environment is a few hundred thousand
+# small files that appear all at once, which OneDrive then holds open long
+# enough that `pixi install` fails part-way through with
+# "failed to delete empty directory" - a different directory each run,
+# because it is a race rather than a permission.
+#
+# Detached environments put them under the pixi cache instead
+# (`pixi info` prints where). Nothing else changes: `pixi run` and
+# `pixi shell` find them the same way, and the lockfile is unaffected.
+#
+# It is committed rather than left to each person's global config because
+# the reason is a property of *this* project - where it is checked out -
+# and someone who clones it into their own synced folder hits the same
+# race on their first install. It is harmless where the problem does not
+# exist, which is why it is safe to apply to everyone.
+detached-environments = true

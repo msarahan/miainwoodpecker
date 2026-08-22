@@ -88,7 +88,11 @@ from miainwoodpecker.acquisition.sequence import (
     camera_series,
     multichannel_scan_series,
 )
-from miainwoodpecker.devices.interface import CameraParameters, ScanParameters
+from miainwoodpecker.devices.interface import (
+    CameraParameters,
+    ScanParameters,
+    native_scan_parameters,
+)
 from miainwoodpecker.storage.nexus import write_frames
 from miainwoodpecker.storage.session import (
     LoadJob,
@@ -103,6 +107,7 @@ from miainwoodpecker.storage.session import (
     free_space,
 )
 from miainwoodpecker.viewer import preferences, profiles
+from miainwoodpecker.viewer.documents import ATTACHED_TO
 from miainwoodpecker.viewer.jobs import AnalysisJob
 from miainwoodpecker.viewer.panels import devices as devices_panel
 from miainwoodpecker.viewer.panels import instrument as instrument_panel
@@ -144,6 +149,12 @@ _CAMERA_BUSY_MESSAGE = "camera still busy - live loop did not stop, try again"
 # Long enough that typing a sentence writes the sidecar once, short enough
 # that an operator who types and immediately clicks Record has their note.
 _NEXUS_FILE_FILTER = "NeXus recordings (*.nxs *.h5 *.hdf5);;All files (*)"
+# What a detector's per-position readout may be, as ranks. One axis of
+# counts is a spectrum; two are an image. Named rather than written as 1
+# and 2 in the branch, because "len(shape) == 1" does not say which of
+# the two kinds of dataset a pass is about to allocate.
+_SPECTRUM_READOUT_RANK = 1
+_IMAGE_READOUT_RANK = 2
 
 
 @dataclasses.dataclass
@@ -186,6 +197,13 @@ class _CameraBinding:
     binning_combo : QtWidgets.QComboBox | None
         Binning for an acquired image, same reasoning as the exposure —
         a live view can afford to be binned where a kept image cannot.
+    readout_combo : QtWidgets.QComboBox | None
+        Which readout mode the *device* is in — and unlike the two
+        above, changing it configures the camera immediately. Readout is
+        not a setting one acquisition uses; it decides the rank of every
+        frame the detector produces, so a camera whose live view is 2D
+        and whose acquisition is 1D would be a camera in two states at
+        once.
     acquire_button : QtWidgets.QPushButton | None
         Take one image with those settings.
     """
@@ -201,6 +219,7 @@ class _CameraBinding:
     record_button: QtWidgets.QPushButton | None = None
     exposure_spin: QtWidgets.QDoubleSpinBox | None = None
     binning_combo: QtWidgets.QComboBox | None = None
+    readout_combo: QtWidgets.QComboBox | None = None
     acquire_button: QtWidgets.QPushButton | None = None
 
 
@@ -614,14 +633,23 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
             ", ".join(str(name) for name in targets) or "no devices",
         )
 
+        # Method *names*, resolved per control inside the loop below.
+        # Binding them eagerly - `DEFOCUS_CONTROL: self._instrument.defocus_nm`
+        # - looked equivalent and was not: the attribute lookup happened
+        # while the dict was built, so an instrument that publishes only
+        # some of these raised AttributeError before the loop's own
+        # try/except could report it, and the panel never appeared at all.
+        # That is exactly the partial instrument `Instrument` and
+        # `InstrumentController` were split apart to support, and it was
+        # unreachable until a backend published a real subset.
         readers = {
-            DEFOCUS_CONTROL: self._instrument.defocus_nm,
-            ENERGY_OFFSET_CONTROL: self._instrument.energy_offset_ev,
+            DEFOCUS_CONTROL: "defocus_nm",
+            ENERGY_OFFSET_CONTROL: "energy_offset_ev",
         }
         failures: list[str] = []
         for name, spin in self._instrument_controls.items():
             try:
-                spin.setValue(float(readers[name]()))
+                spin.setValue(float(getattr(self._instrument, readers[name])()))
             except Exception as error:  # noqa: BLE001 - reported, not raised
                 failures.append(f"{name}: {error}")
         if self._instrument_stage_y is not None:
@@ -981,6 +1009,10 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         self._scan_loop.start()
         self._scan_button.setText("Stop scan")
         self._scan_status.setText("running")
+        # Reversed, so the first enabled detector ends up on top of the
+        # pile rather than under the ones raised after it.
+        for channel in reversed(self.enabled_channel_names()):
+            self._bring_to_front(self._scan_layer_name(channel))
         self._timer.start()
 
     def stop_scan(self) -> bool:
@@ -1031,6 +1063,7 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
             binding.button.setText("Stop camera")
         if binding.status is not None:
             binding.status.setText("running")
+        self._bring_to_front(binding.layer_name)
         self._timer.start()
 
     def stop_camera(self, name: str | None = None) -> bool:
@@ -1555,19 +1588,123 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         return CameraParameters(
             exposure_ms=exposure_spin.value(),
             binning=int(binning_combo.currentText()),
-            # Not from the panel: readout is what the *camera* is set to
-            # do, and an image acquisition is not the place to switch a
+            # Not from the panel's readout row: that row configures the
+            # device the moment it changes (see set_camera_readout), so
+            # the camera's own answer is already what the operator chose
+            # — and an image acquisition is not the place to switch a
             # spectrometer between imaging and projecting.
             readout=binding.camera.parameters().readout,
         )
 
+    def set_camera_readout(self, name: str, readout: str) -> None:
+        """
+        Put one camera into a readout mode, or say why it will not go.
+
+        Applied immediately, unlike the exposure and binning beside it in
+        the panel. Those describe *an acquisition*; this describes the
+        **device**, and it decides the rank of every frame the detector
+        produces — so a camera whose live view was imaging while its next
+        acquisition projected would be a camera in two states at once.
+
+        Refused while the camera is running, and that is about the
+        display rather than the device: the interface explicitly allows
+        ``configure`` on a started camera, but the frame after this one
+        would arrive with a different number of axes than the napari
+        layer showing it, and there is no rank a single image layer can
+        hold both ways. Stopping first is one click and leaves nothing
+        ambiguous.
+
+        A camera with no dispersive direction refuses a projected readout
+        outright (its ``configure`` raises), which is the case this
+        control exists to make reachable: the refusal is the honest
+        answer, and an operator who never sees it learns nothing about
+        why their Ronchigram camera is not a spectrometer.
+
+        Parameters
+        ----------
+        name : str
+            Which camera, by target name.
+        readout : str
+            The requested mode, from
+            :data:`~miainwoodpecker.devices.interface.READOUT_MODES`.
+        """
+        binding = self._binding(name)
+        if binding is None or binding.readout_combo is None:
+            return
+        camera = binding.camera
+        current = camera.parameters()
+        if readout == current.readout:
+            return
+        status = binding.status
+        if binding.loop is not None and binding.loop.is_running:
+            self._show_camera_readout(binding, current.readout)
+            if status is not None:
+                status.setText(
+                    "stop the camera before changing its readout - the live "
+                    "layer cannot change rank underneath itself",
+                )
+            return
+        try:
+            camera.configure(dataclasses.replace(current, readout=readout))
+        except Exception as error:  # noqa: BLE001 - the refusal is the message
+            self._show_camera_readout(binding, current.readout)
+            if status is not None:
+                status.setText(f"readout refused: {error}")
+            return
+        # Shown from what the device answered, not from what was asked
+        # for, and done on success as well as on refusal: this method is
+        # also how a script drives the mode, and then the combo has not
+        # moved at all. A panel showing a mode the detector is not in is
+        # the same lie whichever direction it drifted.
+        taken = camera.parameters().readout
+        self._show_camera_readout(binding, taken)
+        if status is not None:
+            status.setText(f"readout: {taken}")
+
+    @staticmethod
+    def _show_camera_readout(binding: _CameraBinding, readout: str) -> None:
+        """
+        Put the combo back to what the device actually took.
+
+        Without the signal blocked this would re-enter
+        :meth:`set_camera_readout` with the old value, which is harmless
+        but writes a second status line over the message explaining the
+        refusal — so the operator would see the combo revert and no
+        reason for it.
+
+        Parameters
+        ----------
+        binding : _CameraBinding
+            The camera whose combo is being corrected.
+        readout : str
+            The mode the device is in.
+        """
+        combo = binding.readout_combo
+        if combo is None:  # pragma: no cover - guarded by the caller
+            return
+        blocked = combo.blockSignals(True)  # noqa: FBT003 - Qt's own signature
+        try:
+            combo.setCurrentText(readout)
+        finally:
+            combo.blockSignals(blocked)
+
     def acquire_spectrum_image(self) -> None:
         """
-        Acquire a 4D-STEM pass over the current field of view.
+        Acquire one synchronised pass over the current field of view.
 
-        One traversal of the probe over a grid of beam positions, with a
-        full camera image kept at each — see
+        One traversal of the probe over a grid of beam positions, with
+        the selected detector's whole readout kept at each and every scan
+        channel read out alongside it — see
         :class:`~miainwoodpecker.devices.interface.ScanPass`.
+
+        **What lands on disk is decided by the detector's readout mode,
+        not by this button.** A detector left imaging contributes a 4D
+        diffraction cube (the 4D-STEM case); a spectrometer projecting
+        its non-dispersive direction contributes a rank-3 spectrum image
+        (the EELS case). That is the same thing real hardware does — a
+        spectrum image is acquired with the spectrometer summing — and it
+        is why one action covers both rather than two actions differing
+        in which device they name.
 
         **Most of this method is the refusal, and that is the point.**
         Synchronised acquisition is a hardware fact, not a software
@@ -1588,38 +1725,77 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         :class:`~miainwoodpecker.storage.session.RecordingJob` is the
         next step, and is why the grid offered here is deliberately small.
         """
-        from miainwoodpecker.devices.interface import (  # noqa: PLC0415
-            SynchronisedScanner,
-        )
         from miainwoodpecker.storage.passes import PassWriter  # noqa: PLC0415
 
         if self._scanner is None:
             return
+        target = self._spectrum_image_target()
+        if target is None:
+            return
+        if not self.stop_scan():
+            self._recording_status.setText(_SCANNER_BUSY_MESSAGE)
+            return
+        if not self.stop_camera(target):
+            self._recording_status.setText(_CAMERA_BUSY_MESSAGE)
+            return
+        self._run_spectrum_image(PassWriter, target)
+
+    def _spectrum_image_target(self) -> str | None:
+        """
+        Return the detector to read out per beam position, or refuse.
+
+        **This method is the refusals**, which is why it is one: on every
+        backend but the preview, declining to acquire *is* what happens
+        when the button is pressed, and each of the four reasons wants
+        its own sentence because each has a different fix — attach a
+        session, use a different instrument, wire a detector to the
+        column, or choose one that is wired.
+
+        The panel's choice is honoured or refused, never quietly replaced
+        by the first available target: acquiring against a detector the
+        operator did not choose would store it under that detector's name,
+        producing a file that is wrong in a way nothing about it looks
+        wrong.
+
+        Returns
+        -------
+        str | None
+            The chosen target, or None when the acquisition was refused —
+            in which case the status line already says why.
+        """
+        from miainwoodpecker.devices.interface import (  # noqa: PLC0415
+            SynchronisedScanner,
+        )
+
         if self._session is None:
             self._recording_status.setText(_NO_SESSION_MESSAGE)
-            return
+            return None
         if not isinstance(self._scanner, SynchronisedScanner):
             self._recording_status.setText(
                 "this backend cannot acquire a spectrum image: it has no "
                 "synchronised scan/camera mode, so there is no way to tie a "
                 "camera frame to a probe position",
             )
-            return
+            return None
         targets = list(self._scanner.synchronised_targets())
         if not targets:
             self._recording_status.setText(
                 "no camera is wired to the scan unit, so nothing can be read "
                 "out at each beam position",
             )
-            return
-        if not self.stop_scan():
-            self._recording_status.setText(_SCANNER_BUSY_MESSAGE)
-            return
-        target = targets[0]
-        if not self.stop_camera(target):
-            self._recording_status.setText(_CAMERA_BUSY_MESSAGE)
-            return
-        self._run_spectrum_image(PassWriter, target)
+            return None
+        combo = getattr(self, "_sync_target_combo", None)
+        # No panel: an instrument with no scan group has no combo to ask,
+        # and a caller driving this widget from a script has not made a
+        # choice to honour.
+        chosen = targets[0] if combo is None else combo.currentText()
+        if chosen not in targets:
+            self._recording_status.setText(
+                f"the selected detector is not one this scan unit can "
+                f"synchronise; it can read out {targets}",
+            )
+            return None
+        return chosen
 
     def _run_spectrum_image(self, writer_class: type, target: str) -> None:
         """
@@ -1635,22 +1811,19 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         target : str
             The camera target to read out at each beam position.
         """
-        positions = self._positions_spin.value()
-        parameters = ScanParameters(
-            height=positions,
-            width=positions,
-            pixel_time_us=self._profile_settings(profiles.ACQUIRE).dwell_us,
-            fov_nm=self._fov_spin.value(),
-        )
+        parameters = self._pass_parameters()
+        positions = f"{parameters.height}x{parameters.width}"
         binding = self._binding(target)
         camera = binding.camera if binding is not None else None
-        detector = self._detector_shape(camera)
-        path, index, slug, started_at = self._session.reserve("spectrum-image")
-        self._recording_status.setText(f"acquiring {positions}x{positions} pass...")
         try:
-            with writer_class(
-                path, parameters, cubes={target: detector},
-            ) as writer:
+            allocation = self._pass_allocation(target, camera)
+        except Exception as error:  # noqa: BLE001 - the refusal is the message
+            self._recording_status.setText(f"spectrum image failed: {error}")
+            return
+        path, index, slug, started_at = self._session.reserve("spectrum-image")
+        self._recording_status.setText(f"acquiring {positions} pass...")
+        try:
+            with writer_class(path, parameters, **allocation) as writer:
                 result = self._scanner.scan_synchronised(
                     parameters,
                     channels=list(range(len(self._scanner.channel_names))),
@@ -1661,45 +1834,112 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         except Exception as error:  # noqa: BLE001 - the refusal is the message
             self._recording_status.setText(f"spectrum image failed: {error}")
             return
+        # Named from what actually landed rather than from the button:
+        # an operator who left the spectrometer imaging has a 4D stack,
+        # and a status line calling it a spectrum image would be the
+        # first place they could have noticed and did not.
+        kind = "spectrum image" if result.spectra else "4D stack"
         self._recording_status.setText(
-            f"spectrum image saved: {path.name} "
-            f"({positions}x{positions} positions, sync={result.scan_sync})",
+            f"{kind} saved: {path.name} "
+            f"({positions} positions, sync={result.scan_sync})",
         )
         self._refresh_session_labels()
         del index, slug, started_at
 
-    @staticmethod
-    def _detector_shape(camera: object) -> tuple[int, int]:
+    def _pass_parameters(self) -> ScanParameters:
         """
-        Return the per-position detector shape a pass will produce.
+        Return the geometry the next synchronised pass will use.
 
-        Asked of the camera rather than assumed, because the destination
-        has to be allocated before the acquisition starts and an
-        allocation of the wrong size is refused rather than reshaped.
+        The panel's, normally: a square grid of **Positions** beam
+        positions over the field of view, at the Acquire profile's dwell.
+
+        **Unless the device has only one geometry it can acquire**, which
+        is the case for a replay device: it holds the grid the probe
+        actually visited, and no request makes it another. Asking such a
+        device for the panel's numbers would be refused every time, and
+        an operator would have to guess a shape they cannot see - a
+        recording is 22x25, which the square spin box cannot even
+        express. So the device is asked first, and answers None unless it
+        genuinely has a fixed grid.
+
+        This is not the panel being overridden lightly. It is the same
+        rule the readout control follows: what the *device* is set to do
+        wins over what a control would like it to do, because the device
+        is the one that has to do it.
+
+        Returns
+        -------
+        ScanParameters
+            The beam-position grid, dwell and field of view.
+        """
+        native = native_scan_parameters(self._scanner)
+        if native is not None:
+            return native
+        positions = self._positions_spin.value()
+        return ScanParameters(
+            height=positions,
+            width=positions,
+            pixel_time_us=self._profile_settings(profiles.ACQUIRE).dwell_us,
+            fov_nm=self._fov_spin.value(),
+        )
+
+    @staticmethod
+    def _pass_allocation(target: str, camera: object) -> dict[str, dict]:
+        """
+        Return the ``PassWriter`` allocation this detector's readout needs.
+
+        The file has to be created, and its datasets sized, **before**
+        the acquisition starts — that is what lets the device write
+        through to disk rather than into memory that is then copied. So
+        the shape has to be known in advance, and it is asked of the
+        detector rather than assumed: one frame is taken at the settings
+        the pass will use, and its rank decides everything else.
+
+        A 2D readout is allocated as a 4D stack of whole detector images.
+        A 1D readout is allocated as a spectrum image, because a detector
+        delivering one axis of counts is delivering spectra — its
+        surviving axis is the dispersive one, and the pass will carry
+        them as a :class:`~miainwoodpecker.devices.interface.Spectrum`.
+        Nothing here inspects what *kind* of detector it is, which is
+        the point: the rank is a fact and the label would be a guess.
 
         Parameters
         ----------
+        target : str
+            The target name, for the allocation's key and the message.
         camera : object
             The camera that will be read out, or None.
 
         Returns
         -------
-        tuple[int, int]
-            The detector image shape.
+        dict[str, dict]
+            Keyword arguments for :class:`PassWriter` — ``cubes`` or
+            ``spectra``, with one entry.
 
         Raises
         ------
         RuntimeError
-            If the camera cannot say what shape it produces.
+            If there is no camera behind the target, or it produces a
+            frame of a rank a pass has no home for.
         """
         if camera is None:
-            msg = "no camera binding for the synchronised target"
+            msg = f"no camera binding for the synchronised target {target!r}"
             raise RuntimeError(msg)
         camera.start()
         try:
-            return tuple(np.asarray(camera.acquire_frame().data).shape)
+            shape = tuple(np.asarray(camera.acquire_frame().data).shape)
         finally:
             camera.stop()
+        if len(shape) == _SPECTRUM_READOUT_RANK:
+            return {"spectra": {target: shape[0]}}
+        if len(shape) == _IMAGE_READOUT_RANK:
+            return {"cubes": {target: shape}}
+        msg = (
+            f"{target} produces a {len(shape)}D readout of shape {shape}; a "
+            f"pass keeps a 1D spectrum or a 2D image at each beam position, "
+            f"and has nowhere to put anything else"
+        )
+        raise RuntimeError(msg)
 
     def _start_recording(self, frames: Iterable[Frame], label: str) -> None:
         """
@@ -1854,6 +2094,10 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         self._opened_frames = loaded.frames
         data = loaded.data[0] if loaded.data.shape[0] == 1 else loaded.data
         name = f"File: {recording.path.name}"
+        # Before the layer, not after: this both reopens a panel the
+        # operator had closed and queues the raise, and removing the old
+        # layer below closes that panel's window in between.
+        self._bring_to_front(name)
         if name in self._viewer.layers:
             del self._viewer.layers[name]
         self._viewer.add_image(data, name=name, colormap="gray")
@@ -2235,6 +2479,7 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
             return runner.run("mean_projection", _analysis_job_input(source))
 
         def display(payload: object, source: _AnalysisInput) -> str:
+            self._bring_to_front("HyperSpy mean projection (Camera)")
             self._viewer.add_image(
                 payload,
                 name="HyperSpy mean projection (Camera)",
@@ -2292,6 +2537,7 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
             return runner.run("sum_projection", _analysis_job_input(source))
 
         def display(payload: object, source: _AnalysisInput) -> str:
+            self._bring_to_front("LiberTEM sum projection (Camera)")
             self._viewer.add_image(
                 payload,
                 name="LiberTEM sum projection (Camera)",
@@ -2353,6 +2599,7 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
             pattern, radius, x0, y0 = typing.cast(
                 "tuple[typing.Any, float, float, float]", payload
             )
+            self._bring_to_front("py4DSTEM disk fit (Camera)")
             self._viewer.add_image(
                 pattern,
                 name="py4DSTEM disk fit (Camera)",
@@ -2369,6 +2616,10 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
                 name="py4DSTEM disk fit",
                 edge_color="red",
                 face_color="transparent",
+                # The ellipse is in the *pattern's* pixel coordinates, so
+                # it belongs in that image's window rather than one of
+                # its own, where it would be a red circle marking nothing.
+                metadata={ATTACHED_TO: "py4DSTEM disk fit (Camera)"},
             )
             return (
                 f"done - r={radius:.1f}px center=({x0:.1f}, {y0:.1f}) "
@@ -2505,6 +2756,31 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
             autocontrast_every_frame=autocontrast_every_frame,
         )
         self._refresh_rate_label(loop, status_label)
+
+    def _bring_to_front(self, layer_name: str) -> None:
+        """
+        Bring a layer's window out from under whatever is covering it.
+
+        Called when a detector or camera is started, because starting a
+        source again is a request to see it. A panel is free to be
+        covered while it runs — that is the operator's arrangement to
+        make — but it should not stay buried once they ask for it back.
+
+        Nothing happens when the display is a single shared canvas
+        rather than a set of documents: there is no window to raise, and
+        every layer is already on screen. That is why this asks the
+        display whether it can do it rather than assuming, which is the
+        same reason ``documents.DocumentBoard`` is duck-typed to
+        ``napari.Viewer`` at all.
+
+        Parameters
+        ----------
+        layer_name : str
+            The layer whose window should come to the front.
+        """
+        raise_document = getattr(self._viewer, "raise_document", None)
+        if raise_document is not None:
+            raise_document(layer_name)
 
     def _show_frame(
         self,

@@ -38,22 +38,58 @@ The project is early. What exists today:
 * **NeXus/HDF5 storage** (`miainwoodpecker.storage`), including an importer
   for legacy Nion Swift `.ndata` files.
 
+### Try it without a microscope
+
+With [pixi](https://pixi.sh) installed, from a fresh clone:
+
+```shell
+pixi run preview
+```
+
+That opens the viewer against a **synthetic instrument** living in this
+process — a scan unit, a Ronchigram camera and an EEL spectrometer, no
+hardware, no vendor SDK and no device server. It is enough to acquire a
+scan, a 4D-STEM dataset and an EELS spectrum image, and to see them
+written as NeXus files. The numbers are invented and say so on the
+panel's face.
+
+`pixi run` installs what it needs first, so there is no separate setup
+step, and it resolves nothing: `pixi.lock` is committed, so you get the
+versions this was tested against. See
+[`docs/developing-the-ui.md`](docs/developing-the-ui.md) for what the
+preview can and cannot show you.
+
+### Replay a real session
+
+`devices/replay.py` opens a recorded DigitalMicrograph spectrum-image
+session and serves it as a device — one beam position at a time, waiting
+the dwell the instrument waited:
+
+```shell
+pixi run -e replay replay /path/to/session --list
+```
+
+That lists the acquisitions it found; without `--list` it opens the
+viewer against one and replays it. The data is real and was acquired
+elsewhere, so every frame and every spectrum carries the `replay`
+backend name and the file it came from.
+
 ### Run the live viewer
 
+Against the `nionswift-usim` microscope simulator, which needs the
+GPL-3.0 device stack (see "A note on licensing" below — it lives in its
+own environment for exactly that reason):
+
 ```shell
-# needs both extras, plus a display
-uv run --extra device --extra viewer miainwoodpecker-viewer
+pixi run -e device viewer
 ```
 
-To work on the window itself, there is a lighter way in — the same
-panels against an in-process synthetic instrument, no device server and
-no extras beyond `viewer`:
+The equivalents without pixi, if you already have an environment:
 
 ```shell
+uv run --extra device --extra viewer miainwoodpecker-viewer
 uv run --extra viewer miainwoodpecker-preview
 ```
-
-See [`docs/developing-the-ui.md`](docs/developing-the-ui.md).
 
 ### Use the device layer directly
 
@@ -120,21 +156,58 @@ write_frames("migrated.nxs", iter_ndata_directory("old_swift_library/"))
 
 ## How to install
 
-You can install this package using either `pip` or `uv`. We recommend that
-you create a new Python environment to work in when installing this
-package. Use whatever environment manager you wish!
+### With pixi (recommended, and what the microscope PCs use)
 
-To install the package using pip:
+Install [pixi](https://pixi.sh/latest/#installation), clone, and run:
+
+```shell
+pixi run preview
+```
+
+There is no separate install step — `pixi run` creates the environment
+first. `pixi.lock` is committed and covers Windows, Linux and macOS, so
+nothing is resolved on your machine: you get the versions this was
+tested against.
+
+This is the recommended path on **Windows**, which is what the
+instruments run, and the recommendation is not a preference. The viewer
+needs Qt and a GL canvas, storage needs HDF5, and the analysis extras
+need the scientific stack — precisely the packages where pip wheels are
+least reliable on Windows and conda-forge builds are most. A microscope
+PC is also the last machine on which you want to discover that something
+needs a compiler.
+
+The environments, and what each is for:
+
+| Command | What you get |
+|---|---|
+| `pixi run preview` | The viewer against a synthetic instrument. No hardware, no vendor SDK. |
+| `pixi run test` | The unit suite. Needs no display. |
+| `pixi run -e device viewer` | The viewer against the `nionswift-usim` simulator. |
+| `pixi run -e replay replay <dir> --list` | What a recorded session directory holds; without `--list`, replays one. |
+| `pixi run -e analysis test-all` | Everything, with HyperSpy/eXSpy available. |
+| `pixi run -e style lint` | Ruff, without solving the viewer's Qt stack first. |
+
+`pixi run` with no task name lists them all.
+
+The GPL-3.0 device stack lives in its own `device` environment on
+purpose; see "A note on licensing" below.
+
+### With pip or uv
+
+If you already manage your own environment:
 
 ```shell
 pip install miainwoodpecker
 ```
 
-To install the package using uv:
-
 ```shell
 uv pip install miainwoodpecker
 ```
+
+The optional extras are `viewer`, `device`, `analysis`, `camera` and
+`compression` — `pip install "miainwoodpecker[viewer]"`. Note that the
+`device` extra is GPL-3.0.
 
 Or just run `uv run python` in the directory where the package lives and it
 will install it automatically into the chosen uv venv.

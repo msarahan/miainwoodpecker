@@ -75,6 +75,7 @@ from miainwoodpecker.devices.remote import (
     remote_instrument,
 )
 from miainwoodpecker.storage.session import Session, default_root
+from miainwoodpecker.viewer import documents
 from miainwoodpecker.viewer.live import LiveInstrumentWidget
 
 _BACKEND_ENV_VAR = "MIAINWOODPECKER_BACKEND"
@@ -218,7 +219,7 @@ def _ordered_cameras(
 
 def main(argv: list[str] | None = None) -> None:
     """
-    Open a napari window with the live instrument dock widget.
+    Open the application window with the live instrument dock widget.
 
     Parameters
     ----------
@@ -257,19 +258,29 @@ def main(argv: list[str] | None = None) -> None:
                 "from a script instead."
             )
             raise SystemExit(msg)
-        viewer = napari.Viewer(title="miainwoodpecker")
+        window = documents.open_window("miainwoodpecker")
         widget = LiveInstrumentWidget(
-            viewer,
+            # Not a napari.Viewer: a board that gives each dataset its
+            # own viewer in its own window, so two detectors read out of
+            # one pass can be looked at side by side instead of stacked
+            # on top of each other. The widget cannot tell the two
+            # apart - see miainwoodpecker.viewer.documents.
+            window.board,
             microscope.scanner,
             cameras=cameras,
             instrument=microscope.instrument,
         )
         widget.set_session(session)
-        viewer.window.add_dock_widget(widget, area="right", name="Instrument")
-        # No explicit widget.shutdown() after this: closeEvent already calls
-        # it once the window closes (part of Qt's app-quit teardown), and
-        # calling it again here hits an already-destroyed Qt object.
-        napari.run()
+        window.set_panel(widget)
+        window.show()
+        # No explicit widget.shutdown() after this: DocumentWindow.closeEvent
+        # calls it as the window closes, and calling it again here hits an
+        # already-destroyed Qt object.
+        #
+        # force=True because napari counts its own viewers to decide there
+        # is something to show, and at this point there are none: a
+        # document's viewer is not created until its first frame arrives.
+        napari.run(force=True)
 
 
 if __name__ == "__main__":

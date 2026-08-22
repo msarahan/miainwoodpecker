@@ -1296,6 +1296,35 @@ class SynchronisedScanner(typing.Protocol):
         ...
 
 
+def native_scan_parameters(scanner: object) -> ScanParameters | None:
+    """
+    Return the one geometry a device can acquire, if it has only one.
+
+    The question a caller has to be able to ask once replay devices
+    exist: most scan units take whatever grid they are given, and a
+    replay has exactly one. Asked through a function rather than through
+    ``isinstance`` against another protocol, because this is a property
+    of a *device instance* and not a capability class - and because one
+    more runtime-checkable protocol would be one more all-or-nothing
+    check of the kind :class:`Instrument` already documents as a trap.
+
+    Parameters
+    ----------
+    scanner : object
+        Any scan unit.
+
+    Returns
+    -------
+    ScanParameters | None
+        The device's fixed geometry, or None if it accepts any.
+    """
+    native = getattr(scanner, "native_parameters", None)
+    if native is None:
+        return None
+    result = native()
+    return result if isinstance(result, ScanParameters) else None
+
+
 # Neutral names for the controls an InstrumentController may report through
 # available_controls(). Strings rather than an enum so the value survives the
 # device-server IPC boundary as plain data (see devices/rpc.py).

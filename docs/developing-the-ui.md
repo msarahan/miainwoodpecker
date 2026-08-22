@@ -52,7 +52,7 @@ Use the preview to iterate; use `camera_server` to confirm.
 | *(none)* | Scan unit, one camera, all four instrument controls. |
 | `--no-scan` | A detector-only instrument. The window has no Scan group — the absent device is missing, not present and broken. |
 | `--no-camera` | A scan-only instrument. |
-| `--cameras 2` | Two cameras, each with its own section, live loop and napari layer. |
+| `--cameras 2` | Two cameras, each with its own section, live loop and viewing panel — a Ronchigram camera and an **EEL spectrometer**, because the second target is `eels_camera` and the name decides the detector. This is the shape to open for spectrum-image work. Also the cheapest way to see the viewing area tile three panels at once, with the scan. |
 | `--controls defocus,beam_blanker` | An instrument publishing only those controls. The others get no row at all. |
 | `--session DIR` | Where recordings go. Point it at a scratch directory. |
 
@@ -77,6 +77,51 @@ contrast-limits slider against two smooth grey blobs proves nothing.
 
 Frames are seeded, so a preview session is reproducible and a screenshot
 can be retaken.
+
+### Gathering a spectrum image
+
+With `--cameras 2` the instrument has an EEL spectrometer on the
+`eels_camera` target, and the window can acquire a real spectrum image
+against it:
+
+```shell
+uv run --extra viewer miainwoodpecker-preview --cameras 2 --session /tmp/scratch
+```
+
+1. In the EELS camera's section, set **Detector readout** to
+   `projected`. This configures the device immediately, unlike the
+   exposure and binning beside it — readout decides the rank of every
+   frame the detector produces. (Try it on the Ronchigram camera too:
+   it refuses, with a sentence, because it has no dispersive direction.)
+2. In the Scan group, set **Per-position detector** to `eels_camera` and
+   choose a **Positions** count.
+3. Click **Acquire spectrum image**.
+
+One traversal of the probe follows, with a spectrum kept at every beam
+position and every scan channel read out of the same pass. The status
+line names what actually landed — leave the spectrometer imaging and you
+get a 4D stack instead, which is a real experiment rather than a
+mistake, and the line says so.
+
+**What the spectrum contains, and why each part is there.** A zero-loss
+peak at 0 eV, silicon and amorphous-carbon plasmons, the power-law
+background every EELS quantification fits and subtracts, and the
+silicon L<sub>2,3</sub> (99.8 eV) and carbon K (284.2 eV) edges. The
+energy axis is `nionswift-usim`'s — 0.5 eV per channel, channel 0 at
+−20 eV — so a spectrum from here is directly comparable with one from
+the simulator.
+
+The point is that something computed from it has a **right answer**: the
+two edge heights are complementary across the specimen, so a silicon map
+integrated above 99.8 eV rises and falls with the HAADF channel of the
+same pass. An analysis run against a cube of one repeated spectrum would
+"succeed" and prove nothing, which is what this exists to prevent.
+
+Driving the **Energy offset** control moves the zero-loss peak across the
+detector's *channels* while the calibrated axis moves with it, so the
+peak stays at 0 eV. That is what makes
+`acquisition.sequence.energy_offset_series` demonstrable here rather than
+merely runnable.
 
 ### What it is not
 
@@ -104,6 +149,37 @@ xvfb-run -a uv run --extra device --extra viewer --extra tests pytest
 `QT_QPA_PLATFORM=offscreen` is **not** a substitute: it gives no
 `QOpenGLWidget`, napari's layer lifecycle breaks on teardown, and the
 GPU rendering path napari was chosen for is never exercised.
+
+### The viewing area is many napari viewers, not one
+
+`viewer/documents.py` gives every dataset its own `napari.Viewer` inside
+a `QMdiArea` sub-window, which is what makes zoom, pan and contrast
+per-panel. Two consequences are worth knowing before editing it.
+
+**It reparents `viewer.window._qt_window`, which is private napari
+API.** Nothing else exposes the Qt widget behind a viewer, and the
+alternative is not a tidier accessor — it is giving up per-panel zoom
+and napari's own layer controls. The reach-ins are confined to that one
+module (ruff's `SLF001` is silenced there and nowhere else) and each is
+wrapped, so a napari upgrade that renames a dock leaves the chrome
+showing rather than failing to open a window.
+
+**`LiveInstrumentWidget` does not know any of this exists.**
+`DocumentBoard` presents the slice of the `napari.Viewer` API the widget
+uses — `add_image`, `add_shapes`, and membership, lookup and deletion on
+`layers` — and routes each call to the right document. So a plain
+`napari.Viewer` still works wherever the board does, which is why every
+widget test constructs one directly and why a single-canvas window
+remains a supported way to run the application.
+
+**Qt does not promise when move, resize and zoom events arrive**, and
+this module reads all three to tell the operator's actions from its own.
+Both latches — "has the operator arranged the windows" and "has the
+operator zoomed this panel" — therefore guard on *both* an in-progress
+flag and the value the application last set. Either guard alone was
+tried and neither is sufficient: the flag misses queued events, and the
+value alone misses synchronous ones. `test_documents.py` pins both
+cases.
 
 The preview's own tests split along the same line. The devices are
 ordinary objects, so `tests/unit/test_viewer_preview.py` needs no
