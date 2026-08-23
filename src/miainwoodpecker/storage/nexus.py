@@ -183,12 +183,21 @@ _SHUFFLE_BENEFITING_FILTERS = frozenset({"gzip", "lzf"})
 # The NXdata layout this writer builds names exactly two frame axes, so a
 # frame is 2D. Enforced at append() rather than discovered at close().
 _FRAME_RANK = 2
-# Flush after every frame by default. Measured across the whole codec sweep
-# as within run-to-run noise, and it is what converts a SIGKILL mid-recording
-# from "the file does not open at all" into "short but readable" - so the
-# worst case an operator can hit is losing the frame in flight rather than
-# the whole session. See NexusWriter.flush.
-_DEFAULT_FLUSH_EVERY = 1
+DEFAULT_FLUSH_EVERY = 1
+"""
+Flush after every frame by default.
+
+Measured across the whole codec sweep as within run-to-run noise, and it
+is what converts a SIGKILL mid-recording from "the file does not open at
+all" into "short but readable" - so the worst case an operator can hit is
+losing the frame in flight rather than the whole session. See
+:meth:`NexusWriter.flush`.
+
+Public, and read by :mod:`miainwoodpecker.storage.spectra` and
+:mod:`miainwoodpecker.acquisition.sequence` rather than respelled there.
+Three copies of a number whose justification is one measurement is three
+chances for the measurement to stop applying to two of them.
+"""
 
 CompressionSpec = typing.Union[str, "Mapping[str, typing.Any]", None]
 """
@@ -760,7 +769,7 @@ def write_frames(
     path: os.PathLike[str] | str,
     frames: Iterable[Frame],
     *,
-    flush_every: int = _DEFAULT_FLUSH_EVERY,
+    flush_every: int = DEFAULT_FLUSH_EVERY,
     **kwargs: object,
 ) -> int:
     """

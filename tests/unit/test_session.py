@@ -413,6 +413,180 @@ def test_a_projected_recording_is_listed_and_counted_like_any_other(tmp_path):
         assert handle["entry/sample/name"][()].decode() == "graphene"
 
 
+def test_an_item_hands_out_one_path_per_signal_and_reuses_them(tmp_path):
+    """
+    The item is what makes several files one acquisition.
+
+    The number is claimed by the first signal rather than at
+    construction, so an acquisition that is refused before it produces a
+    frame leaves no reserved files and skips no numbers; and asking
+    twice for one signal is the same file, so a caller does not have to
+    remember what it opened.
+    """
+    session = Session(tmp_path / "s")
+
+    item = session.open_item("scan")
+    assert item.index == 0
+    assert not list(session.root.glob("*.nxs"))
+
+    haadf = item.reserve("HAADF")
+    bf = item.reserve("BF")
+
+    assert item.index == 1
+    assert haadf != bf
+    assert item.reserve("HAADF") == haadf
+    assert haadf.name.startswith("0001-scan-haadf-")
+    assert bf.name.startswith("0001-scan-bf-")
+    # The next acquisition gets the next number, not the item's.
+    assert session.reserve_path("camera").name.startswith("0002-camera-")
+
+
+def test_record_datasets_writes_one_file_per_signal_under_one_number(tmp_path):
+    """
+    An item's signals are separate files that say they belong together.
+
+    Separate because every tool an operator reaches for takes a file and
+    gives back a signal; joined by the sequence number and the timestamp,
+    which is what makes them adjacent in a listing without an index to
+    keep in sync.
+    """
+    session = Session(tmp_path / "s")
+
+    recordings = session.record_datasets(
+        [
+            ("HAADF", make_frame(1.0)),
+            ("BF", make_frame(2.0)),
+            ("HAADF", make_frame(3.0)),
+            ("BF", make_frame(4.0)),
+        ],
+        label="scan",
+    )
+
+    assert list(recordings) == ["HAADF", "BF"]
+    assert {recording.index for recording in recordings.values()} == {1}
+    assert sorted(recording.label for recording in recordings.values()) == [
+        "scan-bf",
+        "scan-haadf",
+    ]
+    for recording in recordings.values():
+        expected_count = 2
+        assert recording.frame_count == expected_count
+        assert recording.finalized
+    # Each file holds its own signal's frames, not the stream both came
+    # out of.
+    replayed = list(read_series(recordings["HAADF"].path))
+    assert [frame[0][0, 0] for frame in replayed] == pytest.approx([1.0, 3.0])
+
+
+def test_record_datasets_names_the_signal_inside_each_file(tmp_path):
+    """
+    A file copied out of the session still says which signal it is.
+
+    The filename says it too, but a file that has been renamed or moved
+    has only what is inside it.
+    """
+    session = Session(tmp_path / "s", operator="M. Sarahan")
+
+    recordings = session.record_datasets(
+        [("HAADF", make_frame()), ("BF", make_frame())],
+        label="scan",
+        note="hole 4",
+    )
+
+    context = read_session_context(recordings["BF"].path)
+    assert context["dataset"] == "BF"
+    assert context["label"] == "scan"
+    assert context["operator"] == "M. Sarahan"
+    # One acquisition, so the note is on every file of it rather than on
+    # whichever signal happened to arrive first.
+    assert read_session_context(recordings["HAADF"].path)["note"] == "hole 4"
+
+
+def test_record_datasets_puts_images_and_spectra_in_the_layout_each_calls_for(tmp_path):
+    """
+    One item may hold both, which is what a spectrum image with a survey is.
+
+    Each file's layout is chosen from its own first frame, so the survey
+    lands in the frame layout and the projected readout beside it lands
+    in ``NXspectrum``'s - neither had to be told which it was.
+    """
+    session = Session(tmp_path / "s")
+
+    recordings = session.record_datasets(
+        [
+            ("survey", make_frame()),
+            ("spectrum", make_projected_frame(0)),
+            ("spectrum", make_projected_frame(1)),
+        ],
+        label="si",
+    )
+
+    with h5py.File(recordings["survey"].path, "r") as handle:
+        assert layout.NXDATA_DATA in handle
+        assert layout.SPECTRUM_INTENSITY not in handle
+    with h5py.File(recordings["spectrum"].path, "r") as handle:
+        assert layout.SPECTRUM_INTENSITY in handle
+    expected_spectra = 2
+    assert recordings["spectrum"].frame_count == expected_spectra
+
+
+def test_record_datasets_reserves_a_file_only_for_a_signal_that_arrives(tmp_path):
+    """A signal an acquisition might have produced and did not leaves no file."""
+    session = Session(tmp_path / "s")
+
+    recordings = session.record_datasets([("HAADF", make_frame())], label="scan")
+
+    assert list(recordings) == ["HAADF"]
+    assert len(list(session.root.glob("*.nxs"))) == 1
+
+
+def test_record_datasets_keeps_what_arrived_when_the_stream_fails(tmp_path):
+    """
+    An item that failed part way through is still an item.
+
+    Every signal that got frames keeps a complete file of them, for the
+    same reason a single interrupted recording does: the writers are
+    closed on the way out however the loop unwound.
+    """
+    session = Session(tmp_path / "s")
+
+    def failing() -> Iterator[tuple[str, Frame]]:
+        yield ("HAADF", make_frame(1.0))
+        yield ("BF", make_frame(2.0))
+        message = "the scan unit stopped answering"
+        raise RuntimeError(message)
+
+    with pytest.raises(RuntimeError, match="stopped answering"):
+        session.record_datasets(failing(), label="scan")
+
+    recorded = session.recordings()
+    expected_files = 2
+    assert len(recorded) == expected_files
+    assert all(recording.frame_count == 1 for recording in recorded)
+    assert all(recording.finalized for recording in recorded)
+
+
+def test_an_item_can_be_named_with_the_time_it_was_acquired(tmp_path):
+    """
+    Data written after the fact is stamped with when it was taken.
+
+    The flush path (``dashboard.saving``) writes a whole shift at once,
+    and a directory in which every filename claimed the flush time would
+    have thrown away the only ordering the data had.
+    """
+    session = Session(tmp_path / "s")
+    acquired = datetime.datetime(2026, 8, 10, 14, 25, 30, tzinfo=datetime.UTC)
+
+    recordings = session.record_datasets(
+        [("HAADF", make_frame())],
+        label="scan",
+        started_at=acquired,
+    )
+
+    assert recordings["HAADF"].path.name == "0001-scan-haadf-20260810T142530Z.nxs"
+    assert recordings["HAADF"].started_at == acquired
+
+
 def test_a_reserved_but_unwritten_name_is_reported_as_unreadable(tmp_path):
     """A placeholder from a reservation that never got written is not a data file."""
     session = Session(tmp_path / "s")

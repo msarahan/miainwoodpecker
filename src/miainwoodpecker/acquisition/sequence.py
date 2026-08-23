@@ -9,6 +9,16 @@ practical.
 
 Generators are lazy, so a caller can stop early (``itertools.islice``,
 ``break``) and the device is still released correctly.
+
+:func:`record` writes one series to one file and is what most callers
+want. :class:`FrameSink` is the same recording with its ``for`` loop
+turned inside out — the caller pushes frames in rather than the writer
+pulling them — which is what lets *several* recordings be open at once
+and fed from one interleaved stream. A simultaneous two-detector scan
+yields HAADF, MAADF, HAADF, MAADF, and putting each detector in its own
+file means both files are being written to at the same time; the
+alternative is buffering one detector's frames in memory until the other
+is done, which is exactly what streaming exists to avoid.
 """
 
 from __future__ import annotations
@@ -18,10 +28,14 @@ import itertools
 import typing
 
 from miainwoodpecker.devices.interface import DEFOCUS_CONTROL, ENERGY_OFFSET_CONTROL
-from miainwoodpecker.storage.nexus import write_frames
+from miainwoodpecker.storage.nexus import (
+    DEFAULT_FLUSH_EVERY,
+    NexusWriter,
+    write_frames,
+)
 from miainwoodpecker.storage.spectra import (
+    SpectrumWriter,
     spectrum_from_projected_frame,
-    write_spectra,
 )
 
 if typing.TYPE_CHECKING:
@@ -36,6 +50,10 @@ if typing.TYPE_CHECKING:
         ScanParameters,
         Scanner,
     )
+
+# A 1D frame is a projected camera readout, i.e. a spectrum; see
+# FrameSink._open for what that changes.
+_SPECTRUM_RANK = 1
 
 
 def scan_series(
@@ -444,13 +462,169 @@ def record(
     empty frame file it always did.
     """
     iterator = iter(frames)
+    # Pulled before the sink exists, so a device that fails on its very
+    # first frame leaves no file at all - see the note above, and note
+    # that the sink is what would otherwise create one.
     first = next(iterator, None)
-    if first is None:
-        # An empty series writes the same (empty, finalized) frame file
-        # it always has.
-        return write_frames(path, (), **kwargs)
-    series = itertools.chain([first], iterator)
-    if first.data.ndim == 1:
-        spectra = (spectrum_from_projected_frame(frame) for frame in series)
-        return write_spectra(path, spectra, **kwargs)
-    return write_frames(path, series, **kwargs)
+    sink = FrameSink(path, **kwargs)  # type: ignore[arg-type]
+    try:
+        for frame in itertools.chain([] if first is None else [first], iterator):
+            sink.append(frame)
+    finally:
+        # Whatever unwinds Python - a device error, a KeyboardInterrupt, a
+        # cancelled job breaking out of the generator - still closes the
+        # writer, which is what makes an interrupted recording a complete
+        # file of however many frames arrived.
+        sink.close()
+    return sink.count
+
+
+class FrameSink:
+    """
+    One recording, open, taking frames pushed at it one at a time.
+
+    :func:`record` with its loop inverted, and the same file either way:
+    it dispatches on the first frame's rank exactly as ``record`` does,
+    honours ``flush_every`` exactly as the two writers' own helpers do,
+    and writes the same empty-but-finalized frame file for a series that
+    produced nothing.
+
+    The reason it exists is that a caller may need **more than one**
+    recording open at a time. A pass read out on two detectors arrives as
+    one interleaved stream, and a file per detector means both are being
+    appended to as the frames land; ``record`` cannot express that,
+    because it owns the loop and there is only one of it. See
+    :meth:`~miainwoodpecker.storage.session.Session.record_datasets`,
+    which is what this was extracted for.
+
+    **The writer is opened by the first frame, not by the constructor.**
+    Which writer to open is a question only a frame can answer - a 1D
+    frame is a projected readout and wants ``NXspectrum``'s layout - so
+    constructing a sink touches no disk at all. A sink that is closed
+    having never been appended to writes the empty frame file, which is
+    what ``record`` has always done for an empty series and what makes a
+    reserved name mean something afterwards.
+
+    Not a context manager, deliberately: the whole point is that several
+    of these are open together and closed together, which is a
+    :class:`contextlib.ExitStack` at best and a plain dict plus a
+    ``finally`` at the one call site that needs it. Adding
+    ``__enter__``/``__exit__`` would suggest the single-sink ``with``
+    block that :func:`record` already is.
+
+    Parameters
+    ----------
+    path : os.PathLike[str] | str
+        Destination HDF5 file.
+    flush_every : int
+        Flush after this many frames; ``0`` (or less) never flushes. See
+        :data:`~miainwoodpecker.storage.nexus.DEFAULT_FLUSH_EVERY`.
+    **kwargs : object
+        Passed to whichever writer the first frame calls for, exactly as
+        :func:`record` passes them - so an option only one writer has is
+        refused by the other's signature rather than silently dropped.
+    """
+
+    def __init__(
+        self,
+        path: os.PathLike[str] | str,
+        *,
+        flush_every: int = DEFAULT_FLUSH_EVERY,
+        **kwargs: object,
+    ) -> None:
+        self._path = path
+        self._flush_every = flush_every
+        self._kwargs = kwargs
+        self._writer: NexusWriter | SpectrumWriter | None = None
+        self._count = 0
+        self._closed = False
+
+    @property
+    def path(self) -> os.PathLike[str] | str:
+        """Return the file this sink writes to."""
+        return self._path
+
+    @property
+    def count(self) -> int:
+        """Return how many frames have been appended so far."""
+        return self._count
+
+    def append(self, frame: Frame) -> None:
+        """
+        Write one frame, opening the file if this is the first.
+
+        Parameters
+        ----------
+        frame : Frame
+            The frame to record. Its rank chooses the layout on the first
+            call only; the writers themselves refuse a later frame that
+            does not match, with their own sentence.
+
+        Raises
+        ------
+        RuntimeError
+            If the sink has already been closed. Appending to a finished
+            recording would otherwise reopen the file and truncate it,
+            which loses everything already written.
+        """
+        if self._closed:
+            message = (
+                f"{self._path} has already been closed; nothing more can "
+                f"be appended to it"
+            )
+            raise RuntimeError(message)
+        if self._writer is None:
+            self._writer = self._open(frame)
+        if isinstance(self._writer, SpectrumWriter):
+            self._writer.append(spectrum_from_projected_frame(frame))
+        else:
+            self._writer.append(frame)
+        self._count += 1
+        if self._flush_every > 0 and self._count % self._flush_every == 0:
+            self._writer.flush()
+
+    def close(self) -> None:
+        """
+        Finalize the file, or write an empty one if nothing ever arrived.
+
+        Idempotent, so a caller closing several sinks in a ``finally``
+        does not have to track which of them it already closed.
+        """
+        if self._closed:
+            return
+        self._closed = True
+        if self._writer is None:
+            # An empty series writes the same (empty, finalized) frame
+            # file record has always written for one.
+            write_frames(
+                self._path,
+                (),
+                flush_every=self._flush_every,
+                **self._kwargs,  # type: ignore[arg-type]
+            )
+            return
+        self._writer.close()
+
+    def _open(self, first: Frame) -> NexusWriter | SpectrumWriter:
+        """
+        Open the writer this frame's rank calls for.
+
+        Parameters
+        ----------
+        first : Frame
+            The recording's first frame.
+
+        Returns
+        -------
+        NexusWriter | SpectrumWriter
+            The opened writer.
+        """
+        if first.data.ndim == _SPECTRUM_RANK:
+            return SpectrumWriter(
+                self._path,
+                **self._kwargs,  # type: ignore[arg-type]
+            ).__enter__()
+        return NexusWriter(
+            self._path,
+            **self._kwargs,  # type: ignore[arg-type]
+        ).__enter__()

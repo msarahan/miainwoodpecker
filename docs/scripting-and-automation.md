@@ -524,7 +524,7 @@ where it looked and stops. It will **not** fall back to opening its own
 device session, because that would be a second driver on the instrument —
 the exact interleaving the broker exists to prevent.
 
-Three things about it are worth knowing before you change it:
+Four things about it are worth knowing before you change it:
 
 - **Every tile is a watch.** The poll is one `previews(edge)` per tick,
   which is one round trip for the whole grid rather than a `targets()`
@@ -551,10 +551,12 @@ Three things about it are worth knowing before you change it:
 - **Results go into an append-only log panel, not into new cells.** A
   marimo cell cannot write cells: the dependency graph is the notebook,
   and a program that rewrites its own graph while running has no defined
-  order. Each acquisition adds one entry with a thumbnail, where the
-  frames were written, and the first frame's metadata. Refusals are
-  entries too — "the scanner was leased by the viewer" is part of what
-  happened.
+  order. Each acquisition adds one entry. Refusals are entries too —
+  "the scanner was leased by the viewer" is part of what happened.
+- **An entry is an item, and an item is several signals — one file
+  each.** See [Items, signals, and where the data
+  is](#items-signals-and-where-the-data-is) below, which is the part
+  worth reading before you change how an acquisition is recorded.
 
 The judgement the app is made of — which targets get a tile and in what
 order, what the chrome says, how a frame becomes pixels a browser draws,
@@ -563,6 +565,86 @@ than in the cells, and the unit suite covers it whether or not marimo is
 installed. Leave the detector checkboxes and binning menu built from
 `broker.describe()`: a client in another process has no device handle to
 read them off, which is what that call exists for.
+
+### Items, signals, and where the data is
+
+The unit an operator thinks in is not one array. It is *that spectrum
+image* — which in practice means the HAADF survey with the mapped area
+marked on it, the SI itself, and the HAADF taken immediately afterwards
+in the same place, because the interesting question about an SI is
+usually how much the specimen drifted and how much of it the beam
+removed while the map ran. Or it is one scan pass read out on HAADF and
+BF at once. Or a survey with a beam marker beside the spectrum taken at
+that point.
+
+So one log entry is an **item**, and an item has as many **signals** as
+the acquisition produced. Each signal gets **its own file**. NeXus would
+happily hold all of them in one entry — `storage/passes.py` does exactly
+that for a scan pass, whose signals are pixel-aligned by construction —
+but an item's parts are acquired at different times with different
+geometry, a person opens one of them at a time, and every tool they will
+reach for (`hs.load`, a NeXus viewer, a file manager) takes a file and
+gives back a signal. One file per signal is what those already expect,
+and it makes "send me the HAADF" a copy rather than an extraction.
+
+What keeps an item together is the filename: every file shares the
+item's sequence number and timestamp and differs only in the signal's
+name, so `0007-scan-haadf-…nxs` sorts next to `0007-scan-bf-…nxs`.
+Each file also records `session_dataset`, so one that has been renamed
+or copied out still says which signal it is.
+
+An acquisition names its own signals. `AcquisitionRequest.build` yields
+`(name, frame)` pairs rather than frames, and the two ways of producing
+them are the whole extension mechanism:
+
+```python
+from miainwoodpecker.dashboard import by_channel, named
+
+# a detector per signal, from the frames' own channel_name
+build = lambda leased: by_channel(
+    multichannel_scan_series(leased.scanner("scanner"), parameters, 1,
+                             channels=[0, 1]),
+    fallback="scanner",
+)
+
+# a step per signal, for a recipe that acquires more than one thing
+build = lambda leased: itertools.chain(
+    named("survey", multichannel_scan_series(...)),
+    named("SI", ...),
+    named("followup", multichannel_scan_series(...)),
+)
+```
+
+`named` is labelling, not a new acquisition verb — everything in that
+chain is still one of `miainwoodpecker.acquisition`'s own generators.
+The name travels beside the frame rather than inside its metadata
+because frame metadata is the *device's* vocabulary, and which step of a
+recipe a frame belongs to is not something a detector reports: a survey
+HAADF and a follow-up HAADF thirty seconds later carry byte-identical
+`channel_name`.
+
+**Data acquired without a session is kept, not dropped.** Leaving the
+session directory blank is a real choice — looking at a Ronchigram to
+decide whether it is worth keeping should not litter a session with
+files — and it used to be irreversible, because the frames went into a
+thumbnail and were released. Now the entry keeps them, and the log
+offers two ways out:
+
+- a **Save** button per signal, which is `mo.download` over a NeXus file
+  rendered on demand. This is the one to use when the browser is not on
+  the microscope's machine.
+- **Write everything here** at the bottom of the page, which opens the
+  directory you name as a session and writes every held signal into it —
+  same naming, same numbering, and the session context that directory
+  already has. Files are stamped with the time the data was *acquired*,
+  not the time you pressed the button, so a flush at the end of a shift
+  does not collapse an afternoon's ordering into one timestamp.
+
+Saving releases the frames, so the flush is also how a long shift stops
+filling the kernel up. Failures are per signal: a projected frame with
+no energy calibration cannot be stored as a spectrum, and that is no
+reason to lose the HAADF acquired beside it, so the report names what
+went and what did not and the rest stays in memory to try elsewhere.
 
 ### Starting the broker and a front end together
 

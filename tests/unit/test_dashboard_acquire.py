@@ -1,7 +1,7 @@
 """
 Acquiring from a dashboard: off the display thread, and on the record.
 
-Three properties, and the first is the one the whole design turns on.
+Four properties, and the first is the one the whole design turns on.
 
 * **The lease is taken on a worker, never on the caller's thread.**
   Taking one means waiting out the pass already in flight, which is
@@ -11,6 +11,10 @@ Three properties, and the first is the one the whole design turns on.
   came back anyway.
 * **Every attempt reaches the log, refusals included.** A lease the
   broker refused is part of what happened during the shift.
+* **One acquisition is several signals, and each gets its own file.** A
+  pass read out on two detectors is one item with two datasets, written
+  to two files that share a sequence number - which is what makes "send
+  me the HAADF" a copy rather than an extraction.
 * **No new acquisition verbs.** What runs inside the lease is one of
   :mod:`miainwoodpecker.acquisition`'s own generators, so the fakes here
   are ordinary device protocols rather than dashboard-shaped ones.
@@ -23,6 +27,7 @@ that the dashboard calls the methods it calls.
 """
 
 import datetime
+import itertools
 import threading
 import time
 from collections.abc import Iterator, Sequence
@@ -30,16 +35,20 @@ from collections.abc import Iterator, Sequence
 import numpy as np
 import pytest
 
+from miainwoodpecker.acquisition.sequence import multichannel_scan_series
 from miainwoodpecker.broker.interface import DeviceBusyError
 from miainwoodpecker.broker.local import LocalBroker
 from miainwoodpecker.dashboard.acquisition import (
     AcquisitionJob,
+    AcquisitionRequest,
     camera_request,
+    named,
     scan_request,
 )
 from miainwoodpecker.dashboard.session_log import (
     SessionLog,
     SessionLogEntry,
+    describe_dataset,
     describe_frames,
     highlights,
 )
@@ -52,6 +61,8 @@ _DEADLINE_S = 5.0
 # path exists to produce: one traversal of the probe, every enabled
 # detector read out of it.
 _TWO_PASSES_TWO_DETECTORS = 4
+_TWO_PASSES = 2
+_TWO_SIGNALS = 2
 _CAMERA_FRAMES = 3
 _LOGGED_ENTRIES = 3
 
@@ -356,8 +367,15 @@ def test_the_lease_is_taken_on_the_worker_not_the_caller(broker, devices):
     assert _finished(job)
 
 
-def test_a_successful_acquisition_lands_in_the_log_with_a_thumbnail(broker):
-    """Each acquisition adds one entry carrying a picture and its provenance."""
+def test_a_successful_acquisition_lands_in_the_log_with_a_signal_per_detector(broker):
+    """
+    One entry per acquisition, one dataset per detector, each with a picture.
+
+    The two detectors of a pass are one *item* - they came from one
+    traversal of the probe - so they are one entry; but they are separate
+    signals, so each has its own thumbnail, its own metadata and, when
+    there is a session, its own file.
+    """
     log = SessionLog()
     job = AcquisitionJob(
         broker,
@@ -375,15 +393,28 @@ def test_a_successful_acquisition_lands_in_the_log_with_a_thumbnail(broker):
     assert job.error is None
     (entry,) = log.entries
     assert entry.index == 1
-    assert entry.label == "scan-HAADF-MAADF"
+    assert entry.label == "scan"
     assert entry.frame_count == _TWO_PASSES_TWO_DETECTORS
-    assert entry.shape == _PARAMETERS.shape
-    assert entry.thumbnail.startswith("data:image/png;base64,")
-    assert entry.recording_path is None
-    assert highlights(entry)["channel_name"] == "HAADF"
+    assert [dataset.name for dataset in entry.datasets] == ["HAADF", "MAADF"]
+    for dataset in entry.datasets:
+        assert dataset.frame_count == _TWO_PASSES
+        assert dataset.shape == _PARAMETERS.shape
+        assert dataset.thumbnail.startswith("data:image/png;base64,")
+        # No session was attached, so the frames have nowhere else to be
+        # and the entry keeps them - which is what makes Save possible.
+        assert dataset.in_memory
+        assert len(dataset.frames) == _TWO_PASSES
+    haadf = entry.dataset("HAADF")
+    assert haadf is not None
+    assert highlights(haadf)["channel_name"] == "HAADF"
     # Not a credential, whatever the name looks like: the pass identity
     # is what makes per-pixel arithmetic between two channels legitimate.
-    assert highlights(entry)["scan_pass_id"] == "pass-1"  # noqa: S105
+    assert highlights(haadf)["scan_pass_id"] == "pass-1"  # noqa: S105
+    maadf = entry.dataset("MAADF")
+    assert maadf is not None
+    assert highlights(maadf)["channel_name"] == "MAADF"
+    # Same pass as the HAADF above: one traversal, both detectors.
+    assert highlights(maadf)["scan_pass_id"] == "pass-1"  # noqa: S105
 
 
 def test_the_holder_the_broker_assigned_is_recorded(broker):
@@ -419,7 +450,10 @@ def test_a_refusal_is_logged_as_well_as_raised(broker):
     assert not entry.succeeded
     assert "DeviceBusyError" in (entry.error or "")
     assert entry.frame_count == 0
-    assert entry.thumbnail == ""
+    # No signals at all, rather than one empty one: nothing was acquired,
+    # and a dataset row with no picture would suggest something was.
+    assert entry.datasets == ()
+    assert entry.pending == ()
 
 
 def test_acquiring_into_a_session_writes_the_frames_and_names_the_file(
@@ -440,11 +474,105 @@ def test_acquiring_into_a_session_writes_the_frames_and_names_the_file(
     assert _finished(job)
     assert job.error is None
     (entry,) = log.entries
-    assert entry.recording_path is not None
+    (dataset,) = entry.datasets
+    assert dataset.path is not None
+    assert not dataset.in_memory
+    # The file has them, so the kernel does not keep a second copy.
+    assert dataset.frames == ()
+    assert dataset.frame_count == _CAMERA_FRAMES
     assert entry.frame_count == _CAMERA_FRAMES
+    assert entry.pending == ()
     recorded = session.recordings()
     assert [record.frame_count for record in recorded] == [_CAMERA_FRAMES]
-    assert str(recorded[0].path) == entry.recording_path
+    assert str(recorded[0].path) == dataset.path
+
+
+def test_each_detector_of_a_pass_gets_its_own_file_under_one_number(
+    broker,
+    tmp_path,
+):
+    """
+    Two detectors, two files, one sequence number.
+
+    Separate files because every external tool an operator reaches for -
+    HyperSpy, a NeXus viewer, a file manager - takes a file and gives
+    back a signal. The shared number is what still says the two came out
+    of one pass.
+    """
+    log = SessionLog()
+    session = Session(tmp_path / "shift")
+    job = AcquisitionJob(
+        broker,
+        scan_request(
+            "scanner",
+            parameters=_PARAMETERS,
+            channels=(0, 1),
+            channel_names=("HAADF", "MAADF"),
+            count=2,
+        ),
+        log,
+        session=session,
+    )
+    job.start()
+    assert _finished(job)
+    assert job.error is None
+    (entry,) = log.entries
+    paths = {dataset.name: dataset.path for dataset in entry.datasets}
+    assert set(paths) == {"HAADF", "MAADF"}
+    assert all(path is not None for path in paths.values())
+    assert paths["HAADF"] != paths["MAADF"]
+    recorded = session.recordings()
+    assert len(recorded) == _TWO_SIGNALS
+    assert {record.index for record in recorded} == {1}
+    assert {record.label for record in recorded} == {"scan-haadf", "scan-maadf"}
+    # Each file holds only its own detector's frames, not the interleaved
+    # stream both came out of.
+    assert [record.frame_count for record in recorded] == [_TWO_PASSES] * _TWO_SIGNALS
+
+
+def test_a_multi_step_recipe_becomes_one_item_with_a_signal_per_step(broker):
+    """
+    ``named`` is the whole extension mechanism for a composite acquisition.
+
+    A survey, then the thing you came for, then the same survey again to
+    see what the beam did - one lease, one item, three signals. Nothing
+    in the log or the storage layer had to learn about the recipe; the
+    request labelled its own steps.
+    """
+    log = SessionLog()
+    request = AcquisitionRequest(
+        targets=("scanner",),
+        label="survey-and-followup",
+        reason="a survey, and the same area again afterwards",
+        build=lambda leased: itertools.chain(
+            named(
+                "survey",
+                multichannel_scan_series(
+                    leased.scanner("scanner"),
+                    _PARAMETERS,
+                    1,
+                    channels=[0],
+                ),
+            ),
+            named(
+                "followup",
+                multichannel_scan_series(
+                    leased.scanner("scanner"),
+                    _PARAMETERS,
+                    1,
+                    channels=[0],
+                ),
+            ),
+        ),
+    )
+    job = AcquisitionJob(broker, request, log)
+    job.start()
+    assert _finished(job)
+    assert job.error is None
+    (entry,) = log.entries
+    # In step order, which is first-appearance order - not the order the
+    # detector happens to name itself, which is "HAADF" for both.
+    assert [dataset.name for dataset in entry.datasets] == ["survey", "followup"]
 
 
 def test_a_paused_live_loop_comes_back_after_an_acquisition(broker, devices):
@@ -559,6 +687,118 @@ def test_the_log_has_no_way_to_forget_an_acquisition():
         assert not hasattr(log, name)
 
 
+def _one_signal_entry() -> SessionLogEntry:
+    """
+    Return an entry holding a single in-memory signal.
+
+    Returns
+    -------
+    SessionLogEntry
+        The entry, unstamped.
+    """
+    frame = Frame(
+        data=np.zeros((4, 4), dtype=np.float32),
+        timestamp=datetime.datetime.now(tz=datetime.UTC),
+        metadata={"device_id": "scan-unit", "channel_name": "HAADF"},
+    )
+    return SessionLogEntry(
+        index=0,
+        label="scan",
+        reason="one pass",
+        targets=("scanner",),
+        holder="me",
+        started_at=datetime.datetime.now(tz=datetime.UTC),
+        duration_s=0.1,
+        datasets=(describe_dataset("HAADF", [frame]),),
+    )
+
+
+def test_marking_a_signal_stored_moves_it_and_changes_nothing_else():
+    """
+    Where the bytes live is not part of the account of the shift.
+
+    The one mutation besides append, and it says exactly one thing:
+    this signal is now at this path. It releases the frames as it does
+    so, because the file has them.
+    """
+    log = SessionLog()
+    original = log.append(_one_signal_entry())
+
+    updated = log.mark_stored(original.index, "HAADF", "/data/0001-scan-haadf.nxs")
+
+    assert updated is not None
+    (dataset,) = updated.datasets
+    assert dataset.path == "/data/0001-scan-haadf.nxs"
+    assert dataset.frames == ()
+    assert not dataset.in_memory
+    # Everything the entry claims about what happened is untouched.
+    assert (updated.label, updated.reason, updated.holder) == (
+        original.label,
+        original.reason,
+        original.holder,
+    )
+    assert updated.started_at == original.started_at
+    assert updated.frame_count == original.frame_count
+    assert log.pending == ()
+
+
+def test_a_signal_that_is_already_stored_is_not_repointed():
+    """
+    Data that has been written has not become unwritten.
+
+    A second path would quietly disown the first file, so it is refused
+    rather than applied - and refused by saying nothing changed, which
+    is what a caller retrying a flush needs to hear.
+    """
+    log = SessionLog()
+    entry = log.append(_one_signal_entry())
+    log.mark_stored(entry.index, "HAADF", "/data/first.nxs")
+
+    assert log.mark_stored(entry.index, "HAADF", "/data/second.nxs") is None
+
+    (dataset,) = log.entries[0].datasets
+    assert dataset.path == "/data/first.nxs"
+
+
+def test_marking_a_signal_the_log_does_not_have_changes_nothing():
+    """An index or a name from somewhere else must not invent an entry."""
+    log = SessionLog()
+    entry = log.append(_one_signal_entry())
+
+    assert log.mark_stored(entry.index, "MAADF", "/data/wrong.nxs") is None
+    assert log.mark_stored(entry.index + 1, "HAADF", "/data/wrong.nxs") is None
+    assert log.mark_stored(0, "HAADF", "/data/wrong.nxs") is None
+
+    assert len(log.pending) == 1
+
+
 def test_an_empty_series_describes_itself_as_empty_rather_than_raising():
     """An acquisition of nothing is a real outcome; the log renders it."""
     assert describe_frames([]) == ((), "", "")
+
+
+def test_a_projected_readout_is_described_without_a_thumbnail():
+    """
+    A spectrum is not a picture, and asking for one used to raise.
+
+    A camera in the projected readout delivers a 1D frame, which the PNG
+    encoder refuses - correctly, since a one-pixel-high strip is a
+    picture of nothing. Describing it has to say so rather than take
+    that refusal through the log.
+    """
+    spectrum = Frame(
+        data=np.arange(16, dtype=np.float32),
+        timestamp=datetime.datetime.now(tz=datetime.UTC),
+        metadata={"device_id": "eels_camera", "readout": "projected"},
+    )
+
+    shape, dtype, thumbnail = describe_frames([spectrum])
+
+    assert shape == (16,)
+    assert dtype == "float32"
+    assert thumbnail == ""
+    # And it is still a signal the log holds, with its metadata intact.
+    dataset = describe_dataset("EELS", [spectrum])
+    assert dataset.frame_count == 1
+    assert dataset.in_memory
+    assert highlights(dataset)["readout"] == "projected"
