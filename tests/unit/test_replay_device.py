@@ -440,6 +440,14 @@ class TestTiming:
         Only a lower bound is asserted: a machine can always be slower
         than expected, and a test that also demanded an upper bound would
         fail on a loaded CI runner while proving nothing extra.
+
+        Timed with :func:`time.perf_counter` rather than
+        :func:`time.monotonic`, and that is not a preference. On Windows
+        ``monotonic`` ticks about every 15.6 ms, while the bound here is
+        0.6 ms — so a pass that waited perfectly well measured as zero
+        elapsed and the assertion failed on the clock's resolution
+        rather than on anything the device did. ``perf_counter`` is
+        sub-microsecond on every platform this runs on.
         """
         speed = 20.0
         recording = _recording()
@@ -448,11 +456,11 @@ class TestTiming:
         )
         expected = _HEIGHT * _WIDTH * _DWELL_S / speed
 
-        started = time.monotonic()
+        started = time.perf_counter()
         scanner.scan_synchronised(
             recording.scan_parameters(), targets=[EELS_TARGET],
         )
-        assert time.monotonic() - started >= expected * 0.5
+        assert time.perf_counter() - started >= expected * 0.5
 
     def test_speed_scales_the_wait(self, monkeypatch):
         """
