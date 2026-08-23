@@ -1,0 +1,73 @@
+# SuperSTEM 1 - Daresbury.
+#
+# THE LEAST VERIFIED FILE HERE, and it says so at the top rather than in
+# a footnote. What this project knows about SuperSTEM 1 first-hand is one
+# detector shape: its EEL spectrometer reads out 1340x100 and bins up to
+# 100x vertically, which is a Gatan Enfina, and which
+# viewer/preview.py's simulated spectrometer is modelled on so that a
+# preview window looks like this instrument's.
+#
+# What drives the column, and whether it also drives the spectrometer,
+# are NOT established. This file is a template with a stated hypothesis,
+# not a record of a working configuration: run it unedited and the
+# likely outcome is a startup error naming the device that did not
+# appear. That error is the file working correctly - see
+# docs/instrument-configuration.md, "the enumeration is authoritative" -
+# and it is a great deal better than a session that appears to work.
+#
+# To settle it, run docs/superstem-survey.md's first section from
+# whatever interpreter drives this microscope; the answers replace the
+# guesses below. Until then, instruments/simulator.toml is what to
+# develop against.
+#
+#   python -m miainwoodpecker.broker.app --config instruments/superstem-1.toml
+
+schema = 1
+name = "SuperSTEM 1"
+site = "SuperSTEM, Daresbury"
+description = """\
+A dedicated STEM with a 1340x100 EEL spectrometer (Gatan Enfina). Column \
+control software UNIDENTIFIED; everything below is a hypothesis pending \
+the instrument survey.\
+"""
+
+# ---------------------------------------------------------------------
+# The column, as a hypothesis.
+#
+# Started from the Nion adapter because that is the one this project has
+# built and tested, not because anybody has seen it drive this
+# instrument. Three ways this is wrong, and what each looks like:
+#
+#  - the column is driven by something else entirely. The server exits
+#    reporting no hardware, and this needs an out-of-tree adapter -
+#    `module` is then the only line that changes, which is why the
+#    device server is a parameter at all rather than a constant.
+#  - the column is Nion's but the spectrometer is not. Startup fails
+#    naming `eels_camera`, and the Enfina needs the inbound Gatan
+#    transport (docs/adapters/gatan.md), which this schema cannot yet
+#    express.
+#  - there is a Ronchigram camera nobody wrote down here. It is served
+#    by the same process, and a `[[server.device]]` for it is three
+#    lines; the broker logs by name anything a server offers that this
+#    file does not list, so the startup output will say so.
+#
+# `plugins` empty means the server autodiscovers every installed
+# nionswift_plugin module. Name the vendor's module here once
+# docs/hardware-validation-checklist.md has read it off the control
+# computer.
+# ---------------------------------------------------------------------
+[[server]]
+name = "column"
+module = "miainwoodpecker.devices.nion_server"
+backend = "hardware"
+plugins = []
+controls_column = true
+description = "UNVERIFIED: column control software unidentified (survey run 1)"
+
+[[server.device]]
+target = "scanner"
+description = "Scan unit; channel count and names UNVERIFIED"
+
+[[server.device]]
+target = "eels_camera"
+description = "EEL spectrometer, 1340x100, binning to 100x vertically (Gatan Enfina)"

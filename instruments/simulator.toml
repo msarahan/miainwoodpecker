@@ -1,0 +1,69 @@
+# The bundled simulator: a whole microscope with nothing plugged in.
+#
+# This is the file to copy when writing one for a real instrument, and
+# the one to run first when something on a real instrument does not
+# work - if the same command against this file behaves, the problem is
+# the hardware or its adapter rather than the broker.
+#
+#   python -m miainwoodpecker.broker.app --config instruments/simulator.toml
+#
+# Everything here is `backend = "simulated"`, which needs no vendor
+# software, no detector and no column. See docs/instrument-configuration.md
+# for what each key means.
+
+schema = 1
+name = "Simulator"
+description = """\
+nionswift-usim's simulated UltraSTEM: a scan unit with HAADF and MAADF \
+channels, a Ronchigram camera, and an EELS camera on a simulated \
+spectrometer. What the test suite and every laptop run against.\
+"""
+
+# ---------------------------------------------------------------------
+# The column, and the three devices Nion's simulator registers on it.
+#
+# One process serving four targets, which is the ordinary Nion case: the
+# scan unit and both cameras come out of the same stem_controller, so
+# splitting them across processes would mean three connections to one
+# vendor stack rather than one.
+# ---------------------------------------------------------------------
+[[server]]
+name = "column"
+module = "miainwoodpecker.devices.nion_server"
+backend = "simulated"
+controls_column = true
+description = "nionswift-usim, loaded through the Nion device server"
+
+[[server.device]]
+target = "scanner"
+description = "Simulated scan unit; HAADF and MAADF channels"
+
+[[server.device]]
+target = "ronchigram_camera"
+description = "Simulated Ronchigram camera"
+
+[[server.device]]
+target = "eels_camera"
+description = "Simulated EELS camera on the simulated spectrometer"
+
+# ---------------------------------------------------------------------
+# A second process, off by default.
+#
+# Enable it to exercise the multi-adapter path - two servers started,
+# checked and served as one instrument - without any hardware. That path
+# is what SuperSTEM 2 and 3 need in earnest, and this is the only way to
+# rehearse it on a laptop.
+#
+# It is off rather than on because this file's job is to be "the
+# simulator", and the simulator an operator means is the Nion one above.
+# ---------------------------------------------------------------------
+[[server]]
+name = "edx"
+module = "miainwoodpecker.devices.spectrum_server"
+backend = "simulated"
+enabled = false
+description = "Simulated EDX silicon drift detector, in its own process"
+
+[[server.device]]
+target = "spectrum_detector"
+description = "Synthesised EDX spectra; no vendor software involved"

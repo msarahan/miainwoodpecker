@@ -1,0 +1,80 @@
+# SuperSTEM 3 ("HERMES") - Nion UltraSTEM 100MC, Daresbury.
+#
+# The instrument this schema was shaped by: two adapters, two processes,
+# one microscope. The column is Nion's; the EELS detector is a DECTRIS
+# ELA on a Nion IRIS spectrometer, which speaks SIMPLON over HTTP and
+# knows nothing about Nion. Neither adapter can serve the other's
+# hardware, and before this file the broker could start only one of them.
+#
+# Lines marked UNVERIFIED are hypotheses; docs/superstem-survey.md is the
+# read-only script that settles them at the instrument.
+#
+#   python -m miainwoodpecker.broker.app --config instruments/superstem-3.toml
+
+schema = 1
+name = "SuperSTEM 3"
+site = "SuperSTEM, Daresbury"
+description = """\
+Nion UltraSTEM 100MC ("HERMES"): a monochromated column with a Nion IRIS \
+spectrometer, whose detector is a DECTRIS ELA reached directly over \
+SIMPLON rather than through Gatan Microscopy Suite.\
+"""
+
+# ---------------------------------------------------------------------
+# The column: scan unit and Ronchigram camera.
+#
+# No eels_camera here, and that is the point of this file. The
+# spectrometer's detector is the ELA below, served by its own process;
+# if Nion's stack on this machine *also* registers an EELS camera - the
+# survey's first run reports whether it does - then it is a second path
+# to the same detector, and serving both would put two drivers on one
+# piece of hardware. Add it here only if the survey shows it is a
+# different camera.
+#
+# `plugins` empty means autodiscovery; name the vendor module once
+# docs/hardware-validation-checklist.md has read it off the control
+# computer.
+# ---------------------------------------------------------------------
+[[server]]
+name = "column"
+module = "miainwoodpecker.devices.nion_server"
+backend = "hardware"
+plugins = []
+controls_column = true
+description = "Nion UltraSTEM 100MC, through the vendor's nionswift_plugin"
+
+[[server.device]]
+target = "scanner"
+description = "Nion scan unit; channel count and names UNVERIFIED (survey run 1)"
+
+[[server.device]]
+target = "ronchigram_camera"
+description = "Nion Ronchigram camera"
+
+# ---------------------------------------------------------------------
+# The ELA, in its own process, renamed on the way through.
+#
+# `served_as = "camera"` is not decoration. The DECTRIS server serves
+# one detector under the neutral name `camera`, because that is all a
+# detector adapter can honestly know: the same firmware behind the same
+# API is an EELS detector here and a 4D-STEM camera on somebody else's
+# column. What it is *on this microscope* is a fact about the
+# microscope, so it is stated here, and clients see `eels_camera`.
+#
+# `plugins` carries the control unit's address, which is what this
+# server takes its --plugin value to mean. SIMPLON is served by the DCU
+# on port 80, not by the detector head - use the DCU's address.
+# UNVERIFIED: 192.168.1.10 is the address docs/superstem-survey.md uses
+# as an example, not one anybody has read off this instrument.
+# ---------------------------------------------------------------------
+[[server]]
+name = "ela"
+module = "miainwoodpecker.devices.dectris_server"
+backend = "hardware"
+plugins = ["192.168.1.10"]
+description = "DECTRIS ELA on the Nion IRIS spectrometer, over SIMPLON"
+
+[[server.device]]
+target = "eels_camera"
+served_as = "camera"
+description = "DECTRIS ELA; the EELS detector on this column, not a diffraction camera"
