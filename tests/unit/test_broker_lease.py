@@ -52,6 +52,7 @@ _DEADLINE_S = 5.0
 _JOIN_TIMEOUT_S = 0.05
 _AUTHKEY = b"broker-conformance-tests"
 _PARAMETERS = ScanParameters(height=4, width=4, pixel_time_us=1.0, fov_nm=10.0)
+_A_LONG_EXPOSURE_MS = 250.0
 
 
 def _wait_until(
@@ -330,6 +331,18 @@ class _FakeInstrument:
         self.parked = 0
         self.defocus = 0.0
         self.blanked = False
+
+    def describe(self) -> dict[str, object]:
+        """
+        Return what the device server says it is driving.
+
+        Returns
+        -------
+        dict[str, object]
+            The shape a real instrument handle answers with - see
+            ``RemoteInstrument.describe``.
+        """
+        return {"backend": "simulated", "targets": ["instrument", "scanner"]}
 
     def stage_size_nm(self) -> float:
         """
@@ -704,6 +717,168 @@ def test_what_a_target_is_crosses_the_wire(broker):
     # A camera has no channels and a scanner no binning: absent, not zero.
     assert described["eels_camera"].channel_names == ()
     assert described["scanner"].binning_values == ()
+
+
+def test_the_facts_a_window_is_built_from_all_cross_the_wire(devices, clock):
+    """
+    Backend, per-axis binning and a fixed grid travel with the description.
+
+    The last four device reads a window made to decide what to offer.
+    Each was a call on a handle, and each is now a field: the identity
+    row's backend, the two binning menus a spectrometer needs, and the
+    one geometry a replay device will accept. A client in another
+    process has no handle to make any of them on, so without these it
+    can show a picture and not much else.
+    """
+    fixed = ScanParameters(height=22, width=25, pixel_time_us=4.0, fov_nm=50.0)
+
+    class _PerAxisCamera(_FakeCamera):
+        """A spectrometer whose two axes cost different things to bin."""
+
+        @property
+        def binning_values_yx(self) -> tuple[tuple[int, ...], tuple[int, ...]]:
+            """
+            Return the factors offered down and across.
+
+            Returns
+            -------
+            tuple[tuple[int, ...], tuple[int, ...]]
+                Eight factors down the non-dispersive direction, two
+                across the dispersive one.
+            """
+            return ((1, 2, 4, 8), (1, 2))
+
+    class _ReplayScanner(_FakeScanner):
+        """A scan unit that holds the one grid the probe actually visited."""
+
+        def native_parameters(self) -> ScanParameters:
+            """
+            Return the recorded geometry, which is the only one it has.
+
+            Returns
+            -------
+            ScanParameters
+                The grid this recording was taken on.
+            """
+            return fixed
+
+    devices["eels_camera"] = _PerAxisCamera("eels_camera")
+    devices["scanner"] = _ReplayScanner()
+    described = LocalBroker(devices, clock=clock).describe()
+
+    assert described["instrument"].backend == "simulated"
+    # "Has no synchronised mode" and "has one with nothing wired to it"
+    # are the same empty tuple and want opposite things done about them:
+    # a different instrument, or a detector plugged into this one. The
+    # fake scan unit is the first case.
+    assert described["scanner"].synchronises is False
+    assert described["scanner"].synchronised_targets == ()
+    assert described["eels_camera"].binning_values_yx == ((1, 2, 4, 8), (1, 2))
+    assert described["scanner"].native_scan == fixed
+    # None rather than a doubled-up pair, so a client can tell a
+    # detector that bins its axes alike from one that does not - which
+    # is the difference between one binning control and two.
+    assert described["ronchigram_camera"].binning_values_yx is None
+    # And a scan unit that takes whatever grid it is given says so.
+    assert LocalBroker(
+        {"scanner": _FakeScanner()},
+        clock=clock,
+    ).describe()["scanner"].native_scan is None
+
+
+def test_one_control_that_will_not_be_read_does_not_cost_the_others(
+    devices,
+    clock,
+):
+    """
+    A half-written adapter loses its own row, not the whole reading.
+
+    Every client reads the controls through this one call now, including
+    the Qt window - which used to read each control itself and report
+    the one that refused while leaving the rest on screen. Letting a
+    single raise out of here would take the stage position away from
+    every client because the defocus is broken, and blank a panel that
+    was previously merely incomplete.
+    """
+
+    class _HalfReadableInstrument(_FakeInstrument):
+        """An instrument whose defocus raises when read."""
+
+        def defocus_nm(self) -> float:
+            """
+            Refuse the read, as a half-written vendor adapter would.
+
+            Returns
+            -------
+            float
+                Never; this always raises.
+
+            Raises
+            ------
+            RuntimeError
+                Always.
+            """
+            message = "this adapter cannot read the defocus"
+            raise RuntimeError(message)
+
+    devices["instrument"] = _HalfReadableInstrument()
+    values = LocalBroker(devices, clock=clock).controls()
+
+    assert DEFOCUS_CONTROL not in values
+    assert values[BEAM_BLANKER_CONTROL] is False
+
+
+def test_a_detectors_settings_can_be_read_without_leasing_it(broker):
+    """
+    A window has to show what a detector is set to before offering to change it.
+
+    Watch-side for the same reason the instrument's controls are: a
+    client that had to take a lease to fill in an exposure field would
+    hold one from the moment it opened, and every other client would be
+    locked out by a window that is only looking.
+    """
+    settings = broker.camera_parameters("eels_camera")
+
+    assert settings is not None
+    assert settings.exposure_ms == 1.0
+    # Nobody is holding anything: reading is not driving.
+    assert broker.targets()["eels_camera"].lease is None
+    # A target with no such settings answers None rather than raising -
+    # a scan unit has no exposure, and asking is how a caller finds out.
+    assert broker.camera_parameters("scanner") is None
+    with pytest.raises(KeyError):
+        broker.camera_parameters("no_such_camera")
+
+
+def test_a_detectors_settings_are_served_from_cache_while_it_is_leased(
+    broker,
+    devices,
+):
+    """
+    The last true answer stands, rather than a read across a held connection.
+
+    The device protocol is one request at a time, so reading a
+    detector's settings out from under the client that has leased it is
+    the interleaving the broker exists to prevent - the same rule
+    ``controls`` follows. The holder may also be part-way through
+    changing them, which makes a mid-lease read a value that was never
+    in force.
+    """
+    camera = devices["eels_camera"]
+    before = broker.camera_parameters("eels_camera")
+
+    with broker.lease("eels_camera", reason="acquiring") as leased:
+        leased.camera("eels_camera").configure(
+            CameraParameters(exposure_ms=_A_LONG_EXPOSURE_MS, binning=1),
+        )
+        during = broker.camera_parameters("eels_camera")
+
+    after = broker.camera_parameters("eels_camera")
+
+    assert before.exposure_ms == 1.0
+    assert during == before  # The cache, not the device.
+    assert camera.parameters().exposure_ms == _A_LONG_EXPOSURE_MS
+    assert after.exposure_ms == _A_LONG_EXPOSURE_MS  # Read once the lease ends.
 
 
 def test_a_device_that_refuses_to_describe_itself_says_so(devices, clock):

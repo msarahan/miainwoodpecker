@@ -14,9 +14,8 @@ from qtpy import QtCore, QtWidgets
 from miainwoodpecker.devices.interface import (
     READOUT_MODES,
     CameraParameters,
-    SynchronisedScanner,
-    axis_binning_values,
 )
+from miainwoodpecker.devices.rpc import SCANNER_TARGET
 from miainwoodpecker.viewer import preferences, profiles
 from miainwoodpecker.viewer.panels import settings, toolbar
 from miainwoodpecker.viewer.panels.defaults import (
@@ -66,8 +65,8 @@ def build_scan_group(widget: LiveInstrumentWidget) -> QtWidgets.QGroupBox:
     # entirely for a detector-only instrument, so the widgets it
     # creates (_channel_combo, _scan_count_spin, _scan_status, ...) do
     # not exist in that case. Every method that touches them checks
-    # _scanner rather than hasattr, because the scanner is the reason
-    # they exist and is the honest thing to ask about.
+    # _has_scanner rather than hasattr, because a scan unit being served
+    # is the reason they exist and is the honest thing to ask about.
     scan_group = QtWidgets.QGroupBox("Scan", widget)
     scan_form = QtWidgets.QFormLayout(scan_group)
     widget._scan_settings_dialog = settings.SettingsDialog(
@@ -318,17 +317,14 @@ def _synchronisable_targets(widget: LiveInstrumentWidget) -> list[str]:
     Parameters
     ----------
     widget : LiveInstrumentWidget
-        The widget whose scanner is asked.
+        The widget whose scan unit is asked about.
 
     Returns
     -------
     list[str]
-        Target names, in the order the scanner reports them.
+        Target names, in the order the scan unit reports them.
     """
-    scanner = widget._scanner
-    if scanner is None or not isinstance(scanner, SynchronisedScanner):
-        return []
-    return list(scanner.synchronised_targets())
+    return list(widget._description(SCANNER_TARGET).synchronised_targets)
 
 
 def build_record_controls(
@@ -456,7 +452,7 @@ def build_camera_group(
 
 
 def build_image_controls(
-    widget: LiveInstrumentWidget,  # noqa: ARG001 - kept for builder symmetry
+    widget: LiveInstrumentWidget,
     camera_group: QtWidgets.QWidget,
     camera_form: QtWidgets.QFormLayout,
     binding: object,
@@ -486,7 +482,14 @@ def build_image_controls(
         The camera binding whose ``exposure_spin``, ``binning_combo``
         and ``acquire_button`` are filled in here.
     """
-    current = binding.camera.parameters()
+    current = widget._broker.camera_parameters(binding.name) or CameraParameters(
+        # A detector that reports no settings at all. Not reachable
+        # through a Camera, which must implement ``parameters`` - this is
+        # what keeps the panel buildable against a target that turns out
+        # not to be one, rather than raising while a window is being
+        # assembled.
+        exposure_ms=_MIN_EXPOSURE_MS,
+    )
     binding.exposure_spin = QtWidgets.QDoubleSpinBox(camera_group)
     binding.exposure_spin.setRange(_MIN_EXPOSURE_MS, _MAX_EXPOSURE_MS)
     binding.exposure_spin.setDecimals(_EXPOSURE_DECIMALS)
@@ -494,13 +497,7 @@ def build_image_controls(
     binding.exposure_spin.setSuffix(" ms")
     camera_form.addRow("Image exposure", binding.exposure_spin)
 
-    # Still read off the camera handle rather than from the broker's
-    # description, and knowingly: this grew a *per-axis* answer
-    # (`binning_values_yx`) that `TargetDescription` does not carry yet,
-    # and inventing that mapping here - untested, on a detector whose two
-    # axes cost different things to bin - would be worse than the honest
-    # gap. It is the one capability read the window has left.
-    _add_binning_controls(binding, camera_group, camera_form, current)
+    _add_binning_controls(widget, binding, camera_group, camera_form, current)
 
     binding.readout_combo = QtWidgets.QComboBox(camera_group)
     # Offered on every camera, and refused by the ones that cannot do it.
@@ -525,6 +522,7 @@ def build_image_controls(
     camera_form.addRow("Detector readout", binding.readout_combo)
 
 def _add_binning_controls(
+    widget: LiveInstrumentWidget,
     binding: object,
     camera_group: QtWidgets.QWidget,
     camera_form: QtWidgets.QFormLayout,
@@ -548,6 +546,8 @@ def _add_binning_controls(
 
     Parameters
     ----------
+    widget : LiveInstrumentWidget
+        The widget whose broker describes the detector.
     binding : object
         The camera binding whose ``binning_combo`` — and, for a detector
         with separate axes, ``binning_across_combo`` — are filled in.
@@ -558,10 +558,18 @@ def _add_binning_controls(
     current : CameraParameters
         What the camera reports it is set to now.
     """
-    down_values, across_values = axis_binning_values(binding.camera)
+    described = widget._description(binding.name)
+    # From the description rather than from the handle, which is what
+    # lets this panel be built for a detector in another process. The
+    # None-versus-pair distinction is the same one
+    # ``axis_binning_values`` makes, carried across the wire: None means
+    # one list for both axes, and one control rather than two.
+    per_axis = described.binning_values_yx
+    shared = described.binning_values or (1,)
+    down_values, across_values = per_axis if per_axis is not None else (shared, shared)
     current_down, current_across = current.binning_yx
     binding.binning_combo = _binning_combo(camera_group, down_values, current_down)
-    if getattr(binding.camera, "binning_values_yx", None) is None:
+    if per_axis is None:
         camera_form.addRow("Image binning", binding.binning_combo)
         return
     binding.binning_across_combo = _binning_combo(
@@ -755,9 +763,9 @@ def build_devices_panel(widget: LiveInstrumentWidget) -> QtWidgets.QGroupBox:
     panel = QtWidgets.QGroupBox("Devices", widget)
     layout = QtWidgets.QVBoxLayout(panel)
     built: list[tuple[str, str, QtWidgets.QWidget]] = []
-    if widget._scanner is not None:
+    if widget._has_scanner:
         built.append(("scanner", "Scan", build_scan_group(widget)))
-    titles = _camera_section_titles(widget._camera_bindings.values())
+    titles = _camera_section_titles(widget)
     for index, binding in enumerate(widget._camera_bindings.values()):
         group = build_camera_group(widget, binding)
         if index == 0:
@@ -780,7 +788,7 @@ def build_devices_panel(widget: LiveInstrumentWidget) -> QtWidgets.QGroupBox:
     return panel
 
 
-def _camera_section_titles(bindings: typing.Iterable[object]) -> dict[str, str]:
+def _camera_section_titles(widget: LiveInstrumentWidget) -> dict[str, str]:
     """
     Name each camera section after its device, keeping the names distinct.
 
@@ -794,18 +802,22 @@ def _camera_section_titles(bindings: typing.Iterable[object]) -> dict[str, str]:
 
     Parameters
     ----------
-    bindings : typing.Iterable[object]
-        The camera bindings to name.
+    widget : LiveInstrumentWidget
+        The widget whose camera sections are being titled.
 
     Returns
     -------
     dict[str, str]
         Target name to section title.
     """
-    listed = list(bindings)
+    # What the device calls itself, from the description rather than
+    # from a ``camera_id`` on the handle: the broker reads exactly that
+    # attribute into ``label``, and reading it here too would be a
+    # second answer to keep in step - and no answer at all for a
+    # detector in another process.
     identifiers = {
-        binding.name: getattr(binding.camera, "camera_id", None) or binding.name
-        for binding in listed
+        name: widget._description(name).label
+        for name in widget._camera_bindings
     }
     counts: dict[str, int] = {}
     for identifier in identifiers.values():

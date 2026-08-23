@@ -514,6 +514,23 @@ installed. Leave the detector checkboxes and binning menu built from
 `broker.describe()`: a client in another process has no device handle to
 read them off, which is what that call exists for.
 
+### The viewer as one of the clients
+
+The Qt window connects to a broker the same way, and is worth knowing
+about here because it changes what a script shares the instrument with:
+
+```
+miainwoodpecker-viewer --broker .
+```
+
+It launches no device server, holds no device handle, and takes its
+turn like everything else — so an operator can watch the live view and
+adjust the column while your script runs, and neither of you can
+interleave on the other's frames. What the window offers is built from
+`describe()`, `controls()` and `camera_parameters()`; if you are writing
+a device adapter, those three are what decides whether a window opened
+against it has controls or only a picture.
+
 ## Sessions from scripts
 
 `Session` is the same folder-of-recordings the viewer uses — automatic

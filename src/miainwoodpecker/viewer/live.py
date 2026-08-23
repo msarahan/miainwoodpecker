@@ -17,6 +17,18 @@ the instrument, which stopped being true the moment a notebook or a
 dashboard wanted the same microscope. The rule now lives in one place
 that all of them share, and what is left here is a window.
 
+**And the instrument may be in another process entirely.** Given a
+broker and no devices, every control this window offers is built from
+what the broker *describes* — detector names, binning factors per axis,
+which controls the column implements, which cameras the scan unit can
+read out, whether the scan unit has a fixed grid — and every value it
+displays comes from a watch call. Nothing here reads a device to decide
+what to offer, which is what makes the window on an operator's laptop
+the same window as the one on the microscope PC rather than a cut-down
+one. The visible consequence is that driving can be *refused*: a
+control write takes a lease like everything else, and somebody else may
+be holding it.
+
 **A lease can take as long as a scan pass, so no lease is taken on the
 GUI thread.** Stopping a live loop means waiting out the pass in flight,
 and a pass is ``height x width x dwell`` — a quarter of a second at
@@ -25,6 +37,12 @@ acquisition here therefore takes its lease *inside* the generator the
 worker consumes, where waiting costs nothing but the wait. The two
 paths that still block (Preview, and a spectrum image) blocked before
 this change for the same reason and are marked as such.
+
+The one deliberate exception is a control write, which leases the
+``instrument`` target on the GUI thread — and can, because that target
+runs no live loop, so there is no pass for the grant to wait out. It
+waits half a second and then says who is driving; see
+``_drive_instrument``.
 
 Thread-safety contract: Qt widgets are only touched from the GUI thread.
 Scan settings are handed to the broker, which publishes them to its own
@@ -105,10 +123,10 @@ from miainwoodpecker.acquisition.sequence import (
 from miainwoodpecker.broker.interface import BrokerError, TargetDescription
 from miainwoodpecker.broker.local import LocalBroker
 from miainwoodpecker.devices.interface import (
+    IMAGE_READOUT,
     CameraParameters,
     ScanParameters,
     ScanPass,
-    native_scan_parameters,
 )
 from miainwoodpecker.devices.rpc import (
     INSTRUMENT_TARGET,
@@ -165,6 +183,7 @@ if typing.TYPE_CHECKING:
         Camera,
         Frame,
         Instrument,
+        InstrumentController,
         Scanner,
         SynchronisedScanner,
     )
@@ -196,6 +215,28 @@ _NEXUS_FILE_FILTER = "NeXus recordings (*.nxs *.h5 *.hdf5);;All files (*)"
 _SPECTRUM_READOUT_RANK = 1
 _IMAGE_READOUT_RANK = 2
 
+# The two keys a stage position arrives under in the broker's control
+# map. One control on the instrument, two numbers on the wire, because
+# a mapping of scalars is what crosses a process boundary without a
+# type of its own - see LocalBroker._refresh_controls.
+_STAGE_Y_CONTROL = "stage_position_y_nm"
+_STAGE_X_CONTROL = "stage_position_x_nm"
+
+# How long a control write waits for the instrument target. Short,
+# unlike the default: this is the one lease taken on the GUI thread, and
+# the instrument runs no live loop for the wait to be about - so a wait
+# here means another client is holding it, and saying so beats a window
+# that stops repainting for five seconds every time somebody clicks
+# Apply.
+_CONTROL_LEASE_TIMEOUT_S = 0.5
+
+# The kind of target this window builds a camera section for, as
+# target_kind spells it. Cameras only, which is exactly what
+# RemoteInstrumentDevices.cameras() yields for the in-process path -
+# the two ways of finding detectors have to agree or a window would
+# gain a section by being pointed at a broker.
+_CAMERA_KIND = "camera"
+
 
 @dataclasses.dataclass
 class _CameraBinding:
@@ -211,9 +252,13 @@ class _CameraBinding:
     Attributes
     ----------
     name : str
-        The target name the server serves this camera on.
-    camera : Camera
-        The device itself.
+        The target name the server serves this camera on, which is how
+        the broker is asked about it and how a lease names it. There is
+        deliberately **no device handle here**: what the panel shows and
+        what its buttons drive both go through the broker, so a binding
+        holding one would be the one path by which a window could reach
+        past the arbitration - and the one thing that cannot exist at
+        all when the instrument is in another process.
     layer_name : str
         The napari layer its frames are pushed into. One layer per
         camera, so two live cameras do not overwrite each other.
@@ -254,7 +299,6 @@ class _CameraBinding:
     """
 
     name: str
-    camera: Camera
     layer_name: str
     button: QtWidgets.QPushButton | None = None
     status: QtWidgets.QLabel | None = None
@@ -434,7 +478,13 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
     viewer : napari.Viewer
         The napari viewer whose layers display the live frames.
     scanner : Scanner | None
-        The scan device to drive, or None for a detector-only instrument.
+        The scan device to drive, or None for a detector-only
+        instrument — and None, too, when ``broker`` is one in another
+        process, which is the case this window has no handles for at
+        all. What it offers then comes from
+        :meth:`~miainwoodpecker.broker.interface.InstrumentBroker.describe`
+        rather than from the devices, and everything it drives goes
+        through the broker either way.
     camera : Camera | None
         An optional camera to offer a live view for (e.g. Ronchigram, or
         a commodity USB camera). The one-entry case of ``cameras``, kept
@@ -461,7 +511,11 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         Passing one is how this window stops being the only client: a
         notebook, a dashboard and this dock can hold the same broker and
         take turns at the hardware instead of corrupting each other's
-        frames.
+        frames. Pass one *without* devices - a
+        :class:`~miainwoodpecker.broker.remote.RemoteBroker` - and the
+        instrument is in another process entirely: the window is then
+        made of what ``describe``, ``controls`` and ``camera_parameters``
+        report, which is the whole of what it needs.
     display_interval_ms : int
         How often the display polls for new frames.
     parent : QtWidgets.QWidget | None
@@ -470,16 +524,16 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
     Raises
     ------
     ValueError
-        If neither a scanner nor a camera is given. There would be
-        nothing to show and nothing to record, and every control would
-        be disabled — a window worth refusing to build rather than
-        opening empty.
+        If there is neither a scan unit nor a detector — given as
+        handles, or described by the broker. There would be nothing to
+        show and nothing to record, and every control would be disabled
+        — a window worth refusing to build rather than opening empty.
     """
 
     def __init__(  # noqa: PLR0913 - all but viewer/scanner are keyword-only
         self,
         viewer: napari.Viewer,
-        scanner: Scanner | None,
+        scanner: Scanner | None = None,
         *,
         camera: Camera | None = None,
         cameras: typing.Mapping[str, Camera] | None = None,
@@ -494,7 +548,7 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
             # scripts and every existing test use it. It is the one-entry
             # case of the mapping rather than a separate path.
             served = {"camera": camera, **served}
-        if scanner is None and not served:
+        if broker is None and scanner is None and not served:
             msg = (
                 "LiveInstrumentWidget needs a scanner, a camera, or both - "
                 "an instrument with neither has nothing to display"
@@ -502,29 +556,10 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
             raise ValueError(msg)
         super().__init__(parent)
         self._viewer = viewer
-        self._scanner = scanner
-        self._instrument = instrument
         self._instrument_controls: dict[str, QtWidgets.QDoubleSpinBox] = {}
         self._instrument_stage_y: QtWidgets.QDoubleSpinBox | None = None
         self._instrument_stage_x: QtWidgets.QDoubleSpinBox | None = None
         self._instrument_blanker: QtWidgets.QCheckBox | None = None
-        self._camera_bindings: dict[str, _CameraBinding] = {
-            name: _CameraBinding(
-                name=name,
-                camera=device,
-                layer_name="Camera" if index == 0 else f"Camera ({name})",
-            )
-            for index, (name, device) in enumerate(served.items())
-        }
-        # The devices above are kept for *descriptive* reads only -
-        # channel names, binning values, a synchronised-target list -
-        # which produce no frames and so cannot interleave on the
-        # shared-memory segment the arbitration exists to protect.
-        # Everything that drives goes through the broker. The remaining
-        # consequence is honest and worth stating: those reads are
-        # direct, so this window cannot yet be pointed at a broker in
-        # another process. Moving that metadata onto TargetState is what
-        # a second screen will need.
         self._owns_broker = broker is None
         self._broker: InstrumentBroker = broker if broker is not None else LocalBroker(
             {
@@ -534,6 +569,19 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
             },
             holder="viewer",
         )
+        # What this instrument *has*, asked of the broker rather than of
+        # the handles - because with a broker in another process there
+        # are no handles, and asking the same question two ways would be
+        # two answers to keep in step.
+        #
+        # **The handles are not kept.** Whatever a caller passed went
+        # into the broker above and is reached from here only through a
+        # lease; this object holds no device, which is what makes the
+        # in-process window and the one across a socket the same window
+        # rather than two that resemble each other.
+        described = self._broker.describe()
+        self._has_scanner = SCANNER_TARGET in described
+        self._camera_bindings = self._bind_cameras(described, served)
         # Newest frame already pushed into each napari layer, so a display
         # tick that finds nothing new can skip the upload entirely. Holds
         # a reference for identity comparison only; the array itself is
@@ -588,7 +636,9 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
                 fov_nm=_DEFAULT_FOV_NM,
             ),
             (0,),
-            self.channel_names()[0] if scanner is not None else "",
+            # Replaced by _on_scan_settings_changed below, before the
+            # window is shown; the fallback is for the moment between.
+            (self.channel_names() or ("",))[0],
         )
         # Before _build_ui: a failure part-way through building the UI
         # still leaves a widget whose shutdown() may be called.
@@ -606,13 +656,6 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         self._timer = QtCore.QTimer(self)
         self._timer.setInterval(display_interval_ms)
         self._timer.timeout.connect(self.refresh_display)
-
-
-    @property
-    def _camera(self) -> Camera | None:
-        """The first camera served, which is what ``camera=`` used to mean."""
-        binding = self._first_binding()
-        return binding.camera if binding is not None else None
 
     @property
     def _camera_status(self) -> QtWidgets.QLabel | None:
@@ -643,6 +686,82 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         """The first camera's record button, kept for pre-N callers."""
         binding = self._first_binding()
         return binding.record_button if binding is not None else None
+
+    def _bind_cameras(
+        self,
+        described: typing.Mapping[str, TargetDescription],
+        served: typing.Mapping[str, Camera],
+    ) -> dict[str, _CameraBinding]:
+        """
+        Build one binding per detector, from handles or from names alone.
+
+        Parameters
+        ----------
+        described : typing.Mapping[str, TargetDescription]
+            What the broker says each target is.
+        served : typing.Mapping[str, Camera]
+            The camera handles the caller passed, possibly none.
+
+        Returns
+        -------
+        dict[str, _CameraBinding]
+            Keyed by target name, in display order.
+
+        Raises
+        ------
+        ValueError
+            If this instrument has neither a scan unit nor a detector.
+            An empty window with every control disabled is worse than a
+            message saying why there is none.
+        """
+        names = self._camera_names(described, served)
+        if not self._has_scanner and not names:
+            msg = (
+                "LiveInstrumentWidget needs a scan unit or a detector - the "
+                "broker describes neither, so there is nothing to display"
+            )
+            raise ValueError(msg)
+        return {
+            name: _CameraBinding(
+                name=name,
+                layer_name="Camera" if index == 0 else f"Camera ({name})",
+            )
+            for index, name in enumerate(names)
+        }
+
+    @staticmethod
+    def _camera_names(
+        described: typing.Mapping[str, TargetDescription],
+        served: typing.Mapping[str, Camera],
+    ) -> tuple[str, ...]:
+        """
+        Return the detectors to build a section for, in display order.
+
+        The handles' own order when a caller passed handles, because
+        that order is a choice the caller made — the viewer puts the
+        Ronchigram camera first, which is the one a call naming no
+        camera acts on. Otherwise the broker's, which is the device
+        server's, which is the same order for the same instrument.
+
+        Parameters
+        ----------
+        described : typing.Mapping[str, TargetDescription]
+            What the broker says each target is.
+        served : typing.Mapping[str, Camera]
+            The camera handles the caller passed, possibly none.
+
+        Returns
+        -------
+        tuple[str, ...]
+            Target names, empty on a scan-only instrument.
+        """
+        if served:
+            return tuple(served)
+        return tuple(
+            name
+            for name, description in described.items()
+            if description.kind == _CAMERA_KIND
+        )
 
     def _first_binding(self) -> _CameraBinding | None:
         """
@@ -688,64 +807,61 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         A control that refuses to be read is reported in the status line
         and leaves its field alone, because a stale number an operator
         can see beats a zero they might act on.
+
+        Read through the broker rather than off the instrument handle,
+        which is what lets this panel exist in a window whose instrument
+        is in another process. The broker reads the whole set in one go
+        and only while nothing holds a lease, so a refusal now costs the
+        whole reading rather than one field of it - the status line says
+        which reading failed instead of which control did.
         """
         from miainwoodpecker.devices.interface import (  # noqa: PLC0415
             BEAM_BLANKER_CONTROL,
-            DEFOCUS_CONTROL,
-            ENERGY_OFFSET_CONTROL,
             STAGE_POSITION_CONTROL,
         )
 
-        if self._instrument is None:
-            return
-        try:
-            description = self._instrument.describe()
-        except Exception as error:  # noqa: BLE001 - any failure is a status line
-            self._instrument_status.setText(f"could not describe: {error}")
-            return
-        self._instrument_backend_label.setText(
-            str(description.get("backend", "unknown")),
-        )
-        targets = description.get("targets") or []
+        described = self._description(INSTRUMENT_TARGET)
+        self._instrument_backend_label.setText(described.backend or "unknown")
         self._instrument_targets_label.setText(
-            ", ".join(str(name) for name in targets) or "no devices",
+            ", ".join(self._broker.describe()) or "no devices",
         )
-
-        # Method *names*, resolved per control inside the loop below.
-        # Binding them eagerly - `DEFOCUS_CONTROL: self._instrument.defocus_nm`
-        # - looked equivalent and was not: the attribute lookup happened
-        # while the dict was built, so an instrument that publishes only
-        # some of these raised AttributeError before the loop's own
-        # try/except could report it, and the panel never appeared at all.
-        # That is exactly the partial instrument `Instrument` and
-        # `InstrumentController` were split apart to support, and it was
-        # unreachable until a backend published a real subset.
-        readers = {
-            DEFOCUS_CONTROL: "defocus_nm",
-            ENERGY_OFFSET_CONTROL: "energy_offset_ev",
-        }
-        failures: list[str] = []
+        try:
+            values = self._broker.controls()
+        except Exception as error:  # noqa: BLE001 - any failure is a status line
+            self._instrument_status.setText(f"could not read the controls: {error}")
+            return
+        missing: list[str] = []
+        # The number rows are keyed by the control's own name, which is
+        # the key the broker reports it under. The stage is the one that
+        # is not - one control, two numbers - and is read below.
         for name, spin in self._instrument_controls.items():
-            try:
-                spin.setValue(float(getattr(self._instrument, readers[name])()))
-            except Exception as error:  # noqa: BLE001 - reported, not raised
-                failures.append(f"{name}: {error}")
+            if name not in values:
+                missing.append(name)
+                continue
+            spin.setValue(float(typing.cast("float", values[name])))
         if self._instrument_stage_y is not None:
-            try:
-                y_nm, x_nm = self._instrument.stage_position_nm()
+            y_nm = values.get(_STAGE_Y_CONTROL)
+            x_nm = values.get(_STAGE_X_CONTROL)
+            if y_nm is None or x_nm is None:
+                missing.append(STAGE_POSITION_CONTROL)
+            else:
                 self._instrument_stage_y.setValue(float(y_nm))
-                self._instrument_stage_x.setValue(float(x_nm))
-            except Exception as error:  # noqa: BLE001 - reported, not raised
-                failures.append(f"{STAGE_POSITION_CONTROL}: {error}")
+                typing.cast(
+                    "QtWidgets.QDoubleSpinBox",
+                    self._instrument_stage_x,
+                ).setValue(float(x_nm))
         if self._instrument_blanker is not None:
-            try:
-                self._instrument_blanker.setChecked(
-                    bool(self._instrument.is_beam_blanked()),
-                )
-            except Exception as error:  # noqa: BLE001 - reported, not raised
-                failures.append(f"{BEAM_BLANKER_CONTROL}: {error}")
+            if BEAM_BLANKER_CONTROL not in values:
+                missing.append(BEAM_BLANKER_CONTROL)
+            else:
+                self._instrument_blanker.setChecked(bool(values[BEAM_BLANKER_CONTROL]))
         self._instrument_status.setText(
-            "; ".join(failures) if failures else "read",
+            # A control the instrument said it had and then did not
+            # report. Named rather than passed over: the field beside it
+            # is showing a number nothing refreshed.
+            "; ".join(f"{name}: not reported" for name in missing)
+            if missing
+            else "read",
         )
 
     def apply_instrument_control(self, name: str) -> None:
@@ -770,28 +886,83 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
             STAGE_POSITION_CONTROL,
         )
 
-        if self._instrument is None:
-            return
-        try:
+        def write(instrument: InstrumentController) -> None:
+            """
+            Send the field's value to one control.
+
+            Parameters
+            ----------
+            instrument : InstrumentController
+                The leased instrument.
+            """
             if name == STAGE_POSITION_CONTROL:
-                self._instrument.set_stage_position_nm(
+                instrument.set_stage_position_nm(
                     self._instrument_stage_y.value(),
                     self._instrument_stage_x.value(),
                 )
             elif name == DEFOCUS_CONTROL:
-                self._instrument.set_defocus_nm(
-                    self._instrument_controls[name].value(),
-                )
+                instrument.set_defocus_nm(self._instrument_controls[name].value())
             elif name == ENERGY_OFFSET_CONTROL:
-                self._instrument.set_energy_offset_ev(
-                    self._instrument_controls[name].value(),
-                )
-            else:  # pragma: no cover - only built controls have buttons
-                return
+                instrument.set_energy_offset_ev(self._instrument_controls[name].value())
+
+        if name not in self._description(INSTRUMENT_TARGET).controls:
+            return  # pragma: no cover - only built controls have buttons
+        if self._drive_instrument(write, refusal=f"{name} refused"):
+            self._instrument_status.setText(f"{name} set")
+
+    def _drive_instrument(
+        self,
+        write: Callable[[InstrumentController], None],
+        *,
+        refusal: str,
+    ) -> bool:
+        """
+        Run one control write inside a lease on the instrument target.
+
+        A lease, because writing a control *is* driving the instrument
+        and this window is no longer the only thing that might be: a
+        defocus set from here while a notebook sweeps the same control
+        is the interleaving the broker exists to prevent, and the honest
+        outcome of the collision is a refusal naming who holds it.
+
+        Taken on the GUI thread, which everything else in this file is
+        careful not to do, and the difference is the instrument target:
+        it runs no live loop, so granting a lease on it stops nothing
+        and waits for no pass. The wait this file's docstring warns
+        about is a scan pass finishing, and there is none here.
+
+        Parameters
+        ----------
+        write : Callable[[InstrumentController], None]
+            What to do with the leased instrument.
+        refusal : str
+            How to introduce a failure in the status line - "defocus
+            refused", "beam blanker refused".
+
+        Returns
+        -------
+        bool
+            True if the write went through. False means the status line
+            already says why it did not.
+        """
+        if INSTRUMENT_TARGET not in self._broker.describe():
+            return False
+        try:
+            with self._broker.lease(
+                INSTRUMENT_TARGET,
+                reason="setting a control",
+                timeout_s=_CONTROL_LEASE_TIMEOUT_S,
+            ) as leased:
+                write(leased.instrument)
+        # Both kinds of refusal read the same way in the status line and
+        # want the same response from the operator: a BrokerError says
+        # somebody else is driving, a device exception says the hardware
+        # said no, and either way the value stays in the field to be
+        # tried again.
         except Exception as error:  # noqa: BLE001 - the refusal is the message
-            self._instrument_status.setText(f"{name} refused: {error}")
-            return
-        self._instrument_status.setText(f"{name} set")
+            self._instrument_status.setText(f"{refusal}: {error}")
+            return False
+        return True
 
     def apply_beam_blanker(self, *, blanked: bool) -> None:
         """
@@ -806,13 +977,23 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         blanked : bool
             True to blank the beam, False to unblank it.
         """
-        if self._instrument is None:
-            return
-        try:
-            self._instrument.set_beam_blanked(blanked=blanked)
-        except Exception as error:  # noqa: BLE001 - the refusal is the message
-            self._instrument_status.setText(f"beam blanker refused: {error}")
-            # Put the box back where the hardware actually is.
+
+        def write(instrument: InstrumentController) -> None:
+            """
+            Set the blanker on the leased instrument.
+
+            Parameters
+            ----------
+            instrument : InstrumentController
+                The leased instrument.
+            """
+            instrument.set_beam_blanked(blanked=blanked)
+
+        if not self._drive_instrument(write, refusal="beam blanker refused"):
+            # Put the box back where the hardware actually is - which
+            # matters more here than for a number in a field, because
+            # the checkbox is the operator's picture of whether the beam
+            # is on the specimen.
             self.refresh_instrument()
             return
         self._instrument_status.setText("beam blanked" if blanked else "beam unblanked")
@@ -945,7 +1126,7 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
             tuple(self.enabled_channels()),
             tuple(self.enabled_channel_names()),
         )
-        if self._scanner is not None:
+        if self._has_scanner:
             parameters, channels, _ = self._scan_request
             try:
                 self._broker.reconfigure_live(
@@ -1060,7 +1241,7 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
 
     def _save_scan_preferences(self) -> None:
         """Remember the detector selection and profiles for the next launch."""
-        if self._scanner is None:
+        if not self._has_scanner:
             return
         stored = dict(self._preferences)
         stored["scan_channels"] = self.enabled_channel_names()
@@ -1146,7 +1327,7 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
 
     def start_scan(self) -> None:
         """Start the live scan loop and the display timer. No-op with no scanner."""
-        if self._scanner is None:
+        if not self._has_scanner:
             return
         parameters, channels, _ = self._scan_request
         try:
@@ -1180,7 +1361,7 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
             still in flight. True with no scanner at all: nothing is
             holding the device.
         """
-        if self._scanner is None:
+        if not self._has_scanner:
             return True
         try:
             stopped = self._broker.stop_live(SCANNER_TARGET)
@@ -1511,7 +1692,7 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         produce, which is worse than saying nothing: the free-space
         figure beside it is still true.
         """
-        if self._scanner is not None:
+        if self._has_scanner:
             frames = self._scan_count_spin.value()
             return frames, estimate_size(self._scan_request[0].shape, frames), "scan"
         first = self._first_binding()
@@ -1528,7 +1709,7 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
 
     def save_scan_frame(self) -> None:
         """Save the scan frame currently on screen into the session."""
-        if self._scanner is None:
+        if not self._has_scanner:
             return
         label = f"scan-{self._scan_request[2][0]}-frame"
         self._save_displayed_frame(SCANNER_TARGET, label)
@@ -1571,7 +1752,7 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
 
     def record_scan_frames(self) -> None:
         """Record the requested number of scan frames into the session."""
-        if self._scanner is None:
+        if not self._has_scanner:
             return
         if self._session is None:
             self._recording_status.setText(_NO_SESSION_MESSAGE)
@@ -1636,7 +1817,7 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
 
         Every enabled detector, from one pass, like everything else here.
         """
-        if self._scanner is None:
+        if not self._has_scanner:
             return
         parameters = self.scan_parameters(profiles.PREVIEW)
         channels = list(self._scan_request[1])
@@ -1676,7 +1857,7 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         cost of *not* doing it is a second pass over the same area to
         get the channel you wish you had kept.
         """
-        if self._scanner is None:
+        if not self._has_scanner:
             return
         if self._session is None:
             self._recording_status.setText(_NO_SESSION_MESSAGE)
@@ -1734,8 +1915,7 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
             "camera-image",
         )
 
-    @staticmethod
-    def _image_parameters(binding: _CameraBinding) -> CameraParameters:
+    def _image_parameters(self, binding: _CameraBinding) -> CameraParameters:
         """
         Return the settings an acquired image should be taken with.
 
@@ -1774,9 +1954,31 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
             # device the moment it changes (see set_camera_readout), so
             # the camera's own answer is already what the operator chose
             # — and an image acquisition is not the place to switch a
-            # spectrometer between imaging and projecting.
-            readout=binding.camera.parameters().readout,
+            # spectrometer between imaging and projecting. Asked of the
+            # broker, which reads it from the detector, so the answer is
+            # the device's whichever process it is in.
+            readout=self._current_readout(binding),
         )
+
+    def _current_readout(self, binding: _CameraBinding) -> str:
+        """
+        Return the readout mode a detector is in right now.
+
+        Parameters
+        ----------
+        binding : _CameraBinding
+            The camera to ask about.
+
+        Returns
+        -------
+        str
+            One of :data:`~miainwoodpecker.devices.interface.READOUT_MODES`.
+            The default for a detector that reports no settings at all,
+            which is what a camera with nothing to say about itself has
+            always been treated as.
+        """
+        current = self._broker.camera_parameters(binding.name)
+        return current.readout if current is not None else IMAGE_READOUT
 
     def set_camera_readout(self, name: str, readout: str) -> None:
         """
@@ -1813,9 +2015,8 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         binding = self._binding(name)
         if binding is None or binding.readout_combo is None:
             return
-        camera = binding.camera
-        current = camera.parameters()
-        if readout == current.readout:
+        current = self._broker.camera_parameters(binding.name)
+        if current is None or readout == current.readout:
             return
         status = binding.status
         if self._is_live(binding.name):
@@ -1827,7 +2028,18 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
                 )
             return
         try:
-            camera.configure(dataclasses.replace(current, readout=readout))
+            # Under a lease, because configuring a detector is driving
+            # it. The wait this costs is bounded by the refusal above:
+            # the loop is already stopped, so there is no pass to finish
+            # and nothing for the grant to wait out.
+            with self._broker.lease(
+                binding.name,
+                reason="setting the readout mode",
+                timeout_s=_CONTROL_LEASE_TIMEOUT_S,
+            ) as leased:
+                leased.camera(binding.name).configure(
+                    dataclasses.replace(current, readout=readout),
+                )
         except Exception as error:  # noqa: BLE001 - the refusal is the message
             self._show_camera_readout(binding, current.readout)
             if status is not None:
@@ -1838,7 +2050,7 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         # also how a script drives the mode, and then the combo has not
         # moved at all. A panel showing a mode the detector is not in is
         # the same lie whichever direction it drifted.
-        taken = camera.parameters().readout
+        taken = self._current_readout(binding)
         self._show_camera_readout(binding, taken)
         if status is not None:
             status.setText(f"readout: {taken}")
@@ -1909,7 +2121,7 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         """
         from miainwoodpecker.storage.passes import PassWriter  # noqa: PLC0415
 
-        if self._scanner is None:
+        if not self._has_scanner:
             return
         target = self._spectrum_image_target()
         if target is None:
@@ -1943,21 +2155,23 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
             The chosen target, or None when the acquisition was refused —
             in which case the status line already says why.
         """
-        from miainwoodpecker.devices.interface import (  # noqa: PLC0415
-            SynchronisedScanner,
-        )
-
         if self._session is None:
             self._recording_status.setText(_NO_SESSION_MESSAGE)
             return None
-        if not isinstance(self._scanner, SynchronisedScanner):
+        # Both refusals come from the description now, where they were
+        # an ``isinstance`` against the scan unit and a list read off
+        # it. They stay two messages because the operator does two
+        # different things about them: use a different instrument, or
+        # wire a detector to this one.
+        described = self._description(SCANNER_TARGET)
+        if not described.synchronises:
             self._recording_status.setText(
                 "this backend cannot acquire a spectrum image: it has no "
                 "synchronised scan/camera mode, so there is no way to tie a "
                 "camera frame to a probe position",
             )
             return None
-        targets = list(self._description(SCANNER_TARGET).synchronised_targets)
+        targets = list(described.synchronised_targets)
         if not targets:
             self._recording_status.setText(
                 "no camera is wired to the scan unit, so nothing can be read "
@@ -1993,17 +2207,9 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         """
         parameters = self._pass_parameters()
         positions = f"{parameters.height}x{parameters.width}"
-        binding = self._binding(target)
-        camera = binding.camera if binding is not None else None
-        try:
-            allocation = self._pass_allocation(target, camera)
-        except Exception as error:  # noqa: BLE001 - the refusal is the message
-            self._recording_status.setText(f"spectrum image failed: {error}")
-            return
         path, index, slug, started_at = self._session.reserve("spectrum-image")
         self._recording_status.setText(f"acquiring {positions} pass...")
-        scanner = self._scanner
-        channels = list(range(len(scanner.channel_names)))
+        channels = list(range(len(self.channel_names())))
         # Built on the GUI thread and read from it, so the worker only
         # ever writes through them. See viewer/progress.py.
         watched: dict[str, progress.PassPreview] = {}
@@ -2018,27 +2224,38 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
             # two clients asking in opposite orders deadlock, and the
             # scanner goes last so the probe stands still for the shortest
             # interval the grant allows.
-            with (
-                self._broker.lease(
-                    SCANNER_TARGET,
-                    target,
-                    reason="spectrum image",
-                ) as leased,
-                writer_class(path, parameters, **allocation) as writer,
-            ):
-                watched.update(progress.previews(writer.destinations()))
-                synchronised = typing.cast(
-                    "SynchronisedScanner",
-                    leased.scanner(),
-                )
-                result = synchronised.scan_synchronised(
-                    parameters,
-                    channels=channels,
-                    targets=[target],
-                    into=watched,
-                )
-                writer.finish(result)
-                return result
+            with self._broker.lease(
+                SCANNER_TARGET,
+                target,
+                reason="spectrum image",
+            ) as leased:
+                # Sizing the file is an *acquisition* - one frame out of
+                # the detector at the settings the pass will use - so it
+                # belongs inside the lease with the pass it sizes. It ran
+                # on the GUI thread against a device handle before, which
+                # was a second driver on a shared instrument and is not
+                # possible at all when the instrument is elsewhere. A
+                # failure here now reaches the operator through the job,
+                # in the same words: see _poll_pass.
+                allocation = self._pass_allocation(target, leased.camera(target))
+                with writer_class(path, parameters, **allocation) as writer:
+                    watched.update(progress.previews(writer.destinations()))
+                    # Cast rather than checked: whether the scan unit has
+                    # a synchronised mode was settled before this job was
+                    # started, by the description listing a camera it can
+                    # read out - see _spectrum_image_target.
+                    synchronised = typing.cast(
+                        "SynchronisedScanner",
+                        leased.scanner(),
+                    )
+                    result = synchronised.scan_synchronised(
+                        parameters,
+                        channels=channels,
+                        targets=[target],
+                        into=watched,
+                    )
+                    writer.finish(result)
+                    return result
 
         self._pass_job = jobs_module.PassJob(run)
         self._pass_preview = watched
@@ -2139,8 +2356,10 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         device for the panel's numbers would be refused every time, and
         an operator would have to guess a shape they cannot see - a
         recording is 22x25, which the square spin box cannot even
-        express. So the device is asked first, and answers None unless it
-        genuinely has a fixed grid.
+        express. So the description is read first, and carries None
+        unless the device genuinely has a fixed grid - read from the
+        device once when the broker was built, which is where every
+        other fact about what a target *is* now comes from.
 
         This is not the panel being overridden lightly. It is the same
         rule the readout control follows: what the *device* is set to do
@@ -2152,7 +2371,7 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         ScanParameters
             The beam-position grid, dwell and field of view.
         """
-        native = native_scan_parameters(self._scanner)
+        native = self._description(SCANNER_TARGET).native_scan
         if native is not None:
             return native
         positions = self._positions_spin.value()
@@ -2164,7 +2383,7 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         )
 
     @staticmethod
-    def _pass_allocation(target: str, camera: object) -> dict[str, dict]:
+    def _pass_allocation(target: str, camera: Camera) -> dict[str, dict]:
         """
         Return the ``PassWriter`` allocation this detector's readout needs.
 
@@ -2187,8 +2406,11 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         ----------
         target : str
             The target name, for the allocation's key and the message.
-        camera : object
-            The camera that will be read out, or None.
+        camera : Camera
+            The **leased** camera that will be read out. Leased because
+            this takes a frame from it, which is driving the detector
+            rather than describing it, and the pass it is sizing holds
+            the lease already.
 
         Returns
         -------
@@ -2199,12 +2421,9 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         Raises
         ------
         RuntimeError
-            If there is no camera behind the target, or it produces a
-            frame of a rank a pass has no home for.
+            If the detector produces a frame of a rank a pass has no
+            home for.
         """
-        if camera is None:
-            msg = f"no camera binding for the synchronised target {target!r}"
-            raise RuntimeError(msg)
         camera.start()
         try:
             shape = tuple(np.asarray(camera.acquire_frame().data).shape)
@@ -2807,7 +3026,7 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         See docs/analysis-isolation.md.
         """
         status = self._analyze_status
-        if self._camera is None or status is None:
+        if self._first_binding() is None or status is None:
             return
         try:
             runner = self._analysis_runner("hyperspy")
@@ -2865,7 +3084,7 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         run the same code rather than a copy of it.
         """
         status = self._libertem_status
-        if self._camera is None or status is None:
+        if self._first_binding() is None or status is None:
             return
         try:
             runner = self._analysis_runner("libertem")
@@ -2924,7 +3143,7 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         widget if it is missing.
         """
         status = self._py4dstem_status
-        if self._camera is None or status is None:
+        if self._first_binding() is None or status is None:
             return
         try:
             runner = self._analysis_runner("py4dstem")
