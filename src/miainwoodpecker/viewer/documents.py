@@ -93,6 +93,7 @@ from __future__ import annotations
 
 import contextlib
 import typing
+import warnings
 
 import napari
 import napari.qt
@@ -496,6 +497,23 @@ class Document:
         A panel with no calibration gets no bar. A bar reading "pixel" is
         not a measurement, and one drawn where the geometry is in pixels
         while the label claims nanometres would be worse than none.
+
+        **Two napari versions label the bar differently, and this serves
+        both.** Up to 0.7 the unit belongs to the scale bar and has to be
+        set here. From 0.8 that setter is deprecated to a no-op which
+        always reads None, and the label comes from ``Layer.units`` —
+        which :func:`~miainwoodpecker.viewer.axes.layer_axes` already
+        sets when the layer is added, so 0.8 is labelled correctly
+        without this method's help. Setting it anyway costs a suppressed
+        deprecation on 0.8 and is what keeps 0.7 working, so it is done
+        under a warning filter rather than behind a version check: the
+        deprecation is expected here, not something to report to whoever
+        is running the instrument.
+
+        CI found this, running 0.8 where the lockfile pins 0.7 — the
+        code set the scale bar's unit and the tests read it back, so the
+        pair agreed with itself on one version and failed on the other,
+        where the bar had in fact been right all along.
         """
         unit = None
         for layer in self.viewer.layers:
@@ -506,7 +524,9 @@ class Document:
         with contextlib.suppress(Exception):
             self.viewer.scale_bar.visible = unit is not None
             if unit is not None:
-                self.viewer.scale_bar.unit = unit
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", FutureWarning)
+                    self.viewer.scale_bar.unit = unit
 
     def raise_to_front(self) -> None:
         """

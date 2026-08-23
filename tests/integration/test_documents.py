@@ -874,15 +874,24 @@ def test_each_panel_gets_its_own_units_and_scale_bar(window):
     )
     _settle()
 
-    bars = {
-        d.name: (d.viewer.scale_bar.visible, d.viewer.scale_bar.unit)
+    # Asserted on the *layer* units, which is what labels the bar from
+    # napari 0.8 on. ScaleBar.unit is deprecated there: it always reads
+    # None and setting it does nothing, so reading it back tested only
+    # that this code agreed with itself — which it did on 0.7, while CI
+    # ran 0.8 and the bar was labelled correctly all along.
+    shown = {
+        d.name: (
+            d.viewer.scale_bar.visible,
+            tuple(str(unit) for unit in d.viewer.layers[0].units),
+        )
         for d in window.area.documents()
     }
-    assert bars["Scan (HAADF)"] == (True, "nm")
-    assert bars["Camera"] == (True, "mrad")
+    assert shown["Scan (HAADF)"] == (True, ("nanometer", "nanometer"))
+    assert shown["Camera"] == (True, ("milliradian", "milliradian"))
     # Energy against position does not convert, so no bar rather than a
-    # length drawn across an electronvolt.
-    assert bars["Camera (eels)"][0] is False
+    # length drawn across an electronvolt — though the axes still carry
+    # their own units, for the readout and for the ROI work to come.
+    assert shown["Camera (eels)"] == (False, ("pixel", "electron_volt"))
 
 
 def test_a_calibrated_panel_is_drawn_to_its_physical_shape(window):
@@ -939,7 +948,8 @@ def test_an_anisotropic_detector_draws_square_when_it_is_square(window):
 
     assert _drawn_aspect(document) == pytest.approx(1.0, rel=1e-9)
     assert document.viewer.scale_bar.visible is True
-    assert document.viewer.scale_bar.unit == "mrad"
+    units = tuple(str(unit) for unit in document.viewer.layers[0].units)
+    assert units == ("milliradian", "milliradian")
 
     # And a resize does not disturb it, as for any other panel.
     document.window.resize(900, 200)
