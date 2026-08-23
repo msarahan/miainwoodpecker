@@ -205,7 +205,10 @@ def test_a_projected_readout_is_recognised_as_not_an_image():
     [(2048, 2048), (512, 512), (100, 1340), (513, 513), (257, 100), (16, 16)],
 )
 @pytest.mark.parametrize("edge", [512, 256, 128])
-def test_decimating_early_draws_the_same_tile_as_decimating_late(shape, edge):
+def test_decimating_early_draws_the_same_tile_as_decimating_late(
+    shape: tuple[int, int],
+    edge: int,
+) -> None:
     """
     A preview renders to the same bytes the full frame would have.
 
