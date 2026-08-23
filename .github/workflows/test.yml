@@ -5,14 +5,19 @@ on:
   push:
     branches:
       - main
-      - 'claude/**'
   schedule:
     # run tests at 00:00 UTC on day 1 of every month
     - cron: '0 0 1 * *'
 
-# Cancel superseded runs: pushing to a branch with an open PR would otherwise
-# trigger both the push and pull_request events.
+# `push` is main only: a `claude/**` branch is worked on through a PR, and
+# `pull_request` already covers it. Naming the branch here as well fired every
+# workflow twice per push, and the concurrency group below could not collapse
+# the pair — the two events carry different `github.ref` values
+# (`refs/heads/...` against `refs/pull/N/merge`), so they never share a group.
+# The cost of dropping it: a branch pushed before its PR exists gets no CI
+# until the PR is opened.
 concurrency:
+  # Supersede an in-flight run when the same ref is pushed again.
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 

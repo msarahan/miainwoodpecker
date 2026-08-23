@@ -14,11 +14,22 @@ devices. That is the point — it measures how much of a real adapter is
 protocol plumbing rather than vendor work, and it is the executable
 specification an out-of-tree package writes against.
 
+Including the parts of that contract which only matter occasionally. It
+exits with ``PORT_UNAVAILABLE_EXIT_STATUS`` when a listener cannot bind,
+because an adapter that skips that does not have a bug, it has a *flake*.
+This file had one: the stub let the ``OSError`` escape as a traceback, so
+a lost port arrived as an unexplained exit status, and every assertion
+here about the client's *own* startup diagnostic failed with a message
+about a port instead. It surfaced in CI as one job failing while the job
+for the same commit in the duplicate workflow run passed — the signature
+of a race rather than of anything in the commit.
+
 No ``device`` extra needed; nothing here imports ``nion.*``.
 """
 
 from __future__ import annotations
 
+import socket
 import textwrap
 import time
 
@@ -26,9 +37,11 @@ import numpy as np
 import pytest
 
 from miainwoodpecker.devices import Camera, Scanner
+from miainwoodpecker.devices import remote as remote_module
 from miainwoodpecker.devices.interface import CameraParameters, ScanParameters
 from miainwoodpecker.devices.remote import (
     DEFAULT_SERVER_MODULE,
+    PORT_UNAVAILABLE_EXIT_STATUS,
     SERVER_RESPONSIVE,
     DeviceServerStartupError,
     remote_instrument,
@@ -47,6 +60,10 @@ _CONFIGURED_EXPOSURE_MS = 9.0
 # The fake vendor's scan unit has two detectors, SE and BSE, and reads
 # both out of one pass - the ordinary case on a scanned instrument.
 _CHANNEL_COUNT = 2
+# One collision, then a server that binds: the recovery costs exactly two
+# spawns, and counting them is how "it retried" is told apart from "the
+# port was never taken in the first place".
+_SPAWNS_AFTER_ONE_COLLISION = 2
 
 _SERVER_SOURCE = '''
 """A minimal out-of-tree device server, standing in for a vendor adapter."""
@@ -56,6 +73,7 @@ from __future__ import annotations
 import argparse
 import datetime
 import os
+import sys
 import threading
 import uuid
 from multiprocessing.connection import Listener
@@ -66,6 +84,11 @@ from miainwoodpecker.devices.rpc import Result, target_kind
 VENDOR_CAMERA_ID = "{camera_id}"
 VENDOR_SCANNER_ID = "{scanner_id}"
 FRAME_VALUE = {frame_value}
+# The status the client reads as "your port was taken, try again"; it is
+# part of the contract, not of this project's internals, so it is spelled
+# out here rather than imported. See `bind` below for why an adapter that
+# does not do this is an adapter with an intermittent failure.
+PORT_UNAVAILABLE_EXIT_STATUS = {exit_status}
 
 
 class FakeCamera:
@@ -237,6 +260,50 @@ def handle(connection, target):
         connection.send(Result(value=value))
 
 
+def bind(targets, instrument_port, authkey):
+    """
+    Bind one listener per target, or exit the way the client expects.
+
+    One port is given, for "instrument"; everything else binds port 0 and
+    the OS chooses, which cannot collide because there is no gap between
+    choosing and binding. The given one can. The client picked it by
+    binding to port 0 and *releasing* the socket, so between that probe
+    and this bind — an interpreter start and a vendor stack's imports
+    away — anything *on this machine* may take it: another session
+    starting, a parallel test run, or the client's own connect loop
+    drawing an ephemeral source port from the range this one came from.
+    A loaded test runner is the ordinary case, not a contrived one.
+
+    The client already knows how to cure that: it re-picks ports and
+    respawns. It only knows to, though, if the server says so by exiting
+    with ``PORT_UNAVAILABLE_EXIT_STATUS``. Letting the ``OSError`` escape
+    as a traceback instead spends the exit on "something unexplained went
+    wrong", and the client stops with a diagnostic about the wrong thing.
+    Every server in this project translates the bind failure this way; an
+    out-of-tree adapter has to as well, which is the whole reason the
+    stand-in does it in five lines here rather than leaving it out.
+    """
+    listeners = {{}}
+    try:
+        for name in targets:
+            listeners[name] = Listener(
+                ("localhost", instrument_port if name == "instrument" else 0),
+                authkey=authkey,
+            )
+    except OSError as error:
+        # stderr is inherited from the client, so this lands wherever the
+        # client's own output does — which is what makes a collision that
+        # survives every retry diagnosable rather than just anonymous.
+        print(
+            f"could not bind a listener ({{error}}); the client will retry",
+            file=sys.stderr,
+        )
+        for listener in listeners.values():
+            listener.close()
+        sys.exit(PORT_UNAVAILABLE_EXIT_STATUS)
+    return listeners
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--backend", default="simulated")
@@ -271,17 +338,10 @@ def main():
     targets = {{name: available[name]() for name in served}}
     instrument = FakeInstrument(served, stop_event)
     targets["instrument"] = instrument
-    # One port is given, for "instrument"; everything else binds port 0
-    # and the OS chooses. Saying where they landed is the whole of what a
-    # server owes the client here, and it is what makes this vendor's
-    # device list its own rather than one it had to borrow.
-    listeners = {{
-        name: Listener(
-            ("localhost", arguments.instrument_port if name == "instrument" else 0),
-            authkey=authkey,
-        )
-        for name in targets
-    }}
+    # Saying where the listeners landed is the whole of what a server owes
+    # the client here, and it is what makes this vendor's device list its
+    # own rather than one it had to borrow.
+    listeners = bind(targets, arguments.instrument_port, authkey)
     endpoints = {{
         name: {{
             "port": listener.address[1],
@@ -319,6 +379,7 @@ def vendor_server_module(tmp_path, monkeypatch):
             _SERVER_SOURCE.format(
                 camera_id=_VENDOR_CAMERA_ID,
                 scanner_id=_VENDOR_SCANNER_ID,
+                exit_status=PORT_UNAVAILABLE_EXIT_STATUS,
                 frame_value=_FRAME_VALUE,
             ),
         ),
@@ -418,6 +479,53 @@ def test_a_vendor_serving_fewer_targets_is_handled(vendor_server_module):
         assert list(description["targets"]) == ["ronchigram_camera", "scanner"]
         assert microscope.eels_camera is None
         assert description["controls"] == []
+
+
+def test_a_vendor_server_that_loses_its_port_is_retried_rather_than_failing(
+    vendor_server_module, monkeypatch,
+):
+    """
+    An out-of-tree adapter's bind collision is curable, like an in-tree one's.
+
+    This is the flake this file used to produce rather than a
+    hypothetical. ``_free_port()`` probes a port and releases it, so the
+    stand-in binds it seconds later and can lose it — and the stub let
+    the resulting ``OSError`` escape as a traceback. The client then saw
+    an unexplained exit status, and every test in this file that asserts
+    on *its own* startup diagnostic failed with a message about a port
+    instead.
+
+    So the collision is provoked deterministically here: the first port
+    handed out is one this process is already holding, and the second is
+    genuinely free. What is pinned is not the client's retry — that is
+    :mod:`tests.unit.test_port_collision`'s job — but that the stand-in
+    speaks the exit status that engages it, since the stub is what an
+    out-of-tree package is meant to copy.
+    """
+    original_free_port = remote_module._free_port  # noqa: SLF001 - the seam
+    # Bound and *not* listening: bound is enough to make the child's bind
+    # fail with EADDRINUSE, and not listening is what keeps the client's
+    # connect attempts refused rather than accepted-then-silent, which
+    # would wedge them in the auth handshake until the 15 s deadline.
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as held:
+        held.bind(("localhost", 0))
+        doomed_port = held.getsockname()[1]
+        spawns = []
+
+        def hand_out_the_doomed_port_first() -> int:
+            spawns.append(len(spawns))
+            return doomed_port if len(spawns) == 1 else original_free_port()
+
+        monkeypatch.setattr(
+            remote_module, "_free_port", hand_out_the_doomed_port_first,
+        )
+        with remote_instrument(server_module=vendor_server_module) as microscope:
+            assert microscope.ronchigram_camera.camera_id == _VENDOR_CAMERA_ID
+
+    # Two ports handed out is how "it retried" is told apart from "the
+    # collision never happened": one spawn would mean the doomed port was
+    # somehow bindable, and the assertion above would prove nothing.
+    assert len(spawns) == _SPAWNS_AFTER_ONE_COLLISION
 
 
 def test_a_target_served_without_an_endpoint_is_named_rather_than_a_key_error(

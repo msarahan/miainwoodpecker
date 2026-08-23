@@ -182,6 +182,59 @@
 
 ### Fixed
 
+- **The out-of-tree adapter stand-in did not survive losing a port, so
+  the test file that documents the adapter contract was intermittent.**
+  `_free_port()` picks a port by binding to port 0 and *releasing* the
+  socket, so the port is reserved by convention only until the spawned
+  server binds it an interpreter start and a vendor stack's imports
+  later. Every server in this tree answers a lost port by exiting with
+  `PORT_UNAVAILABLE_EXIT_STATUS`, which the client cures by re-picking
+  ports and respawning. The stand-in server in
+  `tests/unit/test_out_of_tree_server.py` did not: it let the `OSError`
+  escape as a traceback, so a collision reached the client as an
+  unexplained exit status, and every test in that file asserting on the
+  client's *own* startup diagnostic failed with a message about a port
+  instead. It surfaced on CI as the "a target served without an endpoint
+  is named rather than a key error" test failing with `AssertionError:
+  Regex pattern did not match`, over captured server output reading
+  `OSError: [Errno 98] Address already in use`.
+  **The stub now translates the bind failure like the real servers do**,
+  in a `bind()` function whose docstring is the reason rather than the
+  mechanism — the point of that file being that the stub is an honest,
+  copyable example of what an out-of-tree adapter must implement.
+  A new test provokes the collision deterministically, by handing the
+  client a port the test process is holding on the first spawn and a
+  real one afterwards, and pins that the session opens and that it cost
+  two spawns. Reverting the stub's `sys.exit` to `raise` reproduces the
+  original CI traceback and failure against that test, which is how the
+  cure was checked rather than by watching a green run.
+  `tests/unit/test_port_collision.py`'s `serve_everything()` stub had
+  the identical hole — in the file whose subject is port collisions —
+  and now exits the same way.
+  **`docs/vendor-support.md` did not state the requirement anywhere**,
+  so it now does, next to the port and `--instrument-port` contract it
+  belongs to: a server that cannot bind a listener must catch the
+  `OSError` and exit with status 4 rather than let the traceback escape.
+  An adapter that skips it does not have a bug, it has a flake.
+
+- **Every workflow ran twice per push.** `docs`, `lint`, `pixi` and
+  `test` each triggered on `pull_request` *and* on `push` to
+  `'claude/**'`, so a branch with an open PR produced eight runs where
+  four would do — confirmed on one commit, four `push` runs and four
+  `pull_request` runs against the same SHA. Three of the four carried a
+  comment claiming the `concurrency` group collapsed the pair, and it
+  could not: `github.ref` is `refs/heads/…` for the push event and
+  `refs/pull/N/merge` for the pull-request event, so the two never share
+  a group. `push` is now `main` only, `pull_request` covers branches,
+  and the comment says what is actually true. The cost is that a branch
+  pushed before its PR exists gets no CI until the PR is opened; the
+  `pixi` job on a branch is also now subject to its own `paths` filter,
+  which is what that filter is for.
+  **This is not why the flake happened.** Both runs are GitHub-hosted,
+  so they are separate VMs with separate loopback and cannot contend for
+  a port; the collision was inside one job. Halving the runs is worth
+  doing for the bill, not for the race.
+
 - **The aspect-ratio test was measuring nothing.** It computed drawn
   width and height by multiplying each by the same `camera.zoom`, which
   cancels — so it compared the array's pixel ratio with itself and would

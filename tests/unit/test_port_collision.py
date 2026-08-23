@@ -273,17 +273,29 @@ def lose_the_ports_after_describing(ports, authkey):
 
 
 def serve_everything(ports, authkey):
-    """Behave, for the spawn that is meant to succeed."""
+    """
+    Behave, for the spawn that is meant to succeed.
+
+    "Behave" includes losing the port for real. The collisions this file
+    provokes are counted from a file, but the client-allocated port here
+    can also be taken by something else on the machine — a parallel test
+    run is the case — and a server that let that escape as a traceback
+    would turn a curable collision into a test failure about the wrong
+    thing. So the real one is reported the same way the fake ones are.
+    """
     stop_event = threading.Event()
     instrument = FakeInstrument(["ronchigram_camera"], stop_event)
     targets = {{
         "ronchigram_camera": FakeCamera(),
         "instrument": instrument,
     }}
-    listeners = {{
-        name: Listener(("localhost", ports.get(name, 0)), authkey=authkey)
-        for name in targets
-    }}
+    try:
+        listeners = {{
+            name: Listener(("localhost", ports.get(name, 0)), authkey=authkey)
+            for name in targets
+        }}
+    except OSError:
+        sys.exit(PORT_UNAVAILABLE_EXIT_STATUS)
     instrument.publish_endpoints({{
         name: {{
             "port": listener.address[1],
