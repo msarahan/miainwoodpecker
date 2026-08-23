@@ -514,6 +514,26 @@ installed. Leave the detector checkboxes and binning menu built from
 `broker.describe()`: a client in another process has no device handle to
 read them off, which is what that call exists for.
 
+### Starting the broker and a front end together
+
+`miainwoodpecker-instrument` runs the two in order — broker first, front
+end when the invitation appears, broker stopped last — which is worth
+knowing about here for one reason beyond convenience: it stops the
+broker by **asking**, so the instrument is parked. A supervisor that
+killed it would not be, and on Windows that is the easy mistake to make,
+since terminating a process there runs no handler at all.
+
+```
+miainwoodpecker-instrument --publish .                    # window
+miainwoodpecker-instrument --publish . -- marimo run \
+    notebooks/instrument_dashboard.py                     # dashboard
+```
+
+`--publish .` matters if you want to join from a notebook too: without
+it the invitation goes to a temporary directory that is removed when the
+session ends. Whatever runs after `--` is given `$MIAINWOODPECKER_BROKER`,
+which is where the dashboard already looks.
+
 ### The viewer as one of the clients
 
 The Qt window connects to a broker the same way, and is worth knowing

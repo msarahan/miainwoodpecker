@@ -40,6 +40,7 @@ _VIEWER_TEST_MODULES = (
     "test_scan_panel",
     "test_panel_density",
     "test_documents",
+    "test_window_on_a_remote_broker",
 )
 
 

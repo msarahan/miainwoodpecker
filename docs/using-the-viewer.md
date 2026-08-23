@@ -42,6 +42,23 @@ miainwoodpecker-broker --publish ~/instrument      # on the microscope PC
 miainwoodpecker-viewer --broker ~/instrument       # here, and anywhere else
 ```
 
+If both are yours to start, one command does it in the right order and
+stops the broker cleanly when the window closes:
+
+```shell
+pixi run instrument
+```
+
+That is `miainwoodpecker-instrument`, and it takes the same options as
+the two commands it runs — `--backend`, `--plugin`, `--server-module`
+for the instrument, `--session`, `--operator`, `--sample` and `--notes`
+for the window. Add `--publish ~/instrument` and a notebook can join the
+session while it runs; without it the connection details live in a
+temporary directory that goes away with the session. Anything after `--`
+replaces the window, so `miainwoodpecker-instrument -- marimo run
+notebooks/instrument_dashboard.py` serves the microscope and opens the
+[dashboard](scripting-and-automation.md) on it instead.
+
 The window is the same window: the same panels, the same detectors, the
 same controls, built from what the broker reports rather than from
 devices this process can reach. What differs is that you are **not the

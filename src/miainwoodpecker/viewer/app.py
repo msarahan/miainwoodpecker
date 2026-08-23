@@ -98,6 +98,12 @@ from miainwoodpecker.viewer.live import LiveInstrumentWidget
 
 _BACKEND_ENV_VAR = "MIAINWOODPECKER_BACKEND"
 _PLUGINS_ENV_VAR = "MIAINWOODPECKER_HARDWARE_PLUGINS"
+# Where to find a running broker, when nothing says on the command line.
+# The same variable the dashboard reads and the launcher sets, so
+# "which instrument am I joining" is answered once per terminal rather
+# than per program. A stale value fails loudly - "no broker answered" -
+# rather than quietly opening a device server instead.
+_BROKER_ENV_VAR = "MIAINWOODPECKER_BROKER"
 # Named in --server-module's help rather than imported from the module
 # itself: this process must not import the device servers, only launch
 # them, and camera_server needs the "camera" extra the viewer does not.
@@ -132,15 +138,15 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--notes", default=None, help="free-text session notes")
     parser.add_argument(
         "--broker",
-        default=None,
+        default=os.environ.get(_BROKER_ENV_VAR) or None,
         metavar="PATH",
         help=(
             "connect to a broker already running over an instrument, at the "
             "invitation it published (a directory gets broker.json inside "
-            "it). This window then launches no device server of its own and "
-            "shares the instrument with whatever else is connected; "
-            "--backend, --plugin and --server-module are the other case and "
-            "are ignored."
+            f"it; default ${_BROKER_ENV_VAR}). This window then launches no "
+            "device server of its own and shares the instrument with "
+            "whatever else is connected; --backend, --plugin and "
+            "--server-module are the other case and are ignored."
         ),
     )
     parser.add_argument(

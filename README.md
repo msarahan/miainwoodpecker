@@ -184,6 +184,7 @@ The environments, and what each is for:
 | `pixi run preview` | The viewer against a synthetic instrument. No hardware, no vendor SDK. |
 | `pixi run test` | The unit suite. Needs no display. |
 | `pixi run -e device viewer` | The viewer against the `nionswift-usim` simulator. |
+| `pixi run instrument` | The same simulator, served to *everything at once*: a broker in the `device` environment, and a window on it in an environment without the vendor stack. One command, and a notebook can join the same instrument while it runs. |
 | `pixi run -e replay replay <dir> --list` | What a recorded session directory holds; without `--list`, replays one. |
 | `pixi run -e analysis test-all` | Everything, with HyperSpy/eXSpy available. |
 | `pixi run -e style lint` | Ruff, without solving the viewer's Qt stack first. |
