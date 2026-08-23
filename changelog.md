@@ -120,6 +120,38 @@
   fast pass; the display range tracks the positions actually visited, so
   the unwritten zeros do not crush every real value to white.
 
+- **Recordings say which of their axes are the signal, so RosettaSciIO
+  reads them back as images and spectra rather than as a stack of
+  navigation axes.** Measured against rsciio 0.14.0's NeXus plugin: a
+  recording read through `file_reader` arrived with its array
+  bit-identical and its calibration exact — 4.0 nm/pixel out, 4.0
+  nm/pixel back, and 10 eV per channel at -480 eV for a spectrum
+  recording, straight off `NXspectrum`'s own field names — but with
+  *every* axis marked navigation, because nothing in the file said which
+  axes were the signal. HyperSpy would build a `BaseSignal` where the
+  analysis adapters expect a `Signal2D`. Both writers now emit NeXus's
+  `interpretation`: `"image"` for a frame stack, `"spectrum"` for either
+  `NXspectrum` layout, since the energy axis is last in all of them.
+  **Written in two places, because the spec and the reader disagree
+  about where it lives.** The NeXus manual defines `interpretation` as a
+  *field* attribute and it appears nowhere in `NXdata`'s base class;
+  rsciio reads it from the NXdata *group*, which is where its own writer
+  puts it, and ignores it on the field. Both are written, so the file
+  carries the spelling the manual gives and the one the reader looks
+  for.
+  **And withheld from a file that claims an application definition**,
+  which is the part that had to be measured rather than assumed.
+  `pynxtools` rejects any attribute the NXDL does not document, and NXem
+  documents no `interpretation` anywhere: checked one placement at a
+  time, group-only fatal, field-only fatal, and the same file with
+  neither valid. The two goods cannot both be had in one file, so the
+  rule is the one `definition` already follows — a file that makes a
+  schema claim keeps it, and a file that claims nothing carries the
+  hint. Every recording this project writes today claims nothing, so in
+  practice the hint is always there, and an NXem file loses only the
+  navigation/signal split rather than the ability to be read. Asked
+  upstream as FAIRmat-NFDI/pynxtools#834.
+
 ### Changed
 
 - **The live view refreshes at 60 fps, up from 30.** The display timer

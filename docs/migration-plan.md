@@ -782,6 +782,56 @@ problem — read their source and docs before designing our own adapters:
     only failure, while `userID` and `noteID` are optional, so `user` and
     `notes` are there for honesty about where session context belongs
     rather than to satisfy the validator.
+- [x] Make what the writers emit readable by RosettaSciIO without reader-side
+  fixups — the `interpretation` attribute, and **the trade it turned out to
+  force**. Measured against `rsciio` 0.14.0's NeXus plugin: a recording read
+  back through `file_reader` arrives with *every* axis marked navigation,
+  because nothing in the file says which axes are the signal. The array is
+  bit-identical to what `read_frames` returns and the calibration exact
+  (4.0 nm/pixel out, 4.0 nm/pixel back; 10 eV/channel at −480 eV for a
+  spectrum recording, straight off `NXspectrum`'s field names), but HyperSpy
+  would build a `BaseSignal` rather than the `Signal2D` the adapters expect.
+  `interpretation` — `"image"` for a frame stack, `"spectrum"` for either
+  NXspectrum layout, since the energy axis is last in all of them — is what
+  closes that, and it is one attribute rather than a reader-side convention
+  this project would have to publish and defend.
+  - **Where it goes was measured, because the spec and the reader disagree.**
+    The NeXus manual defines `interpretation` as a *field* attribute
+    ([data rules](https://manual.nexusformat.org/datarules.html): `scalar`,
+    `spectrum`, `image`, `rgb-image`, …) and it appears nowhere in `NXdata`'s
+    base class. `rsciio` reads it from the NXdata *group* (`rsciio/nexus/_api.py`,
+    `dataentry.attrs`), which is also where its own writer puts it; on the
+    field alone it is ignored. Both are written, so the file satisfies the
+    spelling the manual gives and the one the reader looks for.
+  - **And it costs the `NXem` claim, which is why it is conditional.**
+    `pynxtools` 0.15.0 rejects a file carrying an attribute the NXDL does not
+    document, and NXem documents no `interpretation` anywhere. Measured one
+    placement at a time: group-only fatal, field-only fatal, both fatal, and
+    the same file with neither validates — the schema job went 6/6 → 3/6 on
+    the unconditional version. The two goods cannot both be had in one file,
+    so the rule is the one `definition` already follows above: **a file that
+    claims an application definition goes without the hint, and a file that
+    claims nothing carries it.** Every recording this project writes today
+    claims nothing (the `NXem` path needs operator-supplied specimen facts),
+    so in practice the hint is always present; what an `NXem` file loses is
+    only the navigation/signal split, since `signal`/`axes` still say where
+    the data is. Asked upstream as
+    [pynxtools#834](https://github.com/FAIRmat-NFDI/pynxtools/issues/834);
+    worth revisiting if it ever accepts the manual's generic field
+    attributes, since the file looks legal by the manual's own rules and the
+    validator is the stricter of the two.
+  - **Not the file's problem, but recorded because it shaped the check.**
+    `rsciio`'s NeXus plugin honours a `@default` chain only under
+    `use_default=True`, and the branch that would infer the entry when a file
+    has *no* root `@default` reads `nxentry == rootlist[0]` — a comparison
+    where an assignment was meant, still present on `main` and reported as
+    [rosettasciio#542](https://github.com/hyperspy/rosettasciio/issues/542).
+    So a bare `file_reader(path)` returns seven signals for a frame
+    recording: the plottable one, plus the hard-linked detector array, the
+    axis datasets read as standalone arrays, and the metadata JSON column. Any
+    of `nxdata_only=True`, `use_default=True` (which our root `@default` then
+    steers), or `dataset_path="/entry/data"` returns exactly the one — and
+    `dataset_path` needs the leading slash or it silently matches nothing.
 - [x] Per-axis calibration for camera frames, configurable per acquisition —
   [`src/miainwoodpecker/storage/calibration.py`](../src/miainwoodpecker/storage/calibration.py).
   Closes the gap §7 recorded: camera frames used to fall back to `"pixel"`

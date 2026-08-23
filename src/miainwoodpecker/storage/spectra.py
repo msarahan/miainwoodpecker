@@ -695,6 +695,21 @@ class SpectrumWriter:
             data_group.attrs["indices_spectrum_indices"] = 0
             data_group.attrs["axis_energy_indices"] = 1
 
+        # Why this exists and why it is written twice: see the matching
+        # pair in :meth:`miainwoodpecker.storage.nexus.NexusWriter._write_nxdata`.
+        # ``"spectrum"`` is right for every layout this writer produces,
+        # because NXspectrum puts the energy axis last in all of them - so
+        # a reader honouring it makes exactly ``axis_energy`` the signal
+        # and leaves ``indices_spectrum``, or a map's ``axis_j``/
+        # ``axis_i``, as navigation.
+        #
+        # Withheld from a file claiming an application definition for the
+        # reason measured there: NXem's NXDL documents no such attribute
+        # and pynxtools rejects the file that carries one.
+        if self._definition is None:
+            data_group.attrs["interpretation"] = "spectrum"
+            self._data.attrs["interpretation"] = "spectrum"
+
         data_group.attrs["signal"] = "intensity"
         # Which NXspectrum layout this file's NXdata follows, written as
         # plain data in the collection rather than as an attribute NeXus
