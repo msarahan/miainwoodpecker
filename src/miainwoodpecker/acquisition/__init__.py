@@ -6,6 +6,7 @@ from miainwoodpecker.acquisition.live import (
     MultiChannelLiveAcquisition,
 )
 from miainwoodpecker.acquisition.sequence import (
+    FrameSink,
     camera_image,
     camera_series,
     energy_offset_series,
@@ -16,6 +17,7 @@ from miainwoodpecker.acquisition.sequence import (
 )
 
 __all__ = [
+    "FrameSink",
     "LiveAcquisition",
     "LiveStats",
     "MultiChannelLiveAcquisition",

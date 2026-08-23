@@ -110,6 +110,7 @@ from miainwoodpecker.storage.calibration import (
     FrameCalibration,
     resolve_axis_calibration,
 )
+from miainwoodpecker.storage.nexus import DEFAULT_FLUSH_EVERY
 
 if typing.TYPE_CHECKING:
     import os
@@ -123,7 +124,7 @@ _PROGRAM_NAME = "miainwoodpecker"
 _DEFAULT_COMPRESSION = "gzip"
 _DEFAULT_COMPRESSION_LEVEL = 4
 _SHUFFLE_BENEFITING_FILTERS = frozenset({"gzip", "lzf"})
-_DEFAULT_FLUSH_EVERY = 1
+
 
 # NXspectrum's own group names, used as this writer's on-disk mode names so
 # nothing has to be translated when reading the NXDL alongside the file.
@@ -823,7 +824,7 @@ def write_spectra(
     path: os.PathLike[str] | str,
     spectra: Iterable[Spectrum],
     *,
-    flush_every: int = _DEFAULT_FLUSH_EVERY,
+    flush_every: int = DEFAULT_FLUSH_EVERY,
     **kwargs: object,
 ) -> int:
     """

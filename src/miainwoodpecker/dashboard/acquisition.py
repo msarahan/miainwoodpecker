@@ -33,6 +33,33 @@ thing the broker's own docstring refuses to do and for the same reason.
 hundred-frame series outlives any fixed time to live, and a kernel that
 dies mid-series stops renewing - which lets the broker reclaim the
 instrument and restart the loops, which is what a time to live is for.
+
+**One acquisition is several signals, and the request names them.** What
+a build function yields is not frames but ``(name, frame)`` pairs, and
+the name is the signal the frame belongs to: a detector for a
+multi-channel scan, a step for a recipe that acquires more than one
+thing. Everything downstream keys off it - one file per name when a
+session is attached
+(:meth:`~miainwoodpecker.storage.session.Session.record_datasets`), one
+row per name in the log, one Save action per name for data with no file.
+
+The pairs are the whole extension mechanism, and they are pairs rather
+than a metadata key on purpose. Frame metadata is the *device's*
+vocabulary (see :class:`~miainwoodpecker.devices.interface.Frame`), and
+which step of a recipe a frame belongs to is not something a detector
+reports; a survey HAADF and the follow-up HAADF thirty seconds later
+carry byte-identical ``channel_name``. So the name travels beside the
+frame, where the acquisition that knows it can put it, and
+:func:`named` is all it takes to compose a multi-step item::
+
+    build=lambda leased: itertools.chain(
+        named("survey", multichannel_scan_series(...)),
+        named("SI", ...),
+        named("followup", multichannel_scan_series(...)),
+    )
+
+That is labelling, not a new acquisition verb: every generator in that
+chain is still one of :mod:`miainwoodpecker.acquisition`'s own.
 """
 
 from __future__ import annotations
@@ -47,20 +74,88 @@ from miainwoodpecker.acquisition.sequence import (
     camera_series,
     multichannel_scan_series,
 )
-from miainwoodpecker.dashboard.session_log import SessionLogEntry, describe_frames
+from miainwoodpecker.dashboard.session_log import SessionLogEntry, describe_dataset
 from miainwoodpecker.jobs import BackgroundJob
 
 if typing.TYPE_CHECKING:
-    from collections.abc import Callable, Iterable, Iterator, Sequence
+    from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 
     from miainwoodpecker.broker.interface import InstrumentBroker, LeasedDevices
-    from miainwoodpecker.dashboard.session_log import SessionLog
+    from miainwoodpecker.dashboard.session_log import LoggedDataset, SessionLog
     from miainwoodpecker.devices.interface import (
         CameraParameters,
         Frame,
         ScanParameters,
     )
     from miainwoodpecker.storage.session import Session
+
+CHANNEL_NAME_KEY = "channel_name"
+"""Frame-metadata key naming the detector a scanned frame was read out of."""
+
+DEVICE_ID_KEY = "device_id"
+"""Frame-metadata key naming the device that produced a frame."""
+
+
+def named(dataset: str, frames: Iterable[Frame]) -> Iterator[tuple[str, Frame]]:
+    """
+    Tag every frame of a series with the signal it belongs to.
+
+    The composition primitive for a multi-step item: chain several of
+    these and the acquisition produces one entry with one file per step.
+    It labels, it does not acquire - what it wraps is one of
+    :mod:`miainwoodpecker.acquisition`'s own generators, and it is lazy,
+    so the device is still driven only as the pairs are pulled.
+
+    Parameters
+    ----------
+    dataset : str
+        The signal's name.
+    frames : Iterable[Frame]
+        The series to label.
+
+    Yields
+    ------
+    tuple[str, Frame]
+        The name and each frame.
+    """
+    for frame in frames:
+        yield (dataset, frame)
+
+
+def by_channel(
+    frames: Iterable[Frame],
+    *,
+    fallback: str,
+) -> Iterator[tuple[str, Frame]]:
+    """
+    Split a simultaneous multi-detector series by the detector each frame names.
+
+    One pass of the probe reads every enabled detector out, so a
+    multi-channel series arrives interleaved - HAADF, BF, HAADF, BF - and
+    this is what turns that into two signals without unpicking the
+    acquisition. The name comes from the frame's own ``channel_name``,
+    which is the scan unit's word for the detector, so a file ends up
+    called ``scan-haadf`` rather than ``scan-0``.
+
+    Parameters
+    ----------
+    frames : Iterable[Frame]
+        The series to split.
+    fallback : str
+        The name to use for a frame that reports neither a channel name
+        nor a device id. An absent key means the instrument did not
+        report it, and inventing a channel number would claim it did.
+
+    Yields
+    ------
+    tuple[str, Frame]
+        The detector's name and each frame.
+    """
+    for frame in frames:
+        name = frame.metadata.get(CHANNEL_NAME_KEY) or frame.metadata.get(
+            DEVICE_ID_KEY,
+        )
+        yield (str(name) if name else fallback, frame)
 
 
 @dataclass(frozen=True)
@@ -89,15 +184,19 @@ class AcquisitionRequest:
         Free text every other client sees while the lease is held. Worth
         filling in: it is the difference between an operator elsewhere
         reading "busy" and reading "energy series, 5 steps".
-    build : Callable[[LeasedDevices], Iterable[Frame]]
-        Turns the leased devices into a frame series. Called on the
-        worker, inside the lease.
+    build : Callable[[LeasedDevices], Iterable[tuple[str, Frame]]]
+        Turns the leased devices into a series of ``(signal name, frame)``
+        pairs. Called on the worker, inside the lease. Pairs rather than
+        bare frames because one acquisition may produce several signals
+        and each gets its own file and its own row in the log - see the
+        module docstring, and :func:`named` and :func:`by_channel` for
+        the two ways of producing them.
     """
 
     targets: tuple[str, ...]
     label: str
     reason: str
-    build: Callable[[LeasedDevices], Iterable[Frame]]
+    build: Callable[[LeasedDevices], Iterable[tuple[str, Frame]]]
 
 
 def scan_request(
@@ -138,19 +237,25 @@ def scan_request(
         The request, ready to hand to an :class:`AcquisitionJob`.
     """
     wanted = list(channels)
-    named = "-".join(channel_names) or "scan"
+    listed = "-".join(channel_names) or "scan"
     return AcquisitionRequest(
         targets=(target,),
-        label=f"scan-{named}",
+        # "scan", not "scan-HAADF-MAADF": the detectors are the item's
+        # signals now and each names its own file, so putting them in the
+        # item label too would produce scan-haadf-maadf-haadf.nxs.
+        label="scan",
         reason=(
             f"{count} scan pass(es), {parameters.width}x{parameters.height} "
-            f"at {parameters.pixel_time_us:g} us, detectors: {named}"
+            f"at {parameters.pixel_time_us:g} us, detectors: {listed}"
         ),
-        build=lambda leased: multichannel_scan_series(
-            leased.scanner(target),
-            parameters,
-            count,
-            channels=wanted,
+        build=lambda leased: by_channel(
+            multichannel_scan_series(
+                leased.scanner(target),
+                parameters,
+                count,
+                channels=wanted,
+            ),
+            fallback=target,
         ),
     )
 
@@ -213,7 +318,10 @@ def camera_request(
                 f"one camera image, {parameters.exposure_ms:g} ms, "
                 f"binning {parameters.binning}"
             ),
-            build=lambda leased: _configured_image(leased, target, parameters),
+            build=lambda leased: named(
+                target,
+                _configured_image(leased, target, parameters),
+            ),
         )
     if parameters is not None:
         message = (
@@ -226,7 +334,7 @@ def camera_request(
         targets=(target,),
         label="camera",
         reason=f"{count} camera frames at the live settings",
-        build=lambda leased: camera_series(leased.camera(target), count),
+        build=lambda leased: named(target, camera_series(leased.camera(target), count)),
     )
 
 
@@ -352,19 +460,19 @@ class AcquisitionJob(BackgroundJob):
         with self._lock:
             return typing.cast("SessionLogEntry | None", self._raw_result)
 
-    def _leased_frames(self) -> Iterator[Frame]:
+    def _leased_pairs(self) -> Iterator[tuple[str, Frame]]:
         """
-        Yield the series from inside a lease taken on this thread.
+        Yield the named series from inside a lease taken on this thread.
 
         A generator, so the lease is taken when the *consumer* starts
-        pulling - which is either this job's own ``list`` below or the
-        session's streaming writer, both on this worker. Nothing here
+        pulling - which is either this job's own loop below or the
+        session's streaming writers, both on this worker. Nothing here
         runs on the notebook's thread.
 
         Yields
         ------
-        Frame
-            Each acquired frame.
+        tuple[str, Frame]
+            Each acquired frame and the signal it belongs to.
         """
         with self._broker.lease(
             *self._request.targets,
@@ -372,7 +480,7 @@ class AcquisitionJob(BackgroundJob):
         ) as leased:
             with self._lock:
                 self._holder = leased.lease.holder
-            for frame in self._request.build(leased):
+            for dataset, frame in self._request.build(leased):
                 # Renewed per frame rather than for a guessed duration:
                 # a long series outlives any fixed TTL, and a job that
                 # wedges stops renewing and lets the broker take the
@@ -380,7 +488,7 @@ class AcquisitionJob(BackgroundJob):
                 leased.renew()
                 with self._lock:
                     self._frames_seen += 1
-                yield frame
+                yield (dataset, frame)
 
     def _work(self) -> SessionLogEntry:
         """
@@ -402,77 +510,114 @@ class AcquisitionJob(BackgroundJob):
         started_at = datetime.datetime.now(tz=datetime.UTC)
         started = time.monotonic()
         try:
-            frames, path = self._acquire()
+            datasets = self._acquire(started_at)
         except Exception as error:
             self._log.append(
                 self._entry(
                     started_at,
                     time.monotonic() - started,
-                    frames=(),
-                    path=None,
+                    datasets=(),
                     error=f"{type(error).__name__}: {error}",
                 ),
             )
             raise
         return self._log.append(
-            self._entry(
-                started_at,
-                time.monotonic() - started,
-                frames=frames,
-                path=path,
-            ),
+            self._entry(started_at, time.monotonic() - started, datasets=datasets),
         )
 
-    def _acquire(self) -> tuple[Sequence[Frame], str | None]:
+    def _acquire(
+        self,
+        started_at: datetime.datetime,
+    ) -> tuple[LoggedDataset, ...]:
         """
-        Run the series, streaming it to disk when a session is attached.
+        Run the series, streaming each signal to its own file if there is one.
 
-        Returns
-        -------
-        tuple[Sequence[Frame], str | None]
-            The frames the log needs for its thumbnail and metadata, and
-            where they were written. With a session attached only the
-            first frame is retained - the rest are streamed to the file
-            and released, because a hundred-frame series held in memory
-            purely to build one thumbnail is a hundred frames of kernel
-            memory for nothing.
-        """
-        if self._session is None:
-            return (list(self._leased_frames()), None)
-        kept: list[Frame] = []
-        recording = self._session.record(
-            self._retaining_first(kept),
-            label=self._request.label,
-            note=self._note,
-        )
-        return (kept, str(recording.path))
-
-    def _retaining_first(self, kept: list[Frame]) -> Iterator[Frame]:
-        """
-        Pass frames through to the writer, keeping only the first.
+        With a session attached only each signal's **first** frame is
+        retained - the rest are streamed to that signal's file and
+        released, because a hundred-frame series held in memory purely to
+        build one thumbnail is a hundred frames of kernel memory for
+        nothing. With no session there is nowhere else for the data to
+        be, so every frame is kept and the entry can still offer to save
+        it.
 
         Parameters
         ----------
-        kept : list[Frame]
-            Filled with the first frame, if there is one.
+        started_at : datetime.datetime
+            When the acquisition began, so the files carry the time the
+            data was taken.
+
+        Returns
+        -------
+        tuple[LoggedDataset, ...]
+            One signal per name the acquisition produced, in the order
+            the names first appeared.
+        """
+        kept: dict[str, list[Frame]] = {}
+        counts: dict[str, int] = {}
+        pairs = self._collected(kept, counts)
+        paths: Mapping[str, str] = {}
+        if self._session is None:
+            # Consumed here rather than by a writer; the collector is
+            # what retains the frames.
+            for _ in pairs:
+                pass
+        else:
+            recordings = self._session.record_datasets(
+                pairs,
+                label=self._request.label,
+                note=self._note,
+                started_at=started_at,
+            )
+            paths = {
+                dataset: str(recording.path)
+                for dataset, recording in recordings.items()
+            }
+        return tuple(
+            describe_dataset(
+                dataset,
+                frames,
+                frame_count=counts[dataset],
+                path=paths.get(dataset),
+            )
+            for dataset, frames in kept.items()
+        )
+
+    def _collected(
+        self,
+        kept: dict[str, list[Frame]],
+        counts: dict[str, int],
+    ) -> Iterator[tuple[str, Frame]]:
+        """
+        Pass the named frames through, counting them and keeping what is needed.
+
+        Parameters
+        ----------
+        kept : dict[str, list[Frame]]
+            Filled with each signal's frames - all of them with no
+            session attached, the first alone otherwise. Insertion order
+            is first-appearance order, which is the order the log shows.
+        counts : dict[str, int]
+            Filled with each signal's frame count, which is not
+            ``len(kept[name])`` once the frames are being streamed away.
 
         Yields
         ------
-        Frame
-            Every frame, unchanged.
+        tuple[str, Frame]
+            Every pair, unchanged.
         """
-        for frame in self._leased_frames():
-            if not kept:
-                kept.append(frame)
-            yield frame
+        for dataset, frame in self._leased_pairs():
+            frames = kept.setdefault(dataset, [])
+            if self._session is None or not frames:
+                frames.append(frame)
+            counts[dataset] = counts.get(dataset, 0) + 1
+            yield (dataset, frame)
 
     def _entry(
         self,
         started_at: datetime.datetime,
         duration_s: float,
         *,
-        frames: Sequence[Frame],
-        path: str | None,
+        datasets: tuple[LoggedDataset, ...],
         error: str | None = None,
     ) -> SessionLogEntry:
         """
@@ -484,10 +629,8 @@ class AcquisitionJob(BackgroundJob):
             When the acquisition began.
         duration_s : float
             How long it took, from a monotonic clock.
-        frames : Sequence[Frame]
-            The frames retained for the thumbnail and metadata.
-        path : str | None
-            Where they were written, if anywhere.
+        datasets : tuple[LoggedDataset, ...]
+            The signals it produced, empty for a refusal.
         error : str | None
             Why it did not happen, if it did not.
 
@@ -497,7 +640,6 @@ class AcquisitionJob(BackgroundJob):
             The entry, without an index - :meth:`SessionLog.append`
             assigns that.
         """
-        shape, dtype, thumbnail = describe_frames(frames)
         return SessionLogEntry(
             index=0,
             label=self._request.label,
@@ -506,11 +648,6 @@ class AcquisitionJob(BackgroundJob):
             holder=self.holder,
             started_at=started_at,
             duration_s=duration_s,
-            frame_count=self.frames_acquired,
-            shape=shape,
-            dtype=dtype,
-            metadata=dict(frames[0].metadata) if frames else {},
-            thumbnail=thumbnail,
-            recording_path=path,
+            datasets=datasets,
             error=error,
         )

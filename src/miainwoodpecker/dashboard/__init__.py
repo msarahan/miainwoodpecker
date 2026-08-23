@@ -21,12 +21,28 @@ Nothing in this package imports marimo, and nothing in it touches a
 device handle. It watches through
 :meth:`~miainwoodpecker.broker.interface.InstrumentBroker.snapshot` and
 drives only inside a lease.
+
+The modules, in the order an acquisition passes through them:
+
+- :mod:`~miainwoodpecker.dashboard.connection` finds the broker.
+- :mod:`~miainwoodpecker.dashboard.tiles` decides what is watchable and
+  what the chrome says.
+- :mod:`~miainwoodpecker.dashboard.images` turns a frame into pixels a
+  browser will draw.
+- :mod:`~miainwoodpecker.dashboard.acquisition` takes the lease off the
+  notebook's thread and names the signals an acquisition produced.
+- :mod:`~miainwoodpecker.dashboard.session_log` records the outcome, one
+  entry per acquisition and one row per signal.
+- :mod:`~miainwoodpecker.dashboard.saving` gets signals that never had a
+  file onto a disk somebody chose.
 """
 
 from miainwoodpecker.dashboard.acquisition import (
     AcquisitionJob,
     AcquisitionRequest,
+    by_channel,
     camera_request,
+    named,
     scan_request,
 )
 from miainwoodpecker.dashboard.connection import (
@@ -42,10 +58,24 @@ from miainwoodpecker.dashboard.images import (
     is_image,
     png_data_uri,
 )
+from miainwoodpecker.dashboard.saving import (
+    NEXUS_MIMETYPE,
+    FailedSignal,
+    SavedSignal,
+    SaveError,
+    SaveJob,
+    SaveReport,
+    download_name,
+    nexus_bytes,
+    save_pending,
+)
 from miainwoodpecker.dashboard.session_log import (
     METADATA_HIGHLIGHTS,
+    LoggedDataset,
     SessionLog,
     SessionLogEntry,
+    describe_dataset,
+    describe_frames,
     highlights,
 )
 from miainwoodpecker.dashboard.tiles import (
@@ -63,26 +93,40 @@ __all__ = [
     "FRAME_SOURCE_KINDS",
     "INVITATION_ENV_VAR",
     "METADATA_HIGHLIGHTS",
+    "NEXUS_MIMETYPE",
     "THUMBNAIL_MAX_EDGE",
     "TILE_EDGES",
     "TILE_MAX_EDGE",
     "AcquisitionJob",
     "AcquisitionRequest",
+    "FailedSignal",
     "FrameTile",
+    "LoggedDataset",
+    "SaveError",
+    "SaveJob",
+    "SaveReport",
+    "SavedSignal",
     "SessionLog",
     "SessionLogEntry",
+    "by_channel",
     "camera_request",
     "channel_labels",
     "connect_dashboard",
+    "describe_dataset",
+    "describe_frames",
+    "download_name",
     "frame_sources",
     "frame_tiles",
     "greyscale_png",
     "highlights",
     "is_image",
     "lease_text",
+    "named",
+    "nexus_bytes",
     "png_data_uri",
     "rate_text",
     "resolve_invitation",
+    "save_pending",
     "scan_request",
     "tile_status",
 ]

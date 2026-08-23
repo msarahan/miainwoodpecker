@@ -70,6 +70,36 @@ prefixed with which scope it came from, because a single ``description``
 field that silently mixed the two would leave a reader unable to tell a
 standing observation from a per-frame one.
 
+One acquisition, several signals, one file each
+-----------------------------------------------
+:meth:`Session.record` writes one series to one file, which is the whole
+story for a camera series and not for anything a scanned instrument
+does. A pass read out on HAADF and BF is two signals; a spectrum image
+comes with the survey image that says where it was taken and the
+follow-up image that says what the beam did to it. Those belong together
+— they are one *item* in an operator's head — and they are stored as
+**separate files**, one per signal, by :meth:`Session.record_datasets`.
+
+Separate rather than combined, and it is a choice rather than a
+limitation: :mod:`miainwoodpecker.storage.passes` demonstrates that NeXus
+is perfectly happy to hold several ``NXdata`` groups in one entry, and
+that is the right shape for a pass whose signals are *pixel-aligned by
+construction* and meaningless apart. An item is not that. Its parts are
+acquired at different times with different geometry, a user opens one of
+them at a time, and every external tool they will reach for —
+HyperSpy's ``hs.load``, a NeXus viewer, a file manager — takes a file
+and gives back a signal. One file per signal is what those tools already
+expect, and it is what makes "send me the HAADF" a copy rather than an
+extraction.
+
+What keeps them together is the filename. Every file of one item shares
+the item's sequence number and timestamp and differs only in the signal's
+name — ``0007-scan-haadf-20260810T142530Z.nxs`` beside
+``0007-scan-bf-20260810T142530Z.nxs`` — so :meth:`Session.recordings`
+lists them adjacently, sorting on that number, without an index to keep
+in sync. Each file also carries ``session_dataset`` in its metadata,
+naming which signal of the item it holds.
+
 Reading a recording back
 ------------------------
 :func:`load_recording` is the read path, and it deliberately goes through
@@ -113,6 +143,7 @@ from pathlib import Path
 import h5py
 import numpy as np
 
+from miainwoodpecker.acquisition.sequence import FrameSink
 from miainwoodpecker.acquisition.sequence import record as record_frames
 from miainwoodpecker.jobs import BackgroundJob
 from miainwoodpecker.storage import layout
@@ -295,6 +326,108 @@ class LoadedRecording:
 
 class RecordingReadError(RuntimeError):
     """Raised when a recording cannot be read, with a reason an operator can use."""
+
+
+class SessionItem:
+    """
+    One acquisition's files, named so that they say they belong together.
+
+    An item is what an operator means by "that spectrum image": the SI,
+    the survey that says where it was taken, and the follow-up image that
+    says what the beam did. Each is a separate file (see this module's
+    docstring for why), and what joins them is the name — every file of
+    one item carries the item's sequence number and timestamp, and
+    differs only in the signal's name.
+
+    Built by :meth:`Session.open_item` and normally driven by
+    :meth:`Session.record_datasets`. It is public because the other
+    caller is a *deferred* write: data acquired with no session attached,
+    kept in memory, and flushed to a directory later
+    (:mod:`miainwoodpecker.dashboard.saving`). That path has to state the
+    acquisition's own start time rather than the flush's, which is the
+    whole reason :meth:`Session.open_item` takes one.
+
+    **The number is claimed by the first signal, not at construction.**
+    Opening an item touches nothing, so an acquisition that is refused
+    before it produces a frame leaves no reserved files and skips no
+    numbers.
+
+    Parameters
+    ----------
+    session : Session
+        The session whose directory and numbering this item takes.
+    label : str
+        What was acquired, shared by every file of the item.
+    started_at : datetime.datetime | None
+        When the acquisition began. Defaults to the time the first signal
+        is reserved.
+    """
+
+    def __init__(
+        self,
+        session: Session,
+        label: str,
+        *,
+        started_at: datetime.datetime | None = None,
+    ) -> None:
+        self._session = session
+        self._label = label
+        self._started_at = started_at
+        self._index: int | None = None
+        self._paths: dict[str, Path] = {}
+
+    @property
+    def label(self) -> str:
+        """Return what this item is called, before any signal name is added."""
+        return self._label
+
+    @property
+    def index(self) -> int:
+        """
+        Return the sequence number every file of this item shares.
+
+        Returns
+        -------
+        int
+            The number, or ``0`` if no signal has been reserved yet -
+            which is not a position in the session's numbering and does
+            not claim to be.
+        """
+        return 0 if self._index is None else self._index
+
+    def reserve(self, dataset: str) -> Path:
+        """
+        Claim the file for one signal of this item.
+
+        The first call fixes the item's sequence number and timestamp;
+        every later one reuses them, so the files sort together and read
+        as one acquisition in a directory listing.
+
+        Parameters
+        ----------
+        dataset : str
+            The signal's name — a detector, a step of a recipe. Slugified
+            and appended to the item's label.
+
+        Returns
+        -------
+        Path
+            The reserved path, created empty. Asking twice for the same
+            signal returns the same path rather than reserving a second
+            file, so a caller does not have to remember what it opened.
+        """
+        existing = self._paths.get(dataset)
+        if existing is not None:
+            return existing
+        path, index, started = self._session.reserve_named(
+            f"{self._label}-{dataset}",
+            started_at=self._started_at,
+            index=self._index,
+        )
+        self._index = index
+        self._started_at = started
+        self._paths[dataset] = path
+        return path
 
 
 class Session:
@@ -486,23 +619,95 @@ class Session:
         """
         return self._reserve(label)[0]
 
-    def _reserve(self, label: str) -> tuple[Path, int, str, datetime.datetime]:
-        """Claim a filename, returning it with the parts it was built from."""
-        slug = _slugify(label)
+    def _reserve(
+        self,
+        label: str,
+        *,
+        started_at: datetime.datetime | None = None,
+    ) -> tuple[Path, int, str, datetime.datetime]:
+        """
+        Claim a filename, returning it with the parts it was built from.
+
+        Parameters
+        ----------
+        label : str
+            What is being recorded; slugified into the filename.
+        started_at : datetime.datetime | None
+            When the acquisition began, for the filename's stamp.
+            Defaults to now, which is right for a recording being written
+            as it happens and wrong for one being flushed out of memory
+            hours later - see :meth:`SessionItem.reserve`.
+
+        Returns
+        -------
+        tuple[Path, int, str, datetime.datetime]
+            The reserved path, its index, the slug, and the start time.
+        """
+        path, index, when = self.reserve_named(label, started_at=started_at)
+        return path, index, _slugify(label), when
+
+    def reserve_named(
+        self,
+        label: str,
+        *,
+        started_at: datetime.datetime | None = None,
+        index: int | None = None,
+    ) -> tuple[Path, int, datetime.datetime]:
+        """
+        Claim a collision-free filename, at a given sequence number or the next.
+
+        The two modes disambiguate in opposite directions, deliberately.
+        Without ``index`` this is a fresh recording: it takes one past the
+        highest number on disk and, if that name is somehow taken anyway,
+        moves to the next *number*. With ``index`` it is a second signal
+        of an item that already has files, and it must **not** move to the
+        next number — sharing the number is what says the files belong to
+        one acquisition — so it appends a counter inside the name instead.
+
+        Either way the file is created empty and atomically (``O_EXCL``,
+        via :meth:`pathlib.Path.touch`), so two acquisitions cannot pick
+        one name within the same second, from two threads, or from two
+        processes pointed at one directory.
+
+        Parameters
+        ----------
+        label : str
+            What is being recorded; slugified into the filename.
+        started_at : datetime.datetime | None
+            When the acquisition began, for the name's stamp. Defaults to
+            now, which is right for a recording written as it happens and
+            wrong for one flushed out of memory hours later.
+        index : int | None
+            The sequence number to use. None takes the next free one.
+
+        Returns
+        -------
+        tuple[Path, int, datetime.datetime]
+            The reserved path, the number it landed on, and the start time
+            its name was stamped with.
+        """
         # Truncated to whole seconds so this matches what reading the name
         # back off disk recovers.
-        started_at = _now().replace(microsecond=0)
-        stamp = started_at.strftime(_STAMP_FORMAT)
-        index = self._next_index()
+        when = (_now() if started_at is None else started_at).replace(microsecond=0)
+        fixed = index is not None
+        number = self._next_index() if index is None else index
+        attempt = 1
         while True:
-            name = f"{index:0{_INDEX_DIGITS}d}-{slug}-{stamp}{_SUFFIX}"
-            candidate = self._root / name
+            candidate = self._root / recording_filename(
+                label,
+                index=number,
+                started_at=when,
+                attempt=attempt,
+            )
             try:
                 candidate.touch(exist_ok=False)
             except FileExistsError:
-                index += 1
+                if fixed:
+                    attempt += 1
+                else:
+                    number += 1
                 continue
-            return candidate, index, slug, started_at
+            return candidate, number, when
 
     def reserve(self, label: str) -> tuple[Path, int, str, datetime.datetime]:
         """
@@ -590,6 +795,142 @@ class Session:
             **self._nexus_context(note),
         )
         return _describe_path(target, index=index, label=slug, started_at=started_at)
+
+    def open_item(
+        self,
+        label: str,
+        *,
+        started_at: datetime.datetime | None = None,
+    ) -> SessionItem:
+        """
+        Begin one acquisition's worth of files, sharing a sequence number.
+
+        Parameters
+        ----------
+        label : str
+            What is being acquired; every file of the item carries it,
+            followed by the signal's own name.
+        started_at : datetime.datetime | None
+            When the acquisition began. Pass it when the files are being
+            written after the fact — flushed out of memory, say — so the
+            names carry the time the data was taken rather than the time
+            it happened to be saved.
+
+        Returns
+        -------
+        SessionItem
+            The item. Nothing is created on disk until a signal is
+            reserved.
+        """
+        return SessionItem(self, label, started_at=started_at)
+
+    def record_datasets(
+        self,
+        datasets: Iterable[tuple[str, Frame]],
+        *,
+        label: str = "acquisition",
+        note: str | None = None,
+        started_at: datetime.datetime | None = None,
+        item: SessionItem | None = None,
+    ) -> dict[str, Recording]:
+        """
+        Stream several named signals into one file each, all at once.
+
+        The multi-signal sibling of :meth:`record`, and the reason this
+        project has one: a scanned instrument reads every enabled
+        detector out of a single pass, so a two-detector scan arrives as
+        one stream of HAADF, BF, HAADF, BF, and each detector wants its
+        own file (see this module's docstring). Every writer stays open
+        while the stream runs, so nothing is buffered waiting for a
+        sibling signal to finish — a file per signal costs a file handle,
+        not a copy of the data.
+
+        A signal's file is reserved when its **first** frame arrives, so
+        a stream that never produces a signal it might have leaves no
+        empty file claiming it did. The layout of each file is chosen the
+        same way :func:`~miainwoodpecker.acquisition.sequence.record`
+        chooses it — from that first frame's rank — so an item may hold
+        images and spectra together and each lands in the layout its own
+        kind already has.
+
+        Parameters
+        ----------
+        datasets : Iterable[tuple[str, Frame]]
+            Signal name and frame, interleaved in acquisition order.
+        label : str
+            What is being acquired; slugified into every filename ahead of
+            the signal's own name.
+        note : str | None
+            A note about this acquisition, written into every file of the
+            item — they are one acquisition, and a note that landed on
+            only the first would be a note about the HAADF and not the
+            spectrum image beside it.
+        started_at : datetime.datetime | None
+            When the acquisition began; see :meth:`open_item`. Ignored
+            when ``item`` is given, which already carries one.
+        item : SessionItem | None
+            An item to add these signals to, rather than starting a new
+            one. Its label and start time are used, and ``label`` and
+            ``started_at`` are ignored.
+
+            The reason to pass one is failure isolation. Everything here
+            is one loop over one stream, so a signal that cannot be
+            written — a projected frame with no energy calibration, say —
+            takes the call down and the sibling signals with it. That is
+            right for a live acquisition, where the signals arrive
+            interleaved and there is nothing to be done about a stream
+            that has stopped. It is wrong for writing data that is
+            already in memory, where each signal can be attempted on its
+            own; that caller passes the same item to several calls, and
+            each file still shares the item's number.
+
+        Returns
+        -------
+        dict[str, Recording]
+            One recording per signal, keyed by the name it was given and
+            in the order the signals first appeared — which for a
+            multi-channel scan is the order the detectors were requested
+            in. Keyed rather than positional because the caller that
+            needs this — a log entry recording where each signal went —
+            would otherwise be matching two sequences by index and
+            trusting them to stay aligned.
+        """
+        target = self.open_item(label, started_at=started_at) if item is None else item
+        name = target.label
+        # Signal name -> its open writer and the metadata stamped onto its
+        # frames. Insertion-ordered, which is what makes the returned
+        # recordings come back in the order the signals first appeared.
+        open_signals: dict[str, tuple[FrameSink, dict[str, str]]] = {}
+        try:
+            for dataset, frame in datasets:
+                found = open_signals.get(dataset)
+                if found is None:
+                    found = (
+                        FrameSink(
+                            target.reserve(dataset),
+                            title=self._default_title(f"{name} {dataset}"),
+                            **self._nexus_context(note),  # type: ignore[arg-type]
+                        ),
+                        self._context_metadata(name, note, dataset=dataset),
+                    )
+                    open_signals[dataset] = found
+                sink, extra = found
+                sink.append(
+                    dataclasses.replace(
+                        frame,
+                        metadata={**frame.metadata, **extra},
+                    ),
+                )
+        finally:
+            # Every writer, whatever unwound the loop: an item that failed
+            # part-way through is still an item, and each signal that got
+            # frames keeps a complete file of them.
+            for sink, _ in open_signals.values():
+                sink.close()
+        return {
+            dataset: _describe_path(Path(sink.path))
+            for dataset, (sink, _) in open_signals.items()
+        }
 
     def recordings(self) -> list[Recording]:
         """
@@ -697,6 +1038,46 @@ class Session:
             arguments["notes"] = combined
         return arguments
 
+    def _context_metadata(
+        self,
+        label: str,
+        note: str | None,
+        *,
+        dataset: str | None = None,
+    ) -> dict[str, str]:
+        """
+        Build the ``session_``-prefixed keys injected into frame metadata.
+
+        Parameters
+        ----------
+        label : str
+            What is being recorded.
+        note : str | None
+            This recording's own note, if the operator wrote one.
+        dataset : str | None
+            Which signal of a multi-signal item this frame belongs to.
+            Absent for a single-signal recording, which has no sibling
+            files for the name to distinguish it from.
+
+        Returns
+        -------
+        dict[str, str]
+            The keys to merge into each frame's metadata.
+        """
+        extra = {
+            f"{_CONTEXT_PREFIX}{key}": value for key, value in self._context.items()
+        }
+        extra[f"{_CONTEXT_PREFIX}label"] = label
+        extra[f"{_CONTEXT_PREFIX}root"] = str(self._root)
+        if dataset is not None:
+            # Which signal of the item this file holds. The filename says
+            # it too, but a file that has been renamed or copied out of
+            # the session still has to be able to answer.
+            extra[f"{_CONTEXT_PREFIX}dataset"] = dataset
+        if note:
+            extra[f"{_CONTEXT_PREFIX}note"] = note
+        return extra
+
     def _with_context(
         self,
         frames: Iterable[Frame],
@@ -704,13 +1085,7 @@ class Session:
         note: str | None,
     ) -> Iterator[Frame]:
         """Yield each frame with the session context added to its metadata."""
-        extra = {
-            f"{_CONTEXT_PREFIX}{key}": value for key, value in self._context.items()
-        }
-        extra[f"{_CONTEXT_PREFIX}label"] = label
-        extra[f"{_CONTEXT_PREFIX}root"] = str(self._root)
-        if note:
-            extra[f"{_CONTEXT_PREFIX}note"] = note
+        extra = self._context_metadata(label, note)
         for frame in frames:
             yield dataclasses.replace(frame, metadata={**frame.metadata, **extra})
 
@@ -1198,6 +1573,49 @@ def _context_from_nexus_groups(handle: object) -> dict[str, str]:
         if value:
             found[key] = value
     return found
+
+
+def recording_filename(
+    label: str,
+    *,
+    index: int,
+    started_at: datetime.datetime,
+    attempt: int = 1,
+) -> str:
+    """
+    Compose the filename a session gives one recording.
+
+    The naming rule, in one function, because a second caller now needs
+    it. Data acquired with no session attached is offered to the browser
+    as a download (:mod:`miainwoodpecker.dashboard.saving`), and the name
+    that download arrives under should be the name the same data would
+    have had on disk — otherwise the file an operator saves through the
+    browser sorts and reads differently from the one beside it that a
+    session wrote, for no reason except that two pieces of code spelled
+    the rule separately.
+
+    Parameters
+    ----------
+    label : str
+        What was recorded, signal name included if it has one. Slugified.
+    index : int
+        The sequence number. Every file of one acquisition shares it.
+    started_at : datetime.datetime
+        When the acquisition began; rendered to whole seconds, which is
+        the precision the name can be read back at.
+    attempt : int
+        Disambiguator for a name already taken, from 1. See
+        :meth:`Session.reserve_named` for when that happens and why it is
+        not the index that moves.
+
+    Returns
+    -------
+    str
+        The filename, extension included.
+    """
+    extra = "" if attempt == 1 else f"-{attempt}"
+    stamp = started_at.strftime(_STAMP_FORMAT)
+    return f"{index:0{_INDEX_DIGITS}d}-{_slugify(label)}{extra}-{stamp}{_SUFFIX}"
 
 
 def default_root(base: os.PathLike[str] | str | None = None) -> Path:

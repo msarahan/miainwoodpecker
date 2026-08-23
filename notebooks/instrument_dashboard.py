@@ -48,6 +48,18 @@ order. So each acquisition adds an entry to a panel instead, which turns
 out to be the better shape anyway: a shift's acquisitions in the order
 they happened, in one place.
 
+**Every entry says where its data is, one signal at a time.** An
+acquisition is not one array: a pass is read out on several detectors, a
+spectrum image comes with the survey that says where it was taken. Each
+of those is a separate file, so each gets its own row under the entry
+with its own picture and its own answer to "where is it". A signal that
+was written says the path. A signal acquired with no session attached
+has no path, and gets a **Save** button instead - the bytes are produced
+when it is pressed, not on every refresh, which is why ``mo.download``
+is handed a callable rather than a payload. Everything still in memory
+can also be written at once, into a directory named at the bottom of the
+page; that is the thing to press before shutting the kernel down.
+
 **Where the judgement lives.** Which targets get a tile, what the chrome
 says, how a frame becomes pixels a browser will draw, and what an
 acquisition records are all in :mod:`miainwoodpecker.dashboard`, not in
@@ -77,17 +89,21 @@ def _():
     import marimo as mo
 
     from miainwoodpecker.dashboard import (
+        NEXUS_MIMETYPE,
         TILE_EDGES,
         TILE_MAX_EDGE,
         AcquisitionJob,
+        SaveJob,
         SessionLog,
         camera_request,
         channel_labels,
         connect_dashboard,
+        download_name,
         frame_sources,
         frame_tiles,
         highlights,
         is_image,
+        nexus_bytes,
         png_data_uri,
         scan_request,
         tile_status,
@@ -96,21 +112,25 @@ def _():
     from miainwoodpecker.storage.session import Session
 
     return (
+        NEXUS_MIMETYPE,
         TILE_EDGES,
         TILE_MAX_EDGE,
         AcquisitionJob,
         CameraParameters,
+        SaveJob,
         ScanParameters,
         Session,
         SessionLog,
         camera_request,
         channel_labels,
         connect_dashboard,
+        download_name,
         frame_sources,
         frame_tiles,
         highlights,
         is_image,
         mo,
+        nexus_bytes,
         png_data_uri,
         scan_request,
         tile_status,
@@ -561,47 +581,80 @@ def _(mo):
         scanner was leased by the viewer" is part of what happened, and
         a log that dropped it would leave a gap somebody later reads as
         a quiet minute.
+
+        One row per **signal**: a pass read out on two detectors is one
+        acquisition and two files. A signal that was written says where;
+        a signal acquired with no session attached says **Save**, which
+        is the browser's own Save-as dialog and works whether or not
+        this page is open on the microscope's machine.
         """,
     )
     return
 
 
 @app.cell
-def _(highlights, log, mo, refresh):
+def _(NEXUS_MIMETYPE, download_name, highlights, log, mo, nexus_bytes, refresh):
     refresh
 
-    def log_row(entry):
-        """Render one acquisition: thumbnail on the left, provenance on the right."""
-        if entry.error is not None:
-            body = mo.callout(mo.md(f"**Refused.** {entry.error}"), kind="danger")
-            return mo.vstack(
-                [
-                    mo.md(
-                        f"**{entry.index}. {entry.label}** - "
-                        f"{entry.started_at:%H:%M:%S} - {entry.reason}",
+    def where(entry, dataset):
+        """Say where one signal's data is, and offer the way to get at it."""
+        if dataset.path is not None:
+            # Deliberately not a clickable file:// link. A browser will
+            # not navigate to one from an http page, so the honest thing
+            # is to name the location - which is copyable, and which is
+            # what somebody sitting at the instrument needs.
+            return mo.md(f"written to `{dataset.path}`")
+        # A callable, not bytes: this cell re-runs on every tick of the
+        # display timer - up to ten a second - and encoding an HDF5 file
+        # per unsaved signal per tick, to build a button nobody pressed,
+        # would be by a wide margin the most expensive thing on the page.
+        # marimo runs it when the button is clicked.
+        return mo.hstack(
+            [
+                mo.md("*in memory only*"),
+                mo.download(
+                    data=lambda entry=entry, dataset=dataset: nexus_bytes(
+                        entry, dataset,
                     ),
-                    body,
-                ],
-                gap=0.25,
+                    filename=download_name(entry, dataset),
+                    mimetype=NEXUS_MIMETYPE,
+                    label="Save",
+                ),
+            ],
+            justify="start",
+            align="center",
+            gap=0.5,
+        )
+
+    def signal_row(entry, dataset):
+        """Render one signal of an acquisition: picture, shape, where it is."""
+        picture = (
+            mo.Html(
+                f'<img src="{dataset.thumbnail}" style="width:128px;'
+                'background:#000;border-radius:4px;'
+                'image-rendering:pixelated;" />',
             )
-        where = entry.recording_path or "in memory only (no session attached)"
+            if dataset.thumbnail
+            # A projected readout is a spectrum, not an image, and a
+            # one-pixel-high strip would be a picture of nothing.
+            else mo.md("<small>*1D readout - no thumbnail*</small>")
+        )
         facts = "\n".join(
-            f"- `{key}`: {value}" for key, value in highlights(entry).items()
+            f"- `{key}`: {value}" for key, value in highlights(dataset).items()
         )
         return mo.hstack(
             [
-                mo.Html(
-                    f'<img src="{entry.thumbnail}" style="width:128px;'
-                    'background:#000;border-radius:4px;'
-                    'image-rendering:pixelated;" />',
-                ),
-                mo.md(
-                    f"**{entry.index}. {entry.label}** - "
-                    f"{entry.started_at:%H:%M:%S} - "
-                    f"{entry.frame_count} frames of {entry.shape} "
-                    f"{entry.dtype} in {entry.duration_s:.1f} s\n\n"
-                    f"held as `{entry.holder}` for *{entry.reason}*\n\n"
-                    f"written to `{where}`\n\n{facts}",
+                picture,
+                mo.vstack(
+                    [
+                        mo.md(
+                            f"**{dataset.name}** - {dataset.frame_count} frames "
+                            f"of {dataset.shape} {dataset.dtype}",
+                        ),
+                        where(entry, dataset),
+                        mo.md(facts) if facts else mo.md(""),
+                    ],
+                    gap=0.25,
                 ),
             ],
             widths=[1, 5],
@@ -609,11 +662,126 @@ def _(highlights, log, mo, refresh):
             gap=1,
         )
 
+    def log_row(entry):
+        """Render one acquisition: its heading, then a row per signal."""
+        heading = mo.md(
+            f"**{entry.index}. {entry.label}** - {entry.started_at:%H:%M:%S} - "
+            f"{entry.frame_count} frames in {entry.duration_s:.1f} s, held as "
+            f"`{entry.holder}` for *{entry.reason}*",
+        )
+        if entry.error is not None:
+            return mo.vstack(
+                [
+                    heading,
+                    mo.callout(mo.md(f"**Refused.** {entry.error}"), kind="danger"),
+                ],
+                gap=0.25,
+            )
+        if not entry.datasets:
+            return mo.vstack(
+                [heading, mo.md("*This acquisition produced no frames.*")],
+                gap=0.25,
+            )
+        return mo.vstack(
+            [heading, *(signal_row(entry, d) for d in entry.datasets)],
+            gap=0.5,
+        )
+
     entries = log.entries
     mo.vstack(
         [log_row(entry) for entry in reversed(entries)],
         gap=1,
     ) if entries else mo.md("*Nothing acquired yet.*")
+    return
+
+
+@app.cell
+def _(mo):
+    mo.md(
+        """
+        ### Save everything that is only in memory
+
+        Anything acquired without a session directory lives in this
+        kernel and nowhere else. Name a directory and press the button
+        and it is written there - one file per signal, numbered and named
+        exactly as data acquired into that session would have been, and
+        stamped with the time it was *acquired* rather than the time it
+        was saved. Saving releases it, so this is also how a long shift
+        stops filling the kernel up.
+        """,
+    )
+    return
+
+
+@app.cell
+def _(log, mo, refresh):
+    refresh
+    held = log.pending
+    mo.md(
+        f"**{len(held)}** signal(s) from "
+        f"**{len({entry.index for entry, _ in held})}** acquisition(s) "
+        f"are held in memory only.",
+    ) if held else mo.md(
+        "*Nothing is held in memory; everything acquired is on disk.*",
+    )
+    return
+
+
+@app.cell
+def _(mo):
+    # Deliberately not on the refresh timer, for the reason the acquire
+    # controls are not: a cell that depended on it would rebuild this
+    # form as often as the display timer fires - ten times a second at
+    # the fastest setting - and throw away the path the operator was
+    # half way through typing.
+    output_form = mo.ui.text(
+        label="Output directory",
+        full_width=True,
+    ).form(submit_button_label="Write everything here", bordered=False)
+    output_form
+    return (output_form,)
+
+
+@app.cell
+def _(SaveJob, log, mo, output_form):
+    # Started, not awaited, for the same reason Acquire is: this writes
+    # every unsaved acquisition at once, gzipped, quite possibly onto a
+    # network mount, and a cell that did it inline would freeze the page
+    # at exactly the moment somebody is trying to leave.
+    mo.stop(
+        not output_form.value,
+        mo.md("*Name a directory to write the held data into.*"),
+    )
+    save_job = SaveJob(log, output_form.value)
+    save_job.start()
+    mo.md(f"Writing held data to `{output_form.value}`...")
+    return (save_job,)
+
+
+@app.cell
+def _(mo, refresh, save_job):
+    refresh
+    if save_job.is_running:
+        save_status = mo.md("Writing...")
+    elif save_job.error is not None:
+        save_status = mo.callout(
+            mo.md(f"**Could not save.** {save_job.error}"), kind="danger",
+        )
+    elif save_job.result is None:
+        save_status = mo.md("")
+    elif save_job.result.complete:
+        save_status = mo.callout(mo.md(save_job.result.summary()), kind="success")
+    else:
+        # Partial, and it says which signals did not make it: they are
+        # still in memory, so another directory can be tried.
+        missed = "\n".join(
+            f"- entry {signal.entry_index}, `{signal.name}`: {signal.reason}"
+            for signal in save_job.result.failed
+        )
+        save_status = mo.callout(
+            mo.md(f"{save_job.result.summary()}\n\n{missed}"), kind="warn",
+        )
+    save_status
     return
 
 
