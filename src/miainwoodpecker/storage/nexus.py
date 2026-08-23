@@ -699,6 +699,46 @@ class NexusWriter:
             axis.attrs["units"] = axis_calibration.units
             axis.attrs["long_name"] = axis_calibration.long_name
 
+        # ``interpretation`` is what tells a reader which axes are the
+        # signal. Without it there is only the rank to go on, and
+        # RosettaSciIO's NeXus plugin gives up: measured against rsciio
+        # 0.14.0, this stack came back as *three navigation axes* and no
+        # image, so HyperSpy would build a `BaseSignal` rather than the
+        # `Signal2D` the analysis adapters expect. With it, `y` and `x`
+        # arrive as the signal axes.
+        #
+        # Written in two places, and the split is not redundancy. The
+        # NeXus manual defines ``interpretation`` as a *field* attribute
+        # (datarules: scalar, spectrum, image, rgb-image, ...) and it does
+        # not appear in NXdata's base class at all; rsciio reads it from
+        # the NXdata *group* (``rsciio/nexus/_api.py``, `dataentry.attrs`)
+        # and its own writer puts it there. Measured both ways: on the
+        # field alone, rsciio ignores it. So the group attribute is what
+        # makes the file readable and the field attribute is what makes it
+        # correct, and neither is worth trading for the other.
+        #
+        # The field attribute lands on the single dataset both paths point
+        # at, so ``entry/instrument/detector/data`` carries it too. That is
+        # accurate rather than a leak - it is the same frames.
+        #
+        # **And withheld entirely from a file that claims an application
+        # definition**, which is the part that had to be measured rather
+        # than assumed. NXem's NXDL documents no ``interpretation``
+        # attribute anywhere, and ``pynxtools`` rejects a file carrying an
+        # undocumented one - group placement and field placement checked
+        # separately, both fatal, while the same file without it validates
+        # (scripts/validate_nexus_schema.py). Asked upstream as
+        # FAIRmat-NFDI/pynxtools#834; until it moves, the two goods are
+        # in direct conflict, so this follows the rule the writer follows
+        # for ``definition`` itself: a file that makes a schema claim
+        # keeps it, and a file that claims nothing carries the hint every
+        # recording this project writes today benefits from. What an
+        # NXem file loses is only the nav/signal split; the
+        # ``signal``/``axes`` attributes below still say where the data is.
+        if self._definition is None:
+            data_group.attrs["interpretation"] = "image"
+            data_group["data"].attrs["interpretation"] = "image"
+
         data_group.attrs["signal"] = "data"
         data_group.attrs["axes"] = ["frame_time", "y", "x"]
         data_group.attrs["frame_time_indices"] = 0

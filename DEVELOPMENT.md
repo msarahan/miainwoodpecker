@@ -19,15 +19,18 @@ pixi run -e style lint
 ```
 
 `pixi run` with no arguments lists every task. The environments are
-`default`, `device`, `analysis`, `all` and `style`; see the commented
-`[tool.pixi]` tables at the bottom of `pyproject.toml` for what each is
-for and why the GPL-3.0 device stack is isolated in its own.
+`default`, `replay`, `device`, `analysis`, `dashboard`, `all`, `validate`
+and `style`; see the commented `[tool.pixi]` tables at the bottom of
+`pyproject.toml` for what each is for and why the GPL-3.0 device stack is
+isolated in its own.
 
 **Hatch is the maintainer's toolchain**, and it is what CI drives: it
 builds the wheel and sdist, runs the test matrix across Python 3.11–3.13,
-validates NeXus files against their schema, and builds the docs. Those
-are jobs pixi is not set up for here. The rest of this page is about
-hatch.
+and builds the docs. Those are jobs pixi is not set up for here. NeXus
+schema validation used to be among them and no longer is: it is
+`pixi run -e validate schema`, so the check guarding the on-disk format
+runs on a machine that has pixi and nothing else. The rest of this page
+is about hatch.
 
 The two share one source of truth for dependencies —
 `[project.dependencies]` and `[project.optional-dependencies]` — so a

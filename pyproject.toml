@@ -505,39 +505,6 @@ extra-dependencies = [
 [tool.hatch.envs.integration.scripts]
 run = "pytest {args:-n auto --cov=miainwoodpecker --cov-report=term-missing}"
 
-#--------------- Validate written files against the NeXus schema ---------------#
-
-# docs/migration-plan.md section 5, Phase 3: validating our output against the
-# official NXem NXDL belongs in CI, not the runtime. pynxtools is a ~90-package
-# stack that ships the NXDL definitions inside the wheel, so the check runs
-# fully offline (the NeXus/FAIRmat spec sites are unreachable here) - but it
-# gets its own env so nothing in that stack can reach the shipped package or
-# the other test environments.
-# Loose ">=" bound: this env's only job is to fail when our files stop
-# validating, and a pynxtools upgrade tightening the schema is a signal worth
-# receiving rather than pinning away.
-[tool.hatch.envs.validate]
-description = """Validate written NeXus files against the NXem NXDL schema."""
-# Python is pinned rather than left to hatch's own default. CI's job sets up
-# 3.11, but hatch resolves each env's interpreter independently of the job's
-# setup-python step, and picked 3.12 on the runner - which is how this env
-# passed locally and failed in CI.
-python = "3.11"
-# Deliberately plain "pynxtools", not "pynxtools[em]". The NXDL definitions
-# (including NXem) ship inside the base wheel, which is what makes offline
-# validation possible at all; the [em] extra adds the vendor-format reader
-# stack - pynxtools-em -> kikuchipy -> numba 0.53.1 -> llvmlite 0.36.0 - which
-# is both the ~70-package dependency the Phase 3 notes explicitly avoided and
-# unbuildable on Python 3.12 (llvmlite 0.36 supports <3.10 only). Nothing here
-# converts vendor formats; this env only checks a file we wrote against a
-# schema.
-extra-dependencies = [
-    "pynxtools>=0.15",
-]
-
-[tool.hatch.envs.validate.scripts]
-schema = "python scripts/validate_nexus_schema.py"
-
 #--------------- Build and preview your documentation ---------------#
 
 # This sets up a hatch environment with associated dependencies that need to be installed
@@ -712,12 +679,52 @@ ruff = "==0.16.2"
 pydoclint = "*"
 pre-commit = "*"
 
+# The NXem schema check. docs/migration-plan.md section 5, Phase 3 put it
+# in CI rather than the runtime, and it stays there - pynxtools is never a
+# dependency of the shipped package. What changed is that it is now an
+# environment anyone can run: `hatch run validate:schema` was the only way
+# in, so the one check guarding the on-disk format could not be run on a
+# machine that has pixi and nothing else. That is not hypothetical; it
+# took a pip-install of pynxtools into a scratch directory to get an
+# answer out of it once.
+#
+# **From pypi, because conda-forge does not have it** - `pixi search
+# pynxtools` finds nothing - and it is the wheel that carries the NXDL
+# definitions, which is what lets the check run offline (the NeXus and
+# FAIRmat spec sites are unreachable from here).
+#
+# Deliberately plain `pynxtools`, not `pynxtools[em]`: the definitions
+# ship in the base wheel, while the extra adds the vendor-format reader
+# stack - pynxtools-em -> kikuchipy -> numba - which is the ~70-package
+# dependency the Phase 3 notes explicitly avoided, and nothing here
+# converts a vendor format.
+#
+# No Python pin, unlike the hatch environment this replaces. That pin
+# existed because hatch resolved each environment's interpreter
+# independently of CI's setup-python step and picked one that failed;
+# pixi resolves and locks the interpreter with everything else, and the
+# lock currently records 3.13, on which pynxtools 0.15 runs the whole
+# check green.
+#
+# The `>=` bound stays loose for the reason the hatch env gave - this
+# environment's only job is to fail when our files stop validating, and a
+# pynxtools release tightening the schema is a signal worth receiving
+# rather than pinning away. One honest difference: `pixi.lock` pins the
+# version, so that signal now arrives on `pixi lock` rather than on the
+# next CI run.
+[tool.pixi.feature.validate.pypi-dependencies]
+pynxtools = ">=0.15"
+
+[tool.pixi.feature.validate.tasks]
+schema = { cmd = "python scripts/validate_nexus_schema.py", description = "Validate written NeXus files against the NXem NXDL schema" }
+
 #--------------- Environments ---------------#
 #
 # `solve-group` is what keeps these consistent: every environment in the
 # "main" group is solved together, so the numpy in `default` is the numpy
 # in `analysis` and a result computed in one is reproducible in the other.
-# `style` sits outside it, having nothing to be consistent with.
+# `style` and `validate` sit outside it, each having nothing to be
+# consistent with.
 
 [tool.pixi.environments]
 # What a new arrival gets, and it is deliberately the one that needs no
@@ -740,6 +747,14 @@ analysis = { features = ["viewer", "analysis", "test"], solve-group = "main" }
 # is then one environment that can both serve an instrument and watch it.
 dashboard = { features = ["dashboard", "device", "test"], solve-group = "main" }
 all = { features = ["viewer", "device", "analysis", "replay", "dashboard", "test"], solve-group = "main" }
+# Outside the "main" solve group on purpose, and for the reason the hatch
+# env it replaces states about itself: pynxtools brings a large pypi tree,
+# this check has nothing to be consistent with, and keeping it out means it
+# cannot move a version underneath the environments that do. It does keep
+# the default feature, because the script imports the package it is
+# checking - `storage.nexus`, `storage.spectra`, `devices.interface` - and
+# nothing beyond h5py and numpy underneath them.
+validate = { features = ["validate"] }
 style = { features = ["style"], no-default-feature = true }
 
 #--------------- Tasks ---------------#

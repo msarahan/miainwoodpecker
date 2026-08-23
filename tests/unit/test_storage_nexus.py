@@ -74,6 +74,54 @@ def test_nexus_structure_and_plotting_hints(tmp_path):
         assert data_group["data"].attrs["units"] == "counts"
 
 
+def test_nxdata_says_the_frames_are_images_so_a_reader_finds_the_signal(tmp_path):
+    """
+    ``interpretation`` on the group *and* on the field, because readers differ.
+
+    Without it a NeXus reader has only the rank to go on. Measured
+    against RosettaSciIO 0.14.0: the stack comes back as three
+    *navigation* axes and no image, so HyperSpy builds a ``BaseSignal``
+    rather than the ``Signal2D`` the analysis adapters expect. rsciio
+    reads the attribute from the ``NXdata`` group; the NeXus manual
+    defines it on the field. Both are written, so both are asserted —
+    dropping either one would satisfy a spec and break a reader, or the
+    reverse.
+    """
+    path = tmp_path / "series.nxs"
+    write_frames(path, [_frame(0)])
+    with h5py.File(path, "r") as handle:
+        assert handle["entry/data"].attrs["interpretation"] == "image"
+        assert handle["entry/data/data"].attrs["interpretation"] == "image"
+        # The field attribute belongs to the one dataset both paths name,
+        # which is why the detector's own array reports it too.
+        detector = handle["entry/instrument/detector/data"]
+        assert detector.attrs["interpretation"] == "image"
+
+
+def test_a_file_claiming_nxem_leaves_the_reader_hint_out(tmp_path):
+    """
+    The schema claim wins over the reader hint, because the two conflict.
+
+    Measured with ``pynxtools`` in ``scripts/validate_nexus_schema.py``:
+    NXem's NXDL documents no ``interpretation`` attribute, and an
+    undocumented attribute fails validation wherever it is written — so a
+    file cannot both say ``NXem`` and carry the hint. Which one gives way
+    is the same order of priority the writer already applies to
+    ``definition`` itself: a claim, once made, is kept honest.
+    """
+    path = tmp_path / "appdef.nxs"
+    write_frames(
+        path,
+        [_frame(0)],
+        definition="NXem",
+        sample={"is_simulation": True, "atom_types": "Si,O"},
+    )
+    with h5py.File(path, "r") as handle:
+        assert handle["entry/definition"][()].decode() == "NXem"
+        assert "interpretation" not in handle["entry/data"].attrs
+        assert "interpretation" not in handle["entry/data/data"].attrs
+
+
 def test_nxdata_links_rather_than_copies_the_array(tmp_path):
     """NXdata/data is a hard link to the detector array, not a second copy."""
     path = tmp_path / "series.nxs"

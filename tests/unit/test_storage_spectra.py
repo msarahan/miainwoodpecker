@@ -126,6 +126,56 @@ def test_the_file_speaks_nxspectrum_rather_than_this_projects_own_names(tmp_path
         )
 
 
+def test_nxdata_says_the_energy_axis_is_the_signal_in_either_layout(tmp_path):
+    """
+    ``interpretation = "spectrum"``, for a series and for a map alike.
+
+    The counterpart to the frame writer's ``"image"``, and the reason it
+    is one value for both layouts is NXspectrum's own rule that the
+    energy axis is always the fastest dimension: a reader honouring the
+    attribute then makes ``axis_energy`` the signal and leaves whatever
+    precedes it — a spectrum index, or a map's two spatial axes — as
+    navigation. Asserted on the group and on the field for the reason
+    the frame writer's twin test gives.
+    """
+    series = tmp_path / "eds.nxs"
+    write_spectra(series, [_spectrum(index) for index in range(_SPECTRA)])
+    height, width = _MAP_SHAPE
+    spectrum_image = tmp_path / "map.nxs"
+    write_spectra(
+        spectrum_image,
+        [_spectrum(0, data=np.ones((height, width, _CHANNELS), dtype="uint32"))],
+    )
+
+    for path in (series, spectrum_image):
+        with h5py.File(path, "r") as handle:
+            group = handle[layout.SPECTRUM_DATA_GROUP]
+            intensity = handle[layout.SPECTRUM_INTENSITY]
+            assert group.attrs["interpretation"] == "spectrum"
+            assert intensity.attrs["interpretation"] == "spectrum"
+
+
+def test_a_spectrum_file_claiming_nxem_leaves_the_reader_hint_out(tmp_path):
+    """
+    Same trade as the frame writer's, for the same measured reason.
+
+    ``interpretation`` is undocumented in NXem's NXDL, so a file carrying
+    it fails validation; a file claiming the definition therefore goes
+    without. See the frame writer's twin test.
+    """
+    path = tmp_path / "appdef.nxs"
+    write_spectra(
+        path,
+        [_spectrum(0)],
+        definition="NXem",
+        sample={"is_simulation": True, "atom_types": "Si,O"},
+    )
+    with h5py.File(path, "r") as handle:
+        assert handle["entry/definition"][()].decode() == "NXem"
+        assert "interpretation" not in handle[layout.SPECTRUM_DATA_GROUP].attrs
+        assert "interpretation" not in handle[layout.SPECTRUM_INTENSITY].attrs
+
+
 def test_one_spectrum_is_stored_the_same_way_as_many(tmp_path):
     """
     A stack of one, not ``spectrum_0d``, so a reader never branches on count.
