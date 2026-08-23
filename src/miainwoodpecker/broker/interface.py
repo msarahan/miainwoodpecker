@@ -73,6 +73,9 @@ from __future__ import annotations
 import typing
 from dataclasses import dataclass
 
+from miainwoodpecker.devices.preview import (
+    DEFAULT_MAX_EDGE as PREVIEW_DEFAULT_MAX_EDGE,
+)
 from miainwoodpecker.devices.rpc import target_kind
 
 if typing.TYPE_CHECKING:
@@ -89,6 +92,7 @@ if typing.TYPE_CHECKING:
         Scanner,
         SpectrumDetector,
     )
+    from miainwoodpecker.devices.preview import FramePreview
 
 
 DEFAULT_LEASE_TIMEOUT_S = 5.0
@@ -126,6 +130,16 @@ On expiry the broker releases the lease exactly as if the block had
 exited - restarting the live loops it paused - and any later call through
 the dead lease raises :class:`LeaseExpiredError` rather than driving a
 device it no longer owns.
+"""
+
+DEFAULT_PREVIEW_EDGE = PREVIEW_DEFAULT_MAX_EDGE
+"""
+Longest edge, in pixels, :meth:`InstrumentBroker.previews` reduces to.
+
+Re-exported from :mod:`miainwoodpecker.devices.preview` rather than
+restated, so the broker's default and the decimation's cannot drift
+apart. A caller that wants smaller tiles - which is what buys the frame
+rate over a slow link - passes its own.
 """
 
 LEASE_ORDER = ("instrument", "spectrum", "camera", "device", "scanner")
@@ -480,6 +494,39 @@ class TargetView:
     frames: tuple[Frame, ...] = ()
 
 
+@dataclass(frozen=True)
+class TargetPreview:
+    """
+    One target's state and its latest frames *as pictures*.
+
+    The same pairing :class:`TargetView` makes, and read under the same
+    lock for the same reason - a tile must not show a rate from one pass
+    beside pixels from another - but carrying
+    :class:`~miainwoodpecker.devices.preview.FramePreview` instead of
+    :class:`~miainwoodpecker.devices.interface.Frame`.
+
+    A separate type rather than a widened :class:`TargetView` because
+    the difference is the one a caller must not get wrong: these pixels
+    are decimated and have no calibration, and code that recorded them
+    or measured off them would be wrong quietly. A watcher that wants
+    the measurement asks :meth:`InstrumentBroker.snapshot`; a watcher
+    that wants a picture asks :meth:`InstrumentBroker.previews`, and the
+    type it gets back says which one it asked for.
+
+    Attributes
+    ----------
+    state : TargetState
+        What the target is doing. Identical to the one
+        :meth:`InstrumentBroker.snapshot` would report at the same
+        instant - the reduction is to the pixels only.
+    frames : tuple[FramePreview, ...]
+        The latest pass's frames, decimated, empty if none has arrived.
+    """
+
+    state: TargetState
+    frames: tuple[FramePreview, ...] = ()
+
+
 @typing.runtime_checkable
 class LeasedDevices(typing.Protocol):
     """
@@ -657,14 +704,66 @@ class InstrumentBroker(typing.Protocol):
         in many, against locks an acquisition worker is reacquiring on
         every grab.
 
-        Frames travel with it, so a *remote* watcher that only needs
-        chrome - is it live, who holds it - should keep asking
-        :meth:`targets` and pull pixels for the one source it is showing.
+        Frames travel with it at **full size**, which is what a viewer
+        sharing a process with its broker wants and what a watcher on
+        the other end of a socket cannot afford at any rate worth
+        calling live: see :meth:`previews`, which is this call with the
+        pixels reduced to what a tile draws.
 
         Returns
         -------
         Mapping[str, TargetView]
             Keyed by target name.
+        """
+
+    def previews(
+        self,
+        max_edge: int = DEFAULT_PREVIEW_EDGE,
+    ) -> Mapping[str, TargetPreview]:
+        """
+        Return every target's state and latest frames, as pictures.
+
+        :meth:`snapshot` with the pixels decimated **before** they are
+        sent, and the only reason it exists is the wire. A snapshot
+        carries every target's frames at full size: on an instrument
+        serving a 2048x2048 camera beside a scan unit that is 19 MB per
+        call, so two frames a second is 320 Mbit/s and a gigabit link is
+        saturated before five. The same view at a 256-pixel edge is
+        roughly 200 kB, which is a live view at ten frames a second over
+        an ordinary network - and the pixels dropped are ones the client
+        was decimating away on arrival anyway.
+
+        In process this saves nothing and is not meant to: a
+        :class:`~miainwoodpecker.broker.local.LocalBroker` hands over the
+        same arrays either way, and a caller sharing the process with
+        its devices should ask :meth:`snapshot`. The reduction is paid
+        here so that it happens once per instrument rather than once per
+        watcher, and so that it happens on the side of the socket where
+        it makes the message smaller.
+
+        Everything :meth:`snapshot` promises about *consistency* holds
+        unchanged: state and frames are read together, under one lock,
+        so a tile cannot show a rate from one pass beside pixels from
+        another.
+
+        **Watching, still.** Costs no device call, starts and stops
+        nothing, and needs no lease - the same guarantee every other
+        watch verb makes.
+
+        A ``max_edge`` below 1 raises ``ValueError``, and both
+        transports raise it before the instrument is asked anything.
+
+        Parameters
+        ----------
+        max_edge : int
+            Longest edge, in pixels, to reduce each frame to. A frame
+            already within it is sent whole rather than resampled.
+
+        Returns
+        -------
+        Mapping[str, TargetPreview]
+            Keyed by target name, with the same keys :meth:`snapshot`
+            would return.
         """
 
     def controls(self) -> Mapping[str, float | bool]:

@@ -45,11 +45,13 @@ from miainwoodpecker.acquisition.live import (
 from miainwoodpecker.broker.interface import (
     DEFAULT_LEASE_TIMEOUT_S,
     DEFAULT_LEASE_TTL_S,
+    DEFAULT_PREVIEW_EDGE,
     DeviceBusyError,
     Lease,
     LeaseExpiredError,
     NotLiveError,
     TargetDescription,
+    TargetPreview,
     TargetState,
     TargetView,
     lease_order,
@@ -61,6 +63,7 @@ from miainwoodpecker.devices.interface import (
     STAGE_POSITION_CONTROL,
     ScanParameters,
 )
+from miainwoodpecker.devices.preview import decimation_stride, preview_of
 from miainwoodpecker.devices.rpc import INSTRUMENT_TARGET, target_kind
 
 if typing.TYPE_CHECKING:
@@ -648,6 +651,65 @@ class LocalBroker:
             return loop.latest_frames()
         frame = loop.latest()
         return () if frame is None else (frame,)
+
+    def previews(
+        self,
+        max_edge: int = DEFAULT_PREVIEW_EDGE,
+    ) -> Mapping[str, TargetPreview]:
+        """
+        Return every target's state and latest frames, as pictures.
+
+        The decimation runs **inside the lock**, with the state read,
+        rather than over the frames afterwards. Both readings would give
+        the same pixels - a ``Frame`` is immutable and the loop replaces
+        rather than mutates - but doing it here keeps this method one
+        sweep of the same lock :meth:`snapshot` takes, and a caller that
+        polls it ten times a second is a caller whose lock discipline is
+        worth being able to state in one sentence.
+
+        In process the reduction buys nothing, since there is no wire to
+        put the pixels on; it is honoured anyway because the protocol
+        promises it, and because
+        :class:`~miainwoodpecker.broker.remote.RemoteBroker` gets its
+        answer by calling this very method in the server process.
+
+        A **1D** frame - a camera in projected readout - previews as
+        itself, decimated along its one axis. It is not an error here
+        for the reason it is not an error in
+        :func:`~miainwoodpecker.devices.preview.preview_of`: it is an
+        ordinary instrument state, and a watch call that raised on one
+        would take the whole grid down with it.
+
+        A ``max_edge`` below 1 raises ``ValueError``, from
+        :func:`~miainwoodpecker.devices.preview.decimation_stride`.
+
+        Parameters
+        ----------
+        max_edge : int
+            Longest edge, in pixels, to reduce each frame to.
+
+        Returns
+        -------
+        Mapping[str, TargetPreview]
+            Keyed by target name.
+        """
+        # Checked here rather than left to the first frame that needs
+        # reducing: an instrument with no loop running yet would
+        # otherwise accept a nonsense edge and refuse it a minute later,
+        # when a frame arrived and the caller had stopped looking.
+        decimation_stride((1,), max_edge)
+        self._reclaim_expired()
+        with self._lock:
+            return {
+                name: TargetPreview(
+                    state=self._state(name),
+                    frames=tuple(
+                        preview_of(frame, max_edge)
+                        for frame in self._frames_of(self._loops.get(name))
+                    ),
+                )
+                for name in self._targets
+            }
 
     def controls(self) -> Mapping[str, float | bool]:
         """

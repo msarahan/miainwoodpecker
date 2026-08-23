@@ -948,6 +948,131 @@ def test_a_description_is_read_once_rather_than_per_ask(broker, devices):
         assert broker.describe()["scanner"].channel_names == first
 
 
+# -- watching: previews ---------------------------------------------------
+#
+# previews() is snapshot() with the pixels reduced before they are sent,
+# and it exists for one reason: a snapshot carries every target's frames
+# at full size, which no network can carry at a rate worth calling live.
+# What these tests protect is that the reduction is the *only* thing that
+# differs - same keys, same state, same consistency, still a watch - and
+# that what comes back cannot be mistaken for a measurement.
+
+
+def test_previews_report_the_same_targets_and_state_as_a_snapshot(broker):
+    """
+    Reducing the pixels changes nothing else about the answer.
+
+    The keys and the state are what a tile's chrome is built from, and a
+    dashboard that switched to previews for the bandwidth must not find
+    the grid rearranged or a rate missing.
+    """
+    broker.start_live("scanner", _PARAMETERS)
+    assert _wait_until(lambda: broker.latest("scanner") is not None)
+
+    viewed = broker.snapshot()
+    previewed = broker.previews(2)
+
+    assert set(previewed) == set(viewed)
+    for name, view in viewed.items():
+        assert previewed[name].state.is_live == view.state.is_live
+        assert previewed[name].state.error == view.state.error
+
+
+def test_a_preview_is_decimated_and_says_by_how_much(broker):
+    """
+    The pixels are subsampled, and the stride is on the preview.
+
+    A picture whose reduction is not stated is a picture nobody can
+    reason about: 64 pixels of a 4096-pixel frame and 64 pixels of a
+    64-pixel frame look identical and mean opposite things.
+    """
+    parameters = ScanParameters(height=8, width=8, pixel_time_us=1.0, fov_nm=10.0)
+    broker.start_live("scanner", parameters)
+    assert _wait_until(
+        lambda: (frame := broker.latest("scanner")) is not None
+        and frame.data.shape == (8, 8),
+    )
+
+    previewed = broker.previews(4)["scanner"]
+
+    assert previewed.frames
+    preview = previewed.frames[0]
+    assert preview.data.shape == (4, 4)
+    assert preview.stride == 2  # noqa: PLR2004
+    assert preview.source_shape == (8, 8)
+    assert preview.metadata["preview_stride"] == preview.stride
+
+
+def test_a_preview_that_fits_is_sent_whole(broker):
+    """
+    A frame already within the limit is not resampled to reach it.
+
+    Upsampling a small frame to fill a tile would invent pixels, and a
+    stride of 1 is the honest answer for a detector smaller than the
+    display.
+    """
+    broker.start_live("scanner", _PARAMETERS)
+    assert _wait_until(lambda: broker.latest("scanner") is not None)
+
+    preview = broker.previews(512)["scanner"].frames[0]
+
+    assert preview.stride == 1
+    assert preview.data.shape == preview.source_shape
+
+
+def test_a_preview_keeps_the_detector_name_and_drops_the_calibration(broker):
+    """
+    Metadata that survives decimation crosses; metadata that does not is gone.
+
+    ``channel_name`` describes the detector and is still true of a
+    subsampled picture - it is what captions a multichannel tile.
+    ``calibration`` is units *per pixel*, so carrying it unchanged past a
+    stride of 8 would claim a pixel size eight times too small, and
+    anything measuring off it would be wrong with nothing saying so.
+    Absent is the honest answer; the frame vocabulary already reads a
+    missing key as "not reported".
+    """
+    broker.start_live("scanner", _PARAMETERS, channels=(0, 1))
+    assert _wait_until(lambda: len(broker.latest_frames("scanner")) == 2)  # noqa: PLR2004
+
+    frames = broker.previews(2)["scanner"].frames
+
+    assert len(frames) == 2  # noqa: PLR2004
+    for preview in frames:
+        # The fakes tag every frame with these two; the point is that
+        # metadata crosses at all, and that the pixel-grid key does not.
+        assert "source" in preview.metadata
+        assert "calibration" not in preview.metadata
+
+
+def test_previewing_never_starts_a_loop(broker, devices):
+    """
+    Asking for pictures of an idle instrument drives nothing.
+
+    The same guarantee every other watch verb makes, asserted separately
+    because a new verb is a new chance to break it - and this one is the
+    verb a dashboard calls ten times a second.
+    """
+    previewed = broker.previews(64)
+
+    assert previewed["scanner"].frames == ()
+    assert previewed["eels_camera"].frames == ()
+    assert devices["scanner"].passes == 0
+    assert devices["eels_camera"].frames == 0
+
+
+def test_previews_refuse_an_edge_no_picture_could_have(broker):
+    """
+    A non-positive edge is refused, on both transports, before anything runs.
+
+    It would divide by zero in the stride, and the remote client checks
+    it locally so that a busy instrument does not have to answer a call
+    that was never going to succeed.
+    """
+    with pytest.raises(ValueError, match="max_edge"):
+        broker.previews(0)
+
+
 # -- leasing: the happy path ----------------------------------------------
 
 

@@ -4,6 +4,54 @@
 
 ### Added
 
+- **A live view that keeps up: 2 fps to 10, which is the ceiling of the
+  thing it runs in.** The browser dashboard's fastest refresh option was
+  `0.5s`, so two frames a second was not what the stack managed — it was
+  the fastest an operator could ask for. Underneath it, two things were
+  in the way, and only one of them was in the notebook.
+  **`previews(max_edge)`, a watch verb that decimates before it sends.**
+  `snapshot()` ships every target's pixels at full size, which is right
+  for a viewer sharing a process with its broker and impossible over a
+  socket at any rate worth calling live: on an instrument serving a
+  2048×2048 camera beside a scan unit it is **19 MB a call**, so even the
+  old one-second tick was 160 Mbit/s. `previews()` reads the same state
+  and the same frames under the same lock — a tile still cannot show a
+  rate from one pass beside pixels from another — and reduces the pixels
+  in the process that holds the device. Measured on the simulator: 834 kB
+  at a 256-pixel edge and 210 kB at 128, against 19 MB, and 1.1 ms a call
+  against 24.5 ms.
+  **What comes back is a `FramePreview`, not a `Frame`, on purpose.** A
+  decimated frame is not a measurement and must not be able to pass as
+  one. The specific trap is `metadata["calibration"]`, which is units
+  *per pixel*: carried unchanged past a stride of 8 it claims a pixel
+  size eight times too small, and every distance measured off it is wrong
+  by that factor with nothing anywhere saying so. A preview therefore has
+  no calibration to be wrong, records the `stride` it was reduced by and
+  the `source_shape` it came from, and keeps the metadata that describes
+  the *detector* rather than the grid — `channel_name` above all, which
+  is what captions a multichannel tile. Look at previews; measure and
+  record frames.
+  **The decimation is one function, shared.** `devices/preview.py` holds
+  it, and `dashboard.images` re-exports `decimate` from there rather than
+  keeping a second copy: two implementations of "every nth pixel" would
+  eventually disagree about the rounding, and a dashboard would then draw
+  one picture in process and a different one over a socket. A
+  parametrised test asserts the two routes produce **byte-identical**
+  PNGs across six frame shapes and three tile sizes, odd sizes included.
+  **The notebook offers the trade rather than choosing it.** Refresh now
+  goes down to `0.1s`, and the tile edge is a control beside it (128,
+  256, 512, 1024) that sets both what the broker sends and what the
+  browser draws. Measured end to end against the simulator — display
+  timer to new pixels on screen, three tiles — `0.1s` sustains 9.7 fps at
+  128 px, 9.0 at 256 and 7.0 at 512.
+  **10 fps is marimo's floor, not ours.** Its front end clamps a refresh
+  interval to 0.1 s, so that is the ceiling of this mechanism however
+  fast the kernel answers. Pushing from a running cell with
+  `mo.output.replace` does reach 38 fps, and is not used: the cell holds
+  the kernel for as long as it runs, so every other cell — Acquire
+  included — is frozen until it stops. Measured: a button pressed two
+  seconds into a twenty-second stream did not respond for thirty.
+
 - **A file per microscope that says what hardware it has, and starts
   it.** An instrument is not one device server: SuperSTEM 3 is a Nion
   column whose scan unit and Ronchigram camera come from Nion's stack

@@ -36,9 +36,11 @@ if typing.TYPE_CHECKING:
 
     from miainwoodpecker.broker.interface import (
         TargetDescription,
+        TargetPreview,
         TargetView,
     )
     from miainwoodpecker.devices.interface import Frame
+    from miainwoodpecker.devices.preview import FramePreview
 
 FRAME_SOURCE_KINDS = ("scanner", "camera")
 """
@@ -104,12 +106,27 @@ class FrameTile:
         that died leaves :attr:`is_live` False and this set, which is
         how a tile says "stopped: camera timed out" rather than going
         quietly blank.
-    frames : tuple[Frame, ...]
+    frames : tuple[Frame | FramePreview, ...]
         The latest pass's frames, in channel-request order, empty before
         the first one arrives. A multichannel scan pass has one per
         enabled detector, and they share a probe position - see
         ``scan_pass_id`` in
         :class:`~miainwoodpecker.devices.interface.Frame`.
+
+        Either type, because a tile is built the same way from either
+        and the difference is the caller's: a watcher in process asks
+        :meth:`~miainwoodpecker.broker.interface.InstrumentBroker.snapshot`
+        and gets frames, and one across a socket asks
+        :meth:`~miainwoodpecker.broker.interface.InstrumentBroker.previews`
+        and gets pictures. What this module reads off them - the pixels,
+        and ``channel_name`` - both carry.
+
+        Which one it is matters to anything that would *measure*, and
+        nothing here does. A caller holding a tile and wanting the
+        calibrated frame behind it must go and ask for it; there is no
+        way back to a measurement from a picture, which is the point of
+        :class:`~miainwoodpecker.devices.preview.FramePreview` being its
+        own type.
     """
 
     name: str
@@ -124,7 +141,7 @@ class FrameTile:
     held_by_me: bool = False
     reason: str = ""
     error: str | None = None
-    frames: tuple[Frame, ...] = field(default_factory=tuple)
+    frames: tuple[Frame | FramePreview, ...] = field(default_factory=tuple)
 
 
 def frame_sources(
@@ -137,8 +154,10 @@ def frame_sources(
     different rates, and confusing them is a real bug rather than a
     stylistic one. Tiles are rebuilt on every poll; the *controls* -
     which target to acquire from, which detectors, which binning - must
-    not be, or an operator's choices are wiped once a second by the
-    display timer. This is the half that comes from ``describe()``,
+    not be, or an operator's choices are wiped by the display timer - up
+    to ten times a second, which is what the fastest interval means and
+    is the rate this argument was already made against at one.
+    This is the half that comes from ``describe()``,
     which is static and cached for the life of the instrument.
 
     Parameters
@@ -160,7 +179,7 @@ def frame_sources(
 
 def frame_tiles(
     described: Mapping[str, TargetDescription],
-    viewed: Mapping[str, TargetView],
+    viewed: Mapping[str, TargetView | TargetPreview],
     *,
     holder: str | None = None,
 ) -> tuple[FrameTile, ...]:
@@ -172,12 +191,17 @@ def frame_tiles(
     described : Mapping[str, TargetDescription]
         What each target is, from ``describe()``. Iterated in its own
         order, which is what fixes each tile's place in the grid.
-    viewed : Mapping[str, TargetView]
+    viewed : Mapping[str, TargetView | TargetPreview]
         What each target is doing and its latest frames, from
-        ``snapshot()``. A target described but missing here still gets a
-        tile - with :attr:`FrameTile.error` saying so - because a grid
-        with a hole in it is harder to read than a grid with a tile that
-        explains itself.
+        ``snapshot()`` or from ``previews()``. Either, and the same code
+        either way: both pair a state with the latest pass's pixels, and
+        the choice between them is about what crosses the wire rather
+        than about what a tile shows.
+
+        A target described but missing here still gets a tile - with
+        :attr:`FrameTile.error` saying so - because a grid with a hole
+        in it is harder to read than a grid with a tile that explains
+        itself.
     holder : str | None
         This client's identity, as the broker assigned it. Learned from
         :attr:`~miainwoodpecker.broker.interface.Lease.holder` on a
@@ -332,7 +356,9 @@ def channel_labels(tile: FrameTile) -> tuple[str, ...]:
     Parameters
     ----------
     tile : FrameTile
-        The tile whose frames to name.
+        The tile whose frames to name. Previews carry this metadata as
+        frames do - ``channel_name`` describes the detector, not the
+        pixel grid, so decimation leaves it alone.
 
     Returns
     -------

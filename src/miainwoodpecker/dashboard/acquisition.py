@@ -14,7 +14,7 @@ moment an operator most wants to see what the instrument is doing.
 So the lease is taken on a worker, exactly as the Qt viewer takes its
 own (:meth:`~miainwoodpecker.viewer.live.LiveInstrumentWidget._leased_frames`),
 and the notebook learns how it went by polling - which it is already
-doing, once a second, to draw the tiles. There is no new mechanism here:
+doing, several times a second, to draw the tiles. There is no new mechanism here:
 :class:`~miainwoodpecker.jobs.BackgroundJob` is the project's one shape
 for "run this off the display thread and tell me how it went", and this
 is a fourth subclass of it.

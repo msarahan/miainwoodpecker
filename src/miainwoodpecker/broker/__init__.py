@@ -18,6 +18,7 @@ device session by :mod:`~miainwoodpecker.broker.app`.
 from miainwoodpecker.broker.interface import (
     DEFAULT_LEASE_TIMEOUT_S,
     DEFAULT_LEASE_TTL_S,
+    DEFAULT_PREVIEW_EDGE,
     LEASE_ORDER,
     BrokerError,
     DeviceBusyError,
@@ -27,6 +28,7 @@ from miainwoodpecker.broker.interface import (
     LeaseExpiredError,
     NotLiveError,
     TargetDescription,
+    TargetPreview,
     TargetState,
     TargetView,
     lease_order,
@@ -35,6 +37,7 @@ from miainwoodpecker.broker.interface import (
 __all__ = [
     "DEFAULT_LEASE_TIMEOUT_S",
     "DEFAULT_LEASE_TTL_S",
+    "DEFAULT_PREVIEW_EDGE",
     "LEASE_ORDER",
     "BrokerError",
     "DeviceBusyError",
@@ -44,6 +47,7 @@ __all__ = [
     "LeasedDevices",
     "NotLiveError",
     "TargetDescription",
+    "TargetPreview",
     "TargetState",
     "TargetView",
     "lease_order",
