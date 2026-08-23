@@ -161,6 +161,155 @@ the DM log line above rather than by us:
    (`docs/analysis-parity.md`), so a linked derived view is either a new
    category or a reason to revisit that boundary.
 
+## An MCP server driving a working microscope
+
+**Source:** [`foundry-mcp/team05-mcp-server`](https://github.com/foundry-mcp/team05-mcp-server)
+— MIT, from LBNL/NCEM (Ercius, Pattison, Wall, Ribet), the MCP layer for
+the **TEAM 0.5** microscope: an FEI/Thermo column with a CEOS corrector,
+TIA, Gatan DigitalMicrograph and the 4D Camera. Actively developed; last
+commit 2026-08-18. Found 2026-08-23.
+**Examined:** the repository cloned and read. All of `README.md`,
+`CLAUDE.md` and `TEAM0.5_Parameters.md`; every tool signature and about
+half the bodies of `mcp_library.py` (1,312 lines); the server loop, stage
+handlers and focus-metric menu of `microscope_server.py` (1,500 lines);
+the heads of `gatan_server.py` and `dm_scripts.py`; the tool list of
+`mcp_ncempy.py`. **Nothing was run** — none of the vendor software, and
+no hardware. Everything below is read off the source rather than
+observed, so statements about *behaviour* are claims about what the code
+says it does.
+
+It is three PCs, ZeroMQ REQ/REP carrying pickled dicts between them, and
+`fastmcp` over SSE at the top:
+
+```
+Claude → mcp_library.py (support PC, FastMCP)
+           ├─ZMQ→ microscope_server.py  → TEMScripting COM, TIA, CEOS RPC
+           └─ZMQ→ gatan_server.py       → writes .s scripts, runs DigitalMicrograph.exe
+```
+
+That is the same shape as this project — vendor-specific server
+processes behind one neutral client — arrived at independently. The
+reason is stated outright in their `CLAUDE.md`: the microscope PC runs
+**WinPython 3.4.4**, and the file instructs contributors to keep that
+server's code compatible with it. This is the strongest external
+evidence yet that our subprocess isolation is a structural necessity
+rather than a licensing convenience: the vendor PC is simply a different
+Python, and no amount of packaging discipline makes that go away.
+
+What they do *not* have is the vendor-neutral interface. `mcp_library.py`
+is a hand-written passthrough, one function per command, with
+`{'type': 'get_mag'}` dict literals inlined at every call site.
+
+### Three things worth taking
+
+**A facility's calibration tables, exposed as an MCP resource.**
+`TEAM0.5_Parameters.md` is registered at `file://TEAM0.5_Parameters.md`
+and contains what the operators actually need to look up: optimal lens
+settings by accelerating voltage, **HAADF collection semi-angles per
+camera length at 80/200/300 kV**, 4D Camera camera-length calibrations,
+and STEM-rotation-versus-diffraction-offset values for DPC. That
+semi-angle table is precisely the gap
+[`scripting-and-automation.md`](scripting-and-automation.md) already
+admits to — we tell users that eXSpy needs convergence and collection
+semi-angles for quantification and that nothing we record supplies them.
+Their table is the missing lookup, keyed on `(voltage, camera length)`,
+both of which are values an instrument can be asked for. A
+per-instrument calibration file is a small thing to add and would let
+those land in metadata without an operator typing them.
+
+**Dwell times are quantized, and ours pretend otherwise.** Their
+parameters file records a flyback of 3.6 ms against a 60 Hz line
+trigger, so usable dwell times satisfy `(d·pL + f)·n/60` — at 1k×1k the
+good values are 13 µs or 29 µs, and the tabulated frame times step
+17 s → 35 s → 52 s → 69 s. Choosing 14 µs instead of 13 doubles the
+frame time for nothing. `ScanParameters.pixel_time_us` accepts any
+float, so on real hardware a large fraction of the values a caller might
+reasonably pick are silently the wrong side of a step.
+
+**Handles, not payloads.** `mcp_ncempy.py` loads a file, keeps the array
+server-side and returns an id; `calculate_image_statistics(file_id)`,
+`retrieve_metadata(file_id)` and `plot_data_fft(file_id)` then operate
+on the id. `acquire_image` likewise returns
+`(path, calx, caly, unit, min, max, std)` and never the array itself.
+This is the concrete answer to "how does an agent work with a 4D dataset
+it cannot fit in a context window", and it is the convention any MCP
+wrapper over our API should start from.
+
+### Smaller things
+
+- **`calculate_optimal_defocus`** — about ten lines, pure function, no
+  hardware: convergence angle, reciprocal sampling and desired probe
+  overlap in, defocus and step size for defocused ptychography out. The
+  transferable idea is *computed advice as a tool*, so the agent is not
+  doing probe geometry in its head. MIT, liftable as written.
+- **Their tool list as a coverage checklist.** Controls they expose that
+  our `InstrumentController` does not: STEM rotation angle,
+  magnification, camera length and camera length index, convergence
+  angle, beam tilt, diffraction shift, condenser stigmator, high
+  tension, and **holder type** (single versus double tilt, which decides
+  whether β tilt is legal at all). Not all of those belong in a neutral
+  interface; STEM rotation and camera length are hard to argue against.
+- **Bayesian autofocus.** `focus_stem_image` drives BEACON: upper
+  confidence bound over C1 within ±range, *n* seed values then *n*
+  samples, `normvar` as the focus metric, an explicit `noise_level`
+  parameter documented as ~1e-4 for HAADF. The focus-metric menu in
+  `microscope_server.py` (`std`, `normstd`, `var`, `normvar`,
+  `roughness`, `varlaplace`) is a useful reference list. BEACON itself
+  is reached through a hardcoded `sys.path.insert` into a local
+  directory — it is not public and not obtainable from this repository.
+
+### What it does not do, which is the other half of the value
+
+- **Safety lives in docstrings, enforced by the model.**
+  `move_stage_delta`'s docstring says the maximum value that should be
+  allowed is 10 microns, and no code anywhere enforces it.
+  `open_column_valve`, `close_column_valve` and `unblank_beam` are bare
+  tools with no interlock. This is the clearest possible illustration of
+  why [`scripting-and-automation.md`](scripting-and-automation.md)
+  insists the dangerous paths must refuse rather than misbehave: a limit
+  that exists only in prose holds only while the model chooses to
+  honour it.
+- **No arbitration — solved in hardware.** There is an NCEM "button
+  pusher": a physical device, with `push_gatan_button()` and
+  `push_tia_button()` tools, that presses a box to hand scan control
+  between Gatan and TIA. That is the same contention the broker lease
+  solves in software, and a useful picture of the alternative.
+- **Transport.** The servers bind `tcp://*:<port>` and unpickle whatever
+  arrives, with no authentication. We also use pickle, but over
+  `localhost` with a `multiprocessing` `authkey`
+  ([`devices/serving.py`](../src/miainwoodpecker/devices/serving.py)) —
+  worth keeping that distinction explicit if anyone ever proposes
+  widening our bind. Separately, ZMQ REQ/REP is strictly lockstep: their
+  50 s receive timeout (commented "5 seconds") leaves the socket
+  unusable once it fires, and a long 4D scan blocks the whole server
+  with no way to cancel.
+- **Agent-facing bugs that no test would catch.**
+  `get_beam_tilt(tilt: tuple)` is a *getter* with a required argument it
+  never uses, so a model must invent a value in order to read anything.
+  `center_region` unpacks two values from `acquire_image`'s seven-tuple
+  and sets `cenetered = True`, so the `centered` it checks stays `False`
+  and the function always raises — it is dead, never called. Both are
+  the failure mode of hand-writing a large tool surface.
+
+### What this means here, concretely
+
+Nothing above argues for changing the architecture; it independently
+confirms it. Three things are actionable, in rough order of how cheaply
+they close a gap we have already written down:
+
+1. **A per-instrument calibration table.** Not a code change so much as
+   a decision about where facility constants live and how they reach a
+   file's metadata. The semi-angle case is already documented as a hole
+   in EELS quantification, and the shape of the fix is now known.
+2. **Dwell-time validation.** At minimum a function that, given a line
+   length and a flyback time, says which nearby dwell times sit on a
+   step boundary. Whether the flyback is discoverable from the device or
+   has to be configured per instrument is the open question.
+3. **The handle-not-payload convention**, for whenever an MCP server is
+   actually written. Our doc already says that server is a thin wrapper;
+   this is the first concrete evidence of what the *return* side of that
+   wrapper has to look like.
+
 ## Tooling note
 
 The transcripts and frames above came from the `watch` plugin
