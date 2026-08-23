@@ -322,12 +322,31 @@ class Call:
         Positional arguments.
     kwargs : dict[str, object]
         Keyword arguments.
+    lease_id : str | None
+        The lease this call is made under, when it is made through a
+        broker (:mod:`miainwoodpecker.broker`). A device server ignores
+        it: a server that arbitrates nothing has nothing to check it
+        against, and the field costs it a pickled ``None``.
+
+        Carried on the call rather than established once per connection
+        because a lease *expires*. A connection outlives the lease taken
+        over it - that is the whole failure the time-to-live exists for,
+        a client whose process died mid-lease - so the broker has to be
+        able to refuse the next call on a connection it was happy with a
+        moment ago.
+
+        Added with a default, so it is wire-compatible in both
+        directions for the same reason
+        :attr:`Result.error_type` is: an older peer's ``Call`` unpickles
+        with ``lease_id=None``, and a newer one's extra field is ignored
+        by code that does not read it.
     """
 
     target: str
     method: str
     args: tuple = ()
     kwargs: dict[str, object] = field(default_factory=dict)
+    lease_id: str | None = None
 
 
 @dataclass(frozen=True)
