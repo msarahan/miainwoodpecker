@@ -417,6 +417,17 @@
   one sitting and wrong for a shared microscope. `pixi run serve` is
   that with the vendor environment chosen and the invitation published
   into the working directory, where a notebook looks by default.
+  **A front end is given five seconds to close, not thirty.** Found by
+  an operator pressing Ctrl-C a second after the window was launched:
+  "pid 24332 did not stop within 30s; terminating it", with the
+  instrument sitting unparked behind a front end that was never going
+  to answer. Measured afterwards - a napari process asked to stop
+  during its own startup stops responding to console control events
+  altogether, and keeps not responding however many times it is asked,
+  while the same window once it is up closes in 0.1s. The thirty
+  seconds belong to the broker, which spends them parking; a window has
+  nothing to park, and the worst it loses by being terminated is a
+  recording the storage layer already reports as unfinalized.
   The launcher installs the same three signal handlers the broker does
   (`SIGINT`, `SIGTERM`, `SIGBREAK`), because a supervisor stopping a
   process whose defaults terminate the interpreter without unwinding
