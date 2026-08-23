@@ -224,8 +224,14 @@ def test_another_environments_interpreter_is_used_rather_than_this_one(tmp_path)
 
     built = child_command([sys.executable, "-m", "a.module", "--flag"], environment)
 
+    interpreter = Path(built[0])
     assert built[0] != sys.executable
-    assert Path(built[0]).parent == prefix
+    # Somewhere inside that prefix, and a python: where exactly differs
+    # by platform - `prefix/python.exe` against `prefix/bin/python` -
+    # and asserting the layout here would restate the implementation
+    # rather than check it, as well as being wrong on one of the two.
+    assert prefix in interpreter.parents
+    assert interpreter.stem.lower() == "python"
     assert built[1:] == ["-m", "a.module", "--flag"]
     # And with nothing resolved - a pip or uv install, or no --broker-env
     # - the command is run exactly as given.
