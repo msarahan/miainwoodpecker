@@ -296,10 +296,10 @@
   not a spectrometer. The target selector is honoured rather than
   falling back to the first target, which would acquire against a
   detector nobody chose and store it under that detector's name.
-  Known limits, unchanged and still stated: the grid is square and the
-  acquisition blocks the GUI thread. The second one matters more now
-  than it did — a spectrum image is what an operator will want a large
-  grid of.
+  Known limit, unchanged and still stated: the grid is square. The
+  acquisition no longer blocks the GUI thread — see the entry above on
+  watching a spectrum image build — which mattered most here, since a
+  spectrum image is what an operator will want a large grid of.
 
 ### Changed
 
@@ -350,6 +350,66 @@
 
 ### Added
 
+- **One instrument, many clients: `miainwoodpecker.broker`.** Everything
+  in `devices` assumes a single driver, and `shared_frame` reuses one
+  segment per source *because* of that — the server cannot publish frame
+  N+1 until the client has copied frame N out. Two clients on one device
+  therefore do not merely contend; they interleave on a reused buffer and
+  produce a frame that is half pass N and half pass N+1, with no
+  exception raised anywhere. Until now that rule was upheld by there
+  being one application: the viewer owns the connection, owns every
+  `LiveAcquisition`, and stops the loop before it acquires. A notebook, a
+  browser dashboard, a second screen or an agent is a *second* client,
+  and there was nowhere for the rule to live.
+  It lives here now, as two verbs. **Watching** (`latest`, `stats`,
+  `targets`, `controls`) reads what the broker already has: no device
+  call, cannot start or stop anything, and safe to leave open on a
+  beamline PC — a caller asking what is on screen must not be able to
+  move the probe by asking. **Leasing** is exclusive control for the
+  duration of a block, and the only way to acquire.
+  A lease yields the *same* `Camera`, `Scanner` and `InstrumentController`
+  protocol objects the device layer already defines, so every generator
+  in `acquisition`, every `Session` recording and every analysis bridge
+  works inside one unchanged. The broker decides *who* may call, never
+  *what* they may call: the moment it grows acquisition verbs of its own
+  there are two acquisition APIs to keep in step, and the property that
+  the viewer is built *on* the scripting API rather than beside it is
+  gone.
+  Three decisions are worth stating because they are not the obvious
+  ones. **A paused live loop is always restarted on release, with no
+  opt-out** — the opposite of DigitalMicrograph, and for a reason that
+  inverts the usual intuition: the beam is on regardless, that being a
+  control outside this software, so a scan that is not scanning is a
+  stationary probe putting the whole dose into one spot. Restarting is
+  the conservative choice. That same fact fixes the **order** of a
+  multi-target lease: targets are taken in `LEASE_ORDER` rather than
+  argument order (which also removes the deadlock two clients could
+  otherwise reach), and the scanner is taken *last* and released *first*,
+  so the probe stands still only for the grant itself. And **contention
+  is refused, not queued** — a queue invites two clients to each believe
+  they are next, and a lease has no bounded duration for a queue to
+  reason about; the honest answer is who holds it and why, which
+  `DeviceBusyError` carries.
+  A lease is granted whole or refused whole, and a refusal restarts
+  whatever it had already stopped: leaving the scan dark in exchange for
+  a camera the lease did not get would park the probe for nothing.
+  Leases expire, because a notebook kernel that dies mid-lease would
+  otherwise hold the beam forever, and the broker releases on a client
+  disconnecting rather than waiting the time out.
+  Implemented twice against one conformance suite — in process
+  (`broker.local`), for the viewer and for tests, and over the existing
+  `devices.rpc` wire (`broker.server`, `broker.remote`) for a notebook or
+  a dashboard. The remote half reuses `RemoteCamera` and its siblings
+  rather than reimplementing them, which cost `_RemoteDevice` two
+  arguments (a lease id, and an injectable lock so several targets can
+  share one connection) and `Call` one optional field. Frames from a
+  *leased* device take the shared-memory path, since a lease means one
+  caller by construction; watched frames stay on the pickle channel,
+  which is the right trade for a dashboard tile and the wrong one for a
+  33MB detector frame — a watcher that needs those should lease.
+  `miainwoodpecker-broker` runs one over a device server and publishes
+  where it is listening, since the port is the OS's choice and nobody can
+  be told it in advance.
 - **A scan pass can be stored, and acquired from the window.**
   `storage/passes.py` writes one `NXentry` per pass holding one `NXdata`
   per signal — `entry/data` the default and plottable one, the rest
@@ -387,9 +447,10 @@
   loop and surfaced as an h5py broadcast `TypeError` naming neither the
   target nor the acquisition. It now checks the whole shape and says
   which of the two numbers is wrong.
-  Known limits, stated rather than papered over: the grid is square and
-  the acquisition blocks the GUI thread (both wait on the target-area UI
-  and a job boundary), and a stored pass appears in the Recordings list
+  Known limits, stated rather than papered over: the grid is square
+  (it waits on the target-area UI), the acquisition ran on the GUI
+  thread until the entry above moved it off, and a stored pass appears
+  in the Recordings list
   as `0 frames` because that list only understands frame stacks — a test
   pins that it does not *break* the list, which is the part that matters
   meanwhile.

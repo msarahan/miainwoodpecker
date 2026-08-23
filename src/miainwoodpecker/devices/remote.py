@@ -901,16 +901,27 @@ class _RemoteDevice:
     *whether the server died* rather than raising a bare ``EOFError``.
     """
 
-    def __init__(
+    def __init__(  # noqa: PLR0913 - one construction site each, all named
         self,
         connection: Connection,
         target: str,
         lifecycle: _ServerLifecycle | None = None,
         pickle_protocol: int | None = None,
+        *,
+        lease_id: str | None = None,
+        lock: threading.Lock | None = None,
     ) -> None:
         self._connection = connection
         self._target = target
-        self._lock = threading.Lock()
+        self._lease_id = lease_id
+        # A device server gives every target its own connection, so the
+        # default - a lock of this device's own - is right there. A
+        # broker multiplexes every target onto one connection instead,
+        # and two devices with private locks would interleave a send and
+        # a recv on the same socket. It passes the connection's lock in;
+        # the frame lock below stays private either way, because it
+        # guards this target's segment rather than the socket.
+        self._lock = lock if lock is not None else threading.Lock()
         # Serializes a frame call *and* its shared-memory copy-out as one
         # unit. self._lock alone is not enough: send_call releases it as
         # soon as the reply is in hand, so a second thread could send the
@@ -959,7 +970,7 @@ class _RemoteDevice:
             return send_call(
                 self._connection,
                 self._lock,
-                Call(self._target, method, args, kwargs),
+                Call(self._target, method, args, kwargs, lease_id=self._lease_id),
                 pickle_protocol=self._pickle_protocol,
             )
         except RemoteConnectionLostError as error:

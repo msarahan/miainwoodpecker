@@ -49,6 +49,10 @@ miainwoodpecker-preview = "miainwoodpecker.viewer.preview:main"
 # recorded acquisition, replayed at the speed it was taken - see
 # src/miainwoodpecker/devices/replay.py.
 miainwoodpecker-replay = "miainwoodpecker.devices.replay:main"
+# Requires the "device" extra and no display: it serves one instrument to
+# however many notebooks, dashboards and viewers connect to it. See
+# src/miainwoodpecker/broker/app.py.
+miainwoodpecker-broker = "miainwoodpecker.broker.app:main"
 
 [project.urls]
 Homepage = "https://github.com/msarahan/miainwoodpecker"
