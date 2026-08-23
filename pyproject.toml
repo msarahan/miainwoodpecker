@@ -668,6 +668,13 @@ miainwoodpecker = { path = ".", editable = true, extras = ["viewer"] }
 [tool.pixi.feature.device.pypi-dependencies]
 miainwoodpecker = { path = ".", editable = true, extras = ["device"] }
 
+[tool.pixi.feature.dashboard.pypi-dependencies]
+# marimo from PyPI rather than conda-forge, and no conda dependencies
+# table beside it: it is pure Python with its own bundled front end, so
+# there is nothing compiled underneath for a conda build to make safer -
+# which is the only reason the features above name one.
+miainwoodpecker = { path = ".", editable = true, extras = ["dashboard"] }
+
 [tool.pixi.feature.replay.dependencies]
 # conda-forge's build, so the compiled readers underneath RosettaSciIO
 # (and the HDF5 it shares with h5py) come from one place rather than
@@ -721,7 +728,13 @@ default = { features = ["viewer", "test"], solve-group = "main" }
 replay = { features = ["viewer", "replay", "test"], solve-group = "main" }
 device = { features = ["viewer", "device", "test"], solve-group = "main" }
 analysis = { features = ["viewer", "analysis", "test"], solve-group = "main" }
-all = { features = ["viewer", "device", "analysis", "replay", "test"], solve-group = "main" }
+# The browser dashboard, and no viewer: it is the front end for people who
+# are *not* opening the Qt window, so pulling Qt in behind it would defeat
+# the point. It does need the device feature, because a dashboard with no
+# broker to connect to has nothing to show - and `pixi run -e dashboard`
+# is then one environment that can both serve an instrument and watch it.
+dashboard = { features = ["dashboard", "device", "test"], solve-group = "main" }
+all = { features = ["viewer", "device", "analysis", "replay", "dashboard", "test"], solve-group = "main" }
 style = { features = ["style"], no-default-feature = true }
 
 #--------------- Tasks ---------------#
