@@ -300,6 +300,40 @@
   acquisition no longer blocks the GUI thread — see the entry above on
   watching a spectrum image build — which mattered most here, since a
   spectrum image is what an operator will want a large grid of.
+- **A live dashboard in the browser, and the descriptions that let it
+  exist.** `notebooks/instrument_dashboard.py` is a marimo app over a
+  running `miainwoodpecker-broker`: fixed-placement tiles polling
+  `snapshot()`, detector checkboxes and a binning menu built from the
+  broker, and an acquire button whose lease is taken on the job's own
+  thread and renewed per frame. Acquisitions append to a session log
+  panel rather than writing new cells - marimo forbids a notebook
+  rewriting itself, and an append-only log is the shape that survives
+  contact with a reactive runtime.
+  The judgement lives in `miainwoodpecker.dashboard`, not in cells, so
+  the unit suite covers the tile rules, the PNG encoding, the log and the
+  acquisition job with marimo uninstalled. `marimo` is an optional extra
+  that nothing else implies.
+  **What made it possible is `broker.describe()`.** `channel_names`,
+  `binning_values`, `synchronised_targets` and `available_controls` were
+  read straight off device handles, and a client in another process has
+  no device handle to read - which is what had kept any out-of-process
+  front end to showing a picture and nothing else. They are read once
+  when the broker is built and cached from then on: not for speed, since
+  it is four calls, but because that is the only honest moment. A read
+  issued later would be a second caller on a device whose live loop is
+  mid-pass, which is the interleaving the broker exists to prevent.
+  A device that *refuses* one of those questions gets empty fields and an
+  `error` naming what it would not answer. The distinction is
+  load-bearing: "this camera supports no binning but 1x" and "this camera
+  would not say what binning it supports" are otherwise the same empty
+  tuple, and they want opposite responses - offer the one value, or tell
+  the operator the device is not answering.
+  The viewer reads descriptions rather than device handles for its
+  detector names, its synchronised targets and its instrument controls.
+  One capability read is knowingly left behind: binning grew a *per-axis*
+  answer that `TargetDescription` does not carry yet, and inventing that
+  mapping untested - on a detector whose two axes cost different things
+  to bin - would be worse than the stated gap.
 
 ### Changed
 

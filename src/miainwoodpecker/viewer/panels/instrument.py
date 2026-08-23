@@ -47,6 +47,7 @@ from miainwoodpecker.devices.interface import (
     ENERGY_OFFSET_CONTROL,
     STAGE_POSITION_CONTROL,
 )
+from miainwoodpecker.devices.rpc import INSTRUMENT_TARGET
 
 if typing.TYPE_CHECKING:
     from miainwoodpecker.viewer.live import LiveInstrumentWidget
@@ -89,7 +90,7 @@ def build_instrument_panel(widget: LiveInstrumentWidget) -> QtWidgets.QGroupBox:
     if instrument is None:
         return panel
 
-    controls = set(instrument.available_controls())
+    controls = set(widget._description(INSTRUMENT_TARGET).controls)
     if DEFOCUS_CONTROL in controls:
         widget._instrument_controls[DEFOCUS_CONTROL] = _add_number_row(
             widget, panel, form, "Defocus (nm)", DEFOCUS_CONTROL,

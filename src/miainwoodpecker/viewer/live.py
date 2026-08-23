@@ -102,7 +102,7 @@ from miainwoodpecker.acquisition.sequence import (
     camera_series,
     multichannel_scan_series,
 )
-from miainwoodpecker.broker.interface import BrokerError
+from miainwoodpecker.broker.interface import BrokerError, TargetDescription
 from miainwoodpecker.broker.local import LocalBroker
 from miainwoodpecker.devices.interface import (
     CameraParameters,
@@ -110,7 +110,11 @@ from miainwoodpecker.devices.interface import (
     ScanPass,
     native_scan_parameters,
 )
-from miainwoodpecker.devices.rpc import INSTRUMENT_TARGET, SCANNER_TARGET
+from miainwoodpecker.devices.rpc import (
+    INSTRUMENT_TARGET,
+    SCANNER_TARGET,
+    target_kind,
+)
 from miainwoodpecker.storage.calibration import FrameCalibration
 from miainwoodpecker.storage.nexus import write_frames
 from miainwoodpecker.storage.session import (
@@ -584,7 +588,7 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
                 fov_nm=_DEFAULT_FOV_NM,
             ),
             (0,),
-            scanner.channel_names[0] if scanner is not None else "",
+            self.channel_names()[0] if scanner is not None else "",
         )
         # Before _build_ui: a failure part-way through building the UI
         # still leaves a widget whose shutdown() may be called.
@@ -1010,8 +1014,7 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
             Channel indices, in the scanner's own order. Never empty
             while a scanner exists - see :meth:`_on_channel_toggled`.
         """
-        scanner = typing.cast("Scanner", self._scanner)
-        names = list(scanner.channel_names)
+        names = list(self.channel_names())
         return [
             index
             for index, name in enumerate(names)
@@ -1027,8 +1030,7 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         list[str]
             Channel names, in the scanner's own order.
         """
-        scanner = typing.cast("Scanner", self._scanner)
-        names = list(scanner.channel_names)
+        names = list(self.channel_names())
         return [names[index] for index in self.enabled_channels()]
 
     def _on_channel_toggled(self, name: str) -> None:
@@ -1067,6 +1069,47 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         )
         self._preferences = stored
         preferences.save(stored)
+
+    def _description(self, target: str) -> TargetDescription:
+        """
+        Return what a target is, or an empty description if it is absent.
+
+        Empty rather than raising, because every caller is asking in
+        order to decide what to offer, and "this instrument has no scan
+        unit" is an ordinary answer rather than a fault.
+
+        Parameters
+        ----------
+        target : str
+            The target name.
+
+        Returns
+        -------
+        TargetDescription
+            Its description.
+        """
+        described = self._broker.describe().get(target)
+        if described is not None:
+            return described
+        return TargetDescription(name=target, kind=target_kind(target), label=target)
+
+    def channel_names(self) -> tuple[str, ...]:
+        """
+        Return the detectors the scan unit reads out, in channel order.
+
+        From the broker's description rather than the scan unit itself.
+        The answer is identical; where it comes from is not, and that is
+        the point: a description crosses a process boundary and a device
+        handle does not, so this is one of the reads that decides whether
+        this window can be pointed at an instrument somewhere else.
+
+        Returns
+        -------
+        tuple[str, ...]
+            Channel names, empty for an instrument with no scan unit.
+        """
+        described = self._broker.describe().get(SCANNER_TARGET)
+        return described.channel_names if described is not None else ()
 
     def _is_live(self, target: str) -> bool:
         """
@@ -1914,7 +1957,7 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
                 "camera frame to a probe position",
             )
             return None
-        targets = list(self._scanner.synchronised_targets())
+        targets = list(self._description(SCANNER_TARGET).synchronised_targets)
         if not targets:
             self._recording_status.setText(
                 "no camera is wired to the scan unit, so nothing can be read "

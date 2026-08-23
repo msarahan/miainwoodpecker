@@ -64,7 +64,11 @@ if typing.TYPE_CHECKING:
     from multiprocessing.connection import Connection
 
     from miainwoodpecker.acquisition.live import LiveStats
-    from miainwoodpecker.broker.interface import TargetState, TargetView
+    from miainwoodpecker.broker.interface import (
+        TargetDescription,
+        TargetState,
+        TargetView,
+    )
     from miainwoodpecker.devices.interface import (
         Camera,
         Frame,
@@ -634,6 +638,23 @@ class RemoteBroker:
             Keyed by target name.
         """
         return typing.cast("Mapping[str, TargetState]", self.broker_call("targets"))
+
+    def describe(self) -> Mapping[str, TargetDescription]:
+        """
+        Return what each target is, rather than what it is doing.
+
+        Static and cached server-side, so calling it per client is one
+        pickled dictionary rather than a burst of device calls. This is
+        what lets a client in another process offer detector checkboxes
+        and a binning menu instead of only a picture.
+
+        Returns
+        -------
+        Mapping[str, TargetDescription]
+            Keyed by target name.
+        """
+        described = self.broker_call("describe")
+        return typing.cast("Mapping[str, TargetDescription]", described)
 
     def snapshot(self) -> Mapping[str, TargetView]:
         """

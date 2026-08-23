@@ -683,6 +683,96 @@ def test_reconfiguring_a_leased_scanner_is_refused(broker):
         broker.reconfigure_live("scanner", _PARAMETERS)
 
 
+def test_what_a_target_is_crosses_the_wire(broker):
+    """
+    Descriptions travel, which is what lets a remote client offer controls.
+
+    Detector names, binning factors and the control list are device
+    *calls*, and a client in another process has no device handle to make
+    them on. Without this a notebook or a second window could show a
+    picture and nothing else - no detector checkboxes, no binning menu,
+    no way to know whether the column has a beam blanker.
+    """
+    described = broker.describe()
+    assert described["scanner"].channel_names == ("HAADF", "MAADF")
+    assert described["eels_camera"].binning_values == (1,)
+    assert described["eels_camera"].label == "eels_camera"
+    assert set(described["instrument"].controls) == {
+        DEFOCUS_CONTROL,
+        BEAM_BLANKER_CONTROL,
+    }
+    # A camera has no channels and a scanner no binning: absent, not zero.
+    assert described["eels_camera"].channel_names == ()
+    assert described["scanner"].binning_values == ()
+
+
+def test_a_device_that_refuses_to_describe_itself_says_so(devices, clock):
+    """
+    An empty field and a refused question must not look the same.
+
+    "This camera supports no binning but 1x" and "this camera would not
+    say what binning it supports" both leave the tuple empty, and they
+    want opposite responses: offer the one value, or tell the operator
+    the device is not answering. A window that silently shows an empty
+    menu for the second has turned a broken adapter into a UI that looks
+    merely poor.
+    """
+
+    class _HalfImplementedCamera(_FakeCamera):
+        """A camera whose adapter raises when asked what it supports."""
+
+        @property
+        def binning_values(self) -> tuple[int, ...]:
+            """
+            Refuse the question, as a half-written vendor adapter would.
+
+            Returns
+            -------
+            tuple[int, ...]
+                Never; this always raises.
+
+            Raises
+            ------
+            RuntimeError
+                Always, standing in for a vendor adapter that answers
+                some of the device protocol and not the rest.
+            """
+            message = "this adapter is half-implemented"
+            raise RuntimeError(message)
+
+    # A subclass rather than a patch on _FakeCamera itself. Assigning to
+    # the shared class and deleting afterwards does not restore it - the
+    # delete removes the *original* property with it, so every later test
+    # sees a camera with no binning at all. Which is exactly what
+    # happened, twice in three runs, before this was a subclass.
+    devices["eels_camera"] = _HalfImplementedCamera("eels_camera")
+    described = LocalBroker(devices, clock=clock).describe()
+
+    assert described["eels_camera"].binning_values == ()
+    assert "binning_values" in (described["eels_camera"].error or "")
+    # A device that simply is not a camera is not "refusing" anything.
+    assert described["scanner"].error is None
+
+
+def test_a_description_is_read_once_rather_than_per_ask(broker, devices):
+    """
+    Asking twice costs the instrument nothing.
+
+    These are device reads, and the only moment at which making them is
+    unambiguously safe is before any loop exists. Re-reading later would
+    put a second caller on a device whose loop is mid-pass, which is the
+    interleaving the broker exists to prevent - so the answer is cached
+    at construction and handed out from there.
+    """
+    devices["scanner"].passes = 0
+    broker.start_live("scanner", _PARAMETERS)
+    assert _wait_until(lambda: broker.latest("scanner") is not None)
+    first = broker.describe()["scanner"].channel_names
+    # Reads while a loop is running, and drives nothing to get them.
+    for _ in range(20):
+        assert broker.describe()["scanner"].channel_names == first
+
+
 # -- leasing: the happy path ----------------------------------------------
 
 

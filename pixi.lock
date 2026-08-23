@@ -17974,6 +17974,7 @@ packages:
   - threadpoolctl>=3 ; extra == 'analysis'
   - opencv-python-headless>=4.9 ; extra == 'camera'
   - hdf5plugin>=5 ; extra == 'compression'
+  - marimo>=0.9 ; extra == 'dashboard'
   - tifffile>=2024.7.24 ; extra == 'dectris'
   - pre-commit ; extra == 'dev'
   - ruff==0.16.2 ; extra == 'dev'

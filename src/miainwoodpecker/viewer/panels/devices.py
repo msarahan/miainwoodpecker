@@ -44,7 +44,6 @@ from miainwoodpecker.viewer.profiles import (
 )
 
 if typing.TYPE_CHECKING:
-    from miainwoodpecker.devices.interface import Scanner
     from miainwoodpecker.viewer.live import LiveInstrumentWidget
 
 
@@ -182,8 +181,7 @@ def build_detector_checks(
     scan_form : QtWidgets.QFormLayout
         The group's layout, appended to.
     """
-    scanner = typing.cast("Scanner", widget._scanner)
-    names = list(scanner.channel_names)
+    names = list(widget.channel_names())
     enabled = set(preferences.stored_channels(widget._preferences, names))
     row = QtWidgets.QWidget(scan_group)
     layout = QtWidgets.QVBoxLayout(row)
@@ -496,6 +494,12 @@ def build_image_controls(
     binding.exposure_spin.setSuffix(" ms")
     camera_form.addRow("Image exposure", binding.exposure_spin)
 
+    # Still read off the camera handle rather than from the broker's
+    # description, and knowingly: this grew a *per-axis* answer
+    # (`binning_values_yx`) that `TargetDescription` does not carry yet,
+    # and inventing that mapping here - untested, on a detector whose two
+    # axes cost different things to bin - would be worse than the honest
+    # gap. It is the one capability read the window has left.
     _add_binning_controls(binding, camera_group, camera_form, current)
 
     binding.readout_combo = QtWidgets.QComboBox(camera_group)

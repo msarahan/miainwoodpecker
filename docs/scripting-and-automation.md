@@ -50,6 +50,7 @@ The API is small, and each layer only depends on the one below it:
 |---|---|
 | `miainwoodpecker.devices` | The instrument: `Camera` (with exposure and binning), `Scanner`, and `InstrumentController` (stage, defocus, beam blanker, spectrometer energy offset). Vendor-neutral, in operator units — pixels, microseconds, nanometres, electronvolts. |
 | `miainwoodpecker.acquisition` | Series as generators: `scan_series`, `multichannel_scan_series`, `camera_series`, `focal_series`, `energy_offset_series`, plus `record()` to stream any of them to disk and `LiveAcquisition` for a latest-frame-wins live loop. |
+| `miainwoodpecker.broker` | Arbitration, for when your program is not the only one on the instrument: `InstrumentBroker` with two verbs — *watch*, which cannot move the probe, and *lease*, which is the only way to acquire. Needed as soon as a notebook, a dashboard, the viewer or an agent share one microscope. |
 | `miainwoodpecker.storage` | Files and sessions: `Session`, `write_frames`/`read_frames`, per-axis calibration, and the legacy `.ndata` importer. |
 | `miainwoodpecker.analysis` | One-line loaders into HyperSpy, LiberTEM, and py4DSTEM. |
 
@@ -62,7 +63,10 @@ on it:
 - **One driver per device.** The device protocol is strictly one
   request at a time, so don't share a camera or scanner between threads
   — the [viewer](using-the-viewer.md#when-something-says-busy-or-try-again)
-  enforces the same rule with its "busy" messages.
+  enforces the same rule with its "busy" messages. When more than one
+  *program* wants the instrument, that rule is what the broker exists to
+  keep: see [driving an instrument that other people are also
+  using](#driving-an-instrument-that-other-people-are-also-using).
 - **Sessions don't reconnect.** If the device connection is lost, the
   `with` block is over; open a new one. That is deliberate: a fresh
   connection is a fresh instrument state, and pretending otherwise
@@ -202,6 +206,313 @@ print(took)                                 # what it actually accepted
 Configure a camera *before* starting it if you need the very first frame
 to be at the new settings — a running camera finishes the frame already
 in flight first.
+
+## Driving an instrument that other people are also using
+
+Everything above assumes your script is the only program on the
+microscope. Often it is not: a notebook and a dashboard, an operator at
+the viewer while an agent runs the sweep, a second screen in the control
+room. `remote_instrument` gives each of them its own driver, and that is
+the one arrangement the device layer cannot survive.
+
+The protocol is strictly one request at a time, and the shared-memory
+transport reuses one segment per source *because* of that — the server
+cannot publish frame N+1 until the client has copied frame N out. Two
+clients on one device therefore do not merely take turns badly. They
+interleave on a reused buffer and produce a frame that is half pass N and
+half pass N+1, with nothing raised anywhere; the recording simply
+contains a torn frame. (That is [architecture review
+§1.2](architecture-review.md), which is where it was found.)
+
+`miainwoodpecker.broker` is where the one-driver rule lives once there is
+more than one program. One process holds the device session and every
+live loop; everybody else is a client of it, and gets exactly two verbs —
+**watch** and **lease**.
+
+### Starting one, and connecting to it
+
+```
+miainwoodpecker-broker --publish ./instrument
+```
+
+It opens a device session exactly as the examples above do — `--backend`,
+`--plugin` and `--server-module` are the same choices `remote_instrument`
+takes, and the default is the simulator rather than hardware — then
+serves it to however many clients connect. `--publish` writes
+`instrument/broker.json`: host, port, and a generated shared secret. The
+port is normally the OS's to choose, so it cannot be agreed in advance
+and has to be published instead; without `--publish` the key is logged
+once, to that terminal, and written nowhere. The listener binds
+`localhost`; `--host` will bind it wherever you ask, which puts an
+instrument's controls on the network, so that is a thing to do knowingly
+rather than by default.
+
+```python
+from miainwoodpecker.broker.invitation import BrokerInvitation
+from miainwoodpecker.broker.remote import connect_broker
+
+invitation = BrokerInvitation.read_from("./instrument")   # or the file itself
+broker = connect_broker(invitation.address(), invitation.authkey)
+```
+
+That is the whole connection step, from a notebook kernel, a dashboard's
+back end or an agent's process. Stopping the broker parks the instrument
+whichever way you stop it — Ctrl-C, a supervisor's `SIGTERM`, Windows
+Ctrl-Break — because the default disposition of the last two would
+terminate the interpreter without ever reaching the park.
+
+### Watching cannot move the probe
+
+```python
+for name, state in broker.targets().items():
+    print(name, state.kind, "live" if state.is_live else "idle", state.error)
+
+frame = broker.latest("scanner")        # None until the first pass lands
+print(broker.controls()["defocus"])     # read-only, from the broker's own polling
+```
+
+`targets`, `describe`, `latest`, `latest_frames`, `stats` and `controls`
+read what the broker already has. They cost no device call, they cannot
+start or stop anything, and that is the point: a caller asking what is on
+screen must not be able to move the probe by asking. A dashboard tile is
+made entirely of these.
+
+Two shapes to expect. `latest` returns None when no frame has arrived
+yet, which is an ordinary state a tile renders every time a loop starts;
+`stats` *raises* `NotLiveError` when nothing is running, because a zeroed
+`LiveStats` would read as "running at 0 fps", which is exactly what a
+stalled loop looks like. And a stopped loop still answers `latest` with
+its last frame — stopping the scan is not a reason to blank the screen,
+and it is what makes somebody else's lease invisible to a watcher instead
+of a flicker to nothing and back. Whether the picture is still *advancing*
+is `TargetState.is_live`'s job.
+
+`snapshot()` answers state and pixels for every target in one entry to
+the broker, which is what an in-process display tick should call: asking
+`targets()` and then `latest_frames()` per source re-takes each loop's
+own lock once per call, against the worker that is reacquiring it on
+every grab. Over a socket it also ships every target's pixels on every
+call, so a *remote* dashboard should ask `targets()` for the chrome and
+`latest()` for the one source it is showing.
+
+### A lease is the only way to acquire
+
+```python
+from miainwoodpecker.acquisition import focal_series, record
+from miainwoodpecker.devices import ScanParameters
+
+parameters = ScanParameters(height=256, width=256, pixel_time_us=1.0, fov_nm=15.0)
+
+with broker.lease("scanner", "instrument", reason="focal series, 5 steps") as leased:
+    record(
+        focal_series(
+            leased.scanner(),
+            parameters,
+            [-40.0, -20.0, 0.0, 20.0, 40.0],
+            instrument=leased.instrument,
+        ),
+        "focal.nxs",
+    )
+```
+
+That is [the focal series from earlier](#a-scripted-experiment-focal-series)
+with two lines changed, and it is not a coincidence. A lease yields the
+*same* `Camera`, `Scanner` and `InstrumentController` objects
+`remote_instrument` hands you, so every generator on this page, every
+`Session` recording and every analysis bridge works inside one unchanged.
+The broker decides *who* may call, never *what* they may call — the
+moment it grows acquisition verbs of its own there are two acquisition
+APIs to keep in step, and the property that the viewer is built *on* this
+API rather than beside it is gone.
+
+Three habits follow from the shape:
+
+- **Name everything the work needs in one lease.** `focal_series` moves
+  the defocus and scans, so it wants `instrument` and `scanner` together.
+  Two nested leases are how two clients that ask in opposite orders
+  deadlock; the broker takes them in its own fixed order instead, with
+  the scanner acquired last and released first, so the probe stands
+  parked for the grant itself rather than for the negotiation of
+  everything else.
+- **Say which device when the lease holds two of a kind** —
+  `leased.camera("eels_camera")`. `leased.camera()` means "the only one"
+  and refuses rather than guessing, because guessing between a Ronchigram
+  and an EELS camera is how a recording ends up labelled as the wrong
+  detector.
+- **Consume inside the block.** These are generators; one built in the
+  `with` and consumed after it is a generator whose lease is gone.
+
+### Taking a lease can block for as long as a scan pass
+
+Granting one means stopping each target's live loop and waiting out the
+pass *already in flight*, and a pass is height × width × dwell: 0.26 s at
+512×512 and 1 µs, but **42 s** at 2048×2048 and 10 µs, and nearly three
+minutes at 4096×4096. So `timeout_s` (5 s by default) is a **floor**
+under the wait rather than a ceiling over it — the broker can see the
+geometry the loop is running and derives the real deadline from it. A
+fixed five seconds would refuse every lease on exactly the instruments
+this project exists for, forever, with "still finishing a scan — try
+again".
+
+The consequence is for anything with a UI: **do not take a lease on a
+thread that has to stay responsive.** Take it the way the viewer records
+— on a worker, reporting progress — not inside a click handler. That is
+not tidiness, it is the viewer's own fixed bug: stopping the scan on the
+GUI thread turned a long scan into "still busy, try again" instead of a
+wait.
+
+A lease also expires on its own, 300 s after it was granted, unless
+somebody renews it. That is not a nicety either: a notebook kernel that
+dies mid-lease would otherwise hold the beam indefinitely, with the
+process that would have released it gone. Nothing renews for you, so
+renew as the work arrives rather than guessing a long time to live up
+front:
+
+```python
+from miainwoodpecker.acquisition import scan_series
+
+with broker.lease("scanner", reason="drift series") as leased:
+    for frame in scan_series(leased.scanner(), parameters, 1000):
+        leased.renew()
+        ...
+```
+
+A thousand frames outlive any fixed deadline, and renewing per frame
+means a job that wedges stops renewing and lets the broker take the
+instrument back — which is what a time to live is for. A call made
+through an expired lease raises `LeaseExpiredError` rather than driving a
+device that may already be somebody else's.
+
+### A paused live loop is always restarted on release
+
+Every loop the lease stopped is started again when the block exits —
+including when it exits by exception, and including when the lease
+expired rather than ended. There is no flag to suppress that, and the
+reason is dose rather than convenience.
+
+The beam is on regardless. It is a separate control, outside this
+software and outside DigitalMicrograph, so a scan that is not scanning is
+not an idle instrument: it is a stationary probe putting the whole dose
+into one spot. Scanning spreads it. **This is a deliberate divergence
+from DigitalMicrograph**, where stopping the view leaves the probe
+standing and it is on the operator to know that. If what you want is the
+beam off, that is `set_beam_blanked(blanked=True)` — a control, not a
+side effect of stopping a display.
+
+The same fact is why `stop_live` is rarely what you want on a scan unit,
+and why `reconfigure_live` exists at all: changing a running scan's field
+of view, dwell or enabled detectors takes effect on the next pass, rather
+than costing a stop and a start with a parked probe in between.
+
+### Contention is refused, not queued
+
+```python
+from miainwoodpecker.broker import DeviceBusyError
+
+try:
+    with broker.lease("scanner", reason="quick check") as leased:
+        ...
+except DeviceBusyError:
+    held = broker.targets()["scanner"].lease
+    print(f"{held.holder} has it: {held.reason}")
+```
+
+There is no queue, and that is a decision rather than an omission. A
+queue invites two clients to each believe they are next, and a lease has
+no bounded duration for a queue to reason about — the honest answer is
+who holds it and what for. The exception carries a message; the *data* is
+on `TargetState.lease`, which is why `reason` is worth filling in: an
+operator reads "energy series, 5 steps" rather than "busy".
+
+`DeviceBusyError` covers a second case too, and the message says which,
+because your response differs: the target's own worker would not finish
+in time, meaning an exposure is genuinely still in flight. Either way
+nothing is left stopped — a lease is granted whole or refused whole, and
+every loop already stopped for the attempt is restarted before the
+refusal is raised. Leaving the scan dark because the camera could not be
+had would park the probe in exchange for nothing.
+
+### Whoever builds a broker closes it
+
+`broker.close()` on a client closes the connection, and the server
+releases whatever that connection still held — at once, rather than
+leaving the probe parked for up to five minutes over a socket that is
+demonstrably gone.
+
+Closing a client is not closing the broker. `close()` on the broker
+itself stops every live loop and parks the instrument, and only the
+program that *built* it should call that: one client leaving must not end
+the session for the others, blank their beam, or stop their live view.
+`miainwoodpecker-broker` does it for you on the way out. If you build a
+`LocalBroker` yourself — embedding one in your own program, or in a test
+— it is yours to close, and forgetting has already cost once: a test that
+handed its broker to a window and then closed only the window leaked a
+live loop that kept a fake scanner spinning flat out for the rest of the
+session, which read as the whole suite becoming slow rather than as a
+failure.
+
+One gap worth knowing about rather than discovering: `miainwoodpecker-viewer`
+opens its own device session and builds its own broker, so it cannot yet
+be pointed at a broker somebody else started. A window that shares an
+instrument is assembled through the API today —
+`LiveInstrumentWidget(..., broker=broker)` — not from the command line.
+
+### A live dashboard in the browser
+
+`notebooks/instrument_dashboard.py` is a [marimo](https://marimo.io) app
+built on everything above: a fixed grid of live tiles for every frame
+source the broker serves, and one Acquire action that takes a lease.
+Install the `dashboard` extra, start a broker, and run it:
+
+```
+pip install -e ".[dashboard]"
+miainwoodpecker-broker --publish .              # one terminal
+marimo run notebooks/instrument_dashboard.py    # another
+```
+
+`marimo edit` instead of `marimo run` opens the same file with the code
+visible, which is what you want while changing it. A marimo notebook *is*
+a Python module — cells are functions and the dependency graph is derived
+from them — so it diffs, lints and reviews like the rest of the tree, and
+there are no stale outputs stored in it.
+
+The notebook finds the broker by itself: the path you type, else
+`$MIAINWOODPECKER_BROKER`, else `./broker.json`. If it finds none it says
+where it looked and stops. It will **not** fall back to opening its own
+device session, because that would be a second driver on the instrument —
+the exact interleaving the broker exists to prevent.
+
+Three things about it are worth knowing before you change it:
+
+- **Every tile is a watch.** The poll is one `snapshot()` per tick, which
+  is one round trip for the whole grid rather than a `targets()` plus a
+  `latest()` per source. Over a socket that ships every source's pixels
+  every tick — the caveat [above](#watching-cannot-move-the-probe) — so
+  the refresh interval *is* the bandwidth, and it is a control on screen.
+  Frames are decimated to at most 512 px and sent as inline greyscale
+  PNGs; the tile is a preview, and the acquisition path never sees any of
+  it.
+- **Acquire does not take its lease in the cell you pressed.** It starts
+  an `AcquisitionJob`, which takes the lease on a worker thread and
+  renews it per frame; the same one-second poll that draws the tiles
+  reports how it is going. A cell that leased inline would hold the
+  kernel for as long as the pass in flight — up to minutes — and freeze
+  every tile at the moment you most want to see them.
+- **Results go into an append-only log panel, not into new cells.** A
+  marimo cell cannot write cells: the dependency graph is the notebook,
+  and a program that rewrites its own graph while running has no defined
+  order. Each acquisition adds one entry with a thumbnail, where the
+  frames were written, and the first frame's metadata. Refusals are
+  entries too — "the scanner was leased by the viewer" is part of what
+  happened.
+
+The judgement the app is made of — which targets get a tile and in what
+order, what the chrome says, how a frame becomes pixels a browser draws,
+what an acquisition records — lives in `miainwoodpecker.dashboard` rather
+than in the cells, and the unit suite covers it whether or not marimo is
+installed. Leave the detector checkboxes and binning menu built from
+`broker.describe()`: a client in another process has no device handle to
+read them off, which is what that call exists for.
 
 ## Sessions from scripts
 
@@ -376,22 +687,44 @@ same ones that make it safe to hand to an agent —
   back to verify what actually happened, including per-frame read-back
   values like the focal-series defocus above.
 - **The dangerous paths refuse rather than misbehave.** One driver per
-  device is enforced at the server; a lost connection ends the session
-  instead of silently reconnecting to an instrument in an unknown
-  state; `park()` puts the instrument in a safe state and runs
-  automatically on shutdown — including when the controlling process
-  dies.
+  device is enforced at the server; contention is refused and named
+  rather than queued; a lost connection ends the session instead of
+  silently reconnecting to an instrument in an unknown state; `park()`
+  puts the instrument in a safe state and runs automatically on shutdown
+  — including when the controlling process dies.
 - **A human can watch.** Because scripts and the viewer share sessions,
   an operator can keep the [viewer](using-the-viewer.md) open on the
   same session directory and see an agent's recordings appear as they
-  are written.
+  are written — and through a broker, any number of watchers can follow
+  the live frames without costing the instrument a device call.
 
-An MCP server is not shipped today. When one is wanted, it is a thin
-wrapper: expose `remote_instrument`, the acquisition generators, and
-`Session` as tools, and the contracts above do the rest. If you are
-experimenting now, the pragmatic route is to let the agent write and
-run short Python scripts against this API — which also leaves an exact,
-replayable record of what it did.
+An MCP server is not shipped today, and the shape it should take is
+sharper than "a thin wrapper" now that the [broker
+exists](#driving-an-instrument-that-other-people-are-also-using): **the
+unit of containment is the lease.** Give an agent a broker connection
+rather than a device session and the division is already drawn. Every
+tool that only reads — what is on screen, how fast it is going, what the
+defocus is — is a watch call, which cannot move the probe however it is
+invoked or however the model was talked into invoking it. Everything that
+*can* move the probe happens inside a lease: exclusive, refused rather
+than queued when somebody else has it, carrying the agent's identity and
+its stated reason where an operator can read them, expiring on its own if
+the agent stops renewing, and restarting the live loops on release
+whether the agent finished, raised, or vanished.
+
+What that does not give you is preemption, and it is worth saying plainly
+before someone relies on it. An operator cannot take the instrument out
+of a lease. What they have is the holder and the reason in
+`TargetState.lease`, the time to live, and the fact that ending the
+agent's connection releases everything it held immediately. For an
+unattended agent that makes the time to live the setting that matters —
+short, and renewed as work completes, so a wedged agent's hold on the
+beam is bounded by its own progress.
+
+If you are experimenting now, the pragmatic route is to let the agent
+write and run short Python scripts against this API, against a broker
+that an operator started — which keeps the containment above and leaves
+an exact, replayable record of what it did.
 
 ## Running against a commodity camera
 
