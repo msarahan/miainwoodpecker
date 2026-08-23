@@ -245,6 +245,12 @@ _TEST_HOOKS_ENV_VAR = "MIAINWOODPECKER_ENABLE_TEST_HOOKS"
 _PORT_RETRY_ATTEMPTS = 3
 
 _CONNECT_TIMEOUT_S = 15.0
+# How often a connect attempt already in flight looks at the server
+# process. The attempt itself can block for as long as the deadline
+# allows, so an exit has to be noticed *during* one rather than only
+# between two - see _connect_once for the socket behaviour that makes
+# that the ordinary case rather than an exotic one.
+_CONNECT_WATCH_S = 0.05
 _TERMINATE_TIMEOUT_S = 5.0
 # How long to wait for the graceful-shutdown acknowledgement. Generous
 # because the server is stopping detectors and blanking the beam, which on
@@ -306,6 +312,23 @@ class _PortsLostError(DeviceServerStartupError):
     :data:`_PORT_RETRY_ATTEMPTS` times. Every other exit status keeps its
     existing message, because retrying a missing instrument or an import
     error would just fail again while hiding the diagnostic that matters.
+    """
+
+
+class _ServerExitedError(Exception):
+    """
+    A connection attempt was abandoned because the server process is gone.
+
+    Control flow rather than a diagnosis, and never seen outside
+    :func:`_connect_with_retry`: an attempt that blocks is the one thing
+    that can keep the loop from ever reading the child's exit status, so
+    :func:`_connect_once` raises this the moment it finds the child dead
+    underneath one. The loop then goes back to its top, where the status
+    decides what to say - :class:`_PortsLostError` for a lost port, the
+    generic startup diagnostic for anything else. Deliberately not a
+    :class:`DeviceServerStartupError`: it carries no verdict, and every
+    verdict this client gives about a dead server is composed in one
+    place.
     """
 
 
@@ -715,12 +738,13 @@ def _connect_with_retry(  # noqa: PLR0913, PLR0917 - one call site each, all nam
     """
     Connect to a Listener that may not have started accepting yet.
 
-    Checks the server process on every attempt rather than only the clock.
-    Without that, the most likely real-world failure — asking for the
-    hardware backend on a machine with no instrument attached, where the
-    server prints what it looked for and exits — would show up here as a
-    silent 15-second wait ending in ``ConnectionRefusedError``, throwing
-    away the one diagnostic that matters.
+    Checks the server process rather than only the clock — between
+    attempts, and, through :func:`_connect_once`, during one. Without
+    that, the most likely real-world failure — asking for the hardware
+    backend on a machine with no instrument attached, where the server
+    prints what it looked for and exits — would show up here as a silent
+    15-second wait ending in ``ConnectionRefusedError``, throwing away
+    the one diagnostic that matters.
 
     Parameters
     ----------
@@ -790,7 +814,15 @@ def _connect_with_retry(  # noqa: PLR0913, PLR0917 - one call site each, all nam
             )
             raise DeviceServerStartupError(msg)
         try:
-            connection = _connect_once(port, authkey, deadline, host=host)
+            connection = _connect_once(
+                port, authkey, deadline, process=process, host=host,
+            )
+        except _ServerExitedError:
+            # Abandoned because the child died underneath it. Nothing is
+            # said here: the top of the loop reads the exit status and
+            # composes the message that fits it, which is the same one it
+            # would have composed had the attempt come back by itself.
+            continue
         except (ConnectionRefusedError, OSError):
             if time.monotonic() > deadline:
                 raise
@@ -804,6 +836,7 @@ def _connect_once(
     port: int,
     authkey: bytes,
     deadline: float,
+    process: subprocess.Popen[bytes] | None = None,
     host: str = "localhost",
 ) -> Connection:
     """
@@ -827,6 +860,26 @@ def _connect_once(
     state, and this project has already been bitten once by fd-mode side
     effects on this exact path (see ``rpc.disable_nagle``).
 
+    Bounding the attempt by the deadline alone is not enough, though,
+    because that bound is the caller's *whole* deadline: one attempt that
+    blocks spends all of it, and the retry loop never gets another look
+    at the child. A port bound by something that is not *listening* does
+    exactly that on macOS, where such a connect is neither refused nor
+    completed but simply left in flight - Linux and Windows refuse it at
+    once - so the client spent fifteen seconds connecting to a port its
+    own server had already given up on, and then reported a server
+    "alive but not completing connections" which had in fact exited with
+    :data:`PORT_UNAVAILABLE_EXIT_STATUS` a second in. That is the one
+    startup failure a respawn cures, reported as the one it cannot, and
+    it reached CI as an intermittent failure of
+    ``tests/unit/test_out_of_tree_server.py`` on macOS runners only.
+
+    So the wait is sliced and the child polled between slices: an attempt
+    whose server is already gone is abandoned at once, and the loop goes
+    back to reading the exit status it should have been dispatching on. A
+    healthy connect returns on the first slice and pays nothing for any
+    of this.
+
     Parameters
     ----------
     port : int
@@ -835,6 +888,10 @@ def _connect_once(
         Shared secret for the connection handshake.
     deadline : float
         ``time.monotonic()`` value after which to abandon the attempt.
+    process : subprocess.Popen[bytes] | None
+        The server this attempt is aimed at, polled while the attempt is
+        in flight — or ``None`` on the attach path, where this client
+        launched nothing and there is no exit to watch for.
     host : str
         Host to connect to; ``localhost`` for a spawned server, which by
         construction runs here.
@@ -846,6 +903,10 @@ def _connect_once(
 
     Raises
     ------
+    _ServerExitedError
+        If ``process`` exited while the attempt was still in flight, so
+        the attempt can only be abandoned and the caller has an exit
+        status to read instead.
     DeviceServerStartupError
         If the deadline passed with the attempt still blocked — a server
         that is alive but not completing handshakes, which retrying will
@@ -870,14 +931,22 @@ def _connect_once(
 
     thread = threading.Thread(target=_attempt, name="device-connect", daemon=True)
     thread.start()
-    if not done.wait(timeout=max(0.05, deadline - time.monotonic())):
-        msg = (
-            f"a connection attempt to the device server (port {port}) was "
-            f"still blocked in the handshake when the connect deadline "
-            f"passed - the server process is alive but not completing "
-            f"connections, which retrying will not fix"
-        )
-        raise DeviceServerStartupError(msg)
+    while not done.wait(timeout=_CONNECT_WATCH_S):
+        if process is not None and process.poll() is not None:
+            msg = (
+                f"the device server exited with status {process.returncode} "
+                f"while a connection attempt to port {port} was still in "
+                f"flight"
+            )
+            raise _ServerExitedError(msg)
+        if time.monotonic() > deadline:
+            msg = (
+                f"a connection attempt to the device server (port {port}) was "
+                f"still blocked in the handshake when the connect deadline "
+                f"passed - the server process is alive but not completing "
+                f"connections, which retrying will not fix"
+            )
+            raise DeviceServerStartupError(msg)
     # Failures cross the thread boundary as objects and are re-raised here
     # as fresh instances of the concrete classes the retry loop dispatches
     # on, with the original chained as __cause__ so no diagnostic is lost.
