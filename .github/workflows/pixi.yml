@@ -24,9 +24,16 @@ on:
   push:
     branches:
       - main
-      - 'claude/**'
 
+# `push` is main only: a `claude/**` branch is worked on through a PR, and
+# `pull_request` already covers it. Naming the branch here as well fired every
+# workflow twice per push, and the concurrency group below could not collapse
+# the pair — the two events carry different `github.ref` values
+# (`refs/heads/...` against `refs/pull/N/merge`), so they never share a group.
+# On a branch this job is now also subject to the `paths` filter above, which
+# is the point of that filter; a push to main still runs it unconditionally.
 concurrency:
+  # Supersede an in-flight run when the same ref is pushed again.
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 

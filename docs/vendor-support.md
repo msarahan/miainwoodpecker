@@ -618,6 +618,40 @@ end that binds there, so it cannot learn a port the far end chose
 without a rendezvous it does not have — the invitation *is* the
 rendezvous, and it is written before either end is listening.
 
+### An adapter must exit 4 when a listener cannot bind
+
+The one part of the port contract that is easy to leave out and that only
+fails *intermittently*, so it is written down here rather than left to be
+inferred from the servers in this tree.
+
+`--instrument-port` is a port the **client** chose, and it chose it by
+binding to port 0 and *releasing* the socket. The adapter binds it an
+interpreter start and a vendor stack's imports later, and in that window
+anything else on the machine may take it — another session starting, a
+parallel test run, or the client's own connect loop drawing an ephemeral
+source port from the range the probe came from. Not theoretical: it was
+found in this project's own CI, as one job failing where the job for the
+same commit in the duplicate workflow run passed.
+
+The client can cure that — it re-picks ports and respawns, up to
+`_PORT_RETRY_ATTEMPTS` times — but only if the server *says* so, and the
+signal is the process exit status:
+
+> A server that cannot bind a listener must catch the `OSError` and exit
+> with status **4** (`PORT_UNAVAILABLE_EXIT_STATUS`) rather than let the
+> traceback escape.
+
+Every server in this tree does it, in `serve()`, in five lines around the
+`bind_targets()` call; so does the stand-in in
+`tests/unit/test_out_of_tree_server.py`, which is the copyable version
+and which has a test provoking the collision on purpose. An adapter that
+skips it still *works* — right up until the collision, which then
+presents as an unexplained exit status, a startup error naming a port
+instead of whatever the caller was actually doing, and a failure that
+does not reproduce. `miainwoodpecker.devices.serving.bind_targets()`
+raises the `OSError` its callers translate; an out-of-tree adapter may
+import it or not, and is obliged only to produce the same exit status.
+
 ## What is still the wrong shape
 
 Two, neither fixed, both estimated below rather than pre-emptively built.
