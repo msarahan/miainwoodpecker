@@ -61,12 +61,63 @@ by isolating this layer behind a process boundary.
 
 | Swift subsystem (reinvented) | Replacement | Why |
 |---|---|---|
-| NionUI (custom widget toolkit + C++ Qt launcher) | **PySide6** + **[napari](https://napari.org/)** as the application shell | Napari is a mature, actively developed Qt/VisPy-based n-dimensional image viewer with a real plugin ecosystem; adopting it deletes the launcher, the widget abstraction, and the declarative-UI layer in one move. |
+| NionUI (custom widget toolkit + C++ Qt launcher) | **PySide6** for the application shell, **[napari](https://napari.org/)** for the image panels | Deletes the launcher, the widget abstraction, and the declarative-UI layer in one move. **Corrected after building it: napari is not the shell.** The window is an ordinary `QMainWindow` (`viewer/documents.py`) whose central widget is an MDI area, because every image needs its own canvas — see the note below. |
 | `CanvasItem`/`DrawingContext` (Python-driven command-list rendering, CPU rasterized via `QPainter`) | Napari's **VisPy/OpenGL** canvas | GPU compositing instead of Python rebuilding a draw program every repaint — this is the single biggest latency fix Swift needs. |
 | `nionutils` (`Event`, `Observable`, `Binding`, `Stream`, `Registry`) | Qt signals/slots, and napari's own **evented models** (`psygnal`) | Standard, widely used reactive primitives instead of a bespoke fan-out graph that amplifies small property changes into cascades. |
 | Custom project format + `.ndata` | **HDF5/Zarr** for arrays, **NeXus/NXem** for metadata, via **[pynxtools-em](https://github.com/FAIRmat-NFDI/pynxtools-em)** and **[RosettaSciIO](https://github.com/hyperspy/rosettasciio)** | NXem is a real, current (Oct 2025) NeXus application definition specifically for electron microscopy; RosettaSciIO (spun out of HyperSpy) already reads/writes essentially every EM vendor format (dm3/dm4, EMD, ser, …), so file I/O becomes "use the library" instead of "maintain a format." |
 | Built-in analysis tools | **[HyperSpy](https://hyperspy.org/)** for general multidimensional EM analysis (EELS/EDS/etc.), **[py4DSTEM](https://github.com/py4dstem/py4DSTEM)** and/or **[LiberTEM](https://libertem.github.io/LiberTEM/)** for 4D-STEM / high-throughput pixelated-detector data, **[pyxem](https://github.com/pyxem/pyxem)**/**[kikuchipy](https://kikuchipy.org/)** for diffraction workflows if needed | These are the community's actual analysis tools for this data, actively maintained, and already ahead of what a small team can build and keep current. |
-| `Facade.py` (hand-maintained versioned API shim) | Not needed | Only existed to keep Swift's own plugin API stable across versions. If new "plugins" are just ordinary napari plugins, there's no bespoke API surface to shim. |
+| `Facade.py` (hand-maintained versioned API shim) | Not needed | Only existed to keep Swift's own plugin API stable across versions. This anticipated new "plugins" being ordinary napari plugins; in the event, analysis went through direct HyperSpy/py4DSTEM/LiberTEM adapters in subprocesses instead (§6 licence isolation, and crash containment), so there are no plugins of either kind and still no API surface to shim. |
+
+### What napari is actually for here — corrected after Phase 5
+
+The table above overstated napari's role, and the viewing-area work made
+the gap concrete enough to be worth recording rather than quietly
+fixing.
+
+**What was claimed and did not happen.** The plugin ecosystem was a
+headline reason and is entirely unused — no npe2 manifest, no entry
+points, no `magicgui`. That is not a failure; analysis deliberately went
+out-of-process to adapters instead, for licence isolation and crash
+containment, and that decision retired the argument.
+
+**What napari is genuinely providing**, in rough order of value:
+
+1. **The VisPy/OpenGL canvas** — the CanvasItem/DrawingContext
+   replacement, and still the single biggest latency fix. Benchmarked
+   below: flat ~11 ms per repaint from 512² to 2048², sixteen times the
+   pixels for no extra cost.
+2. **The `Shapes` layer** — thirteen interaction modes, vertex editing,
+   and `to_masks()`. This is what an EELS ROI-sum interaction is built
+   out of, and interactive shape editing is exactly the kind of
+   low-level primitive Swift's mistake was to write by hand.
+3. **Per-axis units and calibrated display** (`viewer/axes.py`), and the
+   frame slider a recording's stack gets for free.
+4. **The isotropic camera**, which is why "no viewing change stretches an
+   image" is structural rather than something the layout must enforce.
+
+**Where the grain runs against us.** napari's model is one canvas with N
+layers sharing one world, and this application needs one canvas per
+image — because calibration is per image. napari applies units per layer
+but draws the scale bar per viewer, and refuses to render units at all
+when one viewer's layers disagree:
+
+```
+WARNING: Inconsistent units across layers; units will not be used for rendering.
+```
+
+A HAADF map in nm beside a Ronchigram in mrad beside an EEL spectrum in
+eV therefore *cannot* share a canvas. So the MDI arrangement is a
+requirement rather than a preference, and the cost of it —
+reparenting the private `_qt_window`, hiding each viewer's own chrome —
+is the price of using napari as a panel rather than as a shell.
+
+**On `ndv`.** The benchmark below settled the *speed* question and still
+does. The ROI requirement settles the *capability* one in the same
+direction and more firmly: `ndv` has no shapes layer, so choosing it
+would mean building interactive ROI editing ourselves — the Swift
+failure mode, arrived at from the other end. Revisit only if napari's
+per-viewer overhead becomes a problem at panel counts we actually
+reach.
 
 ## 4. Direct prior art to study before building
 

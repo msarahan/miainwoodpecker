@@ -7,6 +7,8 @@ objects, so the parts of it worth testing are testable the cheap way.
 The window it opens is covered by the integration suite instead.
 """
 
+import dataclasses
+
 import h5py
 import numpy as np
 import pytest
@@ -15,6 +17,8 @@ from miainwoodpecker.devices.interface import (
     BEAM_BLANKER_CONTROL,
     DEFOCUS_CONTROL,
     ENERGY_OFFSET_CONTROL,
+    IMAGE_READOUT,
+    PROJECTED_READOUT,
     SCAN_SYNC_SCANNER,
     STAGE_POSITION_CONTROL,
     Camera,
@@ -23,11 +27,24 @@ from miainwoodpecker.devices.interface import (
     Scanner,
     SynchronisedScanner,
 )
-from miainwoodpecker.devices.rpc import SCANNER_TARGET
+from miainwoodpecker.devices.rpc import CAMERA_TARGET_NAMES, SCANNER_TARGET
+from miainwoodpecker.storage.calibration import (
+    METADATA_KEY,
+    AxisKind,
+    FrameCalibration,
+)
+from miainwoodpecker.storage.spectra import EELS_TECHNIQUE, TECHNIQUE_KEY
 from miainwoodpecker.viewer.preview import (
     PREVIEW_BACKEND,
     _CAMERA_PIXELS,
+    _CARBON_K_EDGE_EV,
+    _EELS_BASE_OFFSET_EV,
+    _EELS_CHANNELS,
+    _EELS_DISPERSION_EV,
+    _EELS_TARGET,
+    _SILICON_L_EDGE_EV,
     PreviewCamera,
+    PreviewEELSCamera,
     PreviewInstrument,
     PreviewScanner,
     build_preview_devices,
@@ -45,6 +62,15 @@ _TWO_CHANNELS = 2
 _A_SYNC_GRID = ScanParameters(height=8, width=8, pixel_time_us=1.0, fov_nm=3.0)
 _NOISE_TOLERANCE = 0.05
 _STRONG_CORRELATION = 0.8
+_TWO_AXES = 2
+# How far above an onset an elemental map integrates. Wide, because an
+# ionisation edge is a step that decays rather than a peak, so what
+# carries the element is the area after it.
+_EDGE_WINDOW_EV = 50.0
+# And how far either side of an onset a *step* is looked for. Narrow, for
+# the reason the test using it gives: the background falls as the cube of
+# energy, so a wide comparison across an onset measures the background.
+_EDGE_STEP_EV = 5.0
 
 
 def _scan_once(scanner: PreviewScanner) -> np.ndarray:
@@ -562,7 +588,7 @@ class TestSynchronisedPass:
         devices = build_preview_devices(scan=True, camera=True)
         wrong = np.zeros((2, 2, _CAMERA_PIXELS, _CAMERA_PIXELS), dtype=np.float32)
 
-        with pytest.raises(ValueError, match="navigation shape"):
+        with pytest.raises(ValueError, match="beam positions"):
             devices.scanner.scan_synchronised(
                 _A_SYNC_GRID, targets=["camera"], into={"camera": wrong},
             )
@@ -595,6 +621,599 @@ class TestSynchronisedPass:
         devices = build_preview_devices(scan=True, camera=True)
         with pytest.raises(IndexError):
             devices.scanner.scan_synchronised(_A_SYNC_GRID, channels=[99])
+
+
+def _projected(camera: PreviewEELSCamera) -> PreviewEELSCamera:
+    """
+    Put a spectrometer into its projected readout and return it.
+
+    Parameters
+    ----------
+    camera : PreviewEELSCamera
+        The spectrometer to configure.
+
+    Returns
+    -------
+    PreviewEELSCamera
+        The same camera, now projecting.
+    """
+    camera.configure(
+        dataclasses.replace(camera.parameters(), readout=PROJECTED_READOUT),
+    )
+    return camera
+
+
+def _energies(camera: PreviewEELSCamera) -> np.ndarray:
+    """
+    Return the energy of every channel of a spectrometer, in electronvolts.
+
+    Parameters
+    ----------
+    camera : PreviewEELSCamera
+        The spectrometer whose axis is wanted.
+
+    Returns
+    -------
+    numpy.ndarray
+        One energy per channel.
+    """
+    axis = camera.frame_calibration().x
+    return axis.offset + axis.scale * np.arange(camera.channel_count)
+
+
+def _window(data: np.ndarray, energies: np.ndarray, onset_ev: float) -> np.ndarray:
+    """
+    Return counts integrated over a window just above an edge onset.
+
+    How an elemental map is made from a spectrum image: an ionisation
+    edge is a step that decays rather than a peak, so what carries the
+    element is the area after the onset.
+
+    Parameters
+    ----------
+    data : np.ndarray
+        Counts, energy on the last axis.
+    energies : np.ndarray
+        The energy of each channel.
+    onset_ev : float
+        The edge's threshold.
+
+    Returns
+    -------
+    numpy.ndarray
+        The integral over the window, one value per navigation position.
+    """
+    mask = (energies >= onset_ev) & (energies < onset_ev + _EDGE_WINDOW_EV)
+    return data[..., mask].sum(axis=-1)
+
+
+class _ProjectingCameraWithNoAxis:
+    """
+    A camera claiming a projected readout while reporting no energy axis.
+
+    A state no assembled preview can reach — a camera with no dispersive
+    direction refuses a projected readout in ``configure`` — so this
+    stands in for an out-of-tree adapter whose ``configure`` and whose
+    calibration disagree, which is the only way the scanner's refusal can
+    be reached and therefore the only way it can be shown to work.
+    """
+
+    camera_id = "liar"
+    camera_type = "liar"
+
+    def parameters(self) -> CameraParameters:
+        """
+        Report a projected readout.
+
+        Returns
+        -------
+        CameraParameters
+            Settings claiming to project.
+        """
+        return CameraParameters(exposure_ms=1.0, readout=PROJECTED_READOUT)
+
+    def frame_calibration(self) -> FrameCalibration:
+        """
+        Report no calibrated axis at all.
+
+        Returns
+        -------
+        FrameCalibration
+            The uncalibrated pixel model, which names no energy axis.
+        """
+        return FrameCalibration.uncalibrated()
+
+
+class TestSpectrometer:
+    """
+    The EELS camera is a spectrometer, and its axis is what makes it one.
+
+    What distinguishes this detector from the Ronchigram camera beside it
+    is that one of its axes is calibrated in energy rather than in space.
+    Its *rank* is not the distinguishing thing and these tests are
+    careful not to treat it as one: the ordinary readout here is the 2D
+    dispersed image, and summing it to 1D is a mode, not a promotion to
+    being a real spectrometer.
+    """
+
+    def test_the_eels_target_gets_a_spectrometer(self):
+        """
+        The target name decides the detector, and it did not used to.
+
+        Before the spectrometer existed, asking for two cameras served a
+        *Ronchigram* on the EELS target — a window that looked right
+        against a device that was not what it said it was.
+        """
+        devices = build_preview_devices(camera_count=_TWO_CAMERAS)
+        assert isinstance(devices.cameras[_EELS_TARGET], PreviewEELSCamera)
+        others = [
+            camera
+            for name, camera in devices.cameras.items()
+            if name != _EELS_TARGET
+        ]
+        assert all(not isinstance(camera, PreviewEELSCamera) for camera in others)
+
+    def test_the_eels_target_is_a_name_the_client_serves(self):
+        """
+        The spelling is the transport's, not this module's invention.
+
+        A private spelling here would serve a spectrometer on a target no
+        client builds a handle for, and nothing would fail.
+        """
+        assert _EELS_TARGET in CAMERA_TARGET_NAMES
+
+    def test_it_satisfies_the_camera_protocol(self):
+        """A spectrometer camera is a Camera, whatever its axes mean."""
+        assert isinstance(PreviewEELSCamera(), Camera)
+
+    def test_the_default_readout_is_the_dispersed_image(self):
+        """
+        A spectrometer's ordinary readout is 2D, and this one starts there.
+
+        Keeping the whole dispersed image is a real experiment, and it is
+        also what an operator aligns the spectrum on the detector with —
+        so a live view that started as a line of numbers would be the
+        wrong default twice over.
+        """
+        camera = PreviewEELSCamera()
+        camera.start()
+        data = camera.acquire_frame().data
+        assert data.ndim == _TWO_AXES
+        assert data.shape[1] == _EELS_CHANNELS
+
+    def test_a_projected_readout_is_one_dimensional(self):
+        """Projecting sums the non-dispersive direction away."""
+        camera = _projected(PreviewEELSCamera())
+        camera.start()
+        data = camera.acquire_frame().data
+        assert data.shape == (_EELS_CHANNELS,)
+
+    def test_the_dispersive_axis_is_calibrated_in_energy(self):
+        """
+        The axis is the whole claim, so a frame has to carry it.
+
+        As plain data rather than an object, which is what every other
+        adapter puts in ``metadata["calibration"]`` and what survives
+        being written to a file as JSON.
+        """
+        camera = PreviewEELSCamera()
+        camera.start()
+        calibration = camera.acquire_frame().metadata[METADATA_KEY]
+        assert calibration["x"]["kind"] == AxisKind.ENERGY.value
+        assert calibration["x"]["units"] == "eV"
+        assert calibration["x"]["scale"] == pytest.approx(_EELS_DISPERSION_EV)
+        assert calibration["x"]["offset"] == pytest.approx(_EELS_BASE_OFFSET_EV)
+
+    def test_the_other_axis_is_left_uncalibrated(self):
+        """
+        The non-dispersive direction has no physical scale to report.
+
+        Which is what the real simulator says too: usim's EELS camera
+        publishes empty units for its ``y`` axis, and an axis given a
+        fabricated scale is one an analysis would happily use.
+        """
+        camera = PreviewEELSCamera()
+        camera.start()
+        calibration = camera.acquire_frame().metadata[METADATA_KEY]
+        assert calibration["y"]["kind"] == AxisKind.UNCALIBRATED.value
+
+    def test_binning_trades_channels_for_dispersion(self):
+        """
+        A binned channel spans proportionally more of the energy axis.
+
+        The arithmetic that makes exposure and binning one value object:
+        a caller that recorded the unbinned dispersion against a binned
+        frame would put every identified edge at the wrong energy.
+        """
+        camera = PreviewEELSCamera()
+        camera.configure(CameraParameters(exposure_ms=10.0, binning=2))
+        assert camera.channel_count == _EELS_CHANNELS // 2
+        assert camera.frame_calibration().x.scale == pytest.approx(
+            _EELS_DISPERSION_EV * 2,
+        )
+
+    def test_the_zero_loss_peak_is_at_zero_energy(self):
+        """
+        The brightest channel is the one no energy was lost in.
+
+        The anchor for everything else in the spectrum: an edge is
+        identified by its distance from here.
+        """
+        camera = _projected(PreviewEELSCamera())
+        camera.start()
+        data = camera.acquire_frame().data
+        peak_ev = _energies(camera)[int(np.argmax(data))]
+        assert peak_ev == pytest.approx(0.0, abs=_EELS_DISPERSION_EV)
+
+    def test_the_energy_offset_moves_the_peak_across_the_channels(self):
+        """
+        Driving the spectrometer offset moves the spectrum on the detector.
+
+        And the calibrated axis moves with it, so the zero-loss peak
+        stays at 0 eV while changing *channel*. That is the whole point
+        of a calibrated axis, and it is what makes
+        ``energy_offset_series`` demonstrable on this instrument rather
+        than merely runnable.
+        """
+        instrument = PreviewInstrument()
+        camera = _projected(PreviewEELSCamera(instrument=instrument))
+        camera.start()
+        before = int(np.argmax(camera.acquire_frame().data))
+
+        instrument.set_energy_offset_ev(_AN_ENERGY_OFFSET_EV)
+        data = camera.acquire_frame().data
+        after = int(np.argmax(data))
+
+        assert after != before
+        assert _energies(camera)[after] == pytest.approx(
+            0.0, abs=_EELS_DISPERSION_EV,
+        )
+
+    def test_each_edge_steps_up_at_its_own_onset(self):
+        """
+        An ionisation edge is a step at a real energy, not decoration.
+
+        Compared **across the onset and nowhere else**, over a few
+        electronvolts either side. A wider comparison would measure the
+        background instead: it falls as the cube of energy, so over any
+        broad window the drop in background outweighs an entirely healthy
+        edge and the test would report a failure the spectrum does not
+        have.
+        """
+        camera = _projected(PreviewEELSCamera())
+        camera.start()
+        data = camera.acquire_frame().data
+        energies = _energies(camera)
+        for onset_ev in (_SILICON_L_EDGE_EV, _CARBON_K_EDGE_EV):
+            below = (energies < onset_ev) & (energies >= onset_ev - _EDGE_STEP_EV)
+            above = (energies >= onset_ev) & (energies < onset_ev + _EDGE_STEP_EV)
+            assert data[above].mean() > data[below].mean(), onset_ev
+
+    def test_composition_moves_the_two_edges_in_opposite_directions(self):
+        """
+        The specimen is silicon on a carbon film, and the spectrum says so.
+
+        Without this the spectral model would encode nothing, and an
+        elemental map computed from a spectrum image would "succeed"
+        against a spectrum that was the same everywhere.
+        """
+        camera = _projected(PreviewEELSCamera())
+        energies = _energies(camera)
+        silicon_rich = camera.spectrum_at(1.0)
+        carbon_rich = camera.spectrum_at(0.0)
+
+        assert _window(silicon_rich, energies, _SILICON_L_EDGE_EV) > _window(
+            carbon_rich, energies, _SILICON_L_EDGE_EV,
+        )
+        assert _window(carbon_rich, energies, _CARBON_K_EDGE_EV) > _window(
+            silicon_rich, energies, _CARBON_K_EDGE_EV,
+        )
+
+    def test_blanking_the_beam_collapses_the_spectrum(self):
+        """
+        No beam, no losses. The same collapse the scan and camera show.
+
+        Worth asserting separately rather than trusting the shared
+        instrument: a detector that kept producing a plausible spectrum
+        with the beam off would make the blanker look broken in exactly
+        the situation an operator relies on it.
+        """
+        instrument = PreviewInstrument()
+        camera = _projected(PreviewEELSCamera(instrument=instrument))
+        camera.start()
+        lit = camera.acquire_frame().data.sum()
+        instrument.set_beam_blanked(blanked=True)
+        blanked = camera.acquire_frame().data.sum()
+        assert blanked < lit * _NOISE_TOLERANCE
+
+    def test_summing_the_rows_recovers_the_projected_spectrum(self):
+        """
+        The two readouts differ in what they discard, not in the signal.
+
+        The 2D frame spreads the *same* expected counts over rows rather
+        than repeating them, so its row sum has the projected spectrum's
+        statistics. A model that copied the spectrum into every row would
+        pass every other test here and be wrong by the row count.
+        """
+        camera = PreviewEELSCamera()
+        camera.start()
+        imaged = camera.acquire_frame().data.sum()
+        _projected(camera)
+        projected = camera.acquire_frame().data.sum()
+        assert imaged == pytest.approx(projected, rel=_NOISE_TOLERANCE)
+
+    def test_a_projected_frame_says_who_summed_it(self):
+        """
+        Present only on a projected frame, as the vocabulary specifies.
+
+        On an imaged frame there is nobody to name, and a key claiming
+        the sensor summed would be a claim about noise statistics that is
+        not true of a frame nothing summed.
+        """
+        camera = PreviewEELSCamera()
+        camera.start()
+        assert "projected_by" not in camera.acquire_frame().metadata
+        _projected(camera)
+        assert camera.acquire_frame().metadata["projected_by"] == "sensor"
+
+
+class TestCamerasWithoutAnEnergyAxis:
+    """A camera with no dispersive direction says so, rather than obliging."""
+
+    def test_a_ronchigram_camera_refuses_to_project(self):
+        """
+        Refused in ``configure``, which is where the interface says to.
+
+        Summing one axis of a Ronchigram gives a line of numbers on an
+        angular axis. Producing it would push the failure into the
+        storage layer, which can only say the axis is not energy — one
+        layer too late to name the real mistake.
+        """
+        camera = PreviewCamera()
+        with pytest.raises(ValueError, match="dispersive"):
+            camera.configure(
+                CameraParameters(exposure_ms=10.0, readout=PROJECTED_READOUT),
+            )
+
+    def test_its_readout_is_unchanged_by_the_refusal(self):
+        """A refused setting leaves the device where it was."""
+        camera = PreviewCamera()
+        with pytest.raises(ValueError, match="dispersive"):
+            camera.configure(
+                CameraParameters(exposure_ms=10.0, readout=PROJECTED_READOUT),
+            )
+        assert camera.parameters().readout == IMAGE_READOUT
+
+    def test_it_produces_no_spectra(self):
+        """
+        The refusal has a sentence, rather than being an AttributeError.
+
+        A scan unit asked to read this detector out as spectra should
+        learn *why* it cannot, and "no energy-dispersive axis" is a fact
+        an operator can act on where a missing attribute is not.
+        """
+        camera = PreviewCamera()
+        with pytest.raises(NotImplementedError, match="energy-dispersive"):
+            _ = camera.channel_count
+        with pytest.raises(NotImplementedError, match="energy-dispersive"):
+            camera.spectrum_at(0.5)
+
+    def test_a_ronchigram_frame_carries_its_angular_axes(self):
+        """
+        The axes exist and are angular, which is what makes the refusal legible.
+
+        It is also worth having for its own sake: every other adapter's
+        frames carry calibration, and the preview's did not.
+        """
+        camera = PreviewCamera()
+        camera.start()
+        calibration = camera.acquire_frame().metadata[METADATA_KEY]
+        assert calibration["x"]["units"] == "mrad"
+
+
+class TestSpectrumImagePass:
+    """
+    One traversal of the probe, read out as spectra at every position.
+
+    The acquisition this whole module exists to make demonstrable without
+    hardware, and the tests that matter most are the ones asserting the
+    outputs really came from *one* pass — a spectrum image that merely
+    resembles the image channels beside it is the failure that looks like
+    success.
+    """
+
+    def _pass(self, *, projected: bool = True) -> object:
+        """
+        Acquire one synchronised pass from the EELS target.
+
+        Parameters
+        ----------
+        projected : bool
+            Whether to put the spectrometer into its projected readout
+            first.
+
+        Returns
+        -------
+        ScanPass
+            The completed pass.
+        """
+        devices = build_preview_devices(camera_count=_TWO_CAMERAS)
+        camera = devices.cameras[_EELS_TARGET]
+        if projected:
+            _projected(camera)
+        return devices.scanner.scan_synchronised(
+            _A_SYNC_GRID, channels=[0, 1], targets=[_EELS_TARGET],
+        )
+
+    def test_a_projecting_target_yields_a_spectrum_image(self):
+        """Rank 3, navigation first, energy last — ``NXspectrum``'s order."""
+        result = self._pass()
+        spectrum = result.spectra[_EELS_TARGET]
+        assert spectrum.navigation_shape == _A_SYNC_GRID.shape
+        assert spectrum.channel_count == _EELS_CHANNELS
+        assert not result.diffraction
+
+    def test_an_imaging_target_yields_a_stack_instead(self):
+        """
+        The readout mode decides, not the kind of detector.
+
+        A spectrometer left imaging really does produce a whole frame per
+        beam position, and that is a real experiment rather than a
+        misconfiguration — so it is stored, not refused.
+        """
+        result = self._pass(projected=False)
+        assert not result.spectra
+        assert result.diffraction[_EELS_TARGET].navigation_shape == _A_SYNC_GRID.shape
+
+    def test_an_imaged_spectrometer_keeps_its_energy_axis(self):
+        """
+        The one fact distinguishing that stack from a diffraction cube.
+
+        Both are 4D and the container is named for the other one, so if
+        the detector's own axes did not travel with the stack there would
+        be nothing in the file to say which it was.
+        """
+        result = self._pass(projected=False)
+        calibration = result.diffraction[_EELS_TARGET].metadata[METADATA_KEY]
+        assert calibration["x"]["kind"] == AxisKind.ENERGY.value
+
+    def test_the_spectrum_image_carries_the_pass_identity(self):
+        """
+        What makes the correlation a fact rather than a claim.
+
+        The id is minted by the call that really did traverse once, and
+        the image channels of the same pass carry it too.
+        """
+        result = self._pass()
+        spectrum = result.spectra[_EELS_TARGET]
+        assert spectrum.metadata["scan_pass_id"] == result.pass_id
+        assert all(
+            frame.metadata["scan_pass_id"] == result.pass_id
+            for frame in result.images
+        )
+
+    def test_it_names_what_shared_its_probe_positions(self):
+        """
+        ``simultaneous_with`` is filled because this call established it.
+
+        The vocabulary has carried this key since before anything could
+        honestly fill it; a pass is what can.
+        """
+        result = self._pass()
+        shared = result.spectra[_EELS_TARGET].metadata["simultaneous_with"]
+        assert "preview_scanner" in shared
+        assert _EELS_TARGET in shared
+
+    def test_it_reports_how_the_positions_were_guaranteed(self):
+        """An unsynchronised map has the same shape as a synchronised one."""
+        result = self._pass()
+        assert result.spectra[_EELS_TARGET].metadata["scan_sync"] == SCAN_SYNC_SCANNER
+        assert result.scan_sync == SCAN_SYNC_SCANNER
+
+    def test_it_is_labelled_as_electron_energy_loss(self):
+        """
+        Once stored, this string is all that separates EELS from EDX.
+
+        Both land in the same ``NXspectrum`` layout with the same rank,
+        so an analysis layer that read the shape would happily fit X-ray
+        lines to electron energy losses.
+        """
+        result = self._pass()
+        assert result.spectra[_EELS_TARGET].metadata[TECHNIQUE_KEY] == EELS_TECHNIQUE
+
+    def test_the_energy_axis_is_the_detectors_own(self):
+        """
+        Read from the device, not from what anything requested.
+
+        A spectrum acquired under an energy axis nobody checked would
+        shift every identified edge, and the detector is the only thing
+        that knows what it actually ran at.
+        """
+        devices = build_preview_devices(camera_count=_TWO_CAMERAS)
+        _projected(devices.cameras[_EELS_TARGET])
+        devices.instrument.set_energy_offset_ev(_AN_ENERGY_OFFSET_EV)
+        result = devices.scanner.scan_synchronised(
+            _A_SYNC_GRID, channels=[0], targets=[_EELS_TARGET],
+        )
+        spectrum = result.spectra[_EELS_TARGET]
+        assert spectrum.energy_scale_ev == pytest.approx(_EELS_DISPERSION_EV)
+        assert spectrum.energy_offset_ev == pytest.approx(
+            _EELS_BASE_OFFSET_EV + _AN_ENERGY_OFFSET_EV,
+        )
+
+    def test_the_silicon_map_tracks_the_haadf_channel(self):
+        """
+        The checkable answer, and the reason the model is more than decoration.
+
+        Both signals come from the same sampled specimen, so an elemental
+        map integrated out of the spectrum image rises and falls with the
+        image channel acquired in the same traversal. A spectrum image of
+        one repeated spectrum would pass a shape check and fail this.
+        """
+        result = self._pass()
+        spectrum = result.spectra[_EELS_TARGET]
+        energies = (
+            spectrum.energy_offset_ev
+            + spectrum.energy_scale_ev * np.arange(spectrum.channel_count)
+        )
+        silicon = _window(spectrum.data, energies, _SILICON_L_EDGE_EV)
+        haadf = result.images[0].data
+
+        correlation = np.corrcoef(silicon.ravel(), haadf.ravel())[0, 1]
+        assert correlation > _STRONG_CORRELATION
+
+    def test_a_preallocated_destination_is_filled_in_place(self):
+        """
+        The pass views the caller's memory rather than a copy of it.
+
+        This is what lets a spectrum image be written straight into an
+        HDF5 dataset as it is acquired. A version that filled a buffer
+        and then copied would pass any value-based check while doing
+        exactly the work ``into`` exists to avoid.
+        """
+        devices = build_preview_devices(camera_count=_TWO_CAMERAS)
+        camera = _projected(devices.cameras[_EELS_TARGET])
+        destination = np.zeros(
+            (*_A_SYNC_GRID.shape, camera.channel_count), dtype=np.float32,
+        )
+        result = devices.scanner.scan_synchronised(
+            _A_SYNC_GRID,
+            targets=[_EELS_TARGET],
+            into={_EELS_TARGET: destination},
+        )
+        assert result.spectra[_EELS_TARGET].data is destination
+        assert destination.any()
+
+    def test_a_destination_of_the_wrong_shape_is_refused(self):
+        """
+        A caller allocating gigabytes deserves to be told which number is wrong.
+
+        Refused rather than reshaped around: the caller sized it from its
+        own idea of the acquisition, so a mismatch means one of the two
+        is wrong about what is being acquired.
+        """
+        devices = build_preview_devices(camera_count=_TWO_CAMERAS)
+        _projected(devices.cameras[_EELS_TARGET])
+        with pytest.raises(ValueError, match="energy channels"):
+            devices.scanner.scan_synchronised(
+                _A_SYNC_GRID,
+                targets=[_EELS_TARGET],
+                into={_EELS_TARGET: np.zeros((*_A_SYNC_GRID.shape, 7))},
+            )
+
+    def test_a_projecting_target_with_no_energy_axis_is_refused(self):
+        """
+        A detector that lies about its axes gets an error, not a cube.
+
+        Nothing this module assembles reaches the state — a camera with
+        no dispersive direction refuses a projected readout — but the
+        scanner accepts the cameras it is given, and counts stored
+        against pixel indices called energies would be worse than a
+        failure.
+        """
+        scanner = PreviewScanner(cameras={"liar": _ProjectingCameraWithNoAxis()})
+        with pytest.raises(ValueError, match="no energy-calibrated axis"):
+            scanner.scan_synchronised(_A_SYNC_GRID, targets=["liar"])
 
 
 class TestArgumentParsing:

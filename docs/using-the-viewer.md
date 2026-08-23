@@ -13,7 +13,8 @@ described here is a thin wrapper over one function call there.
 uv run --extra device --extra viewer miainwoodpecker-viewer
 ```
 
-A napari window opens with an **Instrument** panel docked on the right.
+A window opens with an **Instrument** panel docked on the right and a
+viewing area that gives every dataset a panel of its own.
 By default you are connected to the simulated microscope
 (`nionswift-usim`), so everything on this page can be tried without an
 instrument. On a real system, launch with `--backend hardware`.
@@ -66,7 +67,7 @@ The layout will feel familiar, with a few deliberate differences:
 
 | You are used to | Here |
 |---|---|
-| Swift's live display panels / DM's **View** window | The napari canvas. One layer per source (`Scan (HAADF)`, `Camera`), with napari's own zoom, contrast, and colormap controls. |
+| Swift's live display panels / DM's **View** window | A window per source (`Scan (HAADF)`, `Camera`), tiled in the viewing area. Each is a napari canvas with its own zoom, contrast, and colormap controls. |
 | Swift's **Record** / DM's **Record** | **Record frames** in the Scan or Camera section — writes straight to disk as frames arrive, rather than into memory first. |
 | DM's *Save Display As...* | **Save displayed frame** — keeps exactly the frame on screen, without touching the instrument. |
 | Swift's project/library | A **session**: a plain folder of files. No database, no import step — the folder *is* the library, and you can browse it in a file manager. |
@@ -76,6 +77,92 @@ There is no equivalent of Swift's data-item graph or DM's in-app
 processing chains, on purpose: analysis belongs to the scientific Python
 tools you already use, and the [scripting guide](scripting-and-automation.md)
 shows how recordings load into them in one line.
+
+## The viewing area
+
+Every dataset gets **its own window**, and they are tiled side by side:
+each enabled detector, each running camera, each recording you open, and
+each analysis result. Comparing two detectors read out of the same pass
+is the ordinary case on a scanned instrument, so they are shown next to
+each other rather than stacked on one canvas where the only way to see
+either is to hide the other.
+
+Each window is a full napari canvas, so **zoom, pan, contrast and
+colormap are per panel**. Zooming into one corner of the HAADF image
+does not drag the diffraction pattern beside it out of view.
+
+**Nothing is ever stretched.** One scale is used for both axes always,
+so a picture keeps its geometry whatever shape its window is. Where the
+window does not match it — because you reshaped it — the difference
+shows as margin on one side, never as distortion. It is not a convention
+but a property of how each panel draws, and the test suite measures it
+rather than assuming it.
+
+**A window is sized to its picture, so there are no black bars in it.**
+The frame takes the data's own shape and the picture fills it edge to
+edge — a panel with blank space in it spends screen on nothing, and two
+panels of different shapes padded to the same shape look like the same
+panel. That holds for everything: a live detector, a recording you open,
+an analysis result, and a spectrum image building in front of you.
+
+**Small data is magnified rather than shown as a stamp.** Anything whose
+longest side is under 256 pixels opens scaled up to it, so a 64x64
+spectrum-image map is a window worth looking at. Anything already that
+large opens at one screen pixel per acquired pixel, and shrinks only if
+it will not otherwise fit on screen. The floor and the target are the
+same number deliberately: magnifying to 512 while leaving 256 alone
+would open a 128-pixel scan in a *larger* window than a 256-pixel one,
+and window size would stop telling you anything about the data.
+
+**No part of a window is ever off the edge.** A panel too big for the
+workspace is shrunk to it, one that would overhang is moved back in, and
+when the application is made smaller the panels follow it in. The part
+of a window outside the workspace is the part you cannot click.
+
+**Panels go beside each other, and overlap only when there is no room.**
+A panel a few pixels too wide for the row it nearly fits is shrunk
+slightly rather than wrapped, and when there is genuinely no room they
+are offset rather than stacked, so a covered window keeps a corner to
+raise it by. **View → Tile documents**
+(<kbd>Ctrl</kbd>+<kbd>T</kbd>) packs them again after you have moved
+things about; it never resizes a window to fill the screen, because that
+would put the black bars straight back.
+
+**Your own changes are yours.** Reshape a window and the picture refits
+to it — still whole and still undistorted, with blank space on one axis
+because the frame no longer matches it. Zoom a panel and nothing
+automatic will undo it: not tiling, not a new dataset arriving.
+
+**View → Actual resolution** (<kbd>Ctrl</kbd>+<kbd>1</kbd>) switches a
+panel to one screen pixel per acquired pixel, to see exactly what the
+detector recorded with nothing interpolated; larger data is then cropped
+and you pan to see the rest. **View → Fit panel to data**
+(<kbd>Ctrl</kbd>+<kbd>0</kbd>) goes back, and hands the panel to
+automatic fitting again.
+
+Where the axes are calibrated differently — an anisotropically binned
+detector — one scale is used for both, so the window takes the shape the
+*specimen* has rather than the shape the array has.
+
+**Arranging.** Drag a window by its title bar to move it, or its edges
+to resize it. Until you do, the area packs new datasets in beside what
+is already open. The first time you place a window yourself it stops
+rearranging things around you, and later datasets are dropped into
+whatever space is clearest instead. **View → Tile documents**
+(<kbd>Ctrl</kbd>+<kbd>T</kbd>) packs everything again and hands tiling
+back; **View → Cascade documents** stacks them offset from one corner.
+
+**Closing a panel is not the same as stopping its source.** A closed
+panel stays closed — a running detector would otherwise reopen its
+window on the very next frame, which would make the close button
+useless. Start that detector or camera again and its panel comes back
+and comes to the front. The same is true of a panel that is merely
+buried: being covered while it runs is a legitimate way to arrange the
+area, and starting the source again is what says you want to look at it.
+
+**View → Show layer controls** turns on napari's contrast, colormap and
+gamma sidebar in every panel. It is off by default because at a tile's
+size that sidebar is bigger than the image it belongs to.
 
 ## The dock
 
@@ -109,7 +196,7 @@ invites you to go looking for hardware that is not fitted.
 - **Beam** blanks or unblanks on click, with no Set button: it is one bit
   and the click *is* the decision.
 - **Refresh** re-reads everything. Values are not polled — asking the
-  instrument for four controls thirty times a second would put traffic on
+  instrument for four controls sixty times a second would put traffic on
   the wire to answer a question nobody asked.
 
 **The viewer applies no range limits, on purpose.** Limits live behind
@@ -138,10 +225,11 @@ pass as a matter of course — HAADF and MAADF arrive together, and on an
 EDX-fitted column the X-ray spectra come with them. Serial acquisition
 is the special case.
 
-Every checked detector gets its own napari layer and they are all fed
-from the **same pass**, so you can difference them per pixel — DPC,
-ratios — without wondering whether the probe moved in between. Enabling
-a second detector costs no extra dose and no extra time.
+Every checked detector gets its own **window** in the viewing area and
+they are all fed from the **same pass**, so you can difference them per
+pixel — DPC, ratios — without wondering whether the probe moved in
+between. Enabling a second detector costs no extra dose and no extra
+time, and puts its image beside the first rather than on top of it.
 
 At least one has to stay checked; a scan with none reads nothing out.
 Your selection is remembered between launches — it follows you and the
@@ -187,9 +275,22 @@ status line shows the acquisition rate.
 **Camera section** — **Start camera** runs that camera continuously.
 **Each camera gets its own section, and its own controls.** Start the USB
 microscope and the webcam beside it stays off; both can run at once, each
-into its own napari layer (`Camera`, `Camera (camera:2)`), so they never
+into its own window (`Camera`, `Camera (camera:2)`), so they never
 overwrite each other's image. On the camera server you get a section per
 camera found, without having named any of them.
+
+**Binning is per axis where the detector says its axes differ.** Most
+cameras bin both directions by the same factor and get a single **Image
+binning** control. A spectrometer does not: binning the rows together
+trades dynamic range for signal-to-noise and is the routine move, while
+binning the energy channels together spends the spectral resolution the
+instrument exists to provide. Those are two settings with opposite
+costs, so an EEL spectrometer gets **Binning (rows)** and **Binning
+(channels)** separately, each offering only what that axis will take —
+typically a generous range down and very little across. Binning rows
+leaves the energy scale untouched; binning channels widens it in
+proportion, and the panel's scale bar and the recorded calibration both
+follow.
 
 The analysis buttons sit in the *first* camera's section and run against
 that camera. Repeating them in every section would offer three buttons
@@ -197,6 +298,15 @@ per camera with no way to tell which burst you were about to take.
 
 The display never slows the instrument down: if the scan is faster than
 the screen, frames are skipped on screen but acquisition is unaffected.
+Acquisition runs on its own thread at whatever the device manages, and
+the screen samples it — the two rates are independent by construction.
+
+**The live view refreshes at 60 fps.** Measured end to end through the
+whole display path, a frame costs 9.4 ms at 512², 9.7 ms at 1024² and
+10.2 ms at 2048² — near enough flat, because the pixels go to the GPU —
+so the ceiling is about 100 fps and 60 is comfortably inside it. A
+refresh that finds no new frame costs 4 microseconds, so the rate costs
+nothing when the source is slower than the screen.
 
 ## Keeping data: the status bar and Session settings
 
@@ -247,7 +357,7 @@ timestamps whether the probe moved in between.
 section's own **Image exposure** and **Image binning**, which are
 deliberately separate from whatever the live view is running. The two
 are different jobs: the feed stays short and often binned so it keeps up
-at thirty frames a second, while the image you keep is worth a long
+at sixty frames a second, while the image you keep is worth a long
 unbinned exposure. The live settings are put back afterwards, so one
 long acquisition does not leave the feed crawling. The binning choices
 are the camera's own — a detector that only does 1× does not offer a 4×
@@ -256,14 +366,67 @@ it would refuse.
 Neither is affected by the **Frames** count beside it: an image is one
 acquisition, whatever that says.
 
-### Acquiring a spectrum image (4D-STEM)
+### Detector readout: images or spectra
 
-**Acquire spectrum image (4D)** drives the probe over a grid of
-**Positions** beam positions across the current field of view, keeping a
-full camera image at every one. The result is a 4D dataset —
-`(scan_y, scan_x, det_y, det_x)` — written straight to disk as it is
-acquired rather than assembled in memory first, so its size is bounded
-by the disk rather than by RAM.
+**Detector readout** sets what the detector delivers. `image` is the
+sensor's own 2D frame. `projected` sums the whole non-dispersive
+direction into a 1D spectrum, which is what an EEL spectrometer is set
+to for an ordinary spectrum image — vertical binning taken to its limit,
+traded for signal-to-noise.
+
+Unlike the exposure and binning above it, **this one applies to the
+device as soon as you change it.** Those describe an acquisition;
+readout describes the detector, and it decides the rank of every frame
+the detector produces. Stop the camera first — the live layer cannot
+change its number of axes underneath itself, and the control says so
+rather than doing something surprising.
+
+A camera with no dispersive direction refuses `projected` and explains
+why. That is not a bug to work around: summing one axis of a Ronchigram
+gives a line of numbers on an *angular* axis, which is not a spectrum,
+and the file it landed in would be a spectrum recording that is not one.
+
+### Acquiring a spectrum image
+
+**Acquire spectrum image** drives the probe over a grid of
+**Positions** beam positions across the current field of view, keeping
+the whole readout of one detector at every one — and reading every scan
+channel out of the same traversal, so the images you navigate the
+dataset with afterwards share its probe positions by construction.
+
+**Per-position detector** chooses which detector that is. What you get
+depends on the readout mode it is in, not on which button you pressed:
+
+| Detector readout | What lands on disk |
+|---|---|
+| `projected` | A **spectrum image**: `(scan_y, scan_x, energy)`, in NeXus's `NXspectrum` vocabulary — the same layout a standalone spectrum recording uses, so the same readers find it. |
+| `image` | A **4D stack**: `(scan_y, scan_x, det_y, det_x)`. For a Ronchigram camera that is 4D-STEM; for a spectrometer it is a spectrum image that kept its non-dispersive direction, which is a real experiment rather than a mistake. |
+
+The status line names which of the two it actually wrote, so leaving a
+spectrometer imaging by accident is visible immediately rather than at
+analysis time.
+
+Either way the data is written straight to disk as it is acquired rather
+than assembled in memory first, so its size is bounded by the disk rather
+than by RAM.
+
+**You can watch it build.** A panel named `Acquiring (…)` opens when the
+first beam positions land and fills in as the probe goes, and the
+Recording line counts positions — `acquiring 64x64 pass - 1537/4096
+positions (37%)`. What the panel shows is a **virtual detector image**:
+the signal summed at each position, formed the same way one is formed
+offline. That is what makes it worth looking at rather than a progress
+bar — drift, contamination, or a probe scanning vacuum are all visible
+in it, minutes before the file exists.
+
+The window stays live throughout. The pass runs on its own thread and
+the screen samples it, so the live view keeps running, the panels still
+zoom and pan, and the application answers. It used to run inline: a long
+spectrum image froze the whole window until it finished, which the
+operating system reports as an application that has stopped responding.
+
+The progress panel is sized to its map like any other, so a 64x64 grid
+opens as a 512-pixel window rather than as a 64-pixel stamp.
 
 **Most instruments will refuse, and the refusal is the point.** A
 spectrum image needs the scan and the detector synchronised in
@@ -284,6 +447,40 @@ target-area UI that would take its aspect ratio from a region you draw
 is not built yet), the acquisition blocks the window while it runs, and
 a saved pass appears in the **File** list as `0 frames` because that
 list only understands frame stacks.
+
+### Replaying a recorded session
+
+A **replay** backend serves a session someone already recorded on a
+microscope, through the same devices as everything else. It is the one
+backend whose data is real, and it behaves like an instrument rather
+than like a file: a pass takes as long as it took, one beam position at
+a time.
+
+```shell
+pixi run -e replay replay /path/to/session
+```
+
+Two things about it are different from every other backend, and both are
+deliberate:
+
+**The grid is not yours to choose.** A recording is the region and
+sampling the operator picked at the time, so **Positions** is ignored
+and the status line names the grid that was actually acquired. Asking
+for another one would mean resampling, and a dataset of the requested
+shape whose every pixel was interpolated looks exactly like a real one.
+
+**Nothing about it can be driven.** The exposure, the binning and the
+spectrometer's energy offset are all fixed by what was recorded, and
+setting them is refused with a sentence rather than accepted and
+ignored. That is the same rule the rest of this application follows: a
+control that appears to work and does nothing is worse than one that
+says it cannot.
+
+Recordings you make from a replay are real NeXus files holding real data
+acquired elsewhere. Every frame and every spectrum in them carries the
+`replay` backend name and the path of the file it came from, so they
+cannot be mistaken later for something taken at your instrument — but
+point the session at a directory where that will be obvious anyway.
 
 ### Recording a series
 
@@ -307,7 +504,7 @@ session has written.
 The **File** list shows this session's recordings with their state
 ("12 frames", "empty", "damaged"). Tick **List every session in the
 parent directory** to see the whole day, or **Open from disk...** for
-any path. **Open selected** loads the file into napari as its own layer;
+any path. **Open selected** opens the file in a window of its own;
 a multi-frame recording gets napari's frame slider.
 
 **Add note / Annotate opened** appends a timestamped note to a recording
@@ -323,7 +520,7 @@ process is reported as damaged.
 ## First-look analysis
 
 Three buttons in the Camera section run one real operation each and put
-the result back into napari as a new layer:
+the result into a window of its own:
 
 - **Analyze in HyperSpy** — mean projection over a short burst.
 - **Sum in LiberTEM** — sum over the burst.

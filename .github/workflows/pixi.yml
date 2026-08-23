@@ -1,0 +1,61 @@
+# The install path the README tells a newcomer to use, exercised.
+#
+# The hatch workflows next to this one are the real test matrix; this one
+# checks something they cannot, because they do not use it: that a fresh
+# clone plus `pixi run test` works. A documented one-command install that
+# nothing runs is a promise that rots quietly, and the person who finds
+# out is a colleague setting up a microscope PC.
+#
+# `--frozen` is the point of the job. It installs from `pixi.lock`
+# exactly and refuses to re-solve, so this fails when the lockfile has
+# fallen behind a dependency change in pyproject.toml — which is the
+# failure that would otherwise reach a user as a silent, unreviewed
+# resolution to whatever is newest today.
+name: Pixi Environment
+
+on:
+  pull_request:
+    paths:
+      - 'pyproject.toml'
+      - 'pixi.lock'
+      - 'src/**'
+      - 'tests/**'
+      - '.github/workflows/pixi.yml'
+  push:
+    branches:
+      - main
+      - 'claude/**'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pixi:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # windows-latest first and never dropped: it is what the
+        # instruments run, and it is the platform whose Qt and HDF5
+        # builds this install path exists to get right.
+        os: [windows-latest, ubuntu-latest]
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+
+      - name: Set up pixi
+        uses: prefix-dev/setup-pixi@f00437f565399d418b0acc85936d12c1fb668347 # v0.10.1
+        with:
+          # Fail rather than re-solve if pixi.lock does not match the
+          # manifest. See the note at the top of this file.
+          frozen: true
+
+      - name: Unit suite
+        run: pixi run test
+
+      - name: Style
+        # One environment, no Qt stack to solve first - so this is cheap
+        # even though the hatch lint workflow already covers it. What it
+        # adds here is that the `style` environment itself still solves.
+        run: pixi run -e style lint

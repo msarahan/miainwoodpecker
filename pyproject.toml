@@ -45,6 +45,10 @@ miainwoodpecker-viewer = "miainwoodpecker.viewer.app:main"
 # in-process synthetic ones, not a device server. For UI development -
 # see src/miainwoodpecker/viewer/preview.py.
 miainwoodpecker-preview = "miainwoodpecker.viewer.preview:main"
+# Requires the "viewer" and "replay" extras. Opens the viewer against a
+# recorded acquisition, replayed at the speed it was taken - see
+# src/miainwoodpecker/devices/replay.py.
+miainwoodpecker-replay = "miainwoodpecker.devices.replay:main"
 # Requires the "device" extra and no display: it serves one instrument to
 # however many notebooks, dashboards and viewers connect to it. See
 # src/miainwoodpecker/broker/app.py.
@@ -138,6 +142,21 @@ viewer = [
 # an EDS signal, an extra that could not do that would be claiming
 # something false. It is also cheap next to HyperSpy itself - one package
 # plus a couple of pure-Python dependencies against HyperSpy's ~35.
+# Replaying a recorded vendor session as a device
+# (miainwoodpecker.devices.replay). RosettaSciIO alone, not HyperSpy:
+# this reads files and hands the arrays to the device layer, and it has
+# no use for a Signal, an AxesManager or a model. That is the whole of
+# the difference from the "analysis" extra below, and it is worth a
+# separate extra because it is about a factor of thirty in packages -
+# rosettasciio's own tree against HyperSpy's dask/scipy/scikit-image
+# one - and because replaying a session on a microscope PC should not
+# require the analysis stack to be installed on it.
+# A loose bound, for the reason the analysis extra gives: this uses
+# only file_reader() and the plain dictionary it returns, which is
+# RosettaSciIO's most stable and most documented surface.
+replay = [
+    "rosettasciio>=0.6",
+]
 analysis = [
     "hyperspy>=2.0",
     "exspy>=0.3",
@@ -310,6 +329,16 @@ exclude = [
 "scripts/**/*.py" = [
     "INP001",  # standalone entry-point scripts, not a package.
     "T201",  # these are diagnostic CLI scripts; print is the interface.
+]
+"src/miainwoodpecker/viewer/documents.py" = [
+    # Reparenting a napari viewer into an MDI sub-window needs the Qt
+    # widget behind it, and napari.Viewer.window exposes it only as
+    # _qt_window. There is no public accessor - the alternative is not a
+    # tidier one, it is giving up per-document zoom and napari's own
+    # layer controls (see the module docstring). Confined to this file,
+    # each such call wrapped so a napari upgrade that renames them
+    # degrades the chrome rather than failing to open a window.
+    "SLF001",  # 'Private member accessed'
 ]
 "src/miainwoodpecker/viewer/panels/*.py" = [
     # These modules ARE LiveInstrumentWidget's construction code; they
@@ -508,3 +537,175 @@ extra-dependencies = [
 
 [tool.hatch.envs.audit.scripts]
 check = ["pip-audit"]
+
+################################################################################
+# Pixi: the cross-platform install path, and the one that works on Windows
+################################################################################
+#
+# Why this exists next to the hatch environments above
+# -----------------------------------------------------
+# The hatch envs are the *maintainer's* tooling: they build wheels, run the
+# matrix, and are what CI drives. Pixi is the **installer's** path — one
+# command from a fresh clone to a running application, on the operating
+# system the microscopes actually run.
+#
+# That is not a preference, it is the reason: this project's viewer needs Qt
+# and a GL canvas, its storage needs HDF5, and its analysis extras need the
+# scientific stack. On Windows those are exactly the packages where pip
+# wheels are least reliable and conda-forge builds are most. A microscope
+# PC is also the machine where "it failed to build a wheel" is least
+# welcome — there is often no compiler on it, and no appetite for
+# installing one.
+#
+# Pixi also locks. `pixi.lock` is committed and covers every platform listed
+# below, so a colleague on a different machine resolves nothing: they get
+# the versions this was tested against. That is the same reason the
+# "device" extra is pinned exactly (see its comment above), reached by a
+# mechanism instead of by discipline.
+#
+# Getting started:
+#     pixi run preview          # the synthetic instrument, no hardware
+#     pixi run test             # the unit suite
+#     pixi run -e device viewer # against the nionswift-usim simulator
+#
+# `pixi run` installs what it needs first, so none of these needs a
+# separate install step.
+
+[tool.pixi.workspace]
+channels = ["conda-forge"]
+# win-64 first, deliberately: it is the platform this has to work on.
+# linux-64 is CI and most contributors; osx-arm64 is the rest of them.
+# Adding a platform costs a re-lock (`pixi lock`) and nothing else.
+platforms = ["win-64", "linux-64", "osx-arm64"]
+
+[tool.pixi.dependencies]
+python = ">=3.11,<3.14"
+# From conda-forge rather than left to the pypi resolver: both are
+# compiled, and h5py's HDF5 library is the single most common source of
+# "installed fine, crashes on import" on Windows. Their versions still
+# come from [project.dependencies] - these bounds only say *where* the
+# build comes from, and pixi checks the two agree.
+h5py = ">=3.12"
+numpy = ">=2.2.6"
+
+# The project itself, editable, so `pixi run` picks up an edit without a
+# reinstall. Pixi adds this automatically for a pyproject manifest; it is
+# written out because every feature below overrides it to name its extras,
+# and a default that was invisible next to four explicit ones would be the
+# one nobody could find.
+[tool.pixi.pypi-dependencies]
+miainwoodpecker = { path = ".", editable = true }
+
+#--------------- Features: one per extra, plus the tooling ---------------#
+
+# Each feature installs the matching extra from [project.optional-dependencies]
+# rather than restating its contents, so there is one list of what the
+# viewer needs and pixi cannot drift from it. What the features *do* add is
+# conda builds of the compiled packages underneath those extras: pixi
+# satisfies a pypi requirement with a conda package of the same name, so
+# naming `pyside6` here means the extra's `napari[pyside6]` is met by
+# conda-forge's build instead of a wheel.
+
+[tool.pixi.feature.viewer.dependencies]
+# Qt is the reason this whole table exists. conda-forge's pyside6 brings
+# its own Qt libraries; the PyPI wheel brings Qt too but is far more
+# likely to disagree with what is already on a Windows box.
+pyside6 = "*"
+napari = ">=0.5"
+platformdirs = ">=3"
+
+[tool.pixi.feature.viewer.pypi-dependencies]
+miainwoodpecker = { path = ".", editable = true, extras = ["viewer"] }
+
+# Nion's device stack, and **its own environment on purpose**. It is
+# GPL-3.0, and this project never imports it into its own process (see the
+# licensing note in README.md): it runs as a subprocess, launched via
+# `python -m miainwoodpecker.devices.nion_server`. Keeping it in a separate
+# pixi environment makes that boundary something you can see in the
+# manifest rather than only in a docstring - the default environment does
+# not contain it, so the shipped application demonstrably runs without it.
+[tool.pixi.feature.device.pypi-dependencies]
+miainwoodpecker = { path = ".", editable = true, extras = ["device"] }
+
+[tool.pixi.feature.replay.dependencies]
+# conda-forge's build, so the compiled readers underneath RosettaSciIO
+# (and the HDF5 it shares with h5py) come from one place rather than
+# from a wheel that brought its own.
+rosettasciio = ">=0.6"
+
+[tool.pixi.feature.replay.pypi-dependencies]
+miainwoodpecker = { path = ".", editable = true, extras = ["replay"] }
+
+[tool.pixi.feature.analysis.dependencies]
+# HyperSpy's tree is dask, scipy and scikit-image; conda-forge builds all
+# three, and this is the extra most likely to want a compiler otherwise.
+hyperspy = ">=2.0"
+exspy = ">=0.3"
+threadpoolctl = ">=3"
+
+[tool.pixi.feature.analysis.pypi-dependencies]
+miainwoodpecker = { path = ".", editable = true, extras = ["analysis"] }
+
+[tool.pixi.feature.test.dependencies]
+pytest = ">=8.4.2"
+pytest-cov = "*"
+pytest-randomly = "*"
+
+# Detached from the project on purpose: a style check that had to solve the
+# viewer's Qt stack first would be the slowest fast feedback available.
+[tool.pixi.feature.style.dependencies]
+# Keep in step with the pin in the "dev" extra and the hatch style env.
+ruff = "==0.16.2"
+pydoclint = "*"
+pre-commit = "*"
+
+#--------------- Environments ---------------#
+#
+# `solve-group` is what keeps these consistent: every environment in the
+# "main" group is solved together, so the numpy in `default` is the numpy
+# in `analysis` and a result computed in one is reproducible in the other.
+# `style` sits outside it, having nothing to be consistent with.
+
+[tool.pixi.environments]
+# What a new arrival gets, and it is deliberately the one that needs no
+# hardware and no vendor SDK: the viewer, the synthetic instrument, and
+# the tests.
+default = { features = ["viewer", "test"], solve-group = "main" }
+# Its own environment, like device and analysis below, rather than part
+# of the default. Replaying a recorded session is something you set out
+# to do, and the file reader it needs has no business in the environment
+# someone gets for opening the synthetic instrument - which is also the
+# environment the viewer's own tests run in, and the fewer packages
+# underneath those the better.
+replay = { features = ["viewer", "replay", "test"], solve-group = "main" }
+device = { features = ["viewer", "device", "test"], solve-group = "main" }
+analysis = { features = ["viewer", "analysis", "test"], solve-group = "main" }
+all = { features = ["viewer", "device", "analysis", "replay", "test"], solve-group = "main" }
+style = { features = ["style"], no-default-feature = true }
+
+#--------------- Tasks ---------------#
+
+[tool.pixi.tasks]
+# The demonstration that needs nothing: a synthetic STEM with a scan unit,
+# a Ronchigram camera and an EEL spectrometer. See docs/developing-the-ui.md.
+preview = { cmd = "miainwoodpecker-preview --cameras 2", description = "Open the viewer against the synthetic instrument" }
+# Unit tests only. They need no display and no devices, which is what makes
+# them the default: a check that cannot run on the machine in front of you
+# is not a check.
+test = { cmd = "pytest tests/unit", description = "Run the unit suite" }
+test-all = { cmd = "pytest", description = "Run every test, including those needing a display" }
+
+[tool.pixi.feature.replay.tasks]
+# Takes a session directory:
+#   pixi run -e replay replay /path/to/session --list
+# says what is in one, and without --list it opens the viewer against
+# an acquisition and replays it at the speed it was recorded.
+replay = { cmd = "miainwoodpecker-replay", description = "Replay a recorded acquisition through the viewer" }
+
+[tool.pixi.feature.device.tasks]
+viewer = { cmd = "miainwoodpecker-viewer", description = "Open the viewer against the nionswift-usim simulator" }
+
+[tool.pixi.feature.style.tasks]
+lint = { cmd = "ruff check", description = "Check the code style" }
+format = { cmd = "ruff format", description = "Reformat the code" }
+docstrings = { cmd = "pydoclint src/ tests/", description = "Check the docstrings" }

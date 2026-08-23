@@ -38,6 +38,8 @@ _VIEWER_TEST_MODULES = (
     "test_acquire_images",
     "test_spectrum_image",
     "test_scan_panel",
+    "test_panel_density",
+    "test_documents",
 )
 
 

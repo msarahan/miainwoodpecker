@@ -2,6 +2,305 @@
 
 ## Unreleased
 
+### Added
+
+- **A viewing area that shows more than one dataset at a time.** Every
+  source became a napari layer on one shared canvas, and napari puts
+  every layer at the world origin — so a 512x512 HAADF image and a
+  128x1024 EELS readout landed *on top of each other*, and the only way
+  to see either was to switch the other one's visibility off. Comparing
+  two detectors read out of the same pass is the ordinary case on a
+  scanned instrument, not an advanced one. `viewer/documents.py` now
+  gives each dataset its own window in a `QMdiArea`: each enabled
+  detector, each running camera, each opened recording, each analysis
+  result.
+  **A window per dataset rather than tiles on one canvas, because that
+  is what makes zoom and pan per panel.** Each document is a real
+  `napari.Viewer`, so focusing on one corner of the scan image does not
+  drag the diffraction pattern beside it out of view, and every panel
+  keeps napari's own contrast, colormap and gamma controls because it
+  *is* napari rather than a reimplementation of it.
+  **Nothing can be stretched by any of it.** napari's camera is
+  isotropic — one zoom scalar drives both axes — so a panel whose shape
+  does not suit its data letterboxes and the picture keeps its geometry.
+  `tests/integration/test_documents.py` measures drawn aspect against
+  data aspect after resizing panels to deliberately hostile shapes
+  (900x200, 200x700, 1000x120) for square, 64x1024 and 1024x64 data,
+  rather than trusting it.
+  **New datasets are tiled into place; a layout you arranged is yours.**
+  Nothing opens hidden underneath something already on screen, but the
+  first time a window is moved or resized by hand the area stops
+  rearranging things and later documents go wherever is clearest
+  instead. **View → Tile documents** hands tiling back.
+  **Closing a panel means it stays closed**, since a running detector
+  would otherwise reopen its window on the next frame and make the close
+  button useless. Starting that source again brings the panel back and
+  raises it — the same request as raising one that is merely buried,
+  which is a legitimate way to arrange the area while a source runs.
+  `LiveInstrumentWidget` is unchanged in shape: `DocumentBoard` presents
+  the slice of `napari.Viewer` the widget already used and routes each
+  call to a document, so a plain viewer still works everywhere the board
+  does and every existing widget test builds one directly.
+
+- **Calibrated axes and a per-panel scale bar.**
+  `storage/calibration.py` has modelled per-axis calibration for a while
+  and the storage and analysis layers used it; the viewer did not, so
+  every panel was in bare pixels with nothing for a scale bar to read.
+  `viewer/axes.py` is the bridge, and each panel now carries its own
+  units — measured against the preview instrument, three at once: the
+  HAADF scan in nm, the Ronchigram in mrad, the EEL spectrometer in eV.
+  Changing the field of view mid-scan rescales the running panel.
+  **This is what one canvas could not have done.** napari applies units
+  per layer but draws the scale bar per viewer, and says so out loud when
+  a viewer's layers disagree — *"Inconsistent units across layers; units
+  will not be used for rendering."* A window per dataset turns out to be
+  a requirement of per-image calibration, not a preference.
+  **Geometry is applied only where the axes are commensurable.** A
+  real-space frame sampled four times more finely across than down is
+  drawn four times wider, because that is the specimen's shape rather
+  than the detector's pixel count. A 2D EELS readout is *not*: there is
+  no rate of exchange between an electronvolt and a nanometre, so it
+  keeps pixel geometry with its axes labelled, as DigitalMicrograph and
+  HyperSpy both show it, and gets no scale bar rather than a length drawn
+  across an energy. The calibration is attached to the layer either way,
+  for the readout and ROI work that need the model rather than the
+  drawing.
+
+- **Binning that can differ between a detector's two axes.**
+  `CameraParameters.binning` was one integer documented as applying "in
+  each direction", which cannot describe a spectrometer camera. Binning
+  the non-dispersive direction trades dynamic range for signal-to-noise
+  and is what an EELS camera is routinely run with; binning the
+  dispersive one spends the energy resolution the instrument exists to
+  provide. Two settings with opposite costs were being held in one
+  number.
+  `binning` now takes an `int` *or* a `(y, x)` pair, read back through
+  `binning_yx`. **A scalar still means both directions**, so every
+  adapter and every caller written before this keeps working unchanged —
+  and `validate_binning` refuses an asymmetric pair to any camera that
+  has not published `binning_values_yx`, so a webcam, a Dectris detector
+  or a replayed recording can never be handed a pair it would apply to
+  only one axis. Cameras advertise per axis, since the limits genuinely
+  differ: the preview spectrometer offers 1–8x down and 1–2x across, and
+  a refusal names the axis it applies to.
+  The camera panel follows — one **Image binning** control for a
+  symmetric detector, **Binning (rows)** and **Binning (channels)** for
+  one that distinguishes them. Measured on the preview spectrometer:
+  binning rows 8x takes the readout from 64x1024 to 8x1024 with the
+  dispersion held at 0.500 eV/channel, while binning channels 2x halves
+  them to 512 and widens it to 1.000 eV/channel.
+
+- **A spectrum image can be watched while it is acquired, and no longer
+  freezes the window.** The pass ran *inline on the GUI thread*: for a
+  64x64 grid at a realistic dwell that is minutes with no repaint, no
+  live view, no answer from "Stop scan", and an acquisition the operating
+  system reports as an application that has stopped responding. It is
+  the same failure the recording, loading and analysis paths each already
+  had a job class for; this was the fourth and last handler doing its
+  work where it was called. `PassJob` moves it to a worker thread and
+  `_poll_pass` reports from the display timer.
+  **And there is now something to watch.** `viewer/progress.py` wraps
+  each pass destination and forwards every write through to it
+  unchanged, forming a **virtual detector image** on the way — the
+  signal summed at each beam position, exactly as one is formed offline.
+  A panel named `Acquiring (…)` fills in as the probe goes and the
+  status line counts positions. Drift, contamination and a probe
+  scanning vacuum are all visible in it minutes before the file exists.
+  **No device change was needed for any of it.**
+  `scan_synchronised(into=...)` documents a destination as "a shape, and
+  assignment at a beam position" so that an `h5py` dataset satisfies it;
+  the preview is one too. Every adapter honouring that contract gets a
+  progress view without knowing this exists, which is why it is done
+  here rather than by adding a callback each future adapter would have
+  to remember to fire. The data is written through **first and in full**
+  — the summary is formed afterwards, and a write the preview cannot
+  summarise still lands.
+  The summary subsamples anything large, so a 512x512 diffraction
+  pattern does not cost a quarter of a million adds per position in a
+  fast pass; the display range tracks the positions actually visited, so
+  the unwritten zeros do not crush every real value to white.
+
+### Changed
+
+- **The live view refreshes at 60 fps, up from 30.** The display timer
+  was a hard-coded 33 ms with nothing behind the number. Measured end to
+  end — through `refresh_display`, the document board and napari, with a
+  zero-cost frame source so the display path is what is being timed —
+  the whole thing costs **9.4 ms at 512², 9.7 ms at 1024² and 10.2 ms at
+  2048²**. Near enough flat, because the pixels go to the GPU, so the
+  path already sustained ~100 fps and the old timer was discarding two
+  thirds of it.
+  **Raising it is close to free when nothing is arriving**, which is what
+  makes it safe on a slower machine than the one measured: a tick that
+  finds the frame it already drew costs **4.4 microseconds** — 0.026% of
+  a core at 60 Hz — because the identity check skips before any upload or
+  contrast pass. Cost tracks frames produced, not ticks.
+  The two per-frame passes the calibration work added are not a factor
+  either: resolving a frame's calibration is 0.01 ms at every size, and
+  the autocontrast min/max is 0.5 ms at 2048² — 5% of the frame budget,
+  and it runs for the scan path only.
+
+- **A window is sized to its picture, so no panel has black bars in
+  it.** The frame takes the data's own shape and the picture fills it
+  edge to edge — measured at 1.000 fill on *both* axes for square, very
+  wide, very tall, tiny and oversized data alike. Blank space in a panel
+  spends screen on nothing, and two panels of different shapes padded to
+  the same shape look like the same panel.
+  **Small data is magnified rather than shown as a stamp**: anything
+  whose longest side is under 256 pixels opens scaled up to it, so a
+  64x64 spectrum-image map opens as a 256-pixel window. The floor and
+  the target are one number deliberately — magnifying to 512 while
+  leaving 256 alone would open a 128-pixel scan in a *larger* window
+  than a 256-pixel one, and window size would stop meaning anything
+  about the data. Anything already that large opens at one screen pixel
+  per acquired pixel and shrinks only if it will not otherwise fit.
+  A panel a few pixels too wide for a row it nearly fits is shrunk into
+  it rather than wrapped: two panels came to a handful of pixels more
+  than a dock-narrowed workspace, and wrapping sent the second to the
+  overlap fallback, so two that all but fitted side by side ended up
+  stacked. Packing resets each window to its content size first, so
+  tiling repeatedly does not erode them.
+  **Tiling means beside, not filling.** `tileSubWindows` divides the
+  whole area between the windows, which gives each the *area's* shape
+  rather than its picture's and puts the bars straight back, so panels
+  are packed at their own sizes instead. **No part of a window is ever
+  outside the workspace** — too big is shrunk, overhanging is moved in,
+  and shrinking the application brings the panels in with it. Overlap is
+  allowed when there is no room, but staggered so a covered window keeps
+  a corner to raise it by.
+  **View → Actual resolution** (`Ctrl+1`) gives one screen pixel per
+  acquired pixel; **View → Fit panel to data** (`Ctrl+0`) returns, and
+  hands the panel back to automatic fitting. A panel the operator has
+  zoomed is never refitted by anything automatic.
+  Two timing traps are recorded in the code because both produced
+  visible faults: the refit has to happen on the panel's *resize event*
+  rather than straight after the resize call, since Qt resizes the
+  canvas afterwards — fitting immediately fits to the size the panel is
+  about to stop being, and drew an image 44% taller than its own panel;
+  and the window can only be sized once it *has* data, since a document
+  is created before its first layer is added.
+
+### Fixed
+
+- **The aspect-ratio test was measuring nothing.** It computed drawn
+  width and height by multiplying each by the same `camera.zoom`, which
+  cancels — so it compared the array's pixel ratio with itself and would
+  have passed however the image was drawn. It now maps unit steps along
+  each world axis through the live VisPy scene transform and compares the
+  screen distances, which is a measurement an anisotropic camera would
+  fail, and a separate test pins that isotropy directly.
+
+- **A device that replays a recorded session, at the speed it was
+  taken.** `devices/replay.py` opens a DigitalMicrograph spectrum-image
+  session and serves it through `Scanner`, `SynchronisedScanner` and
+  `Camera`, so the viewer, `PassWriter` and the NeXus layout run against
+  real data unchanged. It is deliberately a *device* and not a file
+  reader: a reader answers "what is in this file", and the question this
+  answers is "does the acquisition path work" — the synchronisation, the
+  pass, the streaming writer, the refusals, and the timing an operator
+  actually sits through.
+  **The correlation a `ScanPass` asserts is, for the first time,
+  historical fact rather than a property of the adapter.** The HAADF
+  channel in these sets was read out by the instrument *during* the
+  spectrum image's own acquisition, so `scan_sync = "detector"` is a
+  statement about what GMS did in 2011. Measured on the first set:
+  a carbon map integrated above the C-K edge correlates with the HAADF
+  of the same pass at **+0.995**.
+  **What it will not do is resample.** A recording is the grid the
+  operator chose — 22x25 beam positions — and any other geometry is
+  refused rather than interpolated to, because a cube of the requested
+  shape whose every pixel was invented looks exactly like a real one.
+  The viewer therefore asks a device for its geometry before using the
+  panel's: `native_scan_parameters` returns None for every device that
+  has no such constraint, and the square Positions spin box cannot even
+  express 22x25.
+  Everything is read from the file rather than assumed: the energy axis
+  by its *units* (this reader returns an SI as `(energy, y, x)` and a
+  line scan from the same session as `(x, energy)`, so neither the axis
+  order nor the `navigate` flag can be trusted); the dwell from
+  `SI.Acquisition.Pixel time (s)`; the binning by comparing the
+  acquisition's dispersion against the spectrometer's own; the
+  accelerating voltage and drift-tube setting from the microscope tags.
+  Timing is the recording's own unless `--speed` is passed, and a
+  compressed replay says so in the metadata of everything it produces —
+  as does the `replay` backend name, on every frame and every spectrum,
+  because by the time anyone reads a log the session has happened.
+  `pixi run -e replay replay <session> --list` says what a directory
+  holds; without `--list` it opens the viewer against one acquisition.
+  The reader is the new `replay` extra (RosettaSciIO alone, not
+  HyperSpy) and gets its own pixi environment, so a microscope PC does
+  not need the analysis stack to replay a session.
+
+- **A spectrum image can be gathered without hardware.** The preview
+  instrument grows an EEL spectrometer, `PreviewEELSCamera`, and a
+  synchronised pass can now read a detector out *as spectra* at every
+  beam position — so the whole path from device to `NXspectrum` on disk
+  is exercisable on a laptop with no microscope and no vendor SDK.
+  **What makes a detector a spectrometer is that one of its axes is
+  calibrated in energy rather than in space**, and nothing here treats
+  its *rank* as the distinguishing thing. The ordinary readout is the 2D
+  dispersed image, which is what the camera delivers by default and what
+  an operator aligns on; summing the non-dispersive direction to 1D is a
+  mode they choose, and keeping the whole 2D readout per beam position
+  is a real experiment rather than a misconfiguration.
+  So what a pass does with a target follows its **readout mode** and
+  never its type: projecting, it contributes a rank-3 spectrum image;
+  imaging, it contributes a 4D stack of whole detector readouts — the
+  same container a Ronchigram camera fills, because at that point the
+  two are the same shape of data. Which is why the axes now travel with
+  the stack: a `DiffractionStack` carries the detector's own
+  calibration, and `PassWriter` prefers it over its own default, since
+  otherwise the one fact separating a 2D EELS cube from a diffraction
+  cube would be absent from the file.
+  The spectral model encodes something checkable, which is the whole
+  reason it is more than decoration: a zero-loss peak whose *channel*
+  moves when the spectrometer's energy offset is driven while its
+  *energy* stays at zero, silicon and carbon plasmons, the power-law
+  background every quantification subtracts, the Si L2,3 and C K edges
+  at their real onsets with complementary heights, and Poisson noise. A
+  silicon map integrated out of a spectrum image therefore tracks the
+  HAADF channel **of the same pass** — a test asserts it, and a cube of
+  one repeated spectrum would pass a shape check and fail that.
+  The edge heights were sized against the background at their own
+  onsets rather than in isolation; the first attempt buried the silicon
+  edge in its own background, which is a fair model of a *bad*
+  acquisition and no use as the thing a demonstration points at.
+  The energy axis is nionswift-usim's — 0.5 eV per channel, channel 0 at
+  −20 eV — so the preview's spectrometer lands on the same axis as the
+  backend this project validated its calibration path against.
+  **The target name decides the detector**, which is a correction as
+  much as a feature: before this, a preview asked for two cameras served
+  a *Ronchigram* on the `eels_camera` target.
+  `PassWriter` gained `spectra=`, allocating a rank-3 dataset chunked
+  one beam position per chunk — deliberately not `SpectrumWriter`'s row
+  chunking, because that writer receives a finished map and this one is
+  filled position by position as the device acquires. Each signal is
+  spelled in the vocabulary its own kind already has: image channels and
+  cubes keep `data`, spectrum images use `NXspectrum`'s `intensity`,
+  `axis_energy`, `axis_j` and `axis_i`, exactly as a standalone spectrum
+  recording does. `read_pass` therefore asks each `NXdata` group what
+  its signal is called instead of assuming — which is what that
+  attribute is for, and a reader that assumed `data` would silently omit
+  every spectrum image from the list of what a file holds.
+  In the window: a **Detector readout** control per camera, and a
+  **Per-position detector** selector beside the positions count. The
+  readout control configures the device the moment it changes, unlike
+  the exposure and binning beside it — readout decides the rank of every
+  frame the detector produces, so a camera whose live view imaged while
+  its next acquisition projected would be in two states at once. It is
+  offered on every camera and refused by the ones that cannot project,
+  because `Camera` has no capability to ask and widening a
+  `runtime_checkable` protocol would break every adapter that passes its
+  check today; the refusal reaching the operator is the point, since one
+  who never sees it learns nothing about why their Ronchigram camera is
+  not a spectrometer. The target selector is honoured rather than
+  falling back to the first target, which would acquire against a
+  detector nobody chose and store it under that detector's name.
+  Known limit, unchanged and still stated: the grid is square. The
+  acquisition no longer blocks the GUI thread — see the entry above on
+  watching a spectrum image build — which mattered most here, since a
+  spectrum image is what an operator will want a large grid of.
+
 ### Changed
 
 - **Several detectors can be live at once, and the panel says so.** The
@@ -148,9 +447,10 @@
   loop and surfaced as an h5py broadcast `TypeError` naming neither the
   target nor the acquisition. It now checks the whole shape and says
   which of the two numbers is wrong.
-  Known limits, stated rather than papered over: the grid is square and
-  the acquisition blocks the GUI thread (both wait on the target-area UI
-  and a job boundary), and a stored pass appears in the Recordings list
+  Known limits, stated rather than papered over: the grid is square
+  (it waits on the target-area UI), the acquisition ran on the GUI
+  thread until the entry above moved it off, and a stored pass appears
+  in the Recordings list
   as `0 frames` because that list only understands frame stacks — a test
   pins that it does not *break* the list, which is the part that matters
   meanwhile.

@@ -1,5 +1,40 @@
 # Development Guide
 
+## Two toolchains, and which one you want
+
+This project can be worked on through **pixi** or through **hatch**, and
+they are not competing — they answer different questions.
+
+**Pixi is the way in.** One command from a fresh clone to a running
+application, with a committed lockfile so nothing is resolved on your
+machine, and conda-forge builds of Qt, HDF5 and the scientific stack so
+Windows works the same way Linux does. If you are here to run the thing,
+fix a bug, or set up a microscope PC, use pixi:
+
+```shell
+pixi run preview     # the synthetic instrument
+pixi run test        # the unit suite
+pixi run -e style lint
+```
+
+`pixi run` with no arguments lists every task. The environments are
+`default`, `device`, `analysis`, `all` and `style`; see the commented
+`[tool.pixi]` tables at the bottom of `pyproject.toml` for what each is
+for and why the GPL-3.0 device stack is isolated in its own.
+
+**Hatch is the maintainer's toolchain**, and it is what CI drives: it
+builds the wheel and sdist, runs the test matrix across Python 3.11–3.13,
+validates NeXus files against their schema, and builds the docs. Those
+are jobs pixi is not set up for here. The rest of this page is about
+hatch.
+
+The two share one source of truth for dependencies —
+`[project.dependencies]` and `[project.optional-dependencies]` — so a
+package added for one is available to the other. If you add a dependency,
+run `pixi lock` and commit the updated `pixi.lock`.
+
+---
+
 Welcome to your shiny new package. This page will help you get started with using Hatch to manage your package.
 
 If you look at your project, you will see that a `pyproject.toml` file. This file stores both your package configuration and settings for development tools like Hatch that you will use to work on your package.

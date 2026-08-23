@@ -332,6 +332,28 @@ geometry; what a pass adds is a container grouping it with the image
 channels from the same traversal, and `metadata["simultaneous_with"]` is
 where a device that knows already says so.
 
+**Update: the pass was built, and that prediction held.** `ScanPass`
+landed with a `spectra` slot, and filling it needed nothing new from
+this design — the first device to do so, the preview instrument's EEL
+spectrometer, produces exactly the rank-3 `Spectrum` described above and
+fills `simultaneous_with` because the call that made it really did
+traverse the probe once.
+
+Two things the implementation added that this section did not anticipate,
+both about **which** signal a target contributes:
+
+- **The readout mode decides, not the detector type.** A target set to
+  a projected readout contributes a spectrum image; one left imaging
+  contributes a 4D stack. That covers the spectrometer read out in 2D —
+  a real experiment, since what makes a detector a spectrometer is that
+  one axis is calibrated in energy and not that the others have been
+  summed away.
+- **So the detector's axes have to travel with a 4D stack.** A
+  2D-readout spectrum image and a diffraction cube are the same shape of
+  data in the same container; the calibration is the only thing telling
+  them apart, and a writer using its own default for the detector axes
+  would drop it.
+
 ### 2.4 `TARGET_NAMES`: add minimally, do not do the redesign
 
 `docs/vendor-support.md` lists the fixed positional tuple under "What is

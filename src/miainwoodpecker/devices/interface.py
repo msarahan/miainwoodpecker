@@ -337,6 +337,15 @@ sentence, rather than silently imaging.
 """
 
 READOUT_MODES = (IMAGE_READOUT, PROJECTED_READOUT)
+
+BINNING_AXES = ("y", "x")
+"""
+The axes a per-axis binning pair names, slow first.
+
+Same order and same reason as a frame's ``(height, width)`` shape and
+``storage.calibration.AXIS_NAMES``: one convention for which direction
+comes first, so a pair cannot be transposed by whoever reads it next.
+"""
 """Every readout mode a :class:`CameraParameters` may request."""
 
 
@@ -356,11 +365,24 @@ class CameraParameters:
     ----------
     exposure_ms : float
         Integration time per frame, in milliseconds. Must be positive.
-    binning : int
-        How many sensor pixels are combined per stored pixel, in each
-        direction. A binned pixel spans proportionally more of the axis,
-        so this multiplies the calibration scale — which is why the two
-        are one type. Must be one of the camera's ``binning_values``.
+    binning : int | tuple[int, int]
+        How many sensor pixels are combined per stored pixel. A binned
+        pixel spans proportionally more of the axis, so this multiplies
+        the calibration scale — which is why the two are one type.
+
+        **An integer means the same factor in both directions, which is
+        the common case but not the only one.** A spectrometer camera is
+        routinely binned along one axis only: binning the non-dispersive
+        direction trades dynamic range for signal-to-noise, while binning
+        the dispersive one would spend spectral resolution, so an EELS
+        camera is often run at 1 across and 4 or 8 down. A
+        ``(y, x)`` pair says so, slow axis first, matching the
+        ``(height, width)`` convention used for frame shapes throughout.
+
+        Each factor must be one the camera offers for *that* axis — see
+        :func:`axis_binning_values`, since a detector may permit more
+        binning down than across. Read it back through
+        :attr:`binning_yx` rather than branching on the type.
     readout : str
         One of :data:`READOUT_MODES`. :data:`IMAGE_READOUT` (the
         default) delivers the sensor's 2D image exactly as before;
@@ -370,22 +392,75 @@ class CameraParameters:
     """
 
     exposure_ms: float
-    binning: int = 1
+    binning: int | tuple[int, int] = 1
     readout: str = IMAGE_READOUT
 
     def __post_init__(self) -> None:
-        """Reject values no camera could act on."""
+        """
+        Reject values no camera could act on.
+
+        Raises
+        ------
+        ValueError
+            If the exposure is not positive, the readout is not a known
+            mode, or any binning factor is below one — including one
+            factor of an otherwise valid pair, since a frame binned zero
+            times in one direction is not a frame.
+        """
         if not self.exposure_ms > 0:
             msg = f"exposure_ms must be positive, got {self.exposure_ms!r}"
             raise ValueError(msg)
-        if self.binning < 1:
-            msg = f"binning must be at least 1, got {self.binning!r}"
+        if isinstance(self.binning, tuple):
+            if len(self.binning) != len(BINNING_AXES):
+                msg = (
+                    f"binning as a pair is (y, x), so it needs "
+                    f"{len(BINNING_AXES)} factors, got {self.binning!r}"
+                )
+                raise ValueError(msg)
+            invalid = [factor for factor in self.binning if factor < 1]
+        else:
+            invalid = [self.binning] if self.binning < 1 else []
+        if invalid:
+            msg = f"every binning factor must be at least 1, got {self.binning!r}"
             raise ValueError(msg)
         if self.readout not in READOUT_MODES:
             msg = (
                 f"readout must be one of {READOUT_MODES}, got {self.readout!r}"
             )
             raise ValueError(msg)
+
+    @property
+    def binning_yx(self) -> tuple[int, int]:
+        """
+        Return the binning as a ``(y, x)`` pair, whatever it was given as.
+
+        The one place the scalar-or-pair union is resolved, so no device
+        adapter has to branch on the type — and so an adapter written
+        before per-axis binning existed keeps reading a single number
+        while one that cares reads both.
+
+        Returns
+        -------
+        tuple[int, int]
+            Slow-axis and fast-axis binning factors.
+        """
+        if isinstance(self.binning, tuple):
+            return self.binning
+        return (self.binning, self.binning)
+
+    @property
+    def is_symmetric_binning(self) -> bool:
+        """
+        Return whether both axes are binned by the same factor.
+
+        Returns
+        -------
+        bool
+            True for the ordinary square case, including a pair that
+            happens to hold two equal factors.
+        """
+        down, across = self.binning_yx
+        return down == across
 
 
 @typing.runtime_checkable
@@ -411,7 +486,14 @@ class Camera(typing.Protocol):
 
     @property
     def binning_values(self) -> typing.Sequence[int]:
-        """Return the binning factors this camera supports, ascending."""
+        """
+        Return the binning factors this camera supports, ascending.
+
+        For a detector that bins both directions alike — most of them —
+        this is the whole answer. One that does not may additionally
+        offer ``binning_values_yx``; read either through
+        :func:`axis_binning_values`, which is what the viewer asks.
+        """
         ...
 
     def parameters(self) -> CameraParameters:
@@ -453,6 +535,95 @@ class Camera(typing.Protocol):
     def close(self) -> None:
         """Release the device and any background threads it owns."""
         ...
+
+
+def axis_binning_values(
+    camera: Camera,
+) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    """
+    Return the binning factors a camera offers for each axis.
+
+    An optional extension rather than a change to
+    :attr:`Camera.binning_values`, so that every existing adapter — a
+    webcam, a Dectris detector, a replayed recording — keeps describing
+    itself exactly as it did and needs no edit to remain correct. A
+    detector whose axes genuinely differ implements
+    ``binning_values_yx``; everything else is read as offering its one
+    set on both axes.
+
+    Asking rather than assuming matters here because the axes are not
+    interchangeable on a spectrometer: binning the non-dispersive
+    direction trades dynamic range for signal-to-noise and is routine,
+    while binning the dispersive one spends spectral resolution, so a
+    camera may reasonably offer far more of the first than the second.
+    Offering the operator a factor the detector will refuse is the
+    failure this exists to prevent.
+
+    Parameters
+    ----------
+    camera : Camera
+        The camera to ask.
+
+    Returns
+    -------
+    tuple[tuple[int, ...], tuple[int, ...]]
+        Slow-axis and fast-axis factors, ascending. Both are ``(1,)`` for
+        a camera that reports nothing, so a caller always has something
+        to offer.
+    """
+    per_axis = getattr(camera, "binning_values_yx", None)
+    if per_axis is not None:
+        down, across = per_axis
+        return (tuple(down) or (1,), tuple(across) or (1,))
+    shared = tuple(camera.binning_values) or (1,)
+    return (shared, shared)
+
+
+def validate_binning(camera: Camera, parameters: CameraParameters) -> None:
+    """
+    Refuse binning factors a camera cannot actually take.
+
+    **A camera that does not advertise per-axis binning is symmetric
+    only.** That is the load-bearing rule here, and it is what lets
+    per-axis binning be added without auditing every adapter: a webcam,
+    a Dectris detector or a replayed recording never sees an asymmetric
+    pair, because one is rejected before it reaches them rather than
+    silently applied to one axis. Opting in by publishing
+    ``binning_values_yx`` is how a detector says it can tell its axes
+    apart.
+
+    Parameters
+    ----------
+    camera : Camera
+        The camera being configured.
+    parameters : CameraParameters
+        The requested settings.
+
+    Raises
+    ------
+    ValueError
+        If the camera bins symmetrically only and the factors differ, or
+        if either factor is not one that axis offers.
+    """
+    down, across = parameters.binning_yx
+    if getattr(camera, "binning_values_yx", None) is None and down != across:
+        msg = (
+            f"{camera.camera_id} bins both directions by the same factor, so "
+            f"it cannot take {parameters.binning!r}; a detector that can bin "
+            f"its axes separately says so with binning_values_yx"
+        )
+        raise ValueError(msg)
+    offered_down, offered_across = axis_binning_values(camera)
+    for factor, offered, axis in (
+        (down, offered_down, BINNING_AXES[0]),
+        (across, offered_across, BINNING_AXES[1]),
+    ):
+        if factor not in offered:
+            msg = (
+                f"binning {factor} is not supported on {axis}; "
+                f"{camera.camera_id} offers {list(offered)} there"
+            )
+            raise ValueError(msg)
 
 
 @typing.runtime_checkable
@@ -1294,6 +1465,35 @@ class SynchronisedScanner(typing.Protocol):
             The pass and everything read out of it.
         """
         ...
+
+
+def native_scan_parameters(scanner: object) -> ScanParameters | None:
+    """
+    Return the one geometry a device can acquire, if it has only one.
+
+    The question a caller has to be able to ask once replay devices
+    exist: most scan units take whatever grid they are given, and a
+    replay has exactly one. Asked through a function rather than through
+    ``isinstance`` against another protocol, because this is a property
+    of a *device instance* and not a capability class - and because one
+    more runtime-checkable protocol would be one more all-or-nothing
+    check of the kind :class:`Instrument` already documents as a trap.
+
+    Parameters
+    ----------
+    scanner : object
+        Any scan unit.
+
+    Returns
+    -------
+    ScanParameters | None
+        The device's fixed geometry, or None if it accepts any.
+    """
+    native = getattr(scanner, "native_parameters", None)
+    if native is None:
+        return None
+    result = native()
+    return result if isinstance(result, ScanParameters) else None
 
 
 # Neutral names for the controls an InstrumentController may report through
