@@ -85,7 +85,7 @@ jobs:
 
   # Validate the files this project writes against the official NXem NXDL
   # schema, per docs/migration-plan.md Phase 3: that check belongs in CI, not
-  # the runtime, so pynxtools lives in its own hatch env and is never a
+  # the runtime, so pynxtools lives in its own pixi environment and is never a
   # dependency of the shipped package. Its own job rather than a step in the
   # matrix above because it needs no extras, no display, and no OS/Python
   # sweep - the file layout it checks does not vary across them.
@@ -93,18 +93,20 @@ jobs:
   # deliberately non-conforming file is still reported invalid, so this cannot
   # go green on an unvalidated file. (`pynx validate` alone would: the CLI
   # exits 0 even when it prints "is NOT valid".)
+  # pixi rather than hatch, and `environments: validate` so the runner
+  # installs that one environment rather than the Qt and analysis stacks it
+  # has no use for. `frozen: true` for the reason pixi.yml gives: fail rather
+  # than re-solve if pixi.lock and the manifest have drifted apart.
   nexus-schema:
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-    - name: Set up Python
-      uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v5
+    - name: Set up pixi
+      uses: prefix-dev/setup-pixi@f00437f565399d418b0acc85936d12c1fb668347 # v0.10.1
       with:
-        python-version: "3.11"
-
-    - name: Install hatch
-      uses: pypa/hatch@install
+        environments: validate
+        frozen: true
 
     - name: Validate written files against the NXem NXDL schema
-      run: hatch run validate:schema
+      run: pixi run -e validate schema

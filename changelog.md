@@ -212,6 +212,28 @@
   and the window can only be sized once it *has* data, since a document
   is created before its first layer is added.
 
+- **The NeXus schema check is a pixi environment rather than a hatch-only
+  job.** `hatch run validate:schema` was the only way to run the one check
+  that guards the on-disk format, so on a machine with pixi and nothing
+  else it could not be run at all — getting an answer out of it once took
+  a pip-install of pynxtools into a scratch directory. It is now
+  `pixi run -e validate schema`, and CI's `nexus-schema` job installs that
+  one environment from `pixi.lock` instead of hatch. The hatch environment
+  is gone; hatch still owns the wheel and sdist, the Python 3.11–3.13
+  matrix, the integration suite and the docs.
+  **The environment sits outside the "main" solve group**, because
+  pynxtools brings a large pypi tree and this check has nothing to be
+  consistent with — the same isolation the hatch env stated as its reason
+  for existing. Its Python is no longer pinned: that pin existed because
+  hatch resolved each environment's interpreter independently of CI's
+  `setup-python` and picked one that failed, and pixi locks the
+  interpreter with everything else. The lock currently records 3.13, on
+  which pynxtools 0.15 runs the whole check green.
+  **One honest difference.** The hatch env resolved afresh every run, so a
+  pynxtools release tightening the schema showed up on the next CI run;
+  `pixi.lock` pins it, so that signal now arrives when someone runs
+  `pixi lock`.
+
 ### Fixed
 
 - **The out-of-tree adapter stand-in did not survive losing a port, so

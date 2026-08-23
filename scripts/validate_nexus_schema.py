@@ -8,7 +8,7 @@ environment. They still are - but ``pynxtools`` is on PyPI, PyPI *is*
 reachable, and ``pynxtools`` ships the NXDL definitions inside the
 package, so the schema can be checked entirely offline. The Phase 3 note
 also said where this belongs: a CI validation step, not the runtime. This
-script is that step; ``pynxtools`` appears only in the ``validate`` hatch
+script is that step; ``pynxtools`` appears only in the ``validate`` pixi
 environment and is never imported by the shipped package.
 
 What it checks, and why each check exists
@@ -74,7 +74,7 @@ Exits non-zero if any check fails, which is the point: ``pynx validate``
 itself exits 0 even when it prints "is NOT valid", so a CI step built on
 the bare CLI would pass silently forever.
 
-Run with: hatch run validate:schema
+Run with: pixi run -e validate schema
 """
 
 from __future__ import annotations
