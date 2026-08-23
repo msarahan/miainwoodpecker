@@ -31,6 +31,11 @@ _A_DEFOCUS_NM = 175.0
 # Session context is a dialog, not a section: it is set once a shift and
 # spent four form rows and two text boxes in the dock paying for that.
 _EXPECTED_SECTIONS = {"instrument", "recordings", "devices"}
+# Built only when an analysis extra is *missing*, which is a property of
+# the machine the suite runs on rather than of the panel: CI installs all
+# three and never sees it. So it is allowed here rather than required,
+# and test_live_widget.py patches availability to pin down both cases.
+_OPTIONAL_SECTIONS = {"analysis"}
 # One between the path and the free space, one between the free space
 # and napari's "Ready".
 _EXPECTED_RULES = 2
@@ -98,10 +103,12 @@ def test_the_panel_scrolls():
 
 
 def test_every_top_level_group_is_collapsible():
-    """All four groups fold, not just the per-device ones inside Devices."""
+    """Every top-level group folds, not just the per-device ones inside Devices."""
     viewer, widget = _open()
     try:
-        assert set(widget.panel_sections) == _EXPECTED_SECTIONS
+        keys = set(widget.panel_sections)
+        assert keys >= _EXPECTED_SECTIONS
+        assert keys <= _EXPECTED_SECTIONS | _OPTIONAL_SECTIONS
     finally:
         widget.shutdown()
         viewer.close()

@@ -151,6 +151,7 @@ from miainwoodpecker.viewer import axes, preferences, profiles, progress
 from miainwoodpecker.viewer import jobs as jobs_module
 from miainwoodpecker.viewer.documents import ATTACHED_TO
 from miainwoodpecker.viewer.jobs import AnalysisJob
+from miainwoodpecker.viewer.panels import analysis as analysis_panel
 from miainwoodpecker.viewer.panels import devices as devices_panel
 from miainwoodpecker.viewer.panels import instrument as instrument_panel
 from miainwoodpecker.viewer.panels import recordings as recordings_panel
@@ -1006,7 +1007,9 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         Returns
         -------
         dict[str, sections_panel.CollapsibleSection]
-            ``instrument``, ``recordings`` and ``devices``. Session
+            ``instrument``, ``recordings`` and ``devices``, plus
+            ``analysis`` when an analysis extra is not installed — that
+            one is built only when it has something to say. Session
             context is a dialog rather than a section - see
             :meth:`open_session_settings`.
         """
@@ -1039,7 +1042,7 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
 
     def _build_ui(self) -> None:
         """
-        Build the dock: four folding groups in a scroll area.
+        Build the dock: its folding groups, in a scroll area.
 
         Both halves of that are load-bearing, and neither substitutes
         for the other.
@@ -1067,11 +1070,18 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         # widgets it owns, so they have to exist before anything else
         # is assembled. See panels/session.py.
         self._session_dialog = session_panel.build_session_dialog(self)
-        built = (
+        built = [
             ("instrument", instrument_panel.build_instrument_panel(self)),
             ("recordings", recordings_panel.build_recordings_group(self)),
             ("devices", devices_panel.build_devices_panel(self)),
-        )
+        ]
+        # Last, and only when an extra is missing. What this installation
+        # can analyze is not a property of any camera, so it is a section
+        # of its own rather than a row under whichever camera happened to
+        # be first — see panels/analysis.py.
+        extras = analysis_panel.build_analysis_panel(self)
+        if extras is not None:
+            built.append(("analysis", extras))
         for key, content in built:
             # The section header carries the title now, so the box
             # inside it would otherwise say the same word twice - the

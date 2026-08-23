@@ -639,6 +639,34 @@
   not report is named as "not reported" beside the field that is still
   showing its last value.
 
+- **"Analysis extras" was printed under a camera's name, so it read as a
+  property of that camera.** The row naming which analysis libraries are
+  installed was built into the *first* camera's section: a panel headed
+  "Camera - usim_ronchigram_camera" said "Analysis extras / enabled:
+  none" underneath, which reads as this camera having no analysis rather
+  than this machine having no libraries — and on a two-camera instrument
+  it read as a difference between the two cameras, since only one of
+  them carried the row. What `pip install` decided is the same answer
+  for every camera served, so it is a top-level **Analysis extras**
+  section of its own now, beside Instrument, Recordings and Devices,
+  built only when an extra is missing exactly as the row was. The three
+  buttons stay in a Camera section, because those do run against that
+  camera.
+  **The move gave the summary an answer in a case where it had none.**
+  An instrument serving no camera builds no camera section, so the
+  summary had nowhere to appear and an operator on a scanner-only
+  instrument could not find out what was installed at all.
+  `viewer/panels/analysis.py` is the new home of both halves and says
+  which is which; `viewer/panels/devices.py` is 125 lines shorter for
+  it. `_analyze_button`, `_analyze_status` and their siblings are reset
+  to `None` there, before and regardless of the loop over cameras — they
+  used to be set only inside it, so a camera-less widget left them unset
+  entirely and the handlers that read them would have raised
+  `AttributeError` rather than taking their "nothing to analyze" branch.
+  A new test builds a two-camera widget with nothing installed and pins
+  the summary outside every device section and inside the new one, so
+  the row cannot quietly move back under a camera — either camera.
+
 ### Changed
 
 - **The viewer is a client of the broker now, not the owner of the

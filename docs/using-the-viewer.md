@@ -236,8 +236,10 @@ size that sidebar is bigger than the image it belongs to.
 ## The dock
 
 The panel on the right holds three groups — **Instrument**,
-**Recordings** and **Devices**. Click any group's header to fold it
-away; the disclosure triangle shows which way it will go.
+**Recordings** and **Devices** — and a fourth, **Analysis extras**, when
+an analysis library is not installed (see
+[first-look analysis](#first-look-analysis)). Click any group's header
+to fold it away; the disclosure triangle shows which way it will go.
 
 The groups **scroll**, so nothing is ever out of reach no matter how
 many devices your instrument serves or how many groups you have open.
@@ -602,9 +604,9 @@ use the opened file** to run them against a recording you opened
 instead.
 
 **A button only appears when its extra is installed** — `analysis`,
-`libertem` and `py4dstem` respectively. In place of the missing ones the
-Camera section shows a single **Analysis extras** row naming what is
-enabled, what is available, and the command to install it:
+`libertem` and `py4dstem` respectively. In place of the missing ones an
+**Analysis extras** section of its own names what is enabled, what is
+available, and the command to install it:
 
 ```
 enabled: analysis
@@ -612,9 +614,15 @@ available: libertem, py4dstem
 pip install "miainwoodpecker[libertem,py4dstem]"
 ```
 
-With all three installed the row is not shown, because the three buttons
-already say so. A button that cannot work is worse than an absent one:
-it teaches you that this application's buttons sometimes do nothing.
+With all three installed the section is not shown, because the three
+buttons already say so. A button that cannot work is worse than an
+absent one: it teaches you that this application's buttons sometimes do
+nothing.
+
+The buttons sit in a Camera section because they run against that
+camera; what is *installed* is not a camera's property — it is the same
+answer for every camera served, and for an instrument serving none — so
+it is not printed under one camera's name.
 
 These are deliberately previews, not an analysis suite. For real
 analysis, the same recordings open directly in HyperSpy, LiberTEM, or
