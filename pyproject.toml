@@ -781,6 +781,20 @@ replay = { cmd = "miainwoodpecker-replay", description = "Replay a recorded acqu
 
 [tool.pixi.feature.device.tasks]
 viewer = { cmd = "miainwoodpecker-viewer", description = "Open the viewer against the nionswift-usim simulator" }
+# Serve whatever microscope this machine is configured for, from one
+# well-known place rather than a command line nobody remembers. Copy an
+# example out of instruments/ to $HOME/.miainwoodpecker/instrument.toml
+# and edit it; see docs/instrument-configuration.md.
+#
+# $HOME rather than ~ because pixi's task shell expands the first and
+# not the second, on every platform including Windows - a tilde here
+# would be passed through literally and the file would never be found.
+#
+# The invitation is published beside the configuration, so a notebook or
+# a dashboard reads $HOME/.miainwoodpecker/broker.json and needs to be
+# told nothing at all. Extra arguments are appended, so `pixi run -e
+# device broker --host 0.0.0.0` still works.
+broker = { cmd = "miainwoodpecker-broker --config $HOME/.miainwoodpecker/instrument.toml --publish $HOME/.miainwoodpecker", description = "Serve the instrument described by $HOME/.miainwoodpecker/instrument.toml" }
 
 [tool.pixi.feature.style.tasks]
 lint = { cmd = "ruff check", description = "Check the code style" }

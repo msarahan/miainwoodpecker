@@ -4,6 +4,60 @@
 
 ### Added
 
+- **A file per microscope that says what hardware it has, and starts
+  it.** An instrument is not one device server: SuperSTEM 3 is a Nion
+  column whose scan unit and Ronchigram camera come from Nion's stack
+  *plus* a DECTRIS ELA on the spectrometer that speaks SIMPLON and knows
+  nothing about Nion, and SuperSTEM 2 is a Nion column plus a Bruker EDX
+  detector behind a vendor SDK. Each adapter is a separate process, and
+  the broker could start exactly one of them — named on its command line
+  — so an instrument with two adapters could not be served whole at all.
+  `instrument_config.py` is the missing description and
+  `miainwoodpecker-broker --config <file>` reads it: every adapter the
+  file enumerates is started, checked, and served as one instrument with
+  one target map.
+  **The enumeration is authoritative, which is the whole reason it is
+  worth writing.** A device server reports what it found; nothing above
+  it can tell "this column has no EELS camera" from "this column's EELS
+  camera did not come up" — a spectrometer left switched off or a plug-in
+  that failed to load produces a perfectly consistent instrument with one
+  fewer camera, and every layer above serves it happily. Checked against
+  a file that says the camera exists, the same startup is an error
+  naming the device and listing what the server did serve. A device the
+  file does *not* list is not served either, and is logged by name: an
+  enumeration is all of the hardware or it is decoration.
+  **Naming happens in the file, because no server can do it.** The
+  DECTRIS adapter serves one detector called `camera`, since identical
+  firmware behind an identical API is an EELS detector on SuperSTEM 3 and
+  a 4D-STEM camera on somebody else's column. `served_as` is how the file
+  says which, and clients see `eels_camera`.
+  **`--config` replaces `--backend`, `--plugin` and `--server-module`
+  rather than combining with them**, and passing both is refused: honour
+  the file and `--backend hardware` silently does nothing, honour the
+  flag and one word overrides the backend of every server in the file at
+  once. Neither reading is one an operator should have to discover.
+  Servers start in file order on an `ExitStack` and are torn down in
+  reverse, so a failure to start the third adapter still parks the first
+  two, and the column — conventionally first — is parked last.
+  TOML, and unknown keys are refused rather than ignored, because
+  `plugin` where the key is `plugins` would otherwise start a hardware
+  server with no arguments and say nothing about it.
+  Four worked examples ship in `instruments/`: the simulator (scan unit,
+  Ronchigram and EELS cameras, plus a second simulated process that can
+  be switched on to rehearse the multi-adapter path with nothing plugged
+  in), and SuperSTEM 1, 2 and 3. The instrument files mark every line
+  that is a hypothesis rather than a record — nobody has run this project
+  on those microscopes yet, and
+  [the survey runbook](docs/superstem-survey.md) is what settles them.
+  `tests/integration/test_configured_instrument.py` runs the shipped
+  simulator file for real: two device-server subprocesses, one broker,
+  one client that cannot tell which process anything came from.
+  **`pixi run -e device broker`** serves whatever
+  `$HOME/.miainwoodpecker/instrument.toml` describes and publishes the
+  invitation beside it, because a control computer drives the same
+  microscope every day and that belongs in a fixed place rather than in
+  a command line somebody has to remember.
+
 - **A viewing area that shows more than one dataset at a time.** Every
   source became a napari layer on one shared canvas, and napari puts
   every layer at the world origin — so a 512x512 HAADF image and a

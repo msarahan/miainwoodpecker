@@ -1,0 +1,87 @@
+# SuperSTEM 2 - Nion UltraSTEM 100, Daresbury.
+#
+# READ THIS BEFORE RUNNING IT ON THE INSTRUMENT. Parts of this file are
+# a hypothesis rather than a record: nobody has run this project on this
+# microscope yet, and the lines marked UNVERIFIED are what
+# docs/superstem-survey.md exists to settle. A wrong line here is a
+# startup error naming the device that did not appear, which is the
+# failure this file is shaped to produce rather than a session that
+# quietly drives the wrong thing.
+#
+#   python -m miainwoodpecker.broker.app --config instruments/superstem-2.toml
+
+schema = 1
+name = "SuperSTEM 2"
+site = "SuperSTEM, Daresbury"
+description = """\
+Nion UltraSTEM 100 with a Gatan UHV Enfina EEL spectrometer and a Bruker \
+XFlash 6T-100 silicon drift detector. The Enfina and the SDD run \
+together - confirmed by the facility - so this is a column that can \
+collect EELS and EDX in the same pass.\
+"""
+
+# ---------------------------------------------------------------------
+# The column: scan unit, Ronchigram camera, and the Enfina.
+#
+# UNVERIFIED, and the whole reason the survey exists: the working
+# hypothesis (docs/adapters/gatan.md) is that Nion's stack drives the
+# Enfina and publishes it as `eels_camera`, with the drift-tube offset
+# as the `ZLPoffset` control. If that holds, this microscope needs no
+# Gatan-side code at all and the three devices below are simply there.
+# If it does not - `describe()` reports no eels_camera - delete that
+# entry, and the spectrometer needs the inbound Gatan transport instead
+# (docs/adapters/gatan.md, "the adapter that cannot be a subprocess"),
+# which this schema cannot yet express.
+#
+# `plugins` is left empty on purpose, which means the server
+# autodiscovers every installed nionswift_plugin module. Name the
+# vendor's module here once the first item of
+# docs/hardware-validation-checklist.md has read it off the control
+# computer: an explicit list is what stops an unrelated plug-in from
+# claiming a device mid-session.
+# ---------------------------------------------------------------------
+[[server]]
+name = "column"
+module = "miainwoodpecker.devices.nion_server"
+backend = "hardware"
+plugins = []
+controls_column = true
+description = "Nion UltraSTEM 100, through the vendor's nionswift_plugin"
+
+[[server.device]]
+target = "scanner"
+description = "Nion scan unit; channel count and names UNVERIFIED (survey run 1)"
+
+[[server.device]]
+target = "ronchigram_camera"
+description = "Nion Ronchigram camera"
+
+[[server.device]]
+target = "eels_camera"
+description = "Gatan UHV Enfina, as Nion's EELS camera - UNVERIFIED (survey run 1)"
+
+# ---------------------------------------------------------------------
+# The EDX detector, off because its adapter does not exist yet.
+#
+# The XFlash is driven by Bruker ESPRIT, whose control library cannot be
+# redistributed in this repository - so the adapter for it is
+# necessarily out of tree, and `module` below names a package that would
+# have to be installed on the control computer alongside this one. The
+# in-tree spectrum server (`miainwoodpecker.devices.spectrum_server`)
+# defines the shape such an adapter fills and simulates one; see
+# docs/adapters/spectrum-detectors.md, which also gives the honest
+# recommendation about whether writing it is the right first move.
+#
+# Kept here, disabled, rather than left out: the detector is on the
+# microscope, and a file that enumerates the hardware should say so.
+# ---------------------------------------------------------------------
+[[server]]
+name = "edx"
+module = "superstem_esprit.spectrum_server"
+backend = "hardware"
+enabled = false
+description = "Bruker XFlash 6T-100 via ESPRIT; adapter not written (out of tree)"
+
+[[server.device]]
+target = "spectrum_detector"
+description = "Bruker XFlash 6T-100 silicon drift detector"

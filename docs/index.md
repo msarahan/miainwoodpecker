@@ -46,6 +46,10 @@ and a procedure for settling them at the facility.
 The design history is documented unusually thoroughly, decisions and
 measurements included:
 
+- [Instrument configuration](instrument-configuration.md) — the file per
+  microscope that enumerates its hardware and tells the broker which
+  device servers to start, with worked examples for the SuperSTEM
+  instruments and the simulator.
 - [Migration plan](migration-plan.md) — the architecture, why each
   piece was built or adopted, and the phased record of getting here.
 - [Architecture review](architecture-review.md) — a full-stack audit of
@@ -82,6 +86,7 @@ Using the viewer <using-the-viewer>
 Scripting and automation <scripting-and-automation>
 Migration plan <migration-plan>
 Architecture review <architecture-review>
+Instrument configuration <instrument-configuration>
 Hardware validation checklist <hardware-validation-checklist>
 Instrument survey runbook <superstem-survey>
 Work before hardware <pre-hardware-work>

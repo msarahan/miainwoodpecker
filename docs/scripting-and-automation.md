@@ -247,6 +247,21 @@ once, to that terminal, and written nowhere. The listener binds
 instrument's controls on the network, so that is a thing to do knowingly
 rather than by default.
 
+Those three flags describe *one* device server, which is enough for the
+simulator and for a single-adapter instrument. A microscope with two —
+a Nion column plus a DECTRIS detector on the spectrometer, say — is
+described by a file instead:
+
+```
+miainwoodpecker-broker --config instruments/superstem-3.toml --publish ./instrument
+```
+
+The broker then starts every adapter that file enumerates, checks each
+one served the hardware the file says the microscope has, and serves the
+lot as one instrument. See
+[the instrument configuration](instrument-configuration.md); the four
+worked examples live in `instruments/`.
+
 ```python
 from miainwoodpecker.broker.invitation import BrokerInvitation
 from miainwoodpecker.broker.remote import connect_broker
