@@ -45,6 +45,10 @@ miainwoodpecker-viewer = "miainwoodpecker.viewer.app:main"
 # in-process synthetic ones, not a device server. For UI development -
 # see src/miainwoodpecker/viewer/preview.py.
 miainwoodpecker-preview = "miainwoodpecker.viewer.preview:main"
+# Requires the "device" extra and no display: it serves one instrument to
+# however many notebooks, dashboards and viewers connect to it. See
+# src/miainwoodpecker/broker/app.py.
+miainwoodpecker-broker = "miainwoodpecker.broker.app:main"
 
 [project.urls]
 Homepage = "https://github.com/msarahan/miainwoodpecker"
