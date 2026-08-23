@@ -30,6 +30,7 @@ import pytest
 
 from miainwoodpecker.acquisition import camera_series
 from miainwoodpecker.broker import (
+    DEFAULT_LEASE_TIMEOUT_S,
     DeviceBusyError,
     LeaseExpiredError,
     NotLiveError,
@@ -303,7 +304,6 @@ class _FakeScanner:
         list[Frame]
             One frame per channel, all from the one pass.
         """
-        del parameters
         if self.block.is_set():
             self.entered.set()
             while self.block.is_set():
@@ -311,7 +311,12 @@ class _FakeScanner:
         with self._lock:
             self.passes += 1
             number = self.passes
-        return [_frame(f"scan{channel}", number) for channel in channels]
+        # Honours the geometry it was handed, so a test can tell which
+        # settings a pass actually ran under rather than trusting that
+        # the request reached the device.
+        return [
+            _frame(f"scan{channel}", number, parameters.shape) for channel in channels
+        ]
 
     def close(self) -> None:
         """Release the device."""
@@ -583,6 +588,99 @@ def test_multichannel_latest_frames_returns_the_whole_pass(broker):
     frames = broker.latest_frames("scanner")
     passes = {frame.metadata["index"] for frame in frames}
     assert passes == {frames[0].metadata["index"]}
+
+
+def test_a_running_scan_takes_new_geometry_without_stopping(broker, devices):
+    """
+    Re-parameterising does not park the probe to do it.
+
+    Stop-and-restart is not a neutral pair of operations on a scan unit:
+    between them the probe stands still on one spot, and an operator
+    dragging a field of view would pay that every time. The loop stays
+    running and the next pass is the one that differs.
+    """
+    small = ScanParameters(height=2, width=2, pixel_time_us=1.0, fov_nm=10.0)
+    large = ScanParameters(height=8, width=8, pixel_time_us=1.0, fov_nm=10.0)
+    broker.start_live("scanner", small)
+    assert _wait_until(
+        lambda: (frame := broker.latest("scanner")) is not None
+        and frame.data.shape == (2, 2),
+    )
+    passes_before = devices["scanner"].passes
+
+    broker.reconfigure_live("scanner", large)
+    assert broker.targets()["scanner"].is_live
+    assert _wait_until(
+        lambda: (frame := broker.latest("scanner")) is not None
+        and frame.data.shape == (8, 8),
+    )
+    # The loop never restarted: its pass count carried straight on.
+    assert devices["scanner"].passes > passes_before
+    assert broker.targets()["scanner"].is_live
+
+
+def test_detectors_can_be_added_to_a_running_scan(broker):
+    """
+    A detector ticked on mid-scan joins the *same* pass, not a second one.
+
+    Arity is dispatched per grab, so the loop that was reading one
+    channel starts reading two out of one traversal - which is the whole
+    reason `scan_frames` exists.
+    """
+    broker.start_live("scanner", _PARAMETERS, channels=(0,))
+    assert _wait_until(lambda: len(broker.latest_frames("scanner")) == 1)
+
+    broker.reconfigure_live("scanner", _PARAMETERS, channels=(0, 1))
+    assert _wait_until(lambda: len(broker.latest_frames("scanner")) == 2)  # noqa: PLR2004
+    frames = broker.latest_frames("scanner")
+    passes = {frame.metadata["index"] for frame in frames}
+    assert passes == {frames[0].metadata["index"]}
+
+
+def test_a_slow_pass_is_waited_out_rather_than_called_busy(devices, clock):
+    """
+    The lease deadline scales with the scan, because a fixed one cannot.
+
+    A pass is height x width x dwell: 262 ms at 512x512 and 1
+    microsecond, but 42 s at 2048x2048 and 10, and nearly three minutes
+    at 4096x4096. Against the five-second floor the big ones are "still
+    finishing a scan - try again" forever - on exactly the instruments
+    this project exists for. Asserted on the derived deadline rather
+    than by actually waiting 42 s for a fake.
+    """
+    made = LocalBroker(devices, holder="test-client", clock=clock)
+    slow = ScanParameters(height=2048, width=2048, pixel_time_us=10.0, fov_nm=10.0)
+    made.start_live("scanner", slow)
+    try:
+        one_pass_s = 2048 * 2048 * 10.0 / 1e6
+        deadline = made._join_deadline("scanner", DEFAULT_LEASE_TIMEOUT_S)  # noqa: SLF001
+        assert deadline >= one_pass_s
+        # A camera has no geometry to derive one from, so it keeps the floor.
+        assert (
+            made._join_deadline("eels_camera", DEFAULT_LEASE_TIMEOUT_S)  # noqa: SLF001
+            == DEFAULT_LEASE_TIMEOUT_S
+        )
+    finally:
+        made.stop_live("scanner")
+        made.close()
+
+
+def test_a_camera_has_no_scan_geometry_to_reconfigure(broker):
+    """
+    Refused rather than stored, because a camera's live settings are not this.
+
+    Exposure and binning are `Camera.configure` under a lease. Accepting
+    a `ScanParameters` here would take a caller's settings and silently
+    do nothing with them.
+    """
+    with pytest.raises(ValueError, match="not a scan unit"):
+        broker.reconfigure_live("eels_camera", _PARAMETERS)
+
+
+def test_reconfiguring_a_leased_scanner_is_refused(broker):
+    """A lease is exclusive against re-parameterising, as against everything."""
+    with broker.lease("scanner", reason="series"), pytest.raises(DeviceBusyError):
+        broker.reconfigure_live("scanner", _PARAMETERS)
 
 
 # -- leasing: the happy path ----------------------------------------------

@@ -125,10 +125,10 @@ class TestDetectorChecks:
                 check.setChecked(True)
             widget.start_scan()
             assert _wait_until(
-                lambda: len(widget._scan_loop.latest_frames()) == _TWO_CHANNELS,  # noqa: SLF001
+                lambda: len(widget._broker.latest_frames("scanner")) == _TWO_CHANNELS,  # noqa: SLF001
             )
 
-            frames = widget._scan_loop.latest_frames()  # noqa: SLF001
+            frames = widget._broker.latest_frames("scanner")  # noqa: SLF001
             identities = {frame.metadata["scan_pass_id"] for frame in frames}
             assert len(identities) == 1
         finally:

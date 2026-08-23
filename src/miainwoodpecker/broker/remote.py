@@ -64,7 +64,7 @@ if typing.TYPE_CHECKING:
     from multiprocessing.connection import Connection
 
     from miainwoodpecker.acquisition.live import LiveStats
-    from miainwoodpecker.broker.interface import TargetState
+    from miainwoodpecker.broker.interface import TargetState, TargetView
     from miainwoodpecker.devices.interface import (
         Camera,
         Frame,
@@ -159,6 +159,9 @@ def _raise_refusal(error: RemoteCallError) -> typing.NoReturn:
         and has to stay one here: a caller telling "no such camera"
         apart from "the camera refused" branches on the type, not on
         the text.
+    ValueError
+        If the call was wrong rather than refused - asking a camera for
+        a scan geometry, say. Kept as itself for the same reason.
     RemoteCallError
         For anything else. Rebuilt rather than re-raised so that every
         exit from this function names the class it raises - the message
@@ -176,6 +179,12 @@ def _raise_refusal(error: RemoteCallError) -> typing.NoReturn:
         raise NotLiveError(subject, message=detail) from error
     if error.error_type == "KeyError":
         raise KeyError(detail.strip("'")) from error
+    if error.error_type == "ValueError":
+        # Same reasoning as KeyError: asking a camera for a scan
+        # geometry is a ValueError in process and stays one here,
+        # because a caller separating "wrong argument" from "the device
+        # refused" branches on the type rather than on the text.
+        raise ValueError(detail) from error
     raise RemoteCallError(str(error), error_type=error.error_type) from error
 
 
@@ -626,6 +635,24 @@ class RemoteBroker:
         """
         return typing.cast("Mapping[str, TargetState]", self.broker_call("targets"))
 
+    def snapshot(self) -> Mapping[str, TargetView]:
+        """
+        Return every target's state and latest frames, in one pass.
+
+        Note what this costs over a wire that :class:`LocalBroker` does
+        not pay: every target's pixels, pickled, on every call. It is
+        the right call for a viewer sharing a process with its broker
+        and the wrong one for a dashboard polling from another machine,
+        which should ask :meth:`targets` for the chrome and
+        :meth:`latest` for the one source it is showing.
+
+        Returns
+        -------
+        Mapping[str, TargetView]
+            Keyed by target name.
+        """
+        return typing.cast("Mapping[str, TargetView]", self.broker_call("snapshot"))
+
     def controls(self) -> Mapping[str, float | bool]:
         """
         Return the instrument controls' current values, read only.
@@ -712,6 +739,31 @@ class RemoteBroker:
         """
         self.broker_call(
             "start_live",
+            (target, parameters),
+            {"channels": tuple(channels)},
+        )
+
+    def reconfigure_live(
+        self,
+        target: str,
+        parameters: ScanParameters,
+        *,
+        channels: Sequence[int] = (0,),
+    ) -> None:
+        """
+        Change a running scan's geometry without stopping it.
+
+        Parameters
+        ----------
+        target : str
+            The scan unit to reconfigure.
+        parameters : ScanParameters
+            The geometry and dwell to use from the next pass on.
+        channels : Sequence[int]
+            Which detectors to read out per pass.
+        """
+        self.broker_call(
+            "reconfigure_live",
             (target, parameters),
             {"channels": tuple(channels)},
         )

@@ -50,6 +50,7 @@ from miainwoodpecker.broker.interface import (
     LeaseExpiredError,
     NotLiveError,
     TargetState,
+    TargetView,
     lease_order,
 )
 from miainwoodpecker.devices.interface import (
@@ -75,6 +76,15 @@ if typing.TYPE_CHECKING:
 
 
 _LOGGER = logging.getLogger("miainwoodpecker.broker.local")
+
+_PASS_SLACK = 2.0
+"""
+How much longer than the dwell arithmetic a scan pass is allowed to take.
+
+Flyback, readout and thread scheduling are all real and none of them are
+in ``height x width x dwell``. This is a bound on *waiting*, which costs
+nothing when the worker returns early, so it is generous on purpose.
+"""
 
 _CAMERA_KIND = "camera"
 _SCANNER_KIND = "scanner"
@@ -381,6 +391,55 @@ class LocalBroker:
         with self._lock:
             return {name: self._state(name) for name in self._targets}
 
+    def snapshot(self) -> Mapping[str, TargetView]:
+        """
+        Return every target's state and latest frames, in one pass.
+
+        One sweep of expiry, one acquisition of this broker's lock, and
+        one of each loop's - against the several that asking
+        :meth:`targets` and then :meth:`latest_frames` per source costs.
+        The difference is not academic on a fast source: the loop's lock
+        is retaken by its worker on every grab, so each extra
+        acquisition here is another queue behind a thread that never
+        stops asking.
+
+        Returns
+        -------
+        Mapping[str, TargetView]
+            Keyed by target name.
+        """
+        self._reclaim_expired()
+        with self._lock:
+            return {
+                name: TargetView(
+                    state=self._state(name),
+                    frames=self._frames_of(self._loops.get(name)),
+                )
+                for name in self._targets
+            }
+
+    @staticmethod
+    def _frames_of(loop: LiveAcquisition | None) -> tuple[Frame, ...]:
+        """
+        Return a loop's latest pass, whether or not it is still running.
+
+        Parameters
+        ----------
+        loop : LiveAcquisition | None
+            The loop, or None if the target never had one.
+
+        Returns
+        -------
+        tuple[Frame, ...]
+            The pass's frames, empty before the first one arrives.
+        """
+        if loop is None:
+            return ()
+        if isinstance(loop, MultiChannelLiveAcquisition):
+            return loop.latest_frames()
+        frame = loop.latest()
+        return () if frame is None else (frame,)
+
     def controls(self) -> Mapping[str, float | bool]:
         """
         Return the instrument controls' current values, read only.
@@ -418,8 +477,9 @@ class LocalBroker:
         Returns
         -------
         Frame | None
-            The latest frame, or None if no loop is running or none has
-            arrived yet.
+            The latest frame, or None if none has ever arrived. A
+            *stopped* loop still answers with its last one: stopping the
+            scan is not a reason to blank the screen.
         """
         loop = self._loop_or_none(target)
         return None if loop is None else loop.latest()
@@ -438,13 +498,7 @@ class LocalBroker:
         tuple[Frame, ...]
             The pass's frames, empty before the first pass completes.
         """
-        loop = self._loop_or_none(target)
-        if loop is None:
-            return ()
-        if isinstance(loop, MultiChannelLiveAcquisition):
-            return loop.latest_frames()
-        frame = loop.latest()
-        return () if frame is None else (frame,)
+        return self._frames_of(self._loop_or_none(target))
 
     def stats(self, target: str) -> LiveStats:
         """
@@ -465,7 +519,7 @@ class LocalBroker:
         NotLiveError
             If no live loop is running on the target.
         """
-        loop = self._loop_or_none(target)
+        loop = self._loop_or_none(target, running=True)
         if loop is None:
             raise NotLiveError(target)
         return loop.stats
@@ -504,6 +558,62 @@ class LocalBroker:
             spec = _LiveSpec(parameters=parameters, channels=tuple(channels))
             self._specs[target] = spec
             self._start_locked(target, device, spec)
+
+    def reconfigure_live(
+        self,
+        target: str,
+        parameters: ScanParameters,
+        *,
+        channels: Sequence[int] = (0,),
+    ) -> None:
+        """
+        Change a running scan's geometry without stopping it.
+
+        The alternative is stop-and-restart, and on a scan unit that is
+        not a neutral pair of operations: between the stop and the start
+        the probe stands still on one spot. An operator dragging a field
+        of view or ticking a detector on would pay that every time.
+
+        Takes effect on the next pass, because
+        :meth:`_scan_pass` reads the spec per grab. The pass already in
+        flight finishes under the settings it started with, which is the
+        only honest answer - half a frame at one dwell and half at
+        another is not a frame of either.
+
+        Also valid before the loop is running, in which case it is just
+        the settings the next :meth:`start_live` will use.
+
+        A target another client has leased raises
+        :class:`~miainwoodpecker.broker.interface.DeviceBusyError`.
+
+        Parameters
+        ----------
+        target : str
+            The scan unit to reconfigure.
+        parameters : ScanParameters
+            The geometry and dwell to use from the next pass on.
+        channels : Sequence[int]
+            Which detectors to read out per pass.
+
+        Raises
+        ------
+        ValueError
+            If the target is not a scan unit. A camera's live settings
+            are exposure and binning, which are
+            :meth:`~miainwoodpecker.devices.interface.Camera.configure`
+            under a lease rather than a property of the loop.
+        """
+        self._reclaim_expired()
+        with self._lock:
+            self.device(target)
+            self._refuse_if_leased(target)
+            if target_kind(target) != _SCANNER_KIND:
+                message = f"{target} is not a scan unit; there is no geometry to change"
+                raise ValueError(message)
+            self._specs[target] = _LiveSpec(
+                parameters=parameters,
+                channels=tuple(channels),
+            )
 
     def stop_live(self, target: str) -> bool:
         """
@@ -673,25 +783,46 @@ class LocalBroker:
             error=error,
         )
 
-    def _loop_or_none(self, target: str) -> LiveAcquisition | None:
+    def _loop_or_none(self, target: str, *, running: bool = False) -> (
+        LiveAcquisition | None
+    ):
         """
-        Return a target's running loop, or None.
+        Return a target's loop, or None if it never had one.
+
+        **A stopped loop still answers with its last frame.** Watching is
+        for putting a picture on a screen, and stopping the scan is not a
+        reason to blank the screen - the last image is the most recent
+        thing that was true, and an operator who stops to look at it is
+        the ordinary case. It is also what makes a lease invisible to a
+        watcher: the display keeps the pre-lease frame while an
+        acquisition runs, rather than flickering to nothing and back.
+
+        Whether the picture is still *advancing* is
+        :attr:`~miainwoodpecker.broker.interface.TargetState.is_live`'s
+        job, and asking a stopped loop for a rate is
+        :class:`~miainwoodpecker.broker.interface.NotLiveError`'s - which
+        is what ``running`` is for.
 
         Parameters
         ----------
         target : str
             The target name.
+        running : bool
+            Require the loop to be running, for the callers that are
+            asking about progress rather than about pixels.
 
         Returns
         -------
         LiveAcquisition | None
-            The loop if one is running.
+            The loop, or None.
         """
         self._reclaim_expired()
         with self._lock:
             self.device(target)
             loop = self._loops.get(target)
-        return loop if loop is not None and loop.is_running else None
+        if loop is None or (running and not loop.is_running):
+            return None
+        return loop
 
     def _refuse_if_leased(self, target: str) -> None:
         """
@@ -760,24 +891,106 @@ class LocalBroker:
         kind = target_kind(target)
         if kind == _SCANNER_KIND:
             scanner = typing.cast("Scanner", device)
-            parameters = spec.parameters
-            if parameters is None:
+            if spec.parameters is None:
                 message = f"{target} is a scanner; start_live needs parameters"
                 raise ValueError(message)
-            if len(spec.channels) > 1:
-                channels = spec.channels
-                loop: LiveAcquisition = MultiChannelLiveAcquisition(
-                    lambda: scanner.scan_frames(parameters, channels),
-                )
-            else:
-                channel = spec.channels[0]
-                loop = LiveAcquisition(lambda: scanner.scan_frame(parameters, channel))
+            loop: LiveAcquisition = MultiChannelLiveAcquisition(
+                lambda: self._scan_pass(scanner, target),
+            )
         else:
             camera = typing.cast("Camera", device)
             camera.start()
             loop = LiveAcquisition(camera.acquire_frame)
         self._loops[target] = loop
         loop.start()
+
+    def _scan_pass(self, scanner: Scanner, target: str) -> Sequence[Frame]:
+        """
+        Grab one pass, reading the geometry that is current *now*.
+
+        Runs on the loop's worker thread. The spec is read per grab
+        rather than captured when the loop was built, which is what lets
+        :meth:`reconfigure_live` change the field of view or the enabled
+        detectors without stopping the scan - and a scan stopped to be
+        re-parameterised is a probe parked on one spot for as long as
+        that takes.
+
+        Safe without the broker's lock, and deliberately so: this is one
+        dict lookup returning a frozen value, and holding the lock here
+        would put the whole of a scan pass inside it. The worker sees
+        either the old spec or the new one, never a half-written mixture,
+        because a :class:`_LiveSpec` is replaced whole.
+
+        The arity dispatch is per grab for the same reason. A
+        single-channel pass goes through ``scan_frame``, which carries
+        neither ``scan_pass_id`` nor ``simultaneous_channels`` - a lone
+        frame shared its pass with nothing, and an id claiming otherwise
+        would be a fiction in every recording.
+
+        Parameters
+        ----------
+        scanner : Scanner
+            The scan unit.
+        target : str
+            Its target name, for looking the current spec up.
+
+        Returns
+        -------
+        Sequence[Frame]
+            The pass's frames, in channel-request order.
+        """
+        spec = self._specs[target]
+        parameters = typing.cast("ScanParameters", spec.parameters)
+        if len(spec.channels) > 1:
+            return scanner.scan_frames(parameters, list(spec.channels))
+        return [scanner.scan_frame(parameters, spec.channels[0])]
+
+    def _join_deadline(self, target: str, timeout_s: float) -> float:
+        """
+        Return how long to wait for a target's worker, given what it is doing.
+
+        A fixed timeout is a guess about the instrument, and the guess
+        gets worse the bigger the instrument is. Stopping a loop means
+        waiting for the pass already in flight, and a pass is
+        ``height x width x dwell``: 262 ms for 512x512 at 1 microsecond,
+        but **42 s** for 2048x2048 at 10 microseconds and nearly three
+        minutes at 4096x4096. Against a five-second default the second
+        and third are simply "still finishing a scan - try again",
+        forever, on exactly the instruments this project exists for.
+
+        So the deadline is derived rather than assumed. The scan spec is
+        already here, and it says how long a pass takes; the caller's
+        ``timeout_s`` becomes a *floor* under that rather than a ceiling
+        over it, because a caller cannot know the geometry a loop was
+        started with and should not have to.
+
+        A camera has no equivalent here yet - its exposure lives on the
+        device, and asking for it would put a call on a connection whose
+        loop is mid-exposure. Cameras therefore still get the floor, and
+        a long-exposure detector is the case that will want this next.
+
+        Parameters
+        ----------
+        target : str
+            The target whose worker is being joined.
+        timeout_s : float
+            The caller's floor, in seconds.
+
+        Returns
+        -------
+        float
+            Seconds to wait.
+        """
+        spec = self._specs.get(target)
+        if spec is None or spec.parameters is None:
+            return timeout_s
+        parameters = spec.parameters
+        pass_s = parameters.height * parameters.width * parameters.pixel_time_us / 1e6
+        # Flyback, readout and scheduling are all real and none of them
+        # are in the dwell arithmetic, so the pass is a lower bound
+        # rather than an estimate. Doubling it keeps this a bound on
+        # *waiting*, which costs nothing when the worker returns early.
+        return max(timeout_s, pass_s * _PASS_SLACK)
 
     def _stop(self, target: str, timeout_s: float) -> bool:
         """
@@ -788,13 +1001,15 @@ class LocalBroker:
         target : str
             The target name.
         timeout_s : float
-            Seconds to wait for the worker to join.
+            Seconds to wait for the worker to join, as a floor - see
+            :meth:`_join_deadline` for what is actually waited.
 
         Returns
         -------
         bool
             True if the worker finished.
         """
+        timeout_s = self._join_deadline(target, timeout_s)
         with self._lock:
             loop = self._loops.get(target)
         if loop is None or not loop.is_running:
@@ -936,7 +1151,21 @@ class LocalBroker:
                 spec = self._specs.get(name)
                 if spec is None:
                     continue
-                self._start_locked(name, self.device(name), spec)
+                try:
+                    self._start_locked(name, self.device(name), spec)
+                except RuntimeError:
+                    # Restarting means starting a thread, and there is
+                    # one moment when that is impossible however correct
+                    # the request is: interpreter shutdown, which raises
+                    # PythonFinalizationError from Thread.start. It is
+                    # reached whenever a lease is released by a
+                    # generator being finalised rather than closed - an
+                    # abandoned recording, a process on its way out.
+                    # Raising there turns a tidy exit into a traceback
+                    # from a generator nobody is watching, and there is
+                    # no live loop to want on an interpreter that is
+                    # ending anyway.
+                    _LOGGER.warning("could not restart the live loop on %s", name)
 
     def _reclaim_expired(self) -> None:
         """
