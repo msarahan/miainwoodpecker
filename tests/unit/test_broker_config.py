@@ -142,7 +142,7 @@ def _sessions(**extra: object) -> dict:
     return sessions
 
 
-def _record_spawns(monkeypatch) -> list:
+def _record_spawns(monkeypatch: pytest.MonkeyPatch) -> list:
     """
     Replace the device-server spawn with a stub that records its arguments.
 
