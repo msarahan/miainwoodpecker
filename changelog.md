@@ -290,6 +290,61 @@
 
 ### Fixed
 
+- **A device server that lost its port could be reported as one that
+  was running and wedged.** The client bounds every connection attempt
+  by its 15 s connect deadline and polls the spawned server between
+  attempts — but that bound is the *whole* deadline, so one attempt that
+  blocks spends all of it and the child is never looked at again. On
+  Linux and Windows nothing blocks that long, because a port with no
+  listener refuses the connection at once. On macOS a port that is
+  *bound* by something which is not listening neither refuses the
+  connection nor completes it, and that is exactly the port a server
+  reports a collision over: the client spent its whole deadline dialling
+  a port its own server had already given up on, then said "the server
+  process is alive but not completing connections, which retrying will
+  not fix" about a process that had exited a second in with
+  `PORT_UNAVAILABLE_EXIT_STATUS`. The one startup failure a respawn
+  cures, reported as the one it cannot.
+  **`_connect_once` now polls the child while an attempt is in flight**
+  and abandons the attempt the moment it finds it gone, so the retry
+  loop gets back to the exit status it should have been dispatching on.
+  A healthy connect returns on the first 50 ms slice and pays nothing
+  for the vigilance, and the diagnosis this is easily confused with is
+  untouched: a server that really is alive and not handshaking still
+  fails on the deadline with the same message, which is what that
+  message is for.
+  It surfaced as `tests/unit/test_out_of_tree_server.py`'s
+  port-collision test failing on `macos-latest` — both 3.11 and 3.13
+  have hit it — and on no other platform, on `main` as well as on
+  branches, with the same job passing on the pushes either side. That
+  test holds a bound, unlistening socket to make the child's bind fail,
+  which it does everywhere; what is not portable is what the same socket
+  then does to a *connect*, so the deterministic pin for the fix is in
+  `tests/unit/test_remote_connect.py` instead — a `Client` that never
+  answers, over a child that exits underneath it, which is the same
+  situation from the client's side on every platform. Reverting the poll
+  reproduces the CI failure message verbatim against it, which is how
+  the cure was checked rather than by watching a green run.
+  **The analysis worker's client had the same hole in a plainer form**,
+  and had never had either half of the cure: `analysis/remote.py`'s
+  `_connect_with_retry` called `Client()` on the calling thread with no
+  bound at all, so its advertised 30 s budget bounded how *often* it
+  tried rather than how long it waited, and `while time.monotonic() <
+  deadline` could not end an attempt it had already started. A worker
+  that accepted the connection and then stopped short of the handshake
+  hung the application outright — on that path the caller is whichever
+  thread an analysis was requested from, because a worker is started
+  from a button rather than once at session start. Measured against a
+  socket that listens and never accepts, that call is still blocked
+  after five seconds and has no timeout to reach. It now runs on the
+  same kind of scrap thread, polls the worker underneath the attempt,
+  and names the exit status rather than the timeout when one dies mid-
+  attempt. The two connect loops stay separate, as their docstrings say:
+  what differs between them is the sentence each produces, not the
+  plumbing. `tests/unit/test_analysis_connect.py` pins both halves — a
+  never-accepting socket for the bound, a `Client` that never answers
+  over a worker that exits for the poll.
+
 - **The out-of-tree adapter stand-in did not survive losing a port, so
   the test file that documents the adapter contract was intermittent.**
   `_free_port()` picks a port by binding to port 0 and *releasing* the

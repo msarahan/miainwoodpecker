@@ -149,6 +149,16 @@ would be a worse failure than waiting.
 
 _CONNECT_POLL_S = 0.02
 
+_ATTEMPT_WATCH_S = 0.05
+"""
+How often a connection attempt already in flight looks at the worker.
+
+The attempt itself can block for as long as the deadline allows, so a
+worker's exit has to be noticed *during* one rather than only between
+two - see ``_connect_once`` for what blocks, and for how long it used
+to block before this existed.
+"""
+
 _SHUTDOWN_TIMEOUT_S = 5.0
 """
 How long a worker gets to acknowledge ``shutdown`` before it is signalled.
@@ -184,6 +194,21 @@ class AnalysisWorkerError(RuntimeError):
     nothing to answer — and the viewer reports the two the same way, in a
     status label, because from the operator's side both are "that button
     did not work" and the message is the difference.
+    """
+
+
+class _WorkerExitedError(Exception):
+    """
+    A connection attempt was abandoned because the worker process is gone.
+
+    Control flow rather than a diagnosis, and never seen outside
+    ``_connect_with_retry``: an attempt that blocks is the one thing that
+    can keep that loop from ever reading the worker's exit status, so
+    ``_connect_once`` raises this the moment it finds the worker dead
+    underneath one. The loop then goes back to its top, where the status
+    is read and named. Deliberately not an :class:`AnalysisWorkerError`:
+    it carries no verdict, and every verdict this module gives about a
+    dead worker is composed in one place.
     """
 
 
@@ -576,6 +601,10 @@ def _connect_with_retry(
     misleading in an analysis message. The protocol it speaks is the same
     one; only the sentence it produces on failure differs.
 
+    The worker is polled before the clock is consulted, so one that dies
+    just as the deadline passes is diagnosed by its exit status rather
+    than by the timeout — the status is the half an operator can act on.
+
     Parameters
     ----------
     port : int
@@ -594,14 +623,13 @@ def _connect_with_retry(
     Raises
     ------
     AnalysisWorkerError
-        If the worker exited, or never answered within
-        :data:`_CONNECT_TIMEOUT_S`.
+        If the worker exited, never answered within
+        :data:`_CONNECT_TIMEOUT_S`, or left a handshake unfinished for
+        that long.
     """
-    from multiprocessing.connection import Client  # noqa: PLC0415 - see nion_server
-
     deadline = time.monotonic() + _CONNECT_TIMEOUT_S
     last_error: OSError | None = None
-    while time.monotonic() < deadline:
+    while True:
         status = process.poll()
         if status is not None:
             msg = (
@@ -611,8 +639,15 @@ def _connect_with_retry(
                 f"MIAINWOODPECKER_ANALYSIS_LOG_LEVEL=INFO, to see why"
             )
             raise AnalysisWorkerError(msg)
+        if time.monotonic() >= deadline:
+            break
         try:
-            connection = Client(("localhost", port), authkey=authkey)
+            connection = _connect_once(port, authkey, deadline, process)
+        except _WorkerExitedError:
+            # Abandoned because the worker died underneath the attempt.
+            # Nothing is said here: the top of the loop reads the exit
+            # status and composes the message that names it.
+            continue
         except OSError as error:
             last_error = error
             time.sleep(_CONNECT_POLL_S)
@@ -625,6 +660,116 @@ def _connect_with_retry(
         f"within {_CONNECT_TIMEOUT_S}s{detail}"
     )
     raise AnalysisWorkerError(msg)
+
+
+def _connect_once(
+    port: int,
+    authkey: bytes,
+    deadline: float,
+    process: subprocess.Popen[bytes],
+) -> Connection:
+    """
+    Make one connection attempt, bounded by the caller's deadline.
+
+    ``multiprocessing.connection.Client`` blocks with **no timeout**
+    through both the TCP connect and the authentication handshake, so
+    calling it on this thread left the loop above unable to end an
+    attempt it had started: :data:`_CONNECT_TIMEOUT_S` bounded how often
+    it tried, not how long it waited. A worker that accepted the
+    connection and then stopped short of the handshake hung the
+    application outright — and so did a port that swallows a connection
+    instead of refusing it, which is what a bound-but-not-listening
+    socket does on macOS. On the isolated path that hang is on whichever
+    thread the analysis was requested from.
+
+    :func:`miainwoodpecker.devices.remote._connect_once` had the same
+    hole, twice, and this is the same cure both times over: the attempt
+    runs on a scrap daemon thread and is abandoned when the deadline
+    passes, and the worker is polled while the attempt is in flight, so
+    an exit is never waited out. Abandoning is safe precisely because the
+    result is discarded — the thread holds only its own socket, which
+    dies with it or with this process, and nothing else ever learns the
+    connection existed. A thread rather than a socket timeout,
+    deliberately: ``socket.setdefaulttimeout`` is process-global state,
+    and this process also holds a viewer and a device client.
+
+    Parameters
+    ----------
+    port : int
+        The port to connect to.
+    authkey : bytes
+        The shared secret for the handshake.
+    deadline : float
+        ``time.monotonic()`` value after which to abandon the attempt.
+    process : subprocess.Popen[bytes]
+        The worker, polled while the attempt is in flight.
+
+    Returns
+    -------
+    Connection
+        The connected, authenticated client end.
+
+    Raises
+    ------
+    _WorkerExitedError
+        If the worker exited while the attempt was still in flight, so
+        the attempt can only be abandoned and the caller has an exit
+        status to report instead.
+    AnalysisWorkerError
+        If the deadline passed with the attempt still blocked — a worker
+        that is running and not completing the handshake, which trying
+        again will not fix.
+    ConnectionRefusedError
+        If nothing is listening on the port yet, which is the ordinary
+        case while a worker is still starting up. Re-raised as itself
+        rather than as a plain ``OSError`` so the message the loop above
+        keeps for its timeout says which refusal it was.
+    OSError
+        For any other socket-level failure of the attempt.
+    """
+    from multiprocessing.connection import Client  # noqa: PLC0415 - see nion_server
+
+    outcome: list[object] = []
+    done = threading.Event()
+
+    def _attempt() -> None:
+        try:
+            outcome.append(Client(("localhost", port), authkey=authkey))
+        except BaseException as error:  # noqa: BLE001 - re-raised on the caller's thread
+            outcome.append(error)
+        done.set()
+
+    thread = threading.Thread(
+        target=_attempt, name="analysis-connect", daemon=True,
+    )
+    thread.start()
+    while not done.wait(timeout=_ATTEMPT_WATCH_S):
+        if process.poll() is not None:
+            msg = (
+                f"the analysis worker exited while a connection attempt to "
+                f"port {port} was still in flight"
+            )
+            raise _WorkerExitedError(msg)
+        if time.monotonic() >= deadline:
+            msg = (
+                f"the analysis worker accepted a connection on port {port} "
+                f"but had not finished the authentication handshake when "
+                f"the {_CONNECT_TIMEOUT_S}s connect deadline passed; it is "
+                f"running and not answering, which trying again will not fix"
+            )
+            raise AnalysisWorkerError(msg)
+    # Failures cross the thread boundary as objects and are re-raised here
+    # as fresh instances of the concrete classes the loop above dispatches
+    # on, with the original chained as __cause__ so no diagnostic is lost.
+    result = outcome[0]
+    if isinstance(result, ConnectionRefusedError):
+        raise ConnectionRefusedError(*result.args) from result
+    if isinstance(result, OSError):
+        raise OSError(*result.args) from result
+    if isinstance(result, BaseException):
+        msg = f"the connection attempt to the analysis worker failed: {result!r}"
+        raise AnalysisWorkerError(msg) from result
+    return typing.cast("Connection", result)
 
 
 def analysis_runner(name: str, cpu_count: int | None = None) -> AnalysisRunner:

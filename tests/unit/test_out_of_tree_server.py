@@ -503,10 +503,23 @@ def test_a_vendor_server_that_loses_its_port_is_retried_rather_than_failing(
     out-of-tree package is meant to copy.
     """
     original_free_port = remote_module._free_port  # noqa: SLF001 - the seam
-    # Bound and *not* listening: bound is enough to make the child's bind
-    # fail with EADDRINUSE, and not listening is what keeps the client's
-    # connect attempts refused rather than accepted-then-silent, which
-    # would wedge them in the auth handshake until the 15 s deadline.
+    # Bound and *not* listening. Bound is what makes the child's bind
+    # fail with EADDRINUSE, which is the precondition, and it holds on
+    # every platform: the socket below sets no SO_REUSEADDR, so the
+    # `Listener` in the child — which sets it on POSIX — is refused all
+    # the same, since neither Linux nor BSD lets that option share an
+    # exact address and port.
+    #
+    # What the port then does to a *connect* is not portable, and this
+    # test was intermittent on macOS until the client stopped depending
+    # on it. Linux and Windows refuse the connection at once; macOS
+    # neither refuses nor completes it, so the client's first attempt
+    # blocked until its 15 s deadline and never looked at the child
+    # again - which had exited with PORT_UNAVAILABLE_EXIT_STATUS a
+    # second in. Both are covered now, because the client polls the
+    # child underneath an attempt in flight (see `_connect_once`); the
+    # deterministic pin for that is in tests/unit/test_remote_connect.py,
+    # and what stays here is the collision itself.
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as held:
         held.bind(("localhost", 0))
         doomed_port = held.getsockname()[1]
