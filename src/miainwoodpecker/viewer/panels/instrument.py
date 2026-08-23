@@ -75,7 +75,6 @@ def build_instrument_panel(widget: LiveInstrumentWidget) -> QtWidgets.QGroupBox:
     """
     panel = QtWidgets.QGroupBox("Instrument", widget)
     form = QtWidgets.QFormLayout(panel)
-    instrument = widget._instrument
 
     widget._instrument_backend_label = QtWidgets.QLabel("not connected", panel)
     form.addRow("Backend", widget._instrument_backend_label)
@@ -87,9 +86,13 @@ def build_instrument_panel(widget: LiveInstrumentWidget) -> QtWidgets.QGroupBox:
     form.addRow("Status", widget._instrument_status)
 
     widget._instrument_controls = {}
-    if instrument is None:
+    # Asked of the broker rather than of a handle, which is the same
+    # answer whether the instrument is in this process or on another
+    # machine. A broker serving no instrument target at all leaves the
+    # panel as its three identity rows, still saying "not connected" -
+    # which is what a window built without an instrument always showed.
+    if INSTRUMENT_TARGET not in widget._broker.describe():
         return panel
-
     controls = set(widget._description(INSTRUMENT_TARGET).controls)
     if DEFOCUS_CONTROL in controls:
         widget._instrument_controls[DEFOCUS_CONTROL] = _add_number_row(

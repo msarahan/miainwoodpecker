@@ -383,10 +383,46 @@
   the operator the device is not answering.
   The viewer reads descriptions rather than device handles for its
   detector names, its synchronised targets and its instrument controls.
-  One capability read is knowingly left behind: binning grew a *per-axis*
-  answer that `TargetDescription` does not carry yet, and inventing that
-  mapping untested - on a detector whose two axes cost different things
-  to bin - would be worse than the stated gap.
+
+- **The window can be pointed at an instrument in another process.**
+  `miainwoodpecker-viewer --broker PATH` connects to a broker that is
+  already running - at the invitation it published - and launches no
+  device server, holds no device handle, and imports no vendor code.
+  It is the same window: every control is there, because everything the
+  window needed to *build* one now crosses the wire.
+  Five reads stood between the description and that, and each is now a
+  fact rather than a device call. `TargetDescription` gained
+  `binning_values_yx` (the per-axis answer the previous entry left
+  behind, which is what gives a spectrometer two binning menus rather
+  than one), `backend` (the identity row, so an operator can tell the
+  simulator from the microscope), `native_scan` (the one geometry a
+  replay device will accept), and `synchronises` - separate from
+  `synchronised_targets` because "this backend has no synchronised
+  mode" and "it has one with nothing wired to it" are the same empty
+  tuple and want different things done about them. `camera_parameters()`
+  joins `controls()` as a watch call: what a detector is set to, read
+  without a lease, because a window that had to lease a camera to fill
+  in an exposure field would hold one from the moment it opened.
+  **Driving a control is now a lease, and can be refused.** Setting the
+  defocus or the readout mode used to be a direct device call from the
+  GUI thread; it takes the target for the duration now, so a notebook
+  sweeping the same control gets an error naming the holder instead of
+  two writers interleaving on a one-request-at-a-time connection. The
+  wait is bounded at half a second and the instrument target runs no
+  live loop, so the window does not stop repainting for it.
+  **A spectrum image sizes its file inside the lease it acquires
+  under.** Allocating the datasets means taking one frame from the
+  detector at the settings the pass will use - an acquisition, which was
+  being done on the GUI thread against an unleased handle. It moved into
+  the job with the pass it sizes.
+  Reading the instrument's controls is one broker call now rather than
+  four device calls, and the broker guards each control separately so
+  that one it cannot read costs its own row rather than the whole
+  reading — the window had that property by reading each control
+  itself, and going through the broker should not have lost it for
+  every other client too. A control the instrument published and did
+  not report is named as "not reported" beside the field that is still
+  showing its last value.
 
 ### Changed
 

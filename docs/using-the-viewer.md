@@ -28,6 +28,36 @@ Useful launch options:
 | `--backend {simulated,hardware}` | Which microscope to talk to. |
 | `--server-module MODULE` | Which device server to launch. Defaults to the Nion one. |
 | `--plugin` | Server-specific: for Nion, a plug-in module; for the camera server, which camera to open. |
+| `--broker PATH` | Join an instrument somebody is already serving — see below. The three options above are the other case, and are ignored. |
+
+### Joining an instrument somebody else is serving
+
+Everything above launches a device server and takes the microscope for
+this window alone. The other way in is to connect to a
+[broker](scripting-and-automation.md) that is already running over the
+instrument:
+
+```shell
+miainwoodpecker-broker --publish ~/instrument      # on the microscope PC
+miainwoodpecker-viewer --broker ~/instrument       # here, and anywhere else
+```
+
+The window is the same window: the same panels, the same detectors, the
+same controls, built from what the broker reports rather than from
+devices this process can reach. What differs is that you are **not the
+only one driving**. A notebook, the dashboard and another window can be
+on the same microscope, so:
+
+- Watching is always free. The live view, the frame counters and the
+  control values cost the instrument nothing however many windows are
+  open.
+- Driving takes a turn. Setting a control, changing a detector's readout
+  or acquiring anything claims the target for the duration. If somebody
+  else has it, you get a message naming them and what they said they
+  were doing — "defocus refused: instrument is leased by notebook
+  (energy series)" — rather than a change that silently does not take.
+- Turns are refused, not queued. Nothing waits behind anybody, and
+  nothing is taken from anybody: try again when they are done.
 
 If you are working on the window itself rather than using it, there is a
 lighter way in: `miainwoodpecker-preview` opens the same panels against

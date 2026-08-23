@@ -59,6 +59,7 @@ from miainwoodpecker.devices.interface import (
     DEFOCUS_CONTROL,
     ENERGY_OFFSET_CONTROL,
     STAGE_POSITION_CONTROL,
+    ScanParameters,
 )
 from miainwoodpecker.devices.rpc import INSTRUMENT_TARGET, target_kind
 
@@ -68,9 +69,9 @@ if typing.TYPE_CHECKING:
     from miainwoodpecker.acquisition.live import LiveStats
     from miainwoodpecker.devices.interface import (
         Camera,
+        CameraParameters,
         Frame,
         InstrumentController,
-        ScanParameters,
         Scanner,
         SpectrumDetector,
     )
@@ -347,6 +348,10 @@ class LocalBroker:
         self._leases: dict[str, Lease] = {}
         self._claims: dict[str, str] = {}
         self._controls: dict[str, float | bool] = {}
+        # Last settings read from each detector, so a client asking
+        # while somebody else holds the lease gets the last true answer
+        # rather than a device call across a held connection.
+        self._camera_settings: dict[str, CameraParameters] = {}
         # Last, and while nothing is running: see _describe_all.
         self._descriptions = self._describe_all()
 
@@ -431,6 +436,13 @@ class LocalBroker:
         described: dict[str, TargetDescription] = {}
         for name, device in self._targets.items():
             refused: list[str] = []
+            # Read once and reported two ways: *that* the device
+            # answered is whether it has a synchronised mode at all, and
+            # *what* it answered is what is wired to it. Both are empty
+            # tuples to a client that cannot tell them apart, and they
+            # want different things done about them - a different
+            # instrument, or a detector plugged into this one.
+            synchronised = self._ask(device, "synchronised_targets", refused)
             described[name] = TargetDescription(
                 name=name,
                 kind=target_kind(name),
@@ -446,12 +458,14 @@ class LocalBroker:
                 binning_values=tuple(
                     self._ask(device, "binning_values", refused) or (),
                 ),
-                synchronised_targets=tuple(
-                    self._ask(device, "synchronised_targets", refused) or (),
-                ),
+                binning_values_yx=self._axis_binning_of(device, refused),
+                synchronises=synchronised is not None,
+                synchronised_targets=tuple(synchronised or ()),
                 controls=tuple(
                     self._ask(device, "available_controls", refused) or (),
                 ),
+                backend=self._backend_of(device, refused),
+                native_scan=self._native_scan_of(device, refused),
                 error=(
                     f"{name} would not answer: {', '.join(refused)}"
                     if refused
@@ -459,6 +473,90 @@ class LocalBroker:
                 ),
             )
         return described
+
+    def _backend_of(self, device: object, refused: list[str]) -> str:
+        """
+        Read what a device server says it is driving, for an instrument.
+
+        The one fact a window's identity row shows that is not derivable
+        from the target names themselves, and the reason it is worth
+        crossing: an operator looking at a window has to be able to tell
+        the simulator from the microscope, and a client in another
+        process cannot ask the instrument handle directly.
+
+        Parameters
+        ----------
+        device : object
+            The device handle.
+        refused : list[str]
+            Appended to when the device raises, as in :meth:`_ask`.
+
+        Returns
+        -------
+        str
+            The backend name, or empty for a device that does not report
+            one - which is every target but the instrument.
+        """
+        described = self._ask(device, "describe", refused)
+        if not isinstance(described, dict):
+            return ""
+        return str(described.get("backend", "") or "")
+
+    def _axis_binning_of(
+        self,
+        device: object,
+        refused: list[str],
+    ) -> tuple[tuple[int, ...], tuple[int, ...]] | None:
+        """
+        Read a detector's per-axis binning factors, if its axes differ.
+
+        None rather than a doubled-up pair for a detector with one list,
+        so a client can tell "this camera bins both axes alike" from
+        "this spectrometer offers eight down and two across" - the
+        distinction the panel builds one control or two from.
+
+        Parameters
+        ----------
+        device : object
+            The device handle.
+        refused : list[str]
+            Appended to when the device raises, as in :meth:`_ask`.
+
+        Returns
+        -------
+        tuple[tuple[int, ...], tuple[int, ...]] | None
+            Slow-axis and fast-axis factors, or None for a detector that
+            does not distinguish them.
+        """
+        per_axis = self._ask(device, "binning_values_yx", refused)
+        if per_axis is None:
+            return None
+        down, across = per_axis
+        return (tuple(down) or (1,), tuple(across) or (1,))
+
+    def _native_scan_of(
+        self,
+        device: object,
+        refused: list[str],
+    ) -> ScanParameters | None:
+        """
+        Read the one geometry a scan unit can acquire, if it has only one.
+
+        Parameters
+        ----------
+        device : object
+            The device handle.
+        refused : list[str]
+            Appended to when the device raises, as in :meth:`_ask`.
+
+        Returns
+        -------
+        ScanParameters | None
+            The fixed geometry, or None for a scan unit that takes
+            whatever grid it is given.
+        """
+        native = self._ask(device, "native_parameters", refused)
+        return native if isinstance(native, ScanParameters) else None
 
     @staticmethod
     def _ask(device: object, attribute: str, refused: list[str]) -> object:
@@ -575,6 +673,55 @@ class LocalBroker:
             self._refresh_controls(typing.cast("InstrumentController", instrument))
         with self._lock:
             return dict(self._controls)
+
+    def camera_parameters(self, target: str) -> CameraParameters | None:
+        """
+        Return what a detector is currently configured to do.
+
+        Read from the device, and only while nothing holds a lease on
+        it - the same rule :meth:`controls` follows, for the same
+        reason. While it is leased the last read stands, which is the
+        honest answer: the holder may be part-way through changing it.
+
+        Parameters
+        ----------
+        target : str
+            The detector to read.
+
+        Returns
+        -------
+        CameraParameters | None
+            Its settings, or None for a target that has none - a scan
+            unit, an instrument controller - and before the first read
+            of a detector that has been leased since this broker was
+            built.
+
+        Raises
+        ------
+        KeyError
+            If this instrument serves no such target.
+        """
+        self._reclaim_expired()
+        with self._lock:
+            if target not in self._targets:
+                message = f"no such target: {target}"
+                raise KeyError(message)
+            device = self._targets[target]
+            leased = target in self._claims
+            cached = self._camera_settings.get(target)
+        reader = getattr(device, "parameters", None)
+        if reader is None:
+            return None  # Not a detector: a scan unit has no exposure.
+        if leased:
+            return cached
+        # Deliberately unguarded, unlike the reads _describe_all makes: a
+        # description is chrome and this is a *setting*, and a client
+        # about to change the readout mode must not be handed a
+        # plausible stale value in place of the failure.
+        current = typing.cast("CameraParameters", reader())
+        with self._lock:
+            self._camera_settings[target] = current
+        return current
 
     def latest(self, target: str) -> Frame | None:
         """
@@ -966,18 +1113,82 @@ class LocalBroker:
         """
         available = set(instrument.available_controls())
         values: dict[str, float | bool] = {}
+        # One control at a time, each guarded. A half-written vendor
+        # adapter that raises on the defocus must not cost every client
+        # the stage position as well: the failed control is simply
+        # absent, which is the same thing "this instrument does not have
+        # it" looks like, and is what a client can act on either way.
+        # The alternative - one exception for the whole reading - was
+        # what the Qt window used to avoid by reading each control
+        # itself, and it should not lose that by going through here.
         if DEFOCUS_CONTROL in available:
-            values[DEFOCUS_CONTROL] = instrument.defocus_nm()
+            self._read_control(values, DEFOCUS_CONTROL, instrument.defocus_nm)
         if ENERGY_OFFSET_CONTROL in available:
-            values[ENERGY_OFFSET_CONTROL] = instrument.energy_offset_ev()
+            self._read_control(
+                values,
+                ENERGY_OFFSET_CONTROL,
+                instrument.energy_offset_ev,
+            )
         if BEAM_BLANKER_CONTROL in available:
-            values[BEAM_BLANKER_CONTROL] = instrument.is_beam_blanked()
+            self._read_control(
+                values,
+                BEAM_BLANKER_CONTROL,
+                instrument.is_beam_blanked,
+            )
         if STAGE_POSITION_CONTROL in available:
-            y_nm, x_nm = instrument.stage_position_nm()
-            values["stage_position_y_nm"] = y_nm
-            values["stage_position_x_nm"] = x_nm
+            self._read_stage(values, instrument)
         with self._lock:
             self._controls = values
+
+    @staticmethod
+    def _read_control(
+        values: dict[str, float | bool],
+        name: str,
+        read: Callable[[], float | bool],
+    ) -> None:
+        """
+        Read one control into the map, or leave it out and say why.
+
+        Parameters
+        ----------
+        values : dict[str, float | bool]
+            The map being built, added to on success.
+        name : str
+            The control's name, and its key.
+        read : Callable[[], float | bool]
+            The instrument's reader for it.
+        """
+        try:
+            values[name] = read()
+        except Exception as error:  # noqa: BLE001 - see _refresh_controls
+            _LOGGER.warning("could not read %s from the instrument: %s", name, error)
+
+    @staticmethod
+    def _read_stage(
+        values: dict[str, float | bool],
+        instrument: InstrumentController,
+    ) -> None:
+        """
+        Read the stage position into the map, as its two numbers.
+
+        Separate from :meth:`_read_control` because one control answers
+        with a pair, and half a stage position is not a position: both
+        keys appear or neither does.
+
+        Parameters
+        ----------
+        values : dict[str, float | bool]
+            The map being built.
+        instrument : InstrumentController
+            The controller to read.
+        """
+        try:
+            y_nm, x_nm = instrument.stage_position_nm()
+        except Exception as error:  # noqa: BLE001 - see _refresh_controls
+            _LOGGER.warning("could not read the stage position: %s", error)
+            return
+        values["stage_position_y_nm"] = y_nm
+        values["stage_position_x_nm"] = x_nm
 
     def _start_locked(self, target: str, device: object, spec: _LiveSpec) -> None:
         """

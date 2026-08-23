@@ -13,6 +13,22 @@ one directory per day under ``~/miainwoodpecker-data``. Operator, sample,
 and notes can be given here or typed into the Session group at any point
 during the run, and the directory itself can be changed from there too.
 
+Two ways in: own the instrument, or join it
+-------------------------------------------
+Without ``--broker`` this process launches a device server, opens the
+instrument and arbitrates it in-process — one program, one microscope,
+which is what a single operator at a console wants.
+
+``--broker PATH`` is the other case: a
+:class:`~miainwoodpecker.broker.app` is already running over the
+instrument and published where it is, and this window connects to it as
+one client among several. Nothing is launched here, no device handle is
+held, and every control the window offers is built from what the broker
+*describes* rather than from a device it can reach — which is what makes
+a window on another machine, beside a notebook and a dashboard on the
+same microscope, the same window rather than a cut-down one. Acquiring
+takes a lease and can be refused, because somebody else may be driving.
+
 Choosing the backend, and why the default is not configurable away
 ------------------------------------------------------------------
 Phase 1 staged the device layer for hardware:
@@ -66,6 +82,8 @@ import os
 
 import napari
 
+from miainwoodpecker.broker.invitation import BrokerInvitation
+from miainwoodpecker.broker.remote import connect_broker
 from miainwoodpecker.devices.remote import (
     DEFAULT_SERVER_MODULE,
     HARDWARE_BACKEND,
@@ -112,6 +130,19 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--operator", default=None, help="who is on the instrument")
     parser.add_argument("--sample", default=None, help="sample identifier")
     parser.add_argument("--notes", default=None, help="free-text session notes")
+    parser.add_argument(
+        "--broker",
+        default=None,
+        metavar="PATH",
+        help=(
+            "connect to a broker already running over an instrument, at the "
+            "invitation it published (a directory gets broker.json inside "
+            "it). This window then launches no device server of its own and "
+            "shares the instrument with whatever else is connected; "
+            "--backend, --plugin and --server-module are the other case and "
+            "are ignored."
+        ),
+    )
     parser.add_argument(
         "--backend",
         choices=(SIMULATED_BACKEND, HARDWARE_BACKEND),
@@ -217,6 +248,70 @@ def _ordered_cameras(
     }
 
 
+def _open_on_broker(invitation_path: str, session: Session) -> None:
+    """
+    Open the window against a broker that is already running elsewhere.
+
+    No device session of its own, and that is the whole point: this
+    process launches no device server, holds no device handle and
+    imports no vendor code. What the window offers comes from the
+    broker's ``describe``, ``controls`` and ``camera_parameters``, and
+    everything it drives goes through a lease it has to be granted -
+    the same terms a notebook or the dashboard connects on.
+
+    Parameters
+    ----------
+    invitation_path : str
+        Where the broker published its invitation - the ``--publish``
+        path given to ``miainwoodpecker-broker``, or the
+        ``broker.json`` inside it.
+    session : Session
+        Where recordings go. This window's own, not the broker's:
+        two clients of one instrument keep their own session
+        directories, and the frames each records are its own.
+
+    Raises
+    ------
+    SystemExit
+        If the invitation cannot be read, if no broker answers it, or
+        if the instrument it serves has nothing to display. Each is a
+        thing an operator can fix, and none is worth a traceback.
+    """
+    try:
+        invitation = BrokerInvitation.read_from(invitation_path)
+    except (OSError, ValueError) as error:
+        msg = (
+            f"could not read the broker invitation at {invitation_path}: "
+            f"{error}. It is written by 'miainwoodpecker-broker --publish'."
+        )
+        raise SystemExit(msg) from error
+    try:
+        broker = connect_broker(invitation.address(), invitation.authkey)
+    except OSError as error:
+        msg = (
+            f"no broker answered at {invitation.host}:{invitation.port}: "
+            f"{error}. The invitation may be from a broker that has since "
+            "stopped."
+        )
+        raise SystemExit(msg) from error
+    try:
+        window = documents.open_window("miainwoodpecker")
+        try:
+            widget = LiveInstrumentWidget(window.board, broker=broker)
+        except ValueError as error:
+            raise SystemExit(str(error)) from error
+        widget.set_session(session)
+        window.set_panel(widget)
+        window.show()
+        napari.run(force=True)
+    finally:
+        # Closed here rather than by the widget, which did not open it.
+        # It matters on the way out: the server releases whatever this
+        # client still held when the socket closes, so an instrument is
+        # not left leased to a window that has gone.
+        broker.close()
+
+
 def main(argv: list[str] | None = None) -> None:
     """
     Open the application window with the live instrument dock widget.
@@ -239,6 +334,9 @@ def main(argv: list[str] | None = None) -> None:
         sample=args.sample,
         notes=args.notes,
     )
+    if args.broker is not None:
+        _open_on_broker(args.broker, session)
+        return
     plugins = _hardware_plugins(args.plugin)
     with remote_instrument(
         backend=args.backend,

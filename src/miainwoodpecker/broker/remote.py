@@ -71,6 +71,7 @@ if typing.TYPE_CHECKING:
     )
     from miainwoodpecker.devices.interface import (
         Camera,
+        CameraParameters,
         Frame,
         InstrumentController,
         ScanParameters,
@@ -684,6 +685,26 @@ class RemoteBroker:
             Keyed by control name.
         """
         return typing.cast("Mapping[str, float | bool]", self.broker_call("controls"))
+
+    def camera_parameters(self, target: str) -> CameraParameters | None:
+        """
+        Return what a detector is currently configured to do.
+
+        Parameters
+        ----------
+        target : str
+            The detector to read.
+
+        Returns
+        -------
+        CameraParameters | None
+            Its exposure, binning and readout mode, or None for a target
+            that has none.
+        """
+        return typing.cast(
+            "CameraParameters | None",
+            self.broker_call("camera_parameters", (target,)),
+        )
 
     def latest(self, target: str) -> Frame | None:
         """

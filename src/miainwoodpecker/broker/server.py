@@ -68,6 +68,7 @@ BROKER_METHODS = frozenset(
         "describe",
         "snapshot",
         "controls",
+        "camera_parameters",
         "latest",
         "latest_frames",
         "stats",

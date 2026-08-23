@@ -82,6 +82,7 @@ if typing.TYPE_CHECKING:
     from miainwoodpecker.acquisition.live import LiveStats
     from miainwoodpecker.devices.interface import (
         Camera,
+        CameraParameters,
         Frame,
         InstrumentController,
         ScanParameters,
@@ -378,6 +379,28 @@ class TargetDescription:
     binning_values : tuple[int, ...]
         The binning factors a camera supports, ascending. Empty for
         anything that is not a camera.
+    binning_values_yx : tuple[tuple[int, ...], tuple[int, ...]] | None
+        The factors offered *per axis*, slow then fast, for a detector
+        whose axes differ - a spectrometer, where binning rows buys
+        signal-to-noise and binning channels spends energy resolution.
+        None for a detector with one list for both, which is every
+        camera that has not said otherwise; a client reads
+        :attr:`binning_values` then. The same distinction
+        :func:`~miainwoodpecker.devices.interface.axis_binning_values`
+        makes against the handle, carried across a process boundary.
+    synchronises : bool
+        Whether this scan unit has a synchronised scan/camera mode at
+        all - whether, in the device layer's terms, it is a
+        :class:`~miainwoodpecker.devices.interface.SynchronisedScanner`.
+
+        Separate from :attr:`synchronised_targets` because the empty
+        tuple is otherwise two different situations wanting two
+        different actions from an operator: a backend that cannot do
+        synchronised acquisition (use a different instrument) and one
+        that can with nothing wired to it (wire a detector). The
+        distinction was an ``isinstance`` against the handle before
+        this, which is exactly the kind of read a client in another
+        process cannot make.
     synchronised_targets : tuple[str, ...]
         The cameras this scan unit can drive a synchronised pass into.
         Empty when the backend has no such wiring, which is a hardware
@@ -386,6 +409,20 @@ class TargetDescription:
     controls : tuple[str, ...]
         The ``*_CONTROL`` names an instrument implements. Empty for
         anything that is not an instrument controller.
+    backend : str
+        What the device server says it is driving - ``simulated``, a
+        vendor's name - for an instrument target. Empty for anything
+        else, and for a server that does not say.
+    native_scan : ScanParameters | None
+        The one geometry this scan unit can acquire, when it has only
+        one. A replay device does: it holds the grid the probe actually
+        visited, and no request makes it another. None means "takes
+        whatever grid it is given", which is every real scan unit - see
+        :func:`~miainwoodpecker.devices.interface.native_scan_parameters`.
+
+        A client that ignored this would offer an operator a square spin
+        box for a recording that is 22x25, and have every acquisition
+        refused.
     error : str | None
         Why this description is incomplete, when a device refused to
         answer one of the questions above.
@@ -405,8 +442,12 @@ class TargetDescription:
     label: str
     channel_names: tuple[str, ...] = ()
     binning_values: tuple[int, ...] = ()
+    binning_values_yx: tuple[tuple[int, ...], tuple[int, ...]] | None = None
+    synchronises: bool = False
     synchronised_targets: tuple[str, ...] = ()
     controls: tuple[str, ...] = ()
+    backend: str = ""
+    native_scan: ScanParameters | None = None
     error: str | None = None
 
 
@@ -640,7 +681,47 @@ class InstrumentBroker(typing.Protocol):
             Keyed by the names
             :meth:`~miainwoodpecker.devices.interface.InstrumentController.available_controls`
             reports. An absent key is a control this instrument does not
-            have, not one that reads zero.
+            have - or would not answer for, which is logged and looks
+            the same from here on purpose: a client shows the field it
+            has no fresh value for as stale either way, and one broken
+            control must not cost every client the rest of the reading.
+            The stage position appears as ``stage_position_y_nm`` and
+            ``stage_position_x_nm``, both or neither.
+        """
+
+    def camera_parameters(self, target: str) -> CameraParameters | None:
+        """
+        Return what a detector is currently configured to do.
+
+        Watch-side, for the same reason :meth:`controls` is: a client
+        offering an exposure field or a readout selector has to show
+        what the device is set to before it can offer to change it, and
+        having to take a lease to find out would mean every window held
+        one from the moment it opened.
+
+        Unlike :meth:`describe`, this is not static - an exposure is
+        changed under a lease and the next reader should see it - so it
+        is read from the device rather than cached at construction. It
+        is read only while nothing holds a lease on the target, for the
+        reason :meth:`controls` gives: a read issued mid-lease is a
+        second caller on a one-request-at-a-time device.
+
+        A name this instrument does not serve raises ``KeyError``.
+
+        Parameters
+        ----------
+        target : str
+            The detector to read.
+
+        Returns
+        -------
+        CameraParameters | None
+            Its exposure, binning and readout mode, or None for a target
+            that has no such settings - a scan unit, an instrument
+            controller. A detector that *refuses* the question raises
+            rather than answering None: unlike a description, this is
+            what a client is about to change, and "it would not say" and
+            "it has none" want different responses.
         """
 
     def latest(self, target: str) -> Frame | None:

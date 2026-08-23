@@ -377,7 +377,7 @@ class TestAcquiringAnEELSSpectrumImage:
 
             binding = widget._binding(ronchigram)  # noqa: SLF001
             assert "refused" in binding.status.text()
-            assert binding.camera.parameters().readout == IMAGE_READOUT
+            assert devices.cameras[ronchigram].parameters().readout == IMAGE_READOUT
             # And the combo went back, so the panel is not showing a mode
             # the device is not in.
             assert binding.readout_combo.currentText() == IMAGE_READOUT
