@@ -756,6 +756,16 @@ preview = { cmd = "miainwoodpecker-preview --cameras 2", description = "Open the
 # default environment, and re-enters pixi for each child; see
 # src/miainwoodpecker/launcher.py.
 instrument = { cmd = "miainwoodpecker-instrument --broker-env device --ui-env default", description = "Serve the instrument and open a window on it" }
+# The same instrument, with the browser dashboard as the front end
+# instead of the Qt window - in the environment that has marimo and no
+# Qt, which is the whole reason that environment exists. Add --publish
+# to a path of your own if a notebook should join this one too.
+dashboard = { cmd = "miainwoodpecker-instrument --broker-env device --ui-env dashboard --publish . -- marimo run notebooks/instrument_dashboard.py", description = "Serve the instrument and open the browser dashboard on it" }
+# No front end at all: hold the microscope open and let people attach and
+# detach - a window now, a notebook later, both at once - until Ctrl-C.
+# Publishes into the working directory, which is where a notebook looks
+# when it is told nothing else.
+serve = { cmd = "miainwoodpecker-instrument --serve --publish . --broker-env device", description = "Hold the instrument open for clients to come and go" }
 # Unit tests only. They need no display and no devices, which is what makes
 # them the default: a check that cannot run on the machine in front of you
 # is not a check.

@@ -527,12 +527,20 @@ since terminating a process there runs no handler at all.
 miainwoodpecker-instrument --publish .                    # window
 miainwoodpecker-instrument --publish . -- marimo run \
     notebooks/instrument_dashboard.py                     # dashboard
+miainwoodpecker-instrument --serve --publish .            # neither
 ```
 
 `--publish .` matters if you want to join from a notebook too: without
 it the invitation goes to a temporary directory that is removed when the
 session ends. Whatever runs after `--` is given `$MIAINWOODPECKER_BROKER`,
 which is where the dashboard already looks.
+
+The third form is the one to use for a script that should not care
+whether anybody is watching. `--serve` starts no front end at all and
+holds the instrument open until Ctrl-C, so clients — your script, a
+window, the dashboard — attach and detach as they like; the other two
+end the session when their own front end closes. `pixi run serve` is
+that with the vendor stack's environment already chosen.
 
 ### The viewer as one of the clients
 

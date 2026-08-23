@@ -54,10 +54,32 @@ the two commands it runs — `--backend`, `--plugin`, `--server-module`
 for the instrument, `--session`, `--operator`, `--sample` and `--notes`
 for the window. Add `--publish ~/instrument` and a notebook can join the
 session while it runs; without it the connection details live in a
-temporary directory that goes away with the session. Anything after `--`
-replaces the window, so `miainwoodpecker-instrument -- marimo run
-notebooks/instrument_dashboard.py` serves the microscope and opens the
-[dashboard](scripting-and-automation.md) on it instead.
+temporary directory that goes away with the session.
+
+Three shapes, and which you want depends on how the microscope is being
+used rather than on the software:
+
+| Command | The session is |
+|---|---|
+| `pixi run instrument` | One sitting. A window, and the instrument put down when you close it. |
+| `pixi run dashboard` | The same, with the [browser dashboard](scripting-and-automation.md) as the front end instead of the window. |
+| `pixi run serve` | The instrument itself. No front end: it stays served while people attach and detach, and ends when you press Ctrl-C. |
+
+`serve` is the one to reach for when the answer to "napari or the
+notebook?" is "both, and not yet". It publishes into the working
+directory, so from anywhere else on the machine:
+
+```shell
+miainwoodpecker-viewer --broker .                  # a window, now
+marimo run notebooks/instrument_dashboard.py       # a dashboard, later
+```
+
+Both are ordinary clients: they can be opened and closed in any order
+while the instrument stays up, and they take turns at the hardware
+through the same leases everything else does. Under `pixi run
+instrument`, by contrast, closing the window ends the session for
+everyone — which is what you want for one sitting and not for a shared
+column.
 
 The window is the same window: the same panels, the same detectors, the
 same controls, built from what the broker reports rather than from

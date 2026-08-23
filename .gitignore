@@ -256,3 +256,9 @@ _version.py
 .pixi/*
 # ...except the config, which is project settings rather than build output.
 !.pixi/config.toml
+
+# A running broker's connection details, which `pixi run serve` and
+# `pixi run dashboard` publish into the working directory so a notebook
+# can find them. It holds a live authkey and is meaningless once that
+# broker stops, so it is never worth committing.
+broker.json

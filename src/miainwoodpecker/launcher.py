@@ -14,6 +14,15 @@ which is the only part that was manual. Everything either of them can do
 from its own command line it can still do from this one - the flags are
 passed through.
 
+**Two shapes of session, and the difference is about the instrument
+rather than about this command.** The default is one sitting: a broker,
+one front end, and an instrument put down when that front end closes.
+``--serve`` is the other - hold the microscope open and let people come
+and go, a window this morning, a notebook after lunch - and it ends on
+Ctrl-C rather than on anything closing. Which front end the first shape
+opens is a command after ``--``; the second opens none, and clients
+find it through the invitation it publishes.
+
 **Why a process rather than a task graph.** ``depends-on`` in a pixi
 manifest is sequential: a task that depends on the broker and the viewer
 runs the broker to completion and then starts the viewer, which is
@@ -60,6 +69,7 @@ here rather than three processes racing each other to die.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import logging
 import os
@@ -68,6 +78,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import typing
 from pathlib import Path
@@ -434,7 +445,11 @@ def wait_for_invitation(
     raise SystemExit(message)
 
 
-def _supervise(broker: subprocess.Popen, front_end: subprocess.Popen) -> int:
+def _supervise(
+    broker: subprocess.Popen,
+    front_end: subprocess.Popen,
+    requested: threading.Event,
+) -> int:
     """
     Watch both children, and stop the other when either finishes.
 
@@ -451,15 +466,19 @@ def _supervise(broker: subprocess.Popen, front_end: subprocess.Popen) -> int:
         The broker.
     front_end : subprocess.Popen
         The window, dashboard or script being run against it.
+    requested : threading.Event
+        Set when this process has been asked to stop.
 
     Returns
     -------
     int
         What this command should exit with: the front end's status when
-        it ended the session, and a failure when the broker ended it.
+        it ended the session, a failure when the broker ended it, and
+        130 when something ended it from outside - a session cut short
+        is not a session that finished.
     """
     try:
-        while True:
+        while not requested.is_set():
             status = front_end.poll()
             if status is not None:
                 _LOGGER.info(
@@ -478,13 +497,111 @@ def _supervise(broker: subprocess.Popen, front_end: subprocess.Popen) -> int:
                 return status or 1
             time.sleep(_POLL_S)
     except KeyboardInterrupt:
-        _LOGGER.info("interrupted; stopping the front end, then the broker")
-        stop(front_end)
-        stop(broker)
-        # The conventional status for "ended by an interrupt", and not
-        # zero: this command was asked to run a session and the session
-        # did not end on its own terms.
-        return 130
+        # Only reachable where the handlers could not be installed.
+        _LOGGER.info("interrupted")
+    _LOGGER.info("asked to stop; stopping the front end, then the broker")
+    stop(front_end)
+    stop(broker)
+    # The conventional status for "ended from outside", and not zero:
+    # this command was asked to run a session and the session did not
+    # end on its own terms.
+    return 130
+
+
+def stop_requests() -> threading.Event:
+    """
+    Install handlers for every way this process may be asked to stop.
+
+    The same three :mod:`miainwoodpecker.broker.app` installs, and for
+    the same reason one layer up: ``SIGTERM`` from a service manager and
+    ``SIGBREAK`` on Windows both **terminate the interpreter without
+    unwinding** by default, and this process is the one holding the
+    broker that holds the instrument. Left to the defaults, a supervisor
+    stopping this would leave the broker orphaned and the instrument
+    unparked - the exact failure the broker's own handlers exist to
+    prevent, reintroduced by putting a launcher in front of it.
+
+    Ctrl-C is included so that all three arrive the same way: as an
+    event the loops below poll, rather than as an exception in whichever
+    line happened to be executing.
+
+    Returns
+    -------
+    threading.Event
+        Set when a stop has been asked for.
+    """
+    requested = threading.Event()
+
+    def handle(signum: int, frame: object) -> None:
+        """
+        Record that a stop was asked for.
+
+        Parameters
+        ----------
+        signum : int
+            The signal that arrived.
+        frame : object
+            The interrupted frame, unused.
+        """
+        del frame
+        _LOGGER.info("asked to stop by %s", signal.Signals(signum).name)
+        requested.set()
+
+    for name in ("SIGINT", "SIGTERM", "SIGBREAK"):
+        number = getattr(signal, name, None)
+        if number is None:
+            continue  # SIGBREAK is Windows-only; SIGTERM is not on all hosts.
+        # A host that refuses a handler - or a caller running this off
+        # the main thread, as a test may - is not a reason to refuse to
+        # run. The loops keep their KeyboardInterrupt path for that.
+        with contextlib.suppress(ValueError, OSError):
+            signal.signal(number, handle)
+    return requested
+
+
+def _serve(broker: subprocess.Popen, requested: threading.Event) -> int:
+    """
+    Hold the instrument open with no front end of its own, until stopped.
+
+    The other shape a session comes in. :func:`_supervise` runs one
+    front end and ends when it does, which is right for "open a window
+    on the microscope" and wrong for an instrument that stays served
+    while people come and go - a window this morning, a notebook after
+    lunch, a dashboard on the wall throughout. Here the broker is the
+    session, and Ctrl-C is how it ends.
+
+    Nothing is spawned, so nothing has to be stopped in order: the
+    clients are somebody else's processes, started and closed whenever
+    they like against the invitation this published.
+
+    Parameters
+    ----------
+    broker : subprocess.Popen
+        The broker to hold open.
+    requested : threading.Event
+        Set when this process has been asked to stop.
+
+    Returns
+    -------
+    int
+        Zero when it was asked to stop and did, because in this mode
+        that is the ordinary ending rather than a session cut short -
+        the same status the broker itself reports for a requested
+        shutdown. A broker that exited on its own reports why it did.
+    """
+    try:
+        while not requested.is_set():
+            status = broker.poll()
+            if status is not None:
+                _LOGGER.error("the broker exited with status %s", status)
+                return status or 1
+            time.sleep(_POLL_S)
+    except KeyboardInterrupt:
+        # Only reachable where the handlers could not be installed.
+        _LOGGER.info("interrupted")
+    _LOGGER.info("stopping the broker")
+    stop(broker)
+    return 0
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -545,6 +662,17 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "interface for the broker to bind (default localhost). Binding "
             "anywhere else puts an instrument's controls on the network; do "
             "it knowingly"
+        ),
+    )
+    parser.add_argument(
+        "--serve",
+        action="store_true",
+        help=(
+            "hold the instrument open with no front end of its own, until "
+            "Ctrl-C. For a microscope that stays served while people come "
+            "and go - a window now, a notebook later - rather than one "
+            "session that ends when its window closes. Needs --publish, "
+            "since clients have to be able to find it"
         ),
     )
     parser.add_argument(
@@ -652,7 +780,13 @@ def _front_end_command(args: argparse.Namespace, publish: Path) -> list[str]:
 
 def main(argv: list[str] | None = None) -> int:
     """
-    Serve one instrument and open one front end on it, until it closes.
+    Serve one instrument, with a front end on it or with none.
+
+    Two shapes, and which one is wanted is a question about the
+    *instrument* rather than about this command. ``--serve`` holds a
+    microscope open for whoever connects, all day, and ends on Ctrl-C.
+    Without it this is one session: a broker, one front end, and an
+    instrument put down when that front end closes.
 
     Parameters
     ----------
@@ -666,6 +800,12 @@ def main(argv: list[str] | None = None) -> int:
 
     Raises
     ------
+    SystemExit
+        If ``--serve`` was asked for without ``--publish``, or with a
+        front end to run. Both are contradictions rather than
+        preferences: nothing can join a broker whose invitation is in a
+        temporary directory nobody was told about, and a mode whose
+        point is having no front end cannot be given one.
     BaseException
         Whatever went wrong on the way up - a broker that would not
         publish, an environment that cannot be resolved, an interrupt
@@ -675,6 +815,22 @@ def main(argv: list[str] | None = None) -> int:
     """
     logging.basicConfig(level=logging.INFO)
     args = _parse_args(argv)
+    if args.serve and args.publish is None:
+        message = (
+            "--serve holds the instrument open for clients to join, and they "
+            "join at the path it publishes - so it needs somewhere to "
+            "publish. Add --publish . (which is where a notebook looks by "
+            "default), or drop --serve to run one session with its own front "
+            "end."
+        )
+        raise SystemExit(message)
+    if args.serve and [argument for argument in args.front_end if argument != "--"]:
+        message = (
+            "--serve runs no front end, so the command after -- would never "
+            "be started. Run it yourself against the published invitation, "
+            "or drop --serve."
+        )
+        raise SystemExit(message)
     temporary = args.publish is None
     publish = (
         Path(tempfile.mkdtemp(prefix="miainwoodpecker-"))
@@ -689,7 +845,11 @@ def main(argv: list[str] | None = None) -> int:
     # authentication error rather than a refused connection.
     invitation.unlink(missing_ok=True)
     broker_environment = resolve_environment(args.broker_env)
-    front_end_environment = resolve_environment(args.ui_env)
+    front_end_environment = resolve_environment(None if args.serve else args.ui_env)
+    # Before the broker exists, so that a stop arriving while it is
+    # starting is still noticed rather than terminating this process
+    # with a child it has not begun to supervise.
+    requested = stop_requests()
     broker = spawn(
         child_command(
             [sys.executable, "-m", BROKER_MODULE, *_broker_arguments(args, publish)],
@@ -699,6 +859,15 @@ def main(argv: list[str] | None = None) -> int:
     )
     try:
         wait_for_invitation(broker, invitation)
+        if args.serve:
+            _LOGGER.info(
+                "serving %s; connect with 'miainwoodpecker-viewer --broker %s' "
+                "or $%s, and press Ctrl-C here to stop",
+                invitation,
+                publish,
+                BROKER_ENV_VAR,
+            )
+            return _serve(broker, requested)
         front_end = spawn(
             child_command(_front_end_command(args, publish), front_end_environment),
             env={
@@ -707,7 +876,7 @@ def main(argv: list[str] | None = None) -> int:
                 BROKER_ENV_VAR: str(publish),
             },
         )
-        return _supervise(broker, front_end)
+        return _supervise(broker, front_end, requested)
     except BaseException:
         # Including KeyboardInterrupt and SystemExit: whatever went
         # wrong on the way up, the broker is holding an instrument and

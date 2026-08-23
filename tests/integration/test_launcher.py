@@ -21,14 +21,17 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import subprocess
 import sys
 import time
+import typing
 from pathlib import Path
 
 import pytest
 
-from miainwoodpecker.broker.invitation import DEFAULT_FILENAME
+from miainwoodpecker.broker.invitation import DEFAULT_FILENAME, BrokerInvitation
+from miainwoodpecker.broker.remote import connect_broker
 from miainwoodpecker.devices.remote import own_process_group
 from miainwoodpecker.launcher import (
     BROKER_ENV_VAR,
@@ -40,9 +43,35 @@ from miainwoodpecker.launcher import (
     wait_for_invitation,
 )
 
+if typing.TYPE_CHECKING:
+    from collections.abc import Callable
+
 _STUB = "front_end_stub"
 _CAMERA_SERVER = "miainwoodpecker.devices.camera_server"
 _DEADLINE_S = 120.0
+
+
+def _wait_until(condition: Callable[[], bool]) -> bool:
+    """
+    Poll a condition until it is true or the deadline elapses.
+
+    Parameters
+    ----------
+    condition : Callable[[], bool]
+        Checked repeatedly; polled rather than waited on, because what
+        is being waited for happens in another process.
+
+    Returns
+    -------
+    bool
+        Whether it came true in time.
+    """
+    deadline = time.monotonic() + _DEADLINE_S
+    while time.monotonic() < deadline:
+        if condition():
+            return True
+        time.sleep(0.05)
+    return False
 
 
 def _run(report: Path, *extra: str) -> int:
@@ -127,6 +156,97 @@ def test_the_temporary_invitation_does_not_outlive_the_session(tmp_path):
 
     published = Path(json.loads(report.read_text(encoding="utf-8"))["published"])
     assert not published.exists()
+
+
+def test_serving_holds_the_instrument_open_for_clients_to_come_and_go(tmp_path):
+    """
+    Two clients, one after the other, on an instrument that outlives both.
+
+    The shape a microscope actually gets used in: the window closing is
+    not the end of the session, because somebody else is still on the
+    column - or will be after lunch. The default mode ends when its own
+    front end ends, which is right for one sitting and wrong for a day.
+
+    Ctrl-C is what ends it, so the test sends what Ctrl-C sends.
+    """
+    published = tmp_path / "published"
+    invitation = published / DEFAULT_FILENAME
+    # The launcher itself as a subprocess, because what is being tested
+    # includes how it answers a signal - which it can only be sent as a
+    # process of its own.
+    serving = spawn(
+        [
+            sys.executable,
+            "-m",
+            "miainwoodpecker.launcher",
+            "--serve",
+            "--publish",
+            str(published),
+            "--backend",
+            "simulated",
+            "--server-module",
+            _CAMERA_SERVER,
+        ],
+    )
+    try:
+        assert _wait_until(invitation.exists)
+        # Two clients in turn, each opening and closing its own
+        # connection, with the instrument served throughout - which is
+        # the whole difference from the default mode, where the first
+        # one closing would have ended it.
+        for _ in range(2):
+            details = BrokerInvitation.read_from(invitation)
+            client = connect_broker(details.address(), details.authkey)
+            try:
+                assert "instrument" in client.describe()
+            finally:
+                client.close()
+            assert serving.poll() is None
+        port = json.loads(invitation.read_text(encoding="utf-8"))["port"]
+        status = stop(serving)
+    finally:
+        stop(serving)
+
+    # Asked to stop, so zero: in this mode that is the ordinary ending
+    # rather than a session cut short.
+    assert status == 0
+    # And the broker went with it. A launcher that died without taking
+    # its broker down would leave an instrument served by nobody, which
+    # is the failure its signal handlers exist to prevent.
+    assert _wait_until(lambda: not _listening(port))
+
+
+def _listening(port: int) -> bool:
+    """
+    Report whether anything is accepting connections on a port.
+
+    Parameters
+    ----------
+    port : int
+        The port the broker published.
+
+    Returns
+    -------
+    bool
+        True while something answers there.
+    """
+    with socket.socket() as probe:
+        probe.settimeout(1.0)
+        return probe.connect_ex(("localhost", port)) == 0
+
+
+def test_serving_without_somewhere_to_publish_is_refused(tmp_path):
+    """
+    A held-open instrument nobody can find is not a held-open instrument.
+
+    The default publish path is a temporary directory that only this
+    process knows, which is fine for a session with its own front end
+    and useless for one whose whole point is being joined.
+    """
+    with pytest.raises(SystemExit, match=r"needs somewhere to publish|--publish"):
+        main(["--serve"])
+    with pytest.raises(SystemExit, match="runs no front end"):
+        main(["--serve", "--publish", str(tmp_path), "--", "some-dashboard"])
 
 
 def test_the_broker_is_asked_to_stop_and_parks_on_the_way_out(tmp_path):

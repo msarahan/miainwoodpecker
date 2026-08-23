@@ -407,6 +407,22 @@
   `$MIAINWOODPECKER_BROKER` — the variable the dashboard already reads,
   and now the default for the viewer's `--broker` too — so the same
   command serves an instrument to a marimo dashboard or to a script.
+  `pixi run dashboard` is that spelled out, in the environment that has
+  marimo and no Qt.
+  **`--serve` is the other shape of session**, and the difference is
+  about the instrument rather than the software: no front end, held
+  open until Ctrl-C, for a column that people attach to and leave all
+  day — a window this morning, a notebook after lunch, both at once.
+  The default mode ends when *its* front end closes, which is right for
+  one sitting and wrong for a shared microscope. `pixi run serve` is
+  that with the vendor environment chosen and the invitation published
+  into the working directory, where a notebook looks by default.
+  The launcher installs the same three signal handlers the broker does
+  (`SIGINT`, `SIGTERM`, `SIGBREAK`), because a supervisor stopping a
+  process whose defaults terminate the interpreter without unwinding
+  would leave the broker orphaned and the instrument unparked — the
+  failure the broker's own handlers exist to prevent, which putting a
+  launcher in front of it would otherwise reintroduce.
 
 - **A device server is in its own process group on Windows too.**
   `devices/remote.py` has always said it puts the server in its own
