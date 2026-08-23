@@ -91,8 +91,10 @@ from miainwoodpecker.acquisition.sequence import (
 from miainwoodpecker.devices.interface import (
     CameraParameters,
     ScanParameters,
+    ScanPass,
     native_scan_parameters,
 )
+from miainwoodpecker.storage.calibration import FrameCalibration
 from miainwoodpecker.storage.nexus import write_frames
 from miainwoodpecker.storage.session import (
     LoadJob,
@@ -106,7 +108,8 @@ from miainwoodpecker.storage.session import (
     format_bytes,
     free_space,
 )
-from miainwoodpecker.viewer import preferences, profiles
+from miainwoodpecker.viewer import axes, preferences, profiles, progress
+from miainwoodpecker.viewer import jobs as jobs_module
 from miainwoodpecker.viewer.documents import ATTACHED_TO
 from miainwoodpecker.viewer.jobs import AnalysisJob
 from miainwoodpecker.viewer.panels import devices as devices_panel
@@ -115,6 +118,7 @@ from miainwoodpecker.viewer.panels import recordings as recordings_panel
 from miainwoodpecker.viewer.panels import sections as sections_panel
 from miainwoodpecker.viewer.panels import session as session_panel
 from miainwoodpecker.viewer.panels import statusbar as statusbar_panel
+from miainwoodpecker.viewer.panels import toolbar
 from miainwoodpecker.viewer.panels.defaults import (
     _DEFAULT_DWELL_US,
     _DEFAULT_FOV_NM,
@@ -139,7 +143,20 @@ if typing.TYPE_CHECKING:
     from miainwoodpecker.storage.nexus import FrameStack
     from miainwoodpecker.storage.session import LoadedRecording, Recording
 
-_DEFAULT_DISPLAY_INTERVAL_MS = 33
+# 60 fps, not the 30 this was. Measured end to end through the real
+# display path - refresh_display, the document board, and napari - the
+# whole thing costs 9.4 ms at 512^2, 9.7 ms at 1024^2 and 10.2 ms at
+# 2048^2, so it already sustained ~100 fps and the old 33 ms timer was
+# discarding two thirds of that.
+#
+# **Raising it is close to free when nothing is arriving**, which is the
+# property that makes it safe on a slower machine than the one measured:
+# a tick that finds the frame it already drew costs 4.4 microseconds
+# (0.026% of a core at 60 Hz), because the identity check skips before
+# any upload or contrast pass. The cost tracks frames actually produced,
+# not ticks. Overridable per instance for a machine where that does not
+# hold.
+_DEFAULT_DISPLAY_INTERVAL_MS = 16
 _ANALYSIS_BURST_FRAME_COUNT = 5
 # Shown when a live loop would not release the device in time. Refusing is
 # deliberate: driving a device from two threads corrupts frames silently
@@ -197,6 +214,13 @@ class _CameraBinding:
     binning_combo : QtWidgets.QComboBox | None
         Binning for an acquired image, same reasoning as the exposure —
         a live view can afford to be binned where a kept image cannot.
+        On a detector that bins both directions alike this is the whole
+        setting; on one that does not, it is the *slow* axis.
+    binning_across_combo : QtWidgets.QComboBox | None
+        The fast axis's binning, built only for a detector that reports
+        its axes separately — a spectrometer, where binning rows buys
+        signal-to-noise and binning channels costs energy resolution.
+        None means the camera has one binning setting, not two.
     readout_combo : QtWidgets.QComboBox | None
         Which readout mode the *device* is in — and unlike the two
         above, changing it configures the camera immediately. Readout is
@@ -219,6 +243,7 @@ class _CameraBinding:
     record_button: QtWidgets.QPushButton | None = None
     exposure_spin: QtWidgets.QDoubleSpinBox | None = None
     binning_combo: QtWidgets.QComboBox | None = None
+    binning_across_combo: QtWidgets.QComboBox | None = None
     readout_combo: QtWidgets.QComboBox | None = None
     acquire_button: QtWidgets.QPushButton | None = None
 
@@ -464,6 +489,10 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         # a reference for identity comparison only; the array itself is
         # the layer's, not a second copy.
         self._displayed: dict[str, Frame] = {}
+        # Calibration each layer was last given, so a per-frame check can
+        # tell "the field of view changed" from the far commoner "it did
+        # not" without reassigning evented properties either way.
+        self._calibrated: dict[str, FrameCalibration] = {}
         # Section title to section, so a caller - and a test - can ask
         # which devices the window offered and whether each is folded.
         self._device_sections: dict[str, devices_panel.CollapsibleSection] = {}
@@ -474,6 +503,11 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         self._recording_job: RecordingJob | None = None
         self._load_job: LoadJob | None = None
         self._analysis_job: AnalysisJob | None = None
+        self._pass_job: jobs_module.PassJob | None = None
+        self._pass_preview: dict[str, progress.PassPreview] = {}
+        self._pass_target: str | None = None
+        self._pass_path: Path | None = None
+        self._pass_positions = ""
         # Set together with the job, and only read by _poll_analysis, so the
         # result of whichever button started it lands in that button's own
         # status label and layers. One job at a time is enforced in
@@ -603,7 +637,7 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         Re-read the instrument's identity and control values.
 
         On demand rather than on the display timer: four control reads
-        every 33 ms would put traffic on the wire to answer a question
+        at the display rate would put traffic on the wire to answer a question
         nobody asked. Called once when the panel is built, and whenever
         **Refresh** is pressed.
 
@@ -1007,7 +1041,9 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
             return
         self._scan_loop = MultiChannelLiveAcquisition(self._grab_scan)
         self._scan_loop.start()
-        self._scan_button.setText("Stop scan")
+        toolbar.set_action(
+            self._scan_button, toolbar.STOP, "Stop the live scan"
+        )
         self._scan_status.setText("running")
         # Reversed, so the first enabled detector ends up on top of the
         # pile rather than under the ones raised after it.
@@ -1034,7 +1070,11 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         if self._scan_loop is not None:
             stopped = self._scan_loop.stop()
         if stopped:
-            self._scan_button.setText("Start scan")
+            toolbar.set_action(
+                self._scan_button,
+                toolbar.START,
+                "Start the live scan (View profile)",
+            )
             self._scan_status.setText("stopped")
             self._maybe_stop_timer()
         else:
@@ -1060,7 +1100,9 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         binding.loop = LiveAcquisition(binding.camera.acquire_frame)
         binding.loop.start()
         if binding.button is not None:
-            binding.button.setText("Stop camera")
+            toolbar.set_action(
+                binding.button, toolbar.STOP, "Stop the live camera view"
+            )
         if binding.status is not None:
             binding.status.setText("running")
         self._bring_to_front(binding.layer_name)
@@ -1094,7 +1136,9 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
             return False
         binding.camera.stop()
         if binding.button is not None:
-            binding.button.setText("Start camera")
+            toolbar.set_action(
+                binding.button, toolbar.START, "Start the live camera view"
+            )
         if binding.status is not None:
             binding.status.setText("stopped")
         self._maybe_stop_timer()
@@ -1585,9 +1629,21 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         """
         exposure_spin = typing.cast("QtWidgets.QDoubleSpinBox", binding.exposure_spin)
         binning_combo = typing.cast("QtWidgets.QComboBox", binding.binning_combo)
+        down = int(binning_combo.currentText())
+        across_combo = binding.binning_across_combo
+        # A scalar when the camera has one binning control, so a detector
+        # that never learned about per-axis binning is still handed the
+        # spelling it validates - see interface.validate_binning, which
+        # refuses an asymmetric pair to any camera that has not said it
+        # can tell its axes apart.
+        binning: int | tuple[int, int] = (
+            down
+            if across_combo is None
+            else (down, int(across_combo.currentText()))
+        )
         return CameraParameters(
             exposure_ms=exposure_spin.value(),
-            binning=int(binning_combo.currentText()),
+            binning=binning,
             # Not from the panel's readout row: that row configures the
             # device the moment it changes (see set_camera_readout), so
             # the camera's own answer is already what the operator chose
@@ -1822,29 +1878,109 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
             return
         path, index, slug, started_at = self._session.reserve("spectrum-image")
         self._recording_status.setText(f"acquiring {positions} pass...")
-        try:
+        scanner = self._scanner
+        channels = list(range(len(scanner.channel_names)))
+        # Built on the GUI thread and read from it, so the worker only
+        # ever writes through them. See viewer/progress.py.
+        watched: dict[str, progress.PassPreview] = {}
+
+        def run() -> object:
             with writer_class(path, parameters, **allocation) as writer:
-                result = self._scanner.scan_synchronised(
+                watched.update(progress.previews(writer.destinations()))
+                result = scanner.scan_synchronised(
                     parameters,
-                    channels=list(range(len(self._scanner.channel_names))),
+                    channels=channels,
                     targets=[target],
-                    into=writer.destinations(),
+                    into=watched,
                 )
                 writer.finish(result)
-        except Exception as error:  # noqa: BLE001 - the refusal is the message
-            self._recording_status.setText(f"spectrum image failed: {error}")
+                return result
+
+        self._pass_job = jobs_module.PassJob(run)
+        self._pass_preview = watched
+        self._pass_target = target
+        self._pass_path = path
+        self._pass_positions = positions
+        self._pass_job.start()
+        self._timer.start()
+        del index, slug, started_at
+
+    def _poll_pass(self) -> None:
+        """
+        Show a synchronised pass building, and report it when it lands.
+
+        The sampled half of the arrangement the live view already uses:
+        the pass writes flat out on its own thread, and this — called
+        from the display timer — draws whatever has arrived. What it
+        draws is a virtual-detector image formed from the signal at each
+        beam position, which is the map an operator is watching for
+        anyway: it shows drift, contamination, or a probe scanning
+        vacuum, minutes before the file exists.
+        """
+        job = self._pass_job
+        if job is None:
             return
+        for name, preview in self._pass_preview.items():
+            self._show_pass_preview(name, preview)
+        if job.is_running:
+            done = sum(preview.positions for preview in self._pass_preview.values())
+            total = sum(preview.total for preview in self._pass_preview.values())
+            if total:
+                self._recording_status.setText(
+                    f"acquiring {self._pass_positions} pass - "
+                    f"{done}/{total} positions ({100 * done // total}%)",
+                )
+            return
+        self._pass_job = None
+        if job.error is not None:
+            self._recording_status.setText(f"spectrum image failed: {job.error}")
+            self._maybe_stop_timer()
+            return
+        result = typing.cast("ScanPass", job.result)
         # Named from what actually landed rather than from the button:
         # an operator who left the spectrometer imaging has a 4D stack,
         # and a status line calling it a spectrum image would be the
         # first place they could have noticed and did not.
         kind = "spectrum image" if result.spectra else "4D stack"
         self._recording_status.setText(
-            f"{kind} saved: {path.name} "
-            f"({positions} positions, sync={result.scan_sync})",
+            f"{kind} saved: {self._pass_path.name} "
+            f"({self._pass_positions} positions, sync={result.scan_sync})",
         )
         self._refresh_session_labels()
-        del index, slug, started_at
+        self._maybe_stop_timer()
+
+    def _show_pass_preview(
+        self,
+        target: str,
+        preview: progress.PassPreview,
+    ) -> None:
+        """
+        Draw one pass destination's progress map.
+
+        Parameters
+        ----------
+        target : str
+            The detector being read out at each beam position.
+        preview : progress.PassPreview
+            Its live map.
+        """
+        if not preview.positions:
+            return
+        layer_name = f"Acquiring ({target})"
+        if layer_name not in self._viewer.layers:
+            self._bring_to_front(layer_name)
+            self._viewer.add_image(preview.map, name=layer_name, colormap="gray")
+        layer = self._viewer.layers[layer_name]
+        # The same array every tick, updated in place, so this is a
+        # redraw rather than a new upload of a new object.
+        layer.data = preview.map
+        # Restretched every tick, over the positions visited so far
+        # rather than over the whole map: the part the probe has not
+        # reached is zero, and including it would put every real value at
+        # the top of the range and show a white rectangle growing.
+        limits = preview.limits
+        if limits is not None:
+            layer.contrast_limits = limits
 
     def _pass_parameters(self) -> ScanParameters:
         """
@@ -2100,7 +2236,19 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         self._bring_to_front(name)
         if name in self._viewer.layers:
             del self._viewer.layers[name]
-        self._viewer.add_image(data, name=name, colormap="gray")
+        self._viewer.add_image(
+            data,
+            name=name,
+            colormap="gray",
+            # The calibration the file itself carries, read back with the
+            # frames rather than re-derived here. A multi-frame recording
+            # goes in as a stack, so the axes are built for its extra
+            # leading dimension - napari's frame slider, not a drawn axis.
+            **axes.layer_axes(
+                loaded.calibration or FrameCalibration.uncalibrated(),
+                ndim=data.ndim,
+            ),
+        )
         parts = [_condition(recording)]
         if loaded.truncated:
             parts.append(
@@ -2645,12 +2793,14 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         recording = self._recording_job is not None and self._recording_job.is_running
         loading = self._load_job is not None and self._load_job.is_running
         analyzing = self._analysis_job is not None
+        passing = self._pass_job is not None
         if (
             not scan_running
             and not camera_running
             and not recording
             and not loading
             and not analyzing
+            and not passing
         ):
             self._timer.stop()
 
@@ -2659,6 +2809,7 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         self._poll_recording()
         self._poll_load()
         self._poll_analysis()
+        self._poll_pass()
         if self._scan_loop is not None:
             self._refresh_scan()
         for binding in self._camera_bindings.values():
@@ -2809,24 +2960,70 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
             self._viewer.layers
         ):
             # Nothing new since the last tick. The display timer is fixed
-            # at 33 ms while acquisition runs at whatever the device
+            # at 16 ms while acquisition runs at whatever the device
             # manages, so most ticks see the frame they already drew:
             # assigning layer.data schedules a GPU re-upload and the
             # autocontrast pass walks the whole array twice, both for
             # pixels that did not change. Identity is the right test -
             # the loop hands out the same object until it grabs another.
             return
+        calibration = axes.frame_calibration(frame.data, frame.metadata)
         if layer_name in self._viewer.layers:
             layer = self._viewer.layers[layer_name]
             layer.data = frame.data
+            self._recalibrate(layer, layer_name, calibration)
             if autocontrast_every_frame:
                 low = float(frame.data.min())
                 high = float(frame.data.max())
                 if high > low:
                     layer.contrast_limits = (low, high)
         else:
-            self._viewer.add_image(frame.data, name=layer_name, colormap="gray")
+            self._viewer.add_image(
+                frame.data,
+                name=layer_name,
+                colormap="gray",
+                **axes.layer_axes(calibration),
+            )
+            self._calibrated[layer_name] = calibration
         self._displayed[layer_name] = frame
+
+    def _recalibrate(
+        self,
+        layer: typing.Any,  # noqa: ANN401 - a napari layer, imported only for typing
+        layer_name: str,
+        calibration: FrameCalibration,
+    ) -> None:
+        """
+        Update a live layer's axes when its calibration has changed.
+
+        Changing the field of view mid-scan rescales the picture without
+        replacing the layer, so the calibration has to follow the frames
+        rather than being set once when the panel opens — otherwise the
+        scale bar would go on stating the field of view the operator
+        navigated away from, which is worse than showing none.
+
+        Written as a comparison rather than an unconditional assignment
+        because this runs on every displayed frame, and both properties
+        are evented: reassigning an unchanged calibration would refresh
+        the scale bar of every panel sixty times a second.
+
+        Parameters
+        ----------
+        layer : typing.Any
+            The napari layer showing this source.
+        layer_name : str
+            Its name, the key the last calibration is cached under.
+        calibration : FrameCalibration
+            The calibration the newest frame reports.
+        """
+        if self._calibrated.get(layer_name) == calibration:
+            return
+        self._calibrated[layer_name] = calibration
+        for name, value in axes.layer_axes(calibration).items():
+            if name == "metadata":
+                layer.metadata.update(typing.cast("dict", value))
+            else:
+                setattr(layer, name, value)
 
     def _refresh_rate_label(
         self,

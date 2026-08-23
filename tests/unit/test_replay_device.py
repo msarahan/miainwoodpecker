@@ -20,6 +20,7 @@ import time
 import numpy as np
 import pytest
 
+from miainwoodpecker.devices import replay
 from miainwoodpecker.devices.interface import (
     PROJECTED_READOUT,
     SCAN_SYNC_DETECTOR,
@@ -453,27 +454,50 @@ class TestTiming:
         )
         assert time.monotonic() - started >= expected * 0.5
 
-    def test_speed_scales_the_wait(self):
+    def test_speed_scales_the_wait(self, monkeypatch):
         """
         Faster is really faster, rather than the argument being ignored.
 
-        Compared as a ratio rather than against a clock, so this measures
-        the device and not the machine it runs on.
+        The waits are counted as the device asks for them rather than
+        timed against a clock, because a clock cannot see this
+        difference. Each :func:`time.sleep` costs something near half a
+        millisecond whatever interval it is handed, and a pass of twelve
+        beam positions makes twelve such calls: at 5x it asks for 4.8ms
+        and takes about 7ms, at 200x it asks for 0.12ms and still takes
+        about 6ms. The forty-fold difference the device really makes
+        reaches the clock as a few hundred microseconds - inside the
+        noise of a loaded machine, which duly reorders the two and fails
+        a comparison that was only ever passing by luck.
+
+        That the device waits at all is a claim about a real clock, and
+        :meth:`test_a_pass_waits_the_recorded_dwell` above makes it
+        against one. What is left for here is that ``speed`` divides the
+        wait, and the requests answer that exactly.
         """
         recording = _recording()
-        elapsed = {}
-        for speed in (5.0, 200.0):
+        slow, fast = 5.0, 200.0
+        requested = {}
+        for speed in (slow, fast):
+            waits: list[float] = []
+            # replay looks ``sleep`` up on the time module at call time,
+            # so patching it there catches every wait the pass makes,
+            # wherever in the device it is asked for.
+            monkeypatch.setattr(replay.time, "sleep", waits.append)
             scanner = ReplayScanner(
                 recording,
                 ReplaySpectrometer(recording, speed=speed),
                 speed=speed,
             )
-            started = time.monotonic()
             scanner.scan_synchronised(
                 recording.scan_parameters(), targets=[EELS_TARGET],
             )
-            elapsed[speed] = time.monotonic() - started
-        assert elapsed[5.0] > elapsed[200.0]
+            requested[speed] = sum(waits)
+        # Guards the ratio below from holding vacuously between a pair of
+        # passes that never waited at all.
+        assert requested[fast] > 0
+        assert requested[slow] == pytest.approx(
+            requested[fast] * (fast / slow),
+        )
 
 
 class TestFindingRecordings:

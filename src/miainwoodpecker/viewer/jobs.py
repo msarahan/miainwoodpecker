@@ -51,6 +51,64 @@ if typing.TYPE_CHECKING:
     from collections.abc import Callable
 
 
+class PassJob(BackgroundJob):
+    """
+    Run one synchronised pass on a worker thread.
+
+    A spectrum image ran *inline* on the GUI thread until now, which for
+    a 64x64 grid at a realistic dwell means minutes with a frozen window:
+    no repaint, no live view, no answer from "Stop scan", and — since the
+    operating system marks an application that stops answering as not
+    responding — an acquisition that looks like a crash. It is the same
+    failure the recording, loading and analysis paths each already have a
+    job class for; this is the fourth and last handler that did its work
+    where it was called.
+
+    Deliberately not :class:`AnalysisJob`, though the shape is identical.
+    That one runs inside
+    :func:`~miainwoodpecker.analysis.threads.limit_analysis_threads`,
+    which is right for a library that fans out over every core and wrong
+    for a pass: this work is a probe waiting on an instrument, and
+    capping its threads would throttle an acquisition to fix a problem it
+    does not have.
+
+    Parameters
+    ----------
+    work : Callable[[], object]
+        The pass to run. Called once, with no arguments, on the worker
+        thread. It must not touch Qt — the widget reads its progress and
+        its result from the display timer instead.
+    """
+
+    def __init__(self, work: Callable[[], object]) -> None:
+        super().__init__("spectrum image")
+        self._callable = work
+
+    @property
+    def result(self) -> object | None:
+        """
+        Return what the pass returned, or None if it raised or is unfinished.
+
+        Returns
+        -------
+        object | None
+            The completed pass, or None.
+        """
+        with self._lock:
+            return self._raw_result
+
+    def _work(self) -> object:
+        """
+        Run the caller's pass on the worker thread.
+
+        Returns
+        -------
+        object
+            Whatever the pass produced, for the GUI thread to report.
+        """
+        return self._callable()
+
+
 class AnalysisJob(BackgroundJob):
     """
     Run one analysis callable on a worker thread.

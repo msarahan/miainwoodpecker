@@ -91,22 +91,66 @@ Each window is a full napari canvas, so **zoom, pan, contrast and
 colormap are per panel**. Zooming into one corner of the HAADF image
 does not drag the diffraction pattern beside it out of view.
 
-**Nothing is ever stretched.** A panel whose shape does not match its
-data letterboxes — margin at the sides or top — and the picture keeps
-its geometry. That holds when you resize a window, when panels are
-tiled, and at every window shape in between; it is not a convention but
-a property of how each panel draws, and the test suite measures it
+**Nothing is ever stretched.** One scale is used for both axes always,
+so a picture keeps its geometry whatever shape its window is. Where the
+window does not match it — because you reshaped it — the difference
+shows as margin on one side, never as distortion. It is not a convention
+but a property of how each panel draws, and the test suite measures it
 rather than assuming it.
 
+**A window is sized to its picture, so there are no black bars in it.**
+The frame takes the data's own shape and the picture fills it edge to
+edge — a panel with blank space in it spends screen on nothing, and two
+panels of different shapes padded to the same shape look like the same
+panel. That holds for everything: a live detector, a recording you open,
+an analysis result, and a spectrum image building in front of you.
+
+**Small data is magnified rather than shown as a stamp.** Anything whose
+longest side is under 256 pixels opens scaled up to it, so a 64x64
+spectrum-image map is a window worth looking at. Anything already that
+large opens at one screen pixel per acquired pixel, and shrinks only if
+it will not otherwise fit on screen. The floor and the target are the
+same number deliberately: magnifying to 512 while leaving 256 alone
+would open a 128-pixel scan in a *larger* window than a 256-pixel one,
+and window size would stop telling you anything about the data.
+
+**No part of a window is ever off the edge.** A panel too big for the
+workspace is shrunk to it, one that would overhang is moved back in, and
+when the application is made smaller the panels follow it in. The part
+of a window outside the workspace is the part you cannot click.
+
+**Panels go beside each other, and overlap only when there is no room.**
+A panel a few pixels too wide for the row it nearly fits is shrunk
+slightly rather than wrapped, and when there is genuinely no room they
+are offset rather than stacked, so a covered window keeps a corner to
+raise it by. **View → Tile documents**
+(<kbd>Ctrl</kbd>+<kbd>T</kbd>) packs them again after you have moved
+things about; it never resizes a window to fill the screen, because that
+would put the black bars straight back.
+
+**Your own changes are yours.** Reshape a window and the picture refits
+to it — still whole and still undistorted, with blank space on one axis
+because the frame no longer matches it. Zoom a panel and nothing
+automatic will undo it: not tiling, not a new dataset arriving.
+
+**View → Actual resolution** (<kbd>Ctrl</kbd>+<kbd>1</kbd>) switches a
+panel to one screen pixel per acquired pixel, to see exactly what the
+detector recorded with nothing interpolated; larger data is then cropped
+and you pan to see the rest. **View → Fit panel to data**
+(<kbd>Ctrl</kbd>+<kbd>0</kbd>) goes back, and hands the panel to
+automatic fitting again.
+
+Where the axes are calibrated differently — an anisotropically binned
+detector — one scale is used for both, so the window takes the shape the
+*specimen* has rather than the shape the array has.
+
 **Arranging.** Drag a window by its title bar to move it, or its edges
-to resize it. Until you do, the area tiles itself as datasets come and
-go, so a new one never opens hidden underneath something already on
-screen. The first time you place a window yourself the area stops
-rearranging things around you, and new datasets are dropped into
+to resize it. Until you do, the area packs new datasets in beside what
+is already open. The first time you place a window yourself it stops
+rearranging things around you, and later datasets are dropped into
 whatever space is clearest instead. **View → Tile documents**
-(<kbd>Ctrl</kbd>+<kbd>T</kbd>) tidies everything up again and hands
-tiling back; **View → Cascade documents** stacks them offset from one
-corner.
+(<kbd>Ctrl</kbd>+<kbd>T</kbd>) packs everything again and hands tiling
+back; **View → Cascade documents** stacks them offset from one corner.
 
 **Closing a panel is not the same as stopping its source.** A closed
 panel stays closed — a running detector would otherwise reopen its
@@ -152,7 +196,7 @@ invites you to go looking for hardware that is not fitted.
 - **Beam** blanks or unblanks on click, with no Set button: it is one bit
   and the click *is* the decision.
 - **Refresh** re-reads everything. Values are not polled — asking the
-  instrument for four controls thirty times a second would put traffic on
+  instrument for four controls sixty times a second would put traffic on
   the wire to answer a question nobody asked.
 
 **The viewer applies no range limits, on purpose.** Limits live behind
@@ -235,12 +279,34 @@ into its own window (`Camera`, `Camera (camera:2)`), so they never
 overwrite each other's image. On the camera server you get a section per
 camera found, without having named any of them.
 
+**Binning is per axis where the detector says its axes differ.** Most
+cameras bin both directions by the same factor and get a single **Image
+binning** control. A spectrometer does not: binning the rows together
+trades dynamic range for signal-to-noise and is the routine move, while
+binning the energy channels together spends the spectral resolution the
+instrument exists to provide. Those are two settings with opposite
+costs, so an EEL spectrometer gets **Binning (rows)** and **Binning
+(channels)** separately, each offering only what that axis will take —
+typically a generous range down and very little across. Binning rows
+leaves the energy scale untouched; binning channels widens it in
+proportion, and the panel's scale bar and the recorded calibration both
+follow.
+
 The analysis buttons sit in the *first* camera's section and run against
 that camera. Repeating them in every section would offer three buttons
 per camera with no way to tell which burst you were about to take.
 
 The display never slows the instrument down: if the scan is faster than
 the screen, frames are skipped on screen but acquisition is unaffected.
+Acquisition runs on its own thread at whatever the device manages, and
+the screen samples it — the two rates are independent by construction.
+
+**The live view refreshes at 60 fps.** Measured end to end through the
+whole display path, a frame costs 9.4 ms at 512², 9.7 ms at 1024² and
+10.2 ms at 2048² — near enough flat, because the pixels go to the GPU —
+so the ceiling is about 100 fps and 60 is comfortably inside it. A
+refresh that finds no new frame costs 4 microseconds, so the rate costs
+nothing when the source is slower than the screen.
 
 ## Keeping data: the status bar and Session settings
 
@@ -291,7 +357,7 @@ timestamps whether the probe moved in between.
 section's own **Image exposure** and **Image binning**, which are
 deliberately separate from whatever the live view is running. The two
 are different jobs: the feed stays short and often binned so it keeps up
-at thirty frames a second, while the image you keep is worth a long
+at sixty frames a second, while the image you keep is worth a long
 unbinned exposure. The live settings are put back afterwards, so one
 long acquisition does not leave the feed crawling. The binning choices
 are the camera's own — a detector that only does 1× does not offer a 4×
@@ -343,6 +409,24 @@ analysis time.
 Either way the data is written straight to disk as it is acquired rather
 than assembled in memory first, so its size is bounded by the disk rather
 than by RAM.
+
+**You can watch it build.** A panel named `Acquiring (…)` opens when the
+first beam positions land and fills in as the probe goes, and the
+Recording line counts positions — `acquiring 64x64 pass - 1537/4096
+positions (37%)`. What the panel shows is a **virtual detector image**:
+the signal summed at each position, formed the same way one is formed
+offline. That is what makes it worth looking at rather than a progress
+bar — drift, contamination, or a probe scanning vacuum are all visible
+in it, minutes before the file exists.
+
+The window stays live throughout. The pass runs on its own thread and
+the screen samples it, so the live view keeps running, the panels still
+zoom and pan, and the application answers. It used to run inline: a long
+spectrum image froze the whole window until it finished, which the
+operating system reports as an application that has stopped responding.
+
+The progress panel is sized to its map like any other, so a 64x64 grid
+opens as a 512-pixel window rather than as a 64-pixel stamp.
 
 **Most instruments will refuse, and the refusal is the point.** A
 spectrum image needs the scan and the detector synchronised in

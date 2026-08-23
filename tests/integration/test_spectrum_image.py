@@ -11,6 +11,7 @@ Skipped without a display (see conftest.py).
 """
 
 import pathlib
+import time
 
 import pytest
 
@@ -73,6 +74,42 @@ class _UnsynchronisedScanner:
         self._inner.close()
 
 
+
+_DEADLINE_S = 30.0
+
+
+def _finish_pass(widget: LiveInstrumentWidget) -> None:
+    """
+    Drive the display poll until the synchronised pass has finished.
+
+    A spectrum image runs on a worker thread now, so that the window
+    keeps repainting and can show the map building. Tests therefore have
+    to do what the display timer does — call ``refresh_display`` — rather
+    than reading a status line the instant they asked for the pass.
+
+    Returns immediately when nothing is running, so a call after a
+    refusal is harmless.
+
+    Parameters
+    ----------
+    widget : LiveInstrumentWidget
+        The widget whose pass to wait for.
+
+    Raises
+    ------
+    AssertionError
+        If the pass does not finish before the deadline.
+    """
+    deadline = time.monotonic() + _DEADLINE_S
+    while time.monotonic() < deadline:
+        widget.refresh_display()
+        if widget._pass_job is None:  # noqa: SLF001
+            return
+        time.sleep(0.005)
+    msg = "the spectrum image did not finish"
+    raise AssertionError(msg)
+
+
 def _open(
     tmp_path: pathlib.Path,
     *,
@@ -124,6 +161,7 @@ def test_a_backend_without_synchronisation_refuses_and_says_why(tmp_path):
     )
     try:
         widget.acquire_spectrum_image()
+        _finish_pass(widget)
 
         status = widget._recording_status.text()  # noqa: SLF001
         assert "cannot acquire a spectrum image" in status
@@ -139,6 +177,7 @@ def test_acquiring_with_no_session_is_refused(tmp_path):
     viewer, widget, _ = _open(tmp_path, session=False)
     try:
         widget.acquire_spectrum_image()
+        _finish_pass(widget)
         assert "no session" in widget._recording_status.text()  # noqa: SLF001
     finally:
         widget.shutdown()
@@ -165,6 +204,7 @@ def test_a_scanner_with_no_wired_camera_refuses(tmp_path):
     widget._positions_spin.setValue(_A_SMALL_GRID)  # noqa: SLF001
     try:
         widget.acquire_spectrum_image()
+        _finish_pass(widget)
         assert "no camera is wired" in widget._recording_status.text()  # noqa: SLF001
     finally:
         widget.shutdown()
@@ -181,6 +221,7 @@ def test_a_pass_acquires_and_saves(tmp_path):
     viewer, widget, _ = _open(tmp_path)
     try:
         widget.acquire_spectrum_image()
+        _finish_pass(widget)
 
         status = widget._recording_status.text()  # noqa: SLF001
         assert "saved" in status, status
@@ -208,6 +249,7 @@ def test_the_saved_pass_carries_its_image_channels_too(tmp_path):
     viewer, widget, _ = _open(tmp_path)
     try:
         widget.acquire_spectrum_image()
+        _finish_pass(widget)
         path = next((tmp_path / "shift").glob("*spectrum-image*"))
 
         signals = read_pass(path).signals
@@ -233,6 +275,7 @@ def test_a_pass_file_does_not_break_the_recordings_list(tmp_path):
     viewer, widget, _ = _open(tmp_path)
     try:
         widget.acquire_spectrum_image()
+        _finish_pass(widget)
 
         recordings = widget.session.recordings()
         assert len(recordings) == 1
@@ -247,6 +290,7 @@ def test_the_saved_cube_is_not_empty(tmp_path):
     viewer, widget, _ = _open(tmp_path)
     try:
         widget.acquire_spectrum_image()
+        _finish_pass(widget)
         path = next((tmp_path / "shift").glob("*spectrum-image*"))
 
         with h5py.File(path, "r") as handle:
@@ -352,6 +396,7 @@ class TestAcquiringAnEELSSpectrumImage:
         viewer, widget, _ = _open_with_spectrometer(tmp_path)
         try:
             widget.acquire_spectrum_image()
+            _finish_pass(widget)
 
             status = widget._recording_status.text()  # noqa: SLF001
             assert "spectrum image saved" in status, status
@@ -376,6 +421,7 @@ class TestAcquiringAnEELSSpectrumImage:
         viewer, widget, _ = _open_with_spectrometer(tmp_path)
         try:
             widget.acquire_spectrum_image()
+            _finish_pass(widget)
             path = next((tmp_path / "shift").glob("*spectrum-image*"))
 
             signals = read_pass(path).signals
@@ -395,6 +441,7 @@ class TestAcquiringAnEELSSpectrumImage:
         viewer, widget, _ = _open_with_spectrometer(tmp_path)
         try:
             widget.acquire_spectrum_image()
+            _finish_pass(widget)
             path = next((tmp_path / "shift").glob("*spectrum-image*"))
 
             with h5py.File(path, "r") as handle:
@@ -420,6 +467,7 @@ class TestAcquiringAnEELSSpectrumImage:
         viewer, widget, _ = _open_with_spectrometer(tmp_path, projected=False)
         try:
             widget.acquire_spectrum_image()
+            _finish_pass(widget)
 
             status = widget._recording_status.text()  # noqa: SLF001
             assert "4D stack saved" in status, status
@@ -443,6 +491,7 @@ class TestAcquiringAnEELSSpectrumImage:
             widget._sync_target_combo.addItem("not_fitted")  # noqa: SLF001
             widget._sync_target_combo.setCurrentText("not_fitted")  # noqa: SLF001
             widget.acquire_spectrum_image()
+            _finish_pass(widget)
 
             assert "not one this scan unit can synchronise" in (
                 widget._recording_status.text()  # noqa: SLF001
@@ -531,6 +580,7 @@ class TestADeviceWithOneGeometry:
         widget._positions_spin.setValue(_A_SMALL_GRID)  # noqa: SLF001
         try:
             widget.acquire_spectrum_image()
+            _finish_pass(widget)
 
             assert scanner.requested == native
             path = next((tmp_path / "shift").glob("*spectrum-image*"))
@@ -559,6 +609,7 @@ class TestADeviceWithOneGeometry:
         widget.set_session(Session(tmp_path / "shift"))
         try:
             widget.acquire_spectrum_image()
+            _finish_pass(widget)
             assert "3x5 positions" in widget._recording_status.text()  # noqa: SLF001
         finally:
             widget.shutdown()

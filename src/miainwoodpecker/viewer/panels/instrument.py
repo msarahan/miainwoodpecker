@@ -30,7 +30,7 @@ one, and a narrow one would be a clamp wearing a different hat. The
 instrument refuses what it will not do, and the refusal is shown.
 
 **Values are read on demand, not polled.** The display timer runs at
-33 ms; asking the instrument for four controls at that rate would put
+16 ms; asking the instrument for four controls at that rate would put
 traffic on the wire to answer a question nobody asked. They are read
 when the panel is built and when **Refresh** is pressed.
 """

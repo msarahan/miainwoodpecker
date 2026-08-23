@@ -11,8 +11,14 @@ import typing
 
 from qtpy import QtCore, QtWidgets
 
-from miainwoodpecker.devices.interface import READOUT_MODES, SynchronisedScanner
+from miainwoodpecker.devices.interface import (
+    READOUT_MODES,
+    CameraParameters,
+    SynchronisedScanner,
+    axis_binning_values,
+)
 from miainwoodpecker.viewer import preferences, profiles
+from miainwoodpecker.viewer.panels import settings, toolbar
 from miainwoodpecker.viewer.panels.defaults import (
     _DEFAULT_FOV_NM,
     _DEFAULT_POSITIONS,
@@ -65,40 +71,78 @@ def build_scan_group(widget: LiveInstrumentWidget) -> QtWidgets.QGroupBox:
     # they exist and is the honest thing to ask about.
     scan_group = QtWidgets.QGroupBox("Scan", widget)
     scan_form = QtWidgets.QFormLayout(scan_group)
+    widget._scan_settings_dialog = settings.SettingsDialog(
+        "Scan settings", scan_group
+    )
+    settings_form = widget._scan_settings_dialog.form
+
+    widget._scan_button = toolbar.action_button(
+        scan_group, toolbar.START, "Start the live scan (View profile)"
+    )
+    widget._preview_button = toolbar.action_button(
+        scan_group, toolbar.PREVIEW, PROFILE_TOOLTIPS[PREVIEW]
+    )
+    widget._scan_image_button = toolbar.action_button(
+        scan_group,
+        toolbar.ACQUIRE,
+        "Acquire one scan image. One pass of the probe, with every "
+        "detector channel read out of it - the channels are registered "
+        "to each other by construction",
+    )
+    widget._spectrum_image_button = toolbar.action_button(
+        scan_group,
+        toolbar.SPECTRUM_IMAGE,
+        "Acquire a spectrum image: the whole readout of one detector "
+        "kept at every beam position",
+    )
+    widget._scan_save_button = toolbar.action_button(
+        scan_group,
+        toolbar.SAVE,
+        "Save the frame currently on screen, without touching the instrument",
+    )
+    widget._scan_record_button = toolbar.action_button(
+        scan_group, toolbar.RECORD, "Record a series of scan frames to the session"
+    )
+    widget._scan_settings_button = toolbar.action_button(
+        scan_group,
+        toolbar.SETTINGS,
+        "Dwell, resolution and the spectrum-image grid",
+        on_click=widget._scan_settings_dialog.show_modal,
+    )
+    scan_form.addRow(
+        toolbar.toolbar(
+            scan_group,
+            (
+                widget._scan_button,
+                widget._preview_button,
+                widget._scan_image_button,
+                widget._spectrum_image_button,
+                widget._scan_save_button,
+                widget._scan_record_button,
+                widget._scan_settings_button,
+            ),
+        )
+    )
+    widget._scan_status = QtWidgets.QLabel("stopped", scan_group)
+    scan_form.addRow("Status", widget._scan_status)
+
+    # These two stay in the panel while dwell and resolution go behind
+    # the gear, because they are the ones an operator changes while
+    # looking at the image: which detectors to read, and where to look.
     build_detector_checks(widget, scan_group, scan_form)
     widget._fov_spin = QtWidgets.QDoubleSpinBox(scan_group)
     widget._fov_spin.setRange(0.1, 100000.0)
     widget._fov_spin.setValue(_DEFAULT_FOV_NM)
     widget._fov_spin.setSuffix(" nm")
-    # Above the profiles and outside them, because it is the one setting
-    # they share: switching from checking focus to taking the picture
-    # must not move the region the operator navigated to.
+    # Outside the profiles, because it is the one setting they share:
+    # switching from checking focus to taking the picture must not move
+    # the region the operator navigated to.
     scan_form.addRow("FOV (shared)", widget._fov_spin)
-    build_profile_controls(widget, scan_group, scan_form)
-    widget._scan_button = QtWidgets.QPushButton("Start scan (View)", scan_group)
-    scan_form.addRow(widget._scan_button)
-    widget._preview_button = QtWidgets.QPushButton("Preview scan", scan_group)
-    widget._preview_button.setToolTip(PROFILE_TOOLTIPS[PREVIEW])
-    scan_form.addRow(widget._preview_button)
-    widget._scan_status = QtWidgets.QLabel("stopped", scan_group)
-    scan_form.addRow("Status", widget._scan_status)
-    # Above the record controls, because it is the ordinary thing: find
-    # an area on the live view, then keep one image of it. "Record N
-    # frames" below is the less common time series.
-    widget._scan_image_button = QtWidgets.QPushButton(
-        "Acquire scan image", scan_group,
-    )
-    widget._scan_image_button.setToolTip(
-        "One pass of the probe, with every detector channel read out of "
-        "it - the channels are registered to each other by construction",
-    )
-    scan_form.addRow(widget._scan_image_button)
-    build_spectrum_image_controls(widget, scan_group, scan_form)
-    (
-        widget._scan_count_spin,
-        widget._scan_save_button,
-        widget._scan_record_button,
-    ) = build_record_controls(scan_group, scan_form)
+
+    dialog = widget._scan_settings_dialog
+    build_profile_controls(widget, dialog, settings_form)
+    build_spectrum_image_controls(widget, dialog, settings_form)
+    widget._scan_count_spin = build_record_controls(dialog, settings_form)
 
     widget._fov_spin.valueChanged.connect(widget._on_scan_settings_changed)
     widget._scan_button.clicked.connect(widget._toggle_scan)
@@ -111,7 +155,7 @@ def build_scan_group(widget: LiveInstrumentWidget) -> QtWidgets.QGroupBox:
 
 def build_detector_checks(
     widget: LiveInstrumentWidget,
-    scan_group: QtWidgets.QGroupBox,
+    scan_group: QtWidgets.QWidget,
     scan_form: QtWidgets.QFormLayout,
 ) -> None:
     """
@@ -133,7 +177,7 @@ def build_detector_checks(
     ----------
     widget : LiveInstrumentWidget
         The widget that owns the resulting controls.
-    scan_group : QtWidgets.QGroupBox
+    scan_group : QtWidgets.QWidget
         The group box owning the new widgets.
     scan_form : QtWidgets.QFormLayout
         The group's layout, appended to.
@@ -158,7 +202,7 @@ def build_detector_checks(
 
 def build_profile_controls(
     widget: LiveInstrumentWidget,
-    scan_group: QtWidgets.QGroupBox,
+    scan_group: QtWidgets.QWidget,
     scan_form: QtWidgets.QFormLayout,
 ) -> None:
     """
@@ -173,7 +217,7 @@ def build_profile_controls(
     ----------
     widget : LiveInstrumentWidget
         The widget that owns the resulting controls.
-    scan_group : QtWidgets.QGroupBox
+    scan_group : QtWidgets.QWidget
         The group box owning the new widgets.
     scan_form : QtWidgets.QFormLayout
         The group's layout, appended to.
@@ -208,7 +252,7 @@ def build_profile_controls(
 
 def build_spectrum_image_controls(
     widget: LiveInstrumentWidget,
-    scan_group: QtWidgets.QGroupBox,
+    scan_group: QtWidgets.QWidget,
     scan_form: QtWidgets.QFormLayout,
 ) -> None:
     """
@@ -231,7 +275,7 @@ def build_spectrum_image_controls(
     ----------
     widget : LiveInstrumentWidget
         The widget that owns the resulting controls.
-    scan_group : QtWidgets.QGroupBox
+    scan_group : QtWidgets.QWidget
         The group box owning the new widgets.
     scan_form : QtWidgets.QFormLayout
         The group's layout, appended to.
@@ -261,16 +305,6 @@ def build_spectrum_image_controls(
         "spectrum image",
     )
     scan_form.addRow("Per-position detector", widget._sync_target_combo)
-
-    widget._spectrum_image_button = QtWidgets.QPushButton(
-        "Acquire spectrum image", scan_group,
-    )
-    widget._spectrum_image_button.setToolTip(
-        "One pass of the probe keeping the selected detector's whole "
-        "readout at every beam position, alongside every scan channel. "
-        "Needs a backend with synchronised scan/detector hardware",
-    )
-    scan_form.addRow(widget._spectrum_image_button)
 
 
 def _synchronisable_targets(widget: LiveInstrumentWidget) -> list[str]:
@@ -302,35 +336,35 @@ def _synchronisable_targets(widget: LiveInstrumentWidget) -> list[str]:
 def build_record_controls(
     parent: QtWidgets.QWidget,
     form: QtWidgets.QFormLayout,
-) -> tuple[QtWidgets.QSpinBox, QtWidgets.QPushButton, QtWidgets.QPushButton]:
+) -> QtWidgets.QSpinBox:
     """
-    Add "save displayed frame" and "record N frames" controls to a group.
+    Add the "how many frames to record" setting to a settings form.
 
-    Shared by the scan and camera groups so both sources get the same
-    two recording affordances without duplicating the widget setup.
+    Only the count, now: saving and recording are actions and live on
+    the group's icon toolbar, while *how many* is a setting and belongs
+    with the exposure. Shared by the scan and camera groups so both
+    sources describe a series the same way.
 
     Parameters
     ----------
     parent : QtWidgets.QWidget
-        The group box owning the new widgets.
+        The dialog owning the new widget.
     form : QtWidgets.QFormLayout
-        The group's layout, appended to.
+        The settings form, appended to.
 
     Returns
     -------
-    tuple[QtWidgets.QSpinBox, QtWidgets.QPushButton, QtWidgets.QPushButton]
-        The frame-count spin box, the save button, and the record
-        button, for the caller to connect.
+    QtWidgets.QSpinBox
+        The frame-count spin box.
     """
-    save_button = QtWidgets.QPushButton("Save displayed frame", parent)
-    form.addRow(save_button)
     count_spin = QtWidgets.QSpinBox(parent)
     count_spin.setRange(1, _MAX_RECORD_FRAME_COUNT)
     count_spin.setValue(_DEFAULT_RECORD_FRAME_COUNT)
-    form.addRow("Frames", count_spin)
-    record_button = QtWidgets.QPushButton("Record frames", parent)
-    form.addRow(record_button)
-    return count_spin, save_button, record_button
+    count_spin.setToolTip(
+        "How many frames the record button on the toolbar captures",
+    )
+    form.addRow("Frames to record", count_spin)
+    return count_spin
 
 
 def build_camera_group(
@@ -358,16 +392,52 @@ def build_camera_group(
     camera_group = QtWidgets.QGroupBox("Camera", widget)
     camera_form = QtWidgets.QFormLayout(camera_group)
     name = binding.name
-    binding.button = QtWidgets.QPushButton("Start camera", camera_group)
-    camera_form.addRow(binding.button)
+    binding.settings_dialog = settings.SettingsDialog(
+        f"Camera settings - {name}", camera_group
+    )
+    settings_form = binding.settings_dialog.form
+
+    # The row the operator actually uses all day. Everything that used to
+    # be a full-width labelled button is one glyph here, and everything
+    # that used to be a form row is behind the last one.
+    binding.button = toolbar.action_button(
+        camera_group, toolbar.START, "Start the live camera view"
+    )
+    binding.acquire_button = toolbar.action_button(
+        camera_group,
+        toolbar.ACQUIRE,
+        "Acquire one image at the settings in this camera's settings dialog",
+    )
+    binding.save_button = toolbar.action_button(
+        camera_group,
+        toolbar.SAVE,
+        "Save the frame currently on screen, without touching the instrument",
+    )
+    binding.record_button = toolbar.action_button(
+        camera_group, toolbar.RECORD, "Record a series of frames to the session"
+    )
+    binding.settings_button = toolbar.action_button(
+        camera_group,
+        toolbar.SETTINGS,
+        "Exposure, binning and detector readout",
+        on_click=binding.settings_dialog.show_modal,
+    )
+    camera_form.addRow(
+        toolbar.toolbar(
+            camera_group,
+            (
+                binding.button,
+                binding.acquire_button,
+                binding.save_button,
+                binding.record_button,
+                binding.settings_button,
+            ),
+        )
+    )
     binding.status = QtWidgets.QLabel("stopped", camera_group)
     camera_form.addRow("Status", binding.status)
-    build_image_controls(widget, camera_group, camera_form, binding)
-    (
-        binding.count_spin,
-        binding.save_button,
-        binding.record_button,
-    ) = build_record_controls(camera_group, camera_form)
+    build_image_controls(widget, camera_group, settings_form, binding)
+    binding.count_spin = build_record_controls(camera_group, settings_form)
 
     # Each camera's controls name their own target, so the second
     # camera's Record button cannot start the first one's series.
@@ -389,7 +459,7 @@ def build_camera_group(
 
 def build_image_controls(
     widget: LiveInstrumentWidget,  # noqa: ARG001 - kept for builder symmetry
-    camera_group: QtWidgets.QGroupBox,
+    camera_group: QtWidgets.QWidget,
     camera_form: QtWidgets.QFormLayout,
     binding: object,
 ) -> None:
@@ -398,7 +468,7 @@ def build_image_controls(
 
     Separate settings from the live view, deliberately. The feed and the
     kept image are different jobs: the feed runs short and often binned
-    so it stays responsive at thirty frames a second, and the image an
+    so it stays responsive at sixty frames a second, and the image an
     operator keeps is worth a long unbinned exposure. One shared pair of
     settings would force a choice between a usable live view and a
     usable acquisition.
@@ -410,7 +480,7 @@ def build_image_controls(
     ----------
     widget : LiveInstrumentWidget
         The widget these controls belong to.
-    camera_group : QtWidgets.QGroupBox
+    camera_group : QtWidgets.QWidget
         The group box owning the new widgets.
     camera_form : QtWidgets.QFormLayout
         The group's layout, appended to.
@@ -426,15 +496,7 @@ def build_image_controls(
     binding.exposure_spin.setSuffix(" ms")
     camera_form.addRow("Image exposure", binding.exposure_spin)
 
-    binding.binning_combo = QtWidgets.QComboBox(camera_group)
-    # Offered from the camera's own binning_values rather than a fixed
-    # list: a camera that only does 1x has no business showing a 4x it
-    # will refuse.
-    values = list(binding.camera.binning_values) or [1]
-    binding.binning_combo.addItems([str(value) for value in values])
-    if current.binning in values:
-        binding.binning_combo.setCurrentIndex(values.index(current.binning))
-    camera_form.addRow("Image binning", binding.binning_combo)
+    _add_binning_controls(binding, camera_group, camera_form, current)
 
     binding.readout_combo = QtWidgets.QComboBox(camera_group)
     # Offered on every camera, and refused by the ones that cannot do it.
@@ -458,16 +520,91 @@ def build_image_controls(
     )
     camera_form.addRow("Detector readout", binding.readout_combo)
 
-    binding.acquire_button = QtWidgets.QPushButton("Acquire image", camera_group)
-    binding.acquire_button.setToolTip(
-        "One exposure at the settings above; the live view's own "
-        "settings are put back afterwards",
+def _add_binning_controls(
+    binding: object,
+    camera_group: QtWidgets.QWidget,
+    camera_form: QtWidgets.QFormLayout,
+    current: CameraParameters,
+) -> None:
+    """
+    Add one binning control, or two when the detector's axes differ.
+
+    Offered from the camera's own values rather than a fixed list: a
+    camera that only does 1x has no business showing a 4x it will
+    refuse. Per axis when the detector says its axes differ, which on a
+    spectrometer they do — binning rows trades dynamic range for
+    signal-to-noise and is the routine move, while binning channels
+    spends the spectral resolution the instrument exists to provide. Two
+    settings with opposite costs are not one setting, and a single
+    control would make the cheap one unreachable without paying the dear
+    one.
+
+    A detector that does not distinguish them keeps the single control it
+    always had, because for it there is only one thing to choose.
+
+    Parameters
+    ----------
+    binding : object
+        The camera binding whose ``binning_combo`` — and, for a detector
+        with separate axes, ``binning_across_combo`` — are filled in.
+    camera_group : QtWidgets.QWidget
+        The group box owning the new widgets.
+    camera_form : QtWidgets.QFormLayout
+        The group's layout, appended to.
+    current : CameraParameters
+        What the camera reports it is set to now.
+    """
+    down_values, across_values = axis_binning_values(binding.camera)
+    current_down, current_across = current.binning_yx
+    binding.binning_combo = _binning_combo(camera_group, down_values, current_down)
+    if getattr(binding.camera, "binning_values_yx", None) is None:
+        camera_form.addRow("Image binning", binding.binning_combo)
+        return
+    binding.binning_across_combo = _binning_combo(
+        camera_group, across_values, current_across
     )
-    camera_form.addRow(binding.acquire_button)
+    camera_form.addRow("Binning (rows)", binding.binning_combo)
+    camera_form.addRow("Binning (channels)", binding.binning_across_combo)
+    binding.binning_across_combo.setToolTip(
+        "Binning rows trades dynamic range for signal-to-noise. Binning "
+        "channels spends energy resolution, so it is offered sparingly - "
+        "this detector reports what it will take on each axis",
+    )
+
+
+def _binning_combo(
+    parent: QtWidgets.QWidget,
+    values: typing.Sequence[int],
+    current: int,
+) -> QtWidgets.QComboBox:
+    """
+    Build one binning drop-down, selecting the factor already in force.
+
+    Parameters
+    ----------
+    parent : QtWidgets.QWidget
+        The camera's group box.
+    values : typing.Sequence[int]
+        The factors this axis offers, ascending.
+    current : int
+        The factor currently applied to it.
+
+    Returns
+    -------
+    QtWidgets.QComboBox
+        The populated drop-down.
+    """
+    offered = list(values) or [1]
+    combo = QtWidgets.QComboBox(parent)
+    combo.addItems([str(value) for value in offered])
+    if current in offered:
+        combo.setCurrentIndex(offered.index(current))
+    return combo
+
 
 def build_analysis_rows(
     widget: LiveInstrumentWidget,
-    camera_group: QtWidgets.QGroupBox,
+    camera_group: QtWidgets.QWidget,
     camera_form: QtWidgets.QFormLayout,
 ) -> None:
     """
@@ -498,7 +635,7 @@ def build_analysis_rows(
     widget : LiveInstrumentWidget
         The widget that owns the resulting controls; every
         ``_``-prefixed attribute set here belongs to it.
-    camera_group : QtWidgets.QGroupBox
+    camera_group : QtWidgets.QWidget
         The group the widgets are parented to.
     camera_form : QtWidgets.QFormLayout
         The layout the rows are added to.
@@ -551,7 +688,7 @@ def build_analysis_rows(
         )
 
 def build_extras_summary(
-    camera_group: QtWidgets.QGroupBox,
+    camera_group: QtWidgets.QWidget,
     enabled: list[str],
     missing: list[str],
 ) -> QtWidgets.QLabel:
@@ -565,7 +702,7 @@ def build_extras_summary(
 
     Parameters
     ----------
-    camera_group : QtWidgets.QGroupBox
+    camera_group : QtWidgets.QWidget
         The group the label is parented to.
     enabled : list[str]
         Extras whose libraries are importable.

@@ -23,7 +23,12 @@ pytest.importorskip("napari", reason="requires the 'viewer' extra")
 
 from qtpy import QtCore, QtWidgets
 
-from miainwoodpecker.viewer import documents
+from miainwoodpecker.storage.calibration import (
+    AxisCalibration,
+    AxisKind,
+    FrameCalibration,
+)
+from miainwoodpecker.viewer import axes, documents
 
 # A square scan, an extremely wide EEL spectrum readout, and a tall
 # narrow one: the shapes that make a naive fit stretch something.
@@ -32,6 +37,19 @@ _WIDE = (64, 1024)
 _TALL = (1024, 64)
 #: One of each awkward shape, for the tests that open several at once.
 _ASSORTED = (_SQUARE, _WIDE, _TALL)
+
+#: Tolerance for "one screen pixel per data pixel". Not 1e-9: the scene
+#: transform these are measured through is float32, so a calibration
+#: like 15 nm / 256 px comes back a few parts in 10^8 off the number it
+#: went in as. That is rounding, not a panel drawing at the wrong scale.
+_PIXEL_EXACT = 1e-6
+
+#: How exactly a picture must cover its panel. Not zero: a canvas is an
+#: integer number of pixels and the extent it holds rarely divides into
+#: it evenly.
+_FILL_TOLERANCE = 0.01
+#: Slack on a canvas dimension, in pixels, for the same rounding.
+_SIZE_TOLERANCE = 4
 
 
 @pytest.fixture
@@ -87,9 +105,50 @@ def _settle(rounds: int = 20) -> None:
         app.processEvents()
 
 
+def _canvas_pixels_per_world_unit(
+    document: documents.Document,
+) -> tuple[float, float]:
+    """
+    Measure how many screen pixels one world unit covers, per axis.
+
+    Read off the live scene transform rather than inferred from
+    ``camera.zoom``: a single zoom scalar cannot express a stretch, so
+    computing the drawn size from it would assume the very property
+    these tests exist to check. Mapping unit steps along each world axis
+    through the actual canvas transform can catch an anisotropic one.
+
+    Reaches into ``_qt_viewer`` because the transform is not otherwise
+    exposed. That is acceptable in a test in a way it would not be in
+    the application: this is measuring what the user sees.
+
+    Parameters
+    ----------
+    document : documents.Document
+        The document to measure.
+
+    Returns
+    -------
+    tuple[float, float]
+        Canvas pixels per world unit along the slow and fast axes.
+    """
+    canvas = document.viewer.window._qt_viewer.canvas  # noqa: SLF001
+    transform = canvas.view.scene.node_transform(canvas.view)
+    origin, along_y, along_x = transform.map(
+        [[0, 0, 0], [1, 0, 0], [0, 1, 0]]
+    )[:, :2]
+    return (
+        float(np.linalg.norm(along_y - origin)),
+        float(np.linalg.norm(along_x - origin)),
+    )
+
+
 def _drawn_aspect(document: documents.Document) -> float:
     """
     Return the width-to-height ratio of a document's image as drawn.
+
+    Built from the data's own size, the layer's calibration scale, and
+    the measured per-axis canvas transform, so it reflects what is on
+    screen rather than restating the array's shape.
 
     Parameters
     ----------
@@ -101,9 +160,11 @@ def _drawn_aspect(document: documents.Document) -> float:
     float
         Drawn width divided by drawn height, in canvas pixels.
     """
-    height, width = document.viewer.layers[0].data.shape[-2:]
-    zoom = document.viewer.camera.zoom
-    return (width * zoom) / (height * zoom)
+    layer = document.viewer.layers[0]
+    height, width = layer.data.shape[-2:]
+    scale_y, scale_x = float(layer.scale[-2]), float(layer.scale[-1])
+    pixels_y, pixels_x = _canvas_pixels_per_world_unit(document)
+    return (width * scale_x * pixels_x) / (height * scale_y * pixels_y)
 
 
 def test_each_dataset_gets_its_own_window(window):
@@ -117,27 +178,29 @@ def test_each_dataset_gets_its_own_window(window):
         assert len(document.viewer.layers) == 1
 
 
-def test_new_documents_do_not_cover_each_other(window):
+def test_new_documents_go_somewhere_visible(window):
     """
-    Tiling puts every panel somewhere visible.
+    A dataset never arrives buried under one already on screen.
 
-    The point of tiling on open is that a dataset never arrives hidden
-    underneath one already on screen, so this asserts the geometries do
-    not intersect rather than merely that three windows exist. An
-    earlier version tiled each window *before* showing it, which
-    tileSubWindows ignores; every panel after the first landed on top of
-    its neighbour and looked like a window that had lost its title bar.
+    Not "never overlaps": windows are sized to their pictures, so three
+    awkward shapes need not fit side by side in one area, and going off
+    the edge to avoid overlapping would be worse. What is guaranteed is
+    that each lands at its own corner and inside the area, so anything
+    covered still shows an edge to click.
+
+    An earlier version tiled each window *before* showing it, which
+    ``tileSubWindows`` ignores; every panel after the first landed
+    exactly on its neighbour and looked like a window that had lost its
+    title bar.
     """
     for index, shape in enumerate(_ASSORTED):
         window.board.add_image(np.zeros(shape), name=f"panel {index}")
-    _settle()
+        _settle()
 
-    boxes = [d.window.geometry() for d in window.area.documents()]
-    assert len(boxes) == len(_ASSORTED)
-    for first in range(len(boxes)):
-        for second in range(first + 1, len(boxes)):
-            overlap = boxes[first].intersected(boxes[second])
-            assert overlap.isEmpty(), f"panels {first} and {second} overlap"
+    corners = {(d.window.x(), d.window.y()) for d in window.area.documents()}
+    assert len(corners) == len(_ASSORTED)
+    for document in window.area.documents():
+        assert not _outside(window.area, document), document.name
 
 
 @pytest.mark.parametrize("shape", [_SQUARE, _WIDE, _TALL])
@@ -161,6 +224,31 @@ def test_resizing_a_panel_never_stretches_it(window, shape):
         document.window.resize(*size)
         _settle()
         assert _drawn_aspect(document) == pytest.approx(expected, rel=1e-9)
+
+
+def test_one_world_unit_is_the_same_size_on_both_axes(window):
+    """
+    The *view* transform is isotropic, which is what "never stretches" means.
+
+    Every other aspect assertion here rests on this one: if a world unit
+    covered more screen pixels across than down, the picture would be
+    stretched no matter what scale or extent it was given. Measured from
+    the scene transform at several panel shapes, since it is the panel
+    shape that would provoke a non-uniform fit.
+
+    This is about napari's camera in the *viewport* sense. An anisotropic
+    *detector* is a different thing entirely and is handled by giving the
+    layer per-axis scale — see the calibrated tests below.
+    """
+    window.board.add_image(np.zeros(_WIDE), name="panel")
+    _settle()
+    document = window.area.document("panel")
+
+    for size in ((900, 200), (200, 700), (500, 500), (1000, 120)):
+        document.window.resize(*size)
+        _settle()
+        down, across = _canvas_pixels_per_world_unit(document)
+        assert down == pytest.approx(across, rel=1e-9), f"anisotropic at {size}"
 
 
 def test_tiling_many_panels_never_stretches_any(window):
@@ -347,26 +435,516 @@ def test_raising_a_covered_panel_activates_it(window):
     assert active.windowTitle() == "first"
 
 
-def test_a_hand_zoomed_panel_is_not_refitted(window):
+def _panel_fill(document: documents.Document) -> tuple[float, float]:
     """
-    Resizing a panel leaves a view the operator chose alone.
+    Return how much of the panel the drawn image covers, per axis.
 
-    Refitting on resize is what makes dragging a border grow and shrink
-    the picture, but doing it to a panel someone has zoomed into would
-    throw away the view they were looking at.
+    Measured against the canvas widget rather than ``canvas.size``, which
+    reports ``(height, width)`` — reading it as width-then-height made a
+    correctly framed wide picture look 30% oversized and sent me looking
+    for a bug in the framing instead of in the measurement.
+
+    Parameters
+    ----------
+    document : documents.Document
+        The document to measure.
+
+    Returns
+    -------
+    tuple[float, float]
+        Fraction of the panel covered down and across.
+    """
+    canvas = document.viewer.window._qt_viewer.canvas.native  # noqa: SLF001
+    layer = document.viewer.layers[0]
+    height, width = layer.data.shape[-2:]
+    scale_y, scale_x = float(layer.scale[-2]), float(layer.scale[-1])
+    down, across = _canvas_pixels_per_world_unit(document)
+    return (
+        height * scale_y * down / canvas.height(),
+        width * scale_x * across / canvas.width(),
+    )
+
+
+def _assert_no_blank_space(document: documents.Document) -> None:
+    """
+    Assert the picture covers its whole panel, with no bars anywhere.
+
+    Both axes, not just the limiting one: a window sized to its data has
+    the data's shape, so a shortfall on *either* axis is the letterboxing
+    this arrangement exists to remove.
+
+    Parameters
+    ----------
+    document : documents.Document
+        The document to check.
+    """
+    down, across = _panel_fill(document)
+    assert down == pytest.approx(1.0, abs=_FILL_TOLERANCE), f"blank above: {down}"
+    assert across == pytest.approx(
+        1.0, abs=_FILL_TOLERANCE
+    ), f"blank beside: {across}"
+
+
+@pytest.mark.parametrize(
+    "shape", [(64, 64), (256, 256), (2048, 2048), _WIDE, _TALL]
+)
+def test_a_window_is_sized_to_its_picture(window, shape):
+    """
+    The frame takes the data's shape, so there are no black bars in it.
+
+    A panel of a fixed shape showing data of another puts the difference
+    on screen as blank space — and two panels of different shapes then
+    look like the same panel. So the window is sized to the picture and
+    the picture fills it, at both extreme aspect ratios and at sizes far
+    smaller and far larger than the area.
+    """
+    window.board.add_image(np.zeros(shape), name="panel")
+    _settle()
+
+    _assert_no_blank_space(window.area.document("panel"))
+
+
+@pytest.mark.parametrize("shape", [(64, 64), (128, 128), (200, 200)])
+def test_small_data_opens_magnified(window, shape):
+    """
+    A 64x64 map is shown at a useful size, not as a postage stamp.
+
+    One screen pixel per position would be a thumbnail nobody can read;
+    anything whose longest side is under the minimum is scaled up to it.
+    """
+    window.board.add_image(np.zeros(shape), name="panel")
+    _settle()
+    document = window.area.document("panel")
+    canvas = document.viewer.window._qt_viewer.canvas.native  # noqa: SLF001
+
+    assert max(canvas.width(), canvas.height()) == pytest.approx(
+        documents.MIN_LONGEST_SIDE, abs=_SIZE_TOLERANCE
+    )
+    _assert_no_blank_space(document)
+
+
+def test_more_data_is_never_shown_in_a_smaller_window(window):
+    """
+    Window size means something about the data, monotonically.
+
+    The reason the magnification floor and its target are one number: a
+    floor of 256 with a target of 512 would open a 128-pixel scan in a
+    *larger* window than a 256-pixel one, and then a glance at two panels
+    would tell you the opposite of the truth about which held more.
+    """
+    widths = []
+    for side in (64, 128, 256, 512):
+        name = f"panel {side}"
+        window.board.add_image(np.zeros((side, side)), name=name)
+        _settle()
+        canvas = (
+            window.area.document(name).viewer.window._qt_viewer.canvas.native  # noqa: SLF001
+        )
+        widths.append(canvas.width())
+
+    assert widths == sorted(widths), widths
+
+
+def test_a_panel_that_nearly_fits_a_row_is_shrunk_into_it(window):
+    """
+    A few pixels short of fitting beside its neighbour is not a reason to hide.
+
+    Two panels came to a handful of pixels more than a dock-narrowed
+    workspace; wrapping the second onto a row with no vertical room left
+    sent it to the overlap fallback, so two panels that all but fitted
+    side by side ended up stacked. Giving up a few per cent of one is a
+    far better answer than covering it.
+    """
+    window.resize(548, 700)
+    _settle(40)
+    for index in range(2):
+        window.board.add_image(np.zeros((256, 256)), name=f"panel {index}")
+        _settle()
+
+    first, second = (d.window.geometry() for d in window.area.documents())
+    assert first.y() == second.y(), "should have stayed on one row"
+    assert first.intersected(second).isEmpty()
+    for document in window.area.documents():
+        _assert_no_blank_space(document)
+
+
+def test_tiling_twice_gives_the_same_layout(window):
+    """
+    Packing is idempotent, so repeated tiling does not erode the panels.
+
+    Each pass may shrink a window to close a near miss; without resetting
+    to the content size first, every pass would take another slice off
+    and panels would dwindle as datasets came and went.
+    """
+    for index in range(3):
+        window.board.add_image(np.zeros((256, 256)), name=f"panel {index}")
+        _settle()
+
+    window.area.arrange()
+    _settle()
+    once = [d.window.geometry() for d in window.area.documents()]
+    window.area.arrange()
+    _settle()
+
+    assert [d.window.geometry() for d in window.area.documents()] == once
+
+
+def test_data_larger_than_the_minimum_opens_at_its_own_size(window):
+    """
+    Something already big enough is shown pixel for pixel, not magnified.
+
+    The magnification exists to rescue tiny data, not to inflate
+    everything — a 1340-channel readout is wide enough to read as it is.
+
+    The area is widened first because the fixture's is not: a panel is
+    never given more canvas than the workspace has, so on a narrow area
+    this would be measuring the clamp rather than the rule.
+    """
+    window.resize(1600, 800)
+    _settle()
+    window.board.add_image(np.zeros((100, 1340)), name="panel")
+    _settle()
+    document = window.area.document("panel")
+    canvas = document.viewer.window._qt_viewer.canvas.native  # noqa: SLF001
+
+    assert canvas.width() == pytest.approx(1340, abs=_SIZE_TOLERANCE)
+    assert canvas.height() == pytest.approx(100, abs=_SIZE_TOLERANCE)
+
+
+def test_data_too_big_for_the_area_is_shrunk_to_fit(window):
+    """
+    A frame larger than the workspace cannot be sized to itself.
+
+    So it shrinks rather than overhanging — still filling its window
+    exactly, just at less than one screen pixel per acquired pixel.
+    """
+    window.board.add_image(np.zeros((4096, 4096)), name="panel")
+    _settle()
+    document = window.area.document("panel")
+    canvas = document.viewer.window._qt_viewer.canvas.native  # noqa: SLF001
+
+    assert canvas.width() <= window.area.width()
+    assert canvas.height() <= window.area.height()
+    _assert_no_blank_space(document)
+
+
+def test_a_calibrated_panel_is_sized_to_its_picture_too(window):
+    """Calibration decides what a pixel measures, not how it is framed."""
+    pixels = (256, 256)
+    window.board.add_image(
+        np.zeros(pixels),
+        name="panel",
+        **axes.layer_axes(FrameCalibration.from_field_size((15.0, 15.0), pixels)),
+    )
+    _settle()
+
+    _assert_no_blank_space(window.area.document("panel"))
+
+
+def test_an_anisotropic_frame_is_framed_to_its_physical_shape(window):
+    """
+    The window takes the shape the specimen has, not the array.
+
+    A 64x256 readout from a detector binned four times across is
+    physically square, so its window is square and the picture fills it.
+    """
+    window.board.add_image(
+        np.zeros((64, 256)),
+        name="panel",
+        **axes.layer_axes(
+            FrameCalibration(
+                y=AxisCalibration(kind=AxisKind.ANGLE, scale=1.6, units="mrad"),
+                x=AxisCalibration(kind=AxisKind.ANGLE, scale=0.4, units="mrad"),
+            )
+        ),
+    )
+    _settle()
+    document = window.area.document("panel")
+
+    _assert_no_blank_space(document)
+    assert _drawn_aspect(document) == pytest.approx(1.0, rel=_PIXEL_EXACT)
+
+
+def test_panels_are_placed_beside_each_other_not_over(window):
+    """
+    Tiling means side by side, and never resizing a window to the screen.
+
+    ``tileSubWindows`` divides the whole area between the windows, which
+    gives each the *area's* shape and puts the bars straight back. So
+    the windows keep the size their data asked for and are packed
+    instead.
+    """
+    # Two, not three: no panel is ever narrower than the magnification
+    # floor, so three need a larger area than the fixture's and the test
+    # would be measuring the overlap fallback instead of the packing.
+    # Two fit side by side with room to spare, which is the case this is
+    # about.
+    sizes = {}
+    for index in range(2):
+        name = f"panel {index}"
+        window.board.add_image(np.zeros((200, 200)), name=name)
+        _settle()
+        sizes[name] = window.area.document(name).window.size()
+
+    window.area.arrange()
+    _settle()
+
+    # The area genuinely has room for both, so
+    # overlapping here would mean the packing failed rather than that it
+    # ran out of space.
+    boxes = [d.window.geometry() for d in window.area.documents()]
+    for first in range(len(boxes)):
+        for second in range(first + 1, len(boxes)):
+            assert boxes[first].intersected(boxes[second]).isEmpty()
+    for document in window.area.documents():
+        # Same size as it asked for: packing moved it, nothing resized it.
+        assert document.window.size() == sizes[document.name]
+        _assert_no_blank_space(document)
+
+
+def _outside(
+    area: documents.DocumentArea,
+    document: documents.Document,
+) -> bool:
+    """
+    Report whether any part of a document's window is outside the area.
+
+    Parameters
+    ----------
+    area : documents.DocumentArea
+        The area the window should be inside.
+    document : documents.Document
+        The document to check.
+
+    Returns
+    -------
+    bool
+        True if any edge is beyond the area.
+    """
+    box = document.window.geometry()
+    return (
+        box.left() < 0
+        or box.top() < 0
+        or box.right() > area.width()
+        or box.bottom() > area.height()
+    )
+
+
+def test_no_part_of_a_window_is_ever_outside(window):
+    """
+    A panel off the edge cannot be reached, so none is ever put there.
+
+    More data than the area can hold, at sizes larger than it, so both
+    the packing and the clamp are exercised: whatever else happens, every
+    edge stays inside.
+    """
+    for index, shape in enumerate(
+        ((512, 512), (400, 1200), (600, 600), (2048, 2048), (64, 64))
+    ):
+        window.board.add_image(np.zeros(shape), name=f"panel {index}")
+        _settle()
+
+    for document in window.area.documents():
+        assert not _outside(window.area, document), document.name
+
+
+def test_shrinking_the_application_brings_panels_back_inside(window):
+    """
+    Panels follow the application in, rather than being left off the edge.
+
+    Shrinking the window is the way a panel most easily ends up outside,
+    and the part outside is the part that cannot be clicked.
+    """
+    for index in range(3):
+        window.board.add_image(np.zeros((512, 512)), name=f"panel {index}")
+        _settle()
+
+    window.resize(600, 450)
+    _settle()
+
+    for document in window.area.documents():
+        assert not _outside(window.area, document), document.name
+
+
+def test_windows_that_must_overlap_are_offset(window):
+    """
+    Covering is allowed; hiding a window exactly underneath is not.
+
+    Once the area has no clear space left, panels overlap rather than
+    going off the edge — but each is offset from the last, so what is
+    underneath still shows a corner and is visibly there to be raised.
+    """
+    for index in range(5):
+        window.board.add_image(np.zeros((600, 600)), name=f"panel {index}")
+        _settle()
+
+    corners = {
+        (d.window.x(), d.window.y()) for d in window.area.documents()
+    }
+    assert len(corners) == len(window.area.documents())
+
+
+def test_resizing_a_panel_by_hand_refits_without_stretching(window):
+    """
+    A window the operator reshapes keeps the picture whole and undistorted.
+
+    Blank space is unavoidable once the frame stops matching the
+    picture — that is their choice — but the picture must still fit
+    inside it and keep its aspect.
     """
     window.board.add_image(np.zeros(_SQUARE), name="panel")
     _settle()
     document = window.area.document("panel")
-    assert document.zoomed_by_hand is False
+
+    for size in ((900, 300), (300, 700)):
+        document.window.resize(*size)
+        _settle()
+        down, across = _panel_fill(document)
+        assert down <= 1.0 + _FILL_TOLERANCE
+        assert across <= 1.0 + _FILL_TOLERANCE
+        assert _drawn_aspect(document) == pytest.approx(1.0, rel=_PIXEL_EXACT)
+
+
+def test_actual_resolution_is_available_on_request(window):
+    """One screen pixel per acquired pixel, when that is the question."""
+    window.board.add_image(np.zeros((2048, 2048)), name="panel")
+    _settle()
+    document = window.area.document("panel")
+
+    document.show_at_actual_resolution()
+    _settle()
+    down, across = _canvas_pixels_per_world_unit(document)
+    assert down == pytest.approx(1.0, rel=_PIXEL_EXACT)
+    assert across == pytest.approx(1.0, rel=_PIXEL_EXACT)
+
+
+def test_a_scale_the_operator_chose_survives_a_new_dataset(window):
+    """
+    Automatic fitting stops the moment the operator picks a scale.
+
+    Zooming into a feature and then starting a second detector would
+    otherwise throw the view away at the moment it became interesting.
+    """
+    window.board.add_image(np.zeros(_SQUARE), name="panel")
+    _settle()
+    document = window.area.document("panel")
+    assert document.scaled_by_hand is False
 
     document.viewer.camera.zoom = 4.0
     _settle()
-    assert document.zoomed_by_hand is True
+    assert document.scaled_by_hand is True
 
-    document.window.resize(400, 300)
+    window.board.add_image(np.zeros(_WIDE), name="another")
     _settle()
+    window.area.arrange()
+    _settle()
+
     assert document.viewer.camera.zoom == pytest.approx(4.0)
+
+def test_each_panel_gets_its_own_units_and_scale_bar(window):
+    """
+    Three panels, three calibrations, three scale bars — the whole point.
+
+    napari applies units per layer but draws the scale bar per viewer,
+    and refuses to render units at all when one viewer's layers disagree.
+    So this is the case a single shared canvas cannot serve, and the
+    reason the viewing area is a window per dataset rather than tiles on
+    one canvas: a HAADF map in nanometres, a Ronchigram in milliradians,
+    and an EEL spectrum in electronvolts, all on screen together.
+    """
+    window.board.add_image(
+        np.zeros(_SQUARE),
+        name="Scan (HAADF)",
+        **axes.layer_axes(FrameCalibration.real_space(0.25)),
+    )
+    window.board.add_image(
+        np.zeros(_SQUARE),
+        name="Camera",
+        **axes.layer_axes(
+            FrameCalibration(
+                y=AxisCalibration(kind=AxisKind.ANGLE, scale=0.4, units="mrad"),
+                x=AxisCalibration(kind=AxisKind.ANGLE, scale=0.4, units="mrad"),
+            )
+        ),
+    )
+    window.board.add_image(
+        np.zeros(_WIDE),
+        name="Camera (eels)",
+        **axes.layer_axes(FrameCalibration.spectrum(0.5, dispersive_axis="x")),
+    )
+    _settle()
+
+    bars = {
+        d.name: (d.viewer.scale_bar.visible, d.viewer.scale_bar.unit)
+        for d in window.area.documents()
+    }
+    assert bars["Scan (HAADF)"] == (True, "nm")
+    assert bars["Camera"] == (True, "mrad")
+    # Energy against position does not convert, so no bar rather than a
+    # length drawn across an electronvolt.
+    assert bars["Camera (eels)"][0] is False
+
+
+def test_a_calibrated_panel_is_drawn_to_its_physical_shape(window):
+    """
+    Anisotropic sampling changes the drawn shape, and resizing does not.
+
+    Calibration is the data's true geometry, so a frame sampled four
+    times more finely across than down *should* be drawn four times
+    wider — that is not stretching, it is the picture being right. What
+    must not change it is a viewing action, so the calibrated ratio is
+    re-measured at several deliberately wrong panel shapes.
+    """
+    pixels = (100, 100)
+    window.board.add_image(
+        np.zeros(pixels),
+        name="panel",
+        **axes.layer_axes(FrameCalibration.from_field_size((10.0, 40.0), pixels)),
+    )
+    _settle()
+    document = window.area.document("panel")
+
+    # Square in pixels, four times wider than tall on screen: the drawn
+    # shape follows the specimen, not the detector's pixel count.
+    assert pixels[1] / pixels[0] == pytest.approx(1.0)
+    for size in ((900, 200), (200, 700), (500, 500)):
+        document.window.resize(*size)
+        _settle()
+        assert _drawn_aspect(document) == pytest.approx(4.0, rel=1e-9)
+
+
+def test_an_anisotropic_detector_draws_square_when_it_is_square(window):
+    """
+    A 4:1 readout from a 4x-binned-across detector is drawn 1:1.
+
+    The end-to-end version of the unit test: an EELS-style camera binned
+    once along the dispersion and four times across it stores a 64x256
+    frame of a physically square region. Drawing it 4:1 — the shape of
+    the array — would misreport the measurement, and drawing it 1:1 is
+    only possible because per-axis scale is applied while the view
+    transform stays isotropic.
+    """
+    window.board.add_image(
+        np.zeros((64, 256)),
+        name="EELS camera",
+        **axes.layer_axes(
+            FrameCalibration(
+                y=AxisCalibration(kind=AxisKind.ANGLE, scale=1.6, units="mrad"),
+                x=AxisCalibration(kind=AxisKind.ANGLE, scale=0.4, units="mrad"),
+            )
+        ),
+    )
+    _settle()
+    document = window.area.document("EELS camera")
+
+    assert _drawn_aspect(document) == pytest.approx(1.0, rel=1e-9)
+    assert document.viewer.scale_bar.visible is True
+    assert document.viewer.scale_bar.unit == "mrad"
+
+    # And a resize does not disturb it, as for any other panel.
+    document.window.resize(900, 200)
+    _settle()
+    assert _drawn_aspect(document) == pytest.approx(1.0, rel=1e-9)
 
 
 def test_a_document_reuses_its_window_when_its_data_is_replaced(window):

@@ -22,7 +22,7 @@ import napari
 
 from miainwoodpecker.storage.session import Session
 from miainwoodpecker.viewer.live import LiveInstrumentWidget
-from miainwoodpecker.viewer.preview import build_preview_devices
+from miainwoodpecker.viewer.preview import _EELS_CHANNELS, build_preview_devices
 
 _DEADLINE_S = 10.0
 _AN_IMAGE_EXPOSURE_MS = 250.0
@@ -260,6 +260,69 @@ def test_the_binning_choices_come_from_the_camera(tmp_path):
         combo = widget._binding(None).binning_combo  # noqa: SLF001
         offered = [int(combo.itemText(i)) for i in range(combo.count())]
         assert offered == list(camera.binning_values)
+    finally:
+        widget.shutdown()
+        viewer.close()
+
+
+def test_a_spectrometer_gets_a_binning_control_per_axis(tmp_path):
+    """
+    Two controls where the axes differ, one where they do not.
+
+    Binning rows buys signal-to-noise; binning channels costs energy
+    resolution. A single control would make the cheap one unreachable
+    without paying the dear one, so a camera that reports its axes
+    separately gets a control for each — and one that does not keeps the
+    single control it always had, because for it there is only one thing
+    to choose.
+    """
+    viewer, widget, _ = _open(tmp_path, scan=False, camera=True, camera_count=2)
+    try:
+        ronchigram = widget._binding("ronchigram_camera")  # noqa: SLF001
+        eels = widget._binding("eels_camera")  # noqa: SLF001
+
+        assert ronchigram.binning_across_combo is None
+        assert eels.binning_across_combo is not None
+
+        rows = [
+            int(eels.binning_combo.itemText(i))
+            for i in range(eels.binning_combo.count())
+        ]
+        channels = [
+            int(eels.binning_across_combo.itemText(i))
+            for i in range(eels.binning_across_combo.count())
+        ]
+        assert rows == [1, 2, 4, 5, 10, 20, 25, 50, 100]
+        assert channels == [1, 2]
+    finally:
+        widget.shutdown()
+        viewer.close()
+
+
+def test_acquiring_a_spectrometer_image_sends_both_binning_factors(tmp_path):
+    """
+    The two controls reach the device as one ``(y, x)`` pair.
+
+    Reading only the first would silently bin both axes by the row
+    factor, which is exactly the spectral resolution this feature exists
+    to protect.
+    """
+    viewer, widget, devices = _open(
+        tmp_path, scan=False, camera=True, camera_count=2
+    )
+    try:
+        eels = widget._binding("eels_camera")  # noqa: SLF001
+        eels.binning_combo.setCurrentText("100")
+        eels.binning_across_combo.setCurrentText("1")
+
+        taken = widget._image_parameters(eels)  # noqa: SLF001
+        assert taken.binning_yx == (100, 1)
+
+        camera = devices.cameras["eels_camera"]
+        camera.configure(taken)
+        rows, channels = camera.readout_shape
+        # Rows binned away, every channel kept.
+        assert (rows, channels) == (1, _EELS_CHANNELS)
     finally:
         widget.shutdown()
         viewer.close()

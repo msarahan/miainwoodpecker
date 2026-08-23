@@ -42,6 +42,154 @@
   call to a document, so a plain viewer still works everywhere the board
   does and every existing widget test builds one directly.
 
+- **Calibrated axes and a per-panel scale bar.**
+  `storage/calibration.py` has modelled per-axis calibration for a while
+  and the storage and analysis layers used it; the viewer did not, so
+  every panel was in bare pixels with nothing for a scale bar to read.
+  `viewer/axes.py` is the bridge, and each panel now carries its own
+  units — measured against the preview instrument, three at once: the
+  HAADF scan in nm, the Ronchigram in mrad, the EEL spectrometer in eV.
+  Changing the field of view mid-scan rescales the running panel.
+  **This is what one canvas could not have done.** napari applies units
+  per layer but draws the scale bar per viewer, and says so out loud when
+  a viewer's layers disagree — *"Inconsistent units across layers; units
+  will not be used for rendering."* A window per dataset turns out to be
+  a requirement of per-image calibration, not a preference.
+  **Geometry is applied only where the axes are commensurable.** A
+  real-space frame sampled four times more finely across than down is
+  drawn four times wider, because that is the specimen's shape rather
+  than the detector's pixel count. A 2D EELS readout is *not*: there is
+  no rate of exchange between an electronvolt and a nanometre, so it
+  keeps pixel geometry with its axes labelled, as DigitalMicrograph and
+  HyperSpy both show it, and gets no scale bar rather than a length drawn
+  across an energy. The calibration is attached to the layer either way,
+  for the readout and ROI work that need the model rather than the
+  drawing.
+
+- **Binning that can differ between a detector's two axes.**
+  `CameraParameters.binning` was one integer documented as applying "in
+  each direction", which cannot describe a spectrometer camera. Binning
+  the non-dispersive direction trades dynamic range for signal-to-noise
+  and is what an EELS camera is routinely run with; binning the
+  dispersive one spends the energy resolution the instrument exists to
+  provide. Two settings with opposite costs were being held in one
+  number.
+  `binning` now takes an `int` *or* a `(y, x)` pair, read back through
+  `binning_yx`. **A scalar still means both directions**, so every
+  adapter and every caller written before this keeps working unchanged —
+  and `validate_binning` refuses an asymmetric pair to any camera that
+  has not published `binning_values_yx`, so a webcam, a Dectris detector
+  or a replayed recording can never be handed a pair it would apply to
+  only one axis. Cameras advertise per axis, since the limits genuinely
+  differ: the preview spectrometer offers 1–8x down and 1–2x across, and
+  a refusal names the axis it applies to.
+  The camera panel follows — one **Image binning** control for a
+  symmetric detector, **Binning (rows)** and **Binning (channels)** for
+  one that distinguishes them. Measured on the preview spectrometer:
+  binning rows 8x takes the readout from 64x1024 to 8x1024 with the
+  dispersion held at 0.500 eV/channel, while binning channels 2x halves
+  them to 512 and widens it to 1.000 eV/channel.
+
+- **A spectrum image can be watched while it is acquired, and no longer
+  freezes the window.** The pass ran *inline on the GUI thread*: for a
+  64x64 grid at a realistic dwell that is minutes with no repaint, no
+  live view, no answer from "Stop scan", and an acquisition the operating
+  system reports as an application that has stopped responding. It is
+  the same failure the recording, loading and analysis paths each already
+  had a job class for; this was the fourth and last handler doing its
+  work where it was called. `PassJob` moves it to a worker thread and
+  `_poll_pass` reports from the display timer.
+  **And there is now something to watch.** `viewer/progress.py` wraps
+  each pass destination and forwards every write through to it
+  unchanged, forming a **virtual detector image** on the way — the
+  signal summed at each beam position, exactly as one is formed offline.
+  A panel named `Acquiring (…)` fills in as the probe goes and the
+  status line counts positions. Drift, contamination and a probe
+  scanning vacuum are all visible in it minutes before the file exists.
+  **No device change was needed for any of it.**
+  `scan_synchronised(into=...)` documents a destination as "a shape, and
+  assignment at a beam position" so that an `h5py` dataset satisfies it;
+  the preview is one too. Every adapter honouring that contract gets a
+  progress view without knowing this exists, which is why it is done
+  here rather than by adding a callback each future adapter would have
+  to remember to fire. The data is written through **first and in full**
+  — the summary is formed afterwards, and a write the preview cannot
+  summarise still lands.
+  The summary subsamples anything large, so a 512x512 diffraction
+  pattern does not cost a quarter of a million adds per position in a
+  fast pass; the display range tracks the positions actually visited, so
+  the unwritten zeros do not crush every real value to white.
+
+### Changed
+
+- **The live view refreshes at 60 fps, up from 30.** The display timer
+  was a hard-coded 33 ms with nothing behind the number. Measured end to
+  end — through `refresh_display`, the document board and napari, with a
+  zero-cost frame source so the display path is what is being timed —
+  the whole thing costs **9.4 ms at 512², 9.7 ms at 1024² and 10.2 ms at
+  2048²**. Near enough flat, because the pixels go to the GPU, so the
+  path already sustained ~100 fps and the old timer was discarding two
+  thirds of it.
+  **Raising it is close to free when nothing is arriving**, which is what
+  makes it safe on a slower machine than the one measured: a tick that
+  finds the frame it already drew costs **4.4 microseconds** — 0.026% of
+  a core at 60 Hz — because the identity check skips before any upload or
+  contrast pass. Cost tracks frames produced, not ticks.
+  The two per-frame passes the calibration work added are not a factor
+  either: resolving a frame's calibration is 0.01 ms at every size, and
+  the autocontrast min/max is 0.5 ms at 2048² — 5% of the frame budget,
+  and it runs for the scan path only.
+
+- **A window is sized to its picture, so no panel has black bars in
+  it.** The frame takes the data's own shape and the picture fills it
+  edge to edge — measured at 1.000 fill on *both* axes for square, very
+  wide, very tall, tiny and oversized data alike. Blank space in a panel
+  spends screen on nothing, and two panels of different shapes padded to
+  the same shape look like the same panel.
+  **Small data is magnified rather than shown as a stamp**: anything
+  whose longest side is under 256 pixels opens scaled up to it, so a
+  64x64 spectrum-image map opens as a 256-pixel window. The floor and
+  the target are one number deliberately — magnifying to 512 while
+  leaving 256 alone would open a 128-pixel scan in a *larger* window
+  than a 256-pixel one, and window size would stop meaning anything
+  about the data. Anything already that large opens at one screen pixel
+  per acquired pixel and shrinks only if it will not otherwise fit.
+  A panel a few pixels too wide for a row it nearly fits is shrunk into
+  it rather than wrapped: two panels came to a handful of pixels more
+  than a dock-narrowed workspace, and wrapping sent the second to the
+  overlap fallback, so two that all but fitted side by side ended up
+  stacked. Packing resets each window to its content size first, so
+  tiling repeatedly does not erode them.
+  **Tiling means beside, not filling.** `tileSubWindows` divides the
+  whole area between the windows, which gives each the *area's* shape
+  rather than its picture's and puts the bars straight back, so panels
+  are packed at their own sizes instead. **No part of a window is ever
+  outside the workspace** — too big is shrunk, overhanging is moved in,
+  and shrinking the application brings the panels in with it. Overlap is
+  allowed when there is no room, but staggered so a covered window keeps
+  a corner to raise it by.
+  **View → Actual resolution** (`Ctrl+1`) gives one screen pixel per
+  acquired pixel; **View → Fit panel to data** (`Ctrl+0`) returns, and
+  hands the panel back to automatic fitting. A panel the operator has
+  zoomed is never refitted by anything automatic.
+  Two timing traps are recorded in the code because both produced
+  visible faults: the refit has to happen on the panel's *resize event*
+  rather than straight after the resize call, since Qt resizes the
+  canvas afterwards — fitting immediately fits to the size the panel is
+  about to stop being, and drew an image 44% taller than its own panel;
+  and the window can only be sized once it *has* data, since a document
+  is created before its first layer is added.
+
+### Fixed
+
+- **The aspect-ratio test was measuring nothing.** It computed drawn
+  width and height by multiplying each by the same `camera.zoom`, which
+  cancels — so it compared the array's pixel ratio with itself and would
+  have passed however the image was drawn. It now maps unit steps along
+  each world axis through the live VisPy scene transform and compares the
+  screen distances, which is a measurement an anisotropic camera would
+  fail, and a separate test pins that isotropy directly.
+
 - **A device that replays a recorded session, at the speed it was
   taken.** `devices/replay.py` opens a DigitalMicrograph spectrum-image
   session and serves it through `Scanner`, `SynchronisedScanner` and

@@ -106,6 +106,7 @@ from miainwoodpecker.devices.interface import (
     ScanParameters,
     ScanPass,
     Spectrum,
+    validate_binning,
 )
 from miainwoodpecker.devices.rpc import CAMERA_TARGET_NAMES, SCANNER_TARGET
 from miainwoodpecker.storage.calibration import METADATA_KEY, FrameCalibration
@@ -180,10 +181,13 @@ _CAMERA_SEED = _RNG_SEED + 1
 # its calibration path against, so a spectrum from one is directly
 # comparable with a spectrum from the other.
 #
-# 1024 channels of it spans -20 to 492 eV, which is what makes the model
+# 1340 channels of it spans -20 to 650 eV, which is what makes the model
 # below possible: the zero-loss peak, a plasmon, the silicon L2,3 edge at
 # 99.8 eV and the carbon K edge at 284.2 eV all fit in one acquisition.
-_EELS_CHANNELS = 1024
+# 1340x100 is the EEL spectrometer on SuperSTEM 1, so the preview opens
+# the window against a detector shape an operator there will recognise
+# rather than a round number.
+_EELS_CHANNELS = 1340
 _EELS_DISPERSION_EV = 0.5
 _EELS_BASE_OFFSET_EV = -20.0
 # Rows in the unprojected readout. A spectrometer disperses onto a 2D
@@ -191,8 +195,22 @@ _EELS_BASE_OFFSET_EV = -20.0
 # tall rather than an evenly lit rectangle - so the rows exist, carry no
 # information the projection loses, and are few because the interesting
 # direction is the other one.
-_EELS_ROWS = 64
+_EELS_ROWS = 100
 _EELS_STREAK_ROWS = 6.0
+# Binning offered per axis, and deliberately not the same set. Binning
+# rows trades dynamic range for signal-to-noise and is what a
+# spectrometer is routinely run with, so the range down goes all the way;
+# binning channels spends the energy resolution the instrument exists to
+# deliver, so only a token amount is offered across.
+#
+# The numbers are a real detector's rather than invented: the EEL
+# spectrometer on SuperSTEM 1 reads out 1340x100 and bins up to 100x
+# vertically. **That top factor is the whole sensor height**, so binning
+# the rows all the way is the same operation as PROJECTED_READOUT - the
+# two meet at the same place on real hardware, which is why the readout
+# mode exists as well as the binning and not instead of it.
+_EELS_ROW_BINNING = (1, 2, 4, 5, 10, 20, 25, 50, 100)
+_EELS_CHANNEL_BINNING = (1, 2)
 # Energy resolution as the zero-loss peak's FWHM. A Schottky-source STEM
 # figure; at this dispersion it is two channels wide, which is what real
 # EELS at 0.5 eV/channel looks like rather than a defect of the model.
@@ -1413,12 +1431,7 @@ class _PreviewCameraBase(_SyntheticSource):
             direction. Both refused rather than quietly approximated, so
             the viewer's own handling of a rejected setting is reachable.
         """
-        if parameters.binning not in _BINNING_VALUES:
-            msg = (
-                f"binning {parameters.binning} is not supported; "
-                f"{self._camera_id} offers {list(_BINNING_VALUES)}"
-            )
-            raise ValueError(msg)
+        validate_binning(self, parameters)
         if parameters.readout == PROJECTED_READOUT and not self._CAN_PROJECT:
             msg = (
                 f"{self._camera_id} cannot project: it has no dispersive "
@@ -1677,8 +1690,8 @@ class PreviewCamera(_PreviewCameraBase):
         tuple[int, ...]
             ``(pixels, pixels)``.
         """
-        pixels = _CAMERA_PIXELS // self._parameters.binning
-        return (pixels, pixels)
+        down, across = self._parameters.binning_yx
+        return (_CAMERA_PIXELS // down, _CAMERA_PIXELS // across)
 
     def readout_at(self, state: _ProbeState) -> np.ndarray:
         """
@@ -1718,8 +1731,12 @@ class PreviewCamera(_PreviewCameraBase):
         FrameCalibration
             Milliradians per pixel on both axes, centred.
         """
+        # binning_yx, though this camera only ever bins symmetrically:
+        # reading the pair costs nothing and means the arithmetic does not
+        # have to be revisited if it ever learns to do otherwise.
+        down, _ = self._parameters.binning_yx
         return FrameCalibration.diffraction(
-            _RONCHIGRAM_MRAD_PER_PIXEL * self._parameters.binning,
+            _RONCHIGRAM_MRAD_PER_PIXEL * down,
             units="mrad",
             shape=self.readout_shape,
         )
@@ -1853,6 +1870,50 @@ class PreviewEELSCamera(_PreviewCameraBase):
         )
 
     @property
+    def binning_values(self) -> Sequence[int]:
+        """
+        Return the factors this camera will take on *both* axes at once.
+
+        The intersection of the two per-axis sets, because that is what
+        the question means for a detector whose axes differ: a caller
+        asking for one number is asking to bin both directions by it, and
+        the channel axis is the one that limits how far that can go.
+
+        Returns
+        -------
+        Sequence[int]
+            The symmetric factors, ascending.
+        """
+        across = set(_EELS_CHANNEL_BINNING)
+        return tuple(value for value in _EELS_ROW_BINNING if value in across)
+
+    @property
+    def binning_values_yx(self) -> tuple[Sequence[int], Sequence[int]]:
+        """
+        Return what this spectrometer will bin, per axis — they differ.
+
+        Publishing this is what tells
+        :func:`~miainwoodpecker.devices.interface.validate_binning` that
+        this detector can tell its axes apart, and it is the reason the
+        binning controls appear per axis for this camera and as one
+        control for the Ronchigram camera beside it.
+
+        The two axes are not doing the same job. Binning rows together
+        trades dynamic range for signal-to-noise and is the routine move
+        on a spectrometer, so a wide range is offered down. Binning
+        channels together spends spectral resolution, which is the thing
+        the instrument exists to provide, so only a token amount is
+        offered across — enough that a caller can ask for it deliberately
+        and see what it costs, not enough to reach for by accident.
+
+        Returns
+        -------
+        tuple[Sequence[int], Sequence[int]]
+            Row and channel factors, ascending.
+        """
+        return (_EELS_ROW_BINNING, _EELS_CHANNEL_BINNING)
+
+    @property
     def channel_count(self) -> int:
         """
         Return how many energy channels a frame has at the current binning.
@@ -1862,7 +1923,8 @@ class PreviewEELSCamera(_PreviewCameraBase):
         int
             The dispersive axis's length.
         """
-        return _EELS_CHANNELS // self._parameters.binning
+        _, across = self._parameters.binning_yx
+        return _EELS_CHANNELS // across
 
     def frame_calibration(self) -> FrameCalibration:
         """
@@ -1873,6 +1935,12 @@ class PreviewEELSCamera(_PreviewCameraBase):
         ``build_calibration`` does with its ``relative_scale``, and the
         reason :class:`~miainwoodpecker.devices.interface.CameraParameters`
         holds binning and exposure together as one value.
+
+        **Only the dispersive axis's binning does that.** Binning the
+        rows together trades dynamic range for signal-to-noise and
+        changes how many rows there are, but it cannot change how many
+        electronvolts a channel spans, so the energy scale here reads the
+        ``x`` factor alone.
 
         The offset moves with the spectrometer's energy offset, so the
         zero-loss peak sits at a different *channel* when the control is
@@ -1886,8 +1954,9 @@ class PreviewEELSCamera(_PreviewCameraBase):
         FrameCalibration
             An energy ``x`` axis and an uncalibrated ``y`` axis.
         """
+        _, across = self._parameters.binning_yx
         return FrameCalibration.spectrum(
-            _EELS_DISPERSION_EV * self._parameters.binning,
+            _EELS_DISPERSION_EV * across,
             offset=self._offset_ev(),
             dispersive_axis="x",
         )
@@ -1989,7 +2058,8 @@ class PreviewEELSCamera(_PreviewCameraBase):
         int
             The non-dispersive direction's length, at least one.
         """
-        return max(1, _EELS_ROWS // self._parameters.binning)
+        down, _ = self._parameters.binning_yx
+        return max(1, _EELS_ROWS // down)
 
     def _dispersed_image(self, silicon_fraction: float) -> np.ndarray:
         """
