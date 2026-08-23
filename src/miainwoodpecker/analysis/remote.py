@@ -81,6 +81,7 @@ from miainwoodpecker.analysis.transfer import (
     publish_source,
     read_array,
 )
+from miainwoodpecker.devices.remote import own_process_group
 from miainwoodpecker.devices.rpc import Call, disable_nagle, send_call
 from miainwoodpecker.devices.shared_frame import (
     SharedArrayRef,
@@ -535,8 +536,11 @@ class WorkerRunner:
             # Its own process group, for the reason devices/remote.py
             # gives: a Ctrl-C in the launching terminal must not race this
             # process's own teardown, and a process-group kill is the one
-            # case the resource_tracker cannot clean up after.
-            start_new_session=True,
+            # case the resource_tracker cannot clean up after. Through
+            # that module's helper because the spelling differs by
+            # platform and the POSIX one is ignored without a word on
+            # Windows.
+            **own_process_group(),
         )
 
 

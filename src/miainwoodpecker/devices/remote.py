@@ -226,6 +226,7 @@ __all__ = [
     "RemoteSpectrumDetector",
     "ServerHealth",
     "attached_instrument",
+    "own_process_group",
     "remote_instrument",
     "remote_simulated_instrument",
 ]
@@ -1885,8 +1886,38 @@ def _spawn_server(
         # the resource_tracker cannot reclaim the shared-memory segments
         # (it dies in the same sweep). Teardown reaches the server by
         # signalling the process directly, which is unaffected.
-        start_new_session=True,
+        **own_process_group(),
     )
+
+
+def own_process_group() -> dict[str, object]:
+    """
+    Return the ``Popen`` keyword that puts a child in its own group.
+
+    Two spellings for one intention, because ``start_new_session`` is
+    **silently ignored on Windows** - it is a ``setsid`` call, and there
+    is no such thing there. That silence is what made this worth a
+    function: the intention above was expressed once and held on Linux
+    only, on a project whose first platform is win-64.
+
+    Measured, not assumed: with a Ctrl-Break sent to a broker's process
+    group, the device server sharing that group exited with
+    ``0xC000013A`` (``STATUS_CONTROL_C_EXIT``) *before* the broker could
+    park, and the park then failed with a lost connection. With the
+    group split, the broker parks and stops the server itself.
+
+    Returns
+    -------
+    dict[str, object]
+        ``creationflags`` on Windows, ``start_new_session`` elsewhere.
+    """
+    if sys.platform == "win32":
+        # A new group also detaches the child from console Ctrl-C, which
+        # is the same isolation start_new_session buys on POSIX. It does
+        # not affect terminate(), which is a TerminateProcess on the one
+        # process - see how _stop_server ends a session.
+        return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+    return {"start_new_session": True}
 
 
 @dataclass(frozen=True)

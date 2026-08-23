@@ -384,6 +384,58 @@
   The viewer reads descriptions rather than device handles for its
   detector names, its synchronised targets and its instrument controls.
 
+- **One command for the whole arrangement: `pixi run instrument`.**
+  `miainwoodpecker-instrument` starts a broker over the instrument,
+  waits for it to publish where it is listening, starts a front end
+  against it, and stops the broker when that front end goes. The
+  sequence was four manual steps with a port to copy between two of
+  them; it is a supervisor and nothing else — it talks to no device and
+  no broker, and every option either child takes it passes through.
+  **The broker is asked to stop, never killed**, because being asked is
+  what parks the instrument. That constraint decided the design: the
+  obvious `pixi run -e device miainwoodpecker-broker` spelling was
+  measured and rejected — a broker started that way exits with
+  `0xC000013A` and never runs its shutdown, because the signal reaches
+  `pixi.exe` and the broker is taken down under it. So `--broker-env`
+  and `--ui-env` *resolve* an environment through `pixi shell-hook
+  --json` and spawn that environment's own interpreter directly, which
+  is the only arrangement where "ask it to stop, and it parks" holds.
+  It also means the shipped task runs the broker in the environment
+  with the GPL-3.0 device stack and the window in one without it, so
+  the licensing boundary is something you can watch happen.
+  Anything after `--` replaces the window and is given
+  `$MIAINWOODPECKER_BROKER` — the variable the dashboard already reads,
+  and now the default for the viewer's `--broker` too — so the same
+  command serves an instrument to a marimo dashboard or to a script.
+  `pixi run dashboard` is that spelled out, in the environment that has
+  marimo and no Qt.
+  **`--serve` is the other shape of session**, and the difference is
+  about the instrument rather than the software: no front end, held
+  open until Ctrl-C, for a column that people attach to and leave all
+  day — a window this morning, a notebook after lunch, both at once.
+  The default mode ends when *its* front end closes, which is right for
+  one sitting and wrong for a shared microscope. `pixi run serve` is
+  that with the vendor environment chosen and the invitation published
+  into the working directory, where a notebook looks by default.
+  The launcher installs the same three signal handlers the broker does
+  (`SIGINT`, `SIGTERM`, `SIGBREAK`), because a supervisor stopping a
+  process whose defaults terminate the interpreter without unwinding
+  would leave the broker orphaned and the instrument unparked — the
+  failure the broker's own handlers exist to prevent, which putting a
+  launcher in front of it would otherwise reintroduce.
+
+- **A device server is in its own process group on Windows too.**
+  `devices/remote.py` has always said it puts the server in its own
+  group, and gave the reason: an interrupt in the launching terminal
+  must not race the client's teardown and kill the server before
+  anything parks the instrument. It was spelled `start_new_session`,
+  which is a `setsid` call and is **silently ignored on Windows** — so
+  on this project's first platform the stated intention had never held.
+  Measured while building the launcher: a Ctrl-Break to a broker's
+  group killed the device server with `0xC000013A` first, and the
+  broker's park then failed with a lost connection. Fixed, and the
+  analysis worker gets the same treatment for the same reason.
+
 - **The window can be pointed at an instrument in another process.**
   `miainwoodpecker-viewer --broker PATH` connects to a broker that is
   already running - at the invitation it published - and launches no

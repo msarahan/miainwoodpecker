@@ -13,6 +13,7 @@ fix a bug, or set up a microscope PC, use pixi:
 
 ```shell
 pixi run preview     # the synthetic instrument
+pixi run instrument  # a broker over the simulator, and a window on it
 pixi run test        # the unit suite
 pixi run -e style lint
 ```
