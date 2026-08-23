@@ -1,18 +1,36 @@
 """
 Napari dock widget for the live "look at the sample, adjust settings" loop.
 
-One :class:`~miainwoodpecker.acquisition.live.LiveAcquisition` per source
-(scan, camera) grabs frames on worker threads; a single QTimer on the GUI
-thread polls their latest frames at display rate and pushes them into
-napari image layers. Acquisition rate and display rate are fully
-decoupled — a slow display skips frames, and a fast source never floods
-the UI with events.
+**This window is a client of a broker, not the owner of the instrument.**
+:mod:`miainwoodpecker.broker` runs the live loops and decides who may
+drive what; a single QTimer on the GUI thread asks it for the latest
+frames at display rate and pushes them into napari image layers.
+Acquisition rate and display rate are fully decoupled — a slow display
+skips frames, and a fast source never floods the UI with events.
+
+That the arbitration lives elsewhere is the point rather than a detail.
+This file used to enforce "one driver per device" itself, in pieces: a
+``stop_scan`` whose return value callers had to check, a stop dance
+before every acquisition, and two "still busy - try again" strings. It
+worked precisely as long as this window was the only program touching
+the instrument, which stopped being true the moment a notebook or a
+dashboard wanted the same microscope. The rule now lives in one place
+that all of them share, and what is left here is a window.
+
+**A lease can take as long as a scan pass, so no lease is taken on the
+GUI thread.** Stopping a live loop means waiting out the pass in flight,
+and a pass is ``height x width x dwell`` — a quarter of a second at
+512x512 and one microsecond, but 42 seconds at 2048x2048 and ten. Every
+acquisition here therefore takes its lease *inside* the generator the
+worker consumes, where waiting costs nothing but the wait. The two
+paths that still block (Preview, and a spectrum image) blocked before
+this change for the same reason and are marked as such.
 
 Thread-safety contract: Qt widgets are only touched from the GUI thread.
-Scan settings are written to a plain tuple attribute by the GUI thread
-whenever a control changes, and the worker thread only reads that
-attribute — no Qt access from workers. Recording obeys the same contract
-from the other direction: a
+Scan settings are handed to the broker, which publishes them to its own
+worker — no Qt access from workers, and no shared mutable state between
+this file and a running loop. Recording obeys the same contract from the
+other direction: a
 :class:`~miainwoodpecker.storage.session.RecordingJob` streams frames to
 disk on its own thread and touches no Qt, and the GUI thread learns how
 it is going by polling it from the same display timer that drives the
@@ -79,21 +97,20 @@ from pathlib import Path
 import numpy as np
 from qtpy import QtCore, QtWidgets
 
-from miainwoodpecker.acquisition.live import (
-    LiveAcquisition,
-    MultiChannelLiveAcquisition,
-)
 from miainwoodpecker.acquisition.sequence import (
     camera_image,
     camera_series,
     multichannel_scan_series,
 )
+from miainwoodpecker.broker.interface import BrokerError
+from miainwoodpecker.broker.local import LocalBroker
 from miainwoodpecker.devices.interface import (
     CameraParameters,
     ScanParameters,
     ScanPass,
     native_scan_parameters,
 )
+from miainwoodpecker.devices.rpc import INSTRUMENT_TARGET, SCANNER_TARGET
 from miainwoodpecker.storage.calibration import FrameCalibration
 from miainwoodpecker.storage.nexus import write_frames
 from miainwoodpecker.storage.session import (
@@ -128,17 +145,24 @@ from miainwoodpecker.viewer.panels.defaults import (
 )
 
 if typing.TYPE_CHECKING:
-    from collections.abc import Callable, Iterable, Iterator, Sequence
+    from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 
     import napari
 
     from miainwoodpecker.analysis.operations import AnalysisInput
     from miainwoodpecker.analysis.remote import AnalysisRunner
+    from miainwoodpecker.broker.interface import (
+        InstrumentBroker,
+        LeasedDevices,
+        TargetState,
+        TargetView,
+    )
     from miainwoodpecker.devices.interface import (
         Camera,
         Frame,
         Instrument,
         Scanner,
+        SynchronisedScanner,
     )
     from miainwoodpecker.storage.nexus import FrameStack
     from miainwoodpecker.storage.session import LoadedRecording, Recording
@@ -158,11 +182,6 @@ if typing.TYPE_CHECKING:
 # hold.
 _DEFAULT_DISPLAY_INTERVAL_MS = 16
 _ANALYSIS_BURST_FRAME_COUNT = 5
-# Shown when a live loop would not release the device in time. Refusing is
-# deliberate: driving a device from two threads corrupts frames silently
-# rather than raising (docs/architecture-review.md, §1.2).
-_SCANNER_BUSY_MESSAGE = "scanner still busy - live scan did not stop, try again"
-_CAMERA_BUSY_MESSAGE = "camera still busy - live loop did not stop, try again"
 # Long enough that typing a sentence writes the sidecar once, short enough
 # that an operator who types and immediately clicks Record has their note.
 _NEXUS_FILE_FILTER = "NeXus recordings (*.nxs *.h5 *.hdf5);;All files (*)"
@@ -194,8 +213,6 @@ class _CameraBinding:
     layer_name : str
         The napari layer its frames are pushed into. One layer per
         camera, so two live cameras do not overwrite each other.
-    loop : LiveAcquisition | None
-        Its live-acquisition loop while running, None otherwise.
     button : QtWidgets.QPushButton | None
         Start/stop, or None before the panel is built.
     status : QtWidgets.QLabel | None
@@ -235,7 +252,6 @@ class _CameraBinding:
     name: str
     camera: Camera
     layer_name: str
-    loop: LiveAcquisition | None = None
     button: QtWidgets.QPushButton | None = None
     status: QtWidgets.QLabel | None = None
     count_spin: QtWidgets.QSpinBox | None = None
@@ -430,6 +446,18 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         connected to, and the controls it publishes. None gives a panel
         that says what it knows and offers no controls, which is what a
         caller constructing the widget without one has always had.
+    broker : InstrumentBroker | None
+        The arbitration to drive the instrument through, shared with
+        whatever else is connected to it. None builds a private
+        :class:`~miainwoodpecker.broker.local.LocalBroker` over the
+        devices above, which is what a window that is the only program
+        on the instrument wants and what every existing caller gets
+        without changing a line.
+
+        Passing one is how this window stops being the only client: a
+        notebook, a dashboard and this dock can hold the same broker and
+        take turns at the hardware instead of corrupting each other's
+        frames.
     display_interval_ms : int
         How often the display polls for new frames.
     parent : QtWidgets.QWidget | None
@@ -452,6 +480,7 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         camera: Camera | None = None,
         cameras: typing.Mapping[str, Camera] | None = None,
         instrument: Instrument | None = None,
+        broker: InstrumentBroker | None = None,
         display_interval_ms: int = _DEFAULT_DISPLAY_INTERVAL_MS,
         parent: QtWidgets.QWidget | None = None,
     ) -> None:
@@ -483,7 +512,24 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
             )
             for index, (name, device) in enumerate(served.items())
         }
-        self._scan_loop: LiveAcquisition | None = None
+        # The devices above are kept for *descriptive* reads only -
+        # channel names, binning values, a synchronised-target list -
+        # which produce no frames and so cannot interleave on the
+        # shared-memory segment the arbitration exists to protect.
+        # Everything that drives goes through the broker. The remaining
+        # consequence is honest and worth stating: those reads are
+        # direct, so this window cannot yet be pointed at a broker in
+        # another process. Moving that metadata onto TargetState is what
+        # a second screen will need.
+        self._owns_broker = broker is None
+        self._broker: InstrumentBroker = broker if broker is not None else LocalBroker(
+            {
+                **({SCANNER_TARGET: scanner} if scanner is not None else {}),
+                **({INSTRUMENT_TARGET: instrument} if instrument is not None else {}),
+                **served,
+            },
+            holder="viewer",
+        )
         # Newest frame already pushed into each napari layer, so a display
         # tick that finds nothing new can skip the upload entirely. Holds
         # a reference for identity comparison only; the array itself is
@@ -563,12 +609,6 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         """The first camera served, which is what ``camera=`` used to mean."""
         binding = self._first_binding()
         return binding.camera if binding is not None else None
-
-    @property
-    def _camera_loop(self) -> LiveAcquisition | None:
-        """The first camera's live loop, kept for callers written before N."""
-        binding = self._first_binding()
-        return binding.loop if binding is not None else None
 
     @property
     def _camera_status(self) -> QtWidgets.QLabel | None:
@@ -887,12 +927,30 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         loop runs at. Preview and Acquire are read at the moment their
         own action is taken, so changing them never disturbs a running
         live view.
+
+        The broker is told immediately rather than at the next start, so
+        a size or detector change reaches the scan that is *already*
+        running - and reaches it without a stop, because stopping a scan
+        to re-parameterise it parks the probe for as long as that takes.
+        A change made while somebody holds a lease is reported rather
+        than applied: the settings on screen would otherwise disagree
+        with the acquisition in flight.
         """
         self._scan_request = (
             self.scan_parameters(profiles.VIEW),
             tuple(self.enabled_channels()),
             tuple(self.enabled_channel_names()),
         )
+        if self._scanner is not None:
+            parameters, channels, _ = self._scan_request
+            try:
+                self._broker.reconfigure_live(
+                    SCANNER_TARGET,
+                    parameters,
+                    channels=channels,
+                )
+            except BrokerError as error:
+                self._scan_status.setText(str(error))
         self._save_scan_preferences()
 
     def scan_parameters(self, profile: str) -> ScanParameters:
@@ -1010,16 +1068,26 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         self._preferences = stored
         preferences.save(stored)
 
-    def _grab_scan(self) -> Sequence[Frame]:
-        # Runs on the worker thread: reads the request tuple, never Qt state.
-        # One scan_frames call, so every enabled detector comes from the
-        # same traversal - one pass of dose, no drift between channels.
-        parameters, channels, _ = self._scan_request
-        scanner = typing.cast("Scanner", self._scanner)
-        return scanner.scan_frames(parameters, list(channels))
+    def _is_live(self, target: str) -> bool:
+        """
+        Return whether the broker is running a live loop on a target.
+
+        Parameters
+        ----------
+        target : str
+            The target name.
+
+        Returns
+        -------
+        bool
+            False for a target this instrument does not serve, so a
+            caller can ask about a scanner that is not there.
+        """
+        state = self._broker.targets().get(target)
+        return state is not None and state.is_live
 
     def _toggle_scan(self) -> None:
-        if self._scan_loop is not None and self._scan_loop.is_running:
+        if self._is_live(SCANNER_TARGET):
             self.stop_scan()
         else:
             self.start_scan()
@@ -1028,7 +1096,7 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         binding = self._binding(name)
         if binding is None:
             return
-        if binding.loop is not None and binding.loop.is_running:
+        if self._is_live(binding.name):
             self.stop_camera(binding.name)
         else:
             self.start_camera(binding.name)
@@ -1037,10 +1105,12 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         """Start the live scan loop and the display timer. No-op with no scanner."""
         if self._scanner is None:
             return
-        if self._scan_loop is not None and self._scan_loop.is_running:
+        parameters, channels, _ = self._scan_request
+        try:
+            self._broker.start_live(SCANNER_TARGET, parameters, channels=channels)
+        except BrokerError as error:
+            self._scan_status.setText(str(error))
             return
-        self._scan_loop = MultiChannelLiveAcquisition(self._grab_scan)
-        self._scan_loop.start()
         toolbar.set_action(
             self._scan_button, toolbar.STOP, "Stop the live scan"
         )
@@ -1055,20 +1125,25 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         """
         Stop the live scan loop.
 
+        Rarely what a caller wants for its own sake: a stopped scan is a
+        stationary probe. Acquisition paths do **not** call this — they
+        take a lease, and the broker stops and restarts the loop around
+        them.
+
         Returns
         -------
         bool
-            True if the worker actually finished. False means a grab is
-            still in flight and the scanner is still in use — callers
-            about to drive the scanner themselves must not proceed. True
-            with no scanner at all: nothing is holding the device, which
-            is what the callers are asking about.
+            True if the worker actually finished, False if a pass is
+            still in flight. True with no scanner at all: nothing is
+            holding the device.
         """
         if self._scanner is None:
             return True
-        stopped = True
-        if self._scan_loop is not None:
-            stopped = self._scan_loop.stop()
+        try:
+            stopped = self._broker.stop_live(SCANNER_TARGET)
+        except BrokerError as error:
+            self._scan_status.setText(str(error))
+            return False
         if stopped:
             toolbar.set_action(
                 self._scan_button,
@@ -1094,11 +1169,12 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         binding = self._binding(name)
         if binding is None:
             return
-        if binding.loop is not None and binding.loop.is_running:
+        try:
+            self._broker.start_live(binding.name)
+        except BrokerError as error:
+            if binding.status is not None:
+                binding.status.setText(str(error))
             return
-        binding.camera.start()
-        binding.loop = LiveAcquisition(binding.camera.acquire_frame)
-        binding.loop.start()
         if binding.button is not None:
             toolbar.set_action(
                 binding.button, toolbar.STOP, "Stop the live camera view"
@@ -1127,14 +1203,16 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         binding = self._binding(name)
         if binding is None:
             return True
-        stopped = True
-        if binding.loop is not None:
-            stopped = binding.loop.stop()
+        try:
+            stopped = self._broker.stop_live(binding.name)
+        except BrokerError as error:
+            if binding.status is not None:
+                binding.status.setText(str(error))
+            return False
         if not stopped:
             if binding.status is not None:
                 binding.status.setText("still finishing an exposure - try again")
             return False
-        binding.camera.stop()
         if binding.button is not None:
             toolbar.set_action(
                 binding.button, toolbar.START, "Start the live camera view"
@@ -1393,9 +1471,10 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         if self._scanner is not None:
             frames = self._scan_count_spin.value()
             return frames, estimate_size(self._scan_request[0].shape, frames), "scan"
-        if self._camera is None:  # pragma: no cover - one device is required
+        first = self._first_binding()
+        if first is None:  # pragma: no cover - one device is required
             return None
-        frame = self._camera_loop.latest() if self._camera_loop is not None else None
+        frame = self._broker.latest(first.name)
         if frame is None:
             return None
         binding = self._first_binding()
@@ -1409,7 +1488,7 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         if self._scanner is None:
             return
         label = f"scan-{self._scan_request[2][0]}-frame"
-        self._save_displayed_frame(self._scan_loop, label)
+        self._save_displayed_frame(SCANNER_TARGET, label)
 
     def save_camera_frame(self, name: str | None = None) -> None:
         """
@@ -1423,17 +1502,25 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         binding = self._binding(name)
         if binding is None:
             return
-        self._save_displayed_frame(binding.loop, "camera-frame")
+        self._save_displayed_frame(binding.name, "camera-frame")
 
-    def _save_displayed_frame(self, loop: LiveAcquisition | None, label: str) -> None:
+    def _save_displayed_frame(self, target: str, label: str) -> None:
         """
         Record the newest frame from a live loop as a one-frame file.
 
-        This needs no device access — the frame is already in hand from
-        the live loop — so unlike :meth:`record_scan_frames` it leaves the
-        loop running and the operator keeps looking at the sample.
+        Takes no lease, deliberately, and this is the one acquisition
+        button that should not: the frame is already in hand from the
+        broker's own loop, so there is no device to claim. The operator
+        keeps looking at the sample while it is written.
+
+        Parameters
+        ----------
+        target : str
+            The target whose displayed frame to keep.
+        label : str
+            Session label for the one-frame recording.
         """
-        frame = loop.latest() if loop is not None else None
+        frame = self._broker.latest(target)
         if frame is None:
             self._recording_status.setText("no frame on screen yet")
             return
@@ -1446,29 +1533,24 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         if self._session is None:
             self._recording_status.setText(_NO_SESSION_MESSAGE)
             return
-        # One driver per device: the live loop and the recording would
-        # otherwise call scan_frame from two threads at once, and the
-        # device RPC protocol is strictly synchronous request/response
-        # over a single connection (migration plan, §6). Refusing when the
-        # loop did not actually stop is the point of checking: starting
-        # anyway is what tears a frame in half across the reused
-        # shared-memory segment.
-        if not self.stop_scan():
-            self._recording_status.setText(_SCANNER_BUSY_MESSAGE)
-            return
         # Acquire settings, not the live view's: a kept series is worth
         # the dwell of a kept image. Every enabled channel, one pass per
         # repeat, so the series is multichannel for the same reason a
         # scan image is.
         parameters = self.scan_parameters(profiles.ACQUIRE)
-        channels = self._scan_request[1]
+        channels = list(self._scan_request[1])
         names = self._scan_request[2]
+        count = self._scan_count_spin.value()
         self._start_recording(
-            multichannel_scan_series(
-                typing.cast("Scanner", self._scanner),
-                parameters,
-                self._scan_count_spin.value(),
-                channels=list(channels),
+            self._leased_frames(
+                [SCANNER_TARGET],
+                f"recording {count} scan frames",
+                lambda leased: multichannel_scan_series(
+                    leased.scanner(),
+                    parameters,
+                    count,
+                    channels=channels,
+                ),
             ),
             f"scan-{'-'.join(names)}",
         )
@@ -1489,13 +1571,13 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
             self._recording_status.setText(_NO_SESSION_MESSAGE)
             return
         count = binding.count_spin.value()
-        # Same one-driver-per-device rule as record_scan_frames; camera_series
-        # starts and stops the camera around the series itself.
-        if not self.stop_camera(binding.name):
-            self._recording_status.setText(_CAMERA_BUSY_MESSAGE)
-            return
         self._start_recording(
-            camera_series(binding.camera, count), "camera"
+            self._leased_frames(
+                [binding.name],
+                f"recording {count} camera frames",
+                lambda leased: camera_series(leased.camera(binding.name), count),
+            ),
+            "camera",
         )
 
     def preview_scan(self) -> None:
@@ -1513,16 +1595,13 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         """
         if self._scanner is None:
             return
-        if not self.stop_scan():
-            self._scan_status.setText(_SCANNER_BUSY_MESSAGE)
-            return
         parameters = self.scan_parameters(profiles.PREVIEW)
         channels = list(self._scan_request[1])
         names = self._scan_request[2]
-        scanner = typing.cast("Scanner", self._scanner)
         self._scan_status.setText("previewing...")
         try:
-            frames = scanner.scan_frames(parameters, channels)
+            with self._broker.lease(SCANNER_TARGET, reason="preview") as leased:
+                frames = leased.scanner().scan_frames(parameters, channels)
         except Exception as error:  # noqa: BLE001 - the refusal is the message
             self._scan_status.setText(f"preview failed: {error}")
             return
@@ -1559,20 +1638,20 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         if self._session is None:
             self._recording_status.setText(_NO_SESSION_MESSAGE)
             return
-        # Same one-driver-per-device rule as record_scan_frames.
-        if not self.stop_scan():
-            self._recording_status.setText(_SCANNER_BUSY_MESSAGE)
-            return
-        scanner = typing.cast("Scanner", self._scanner)
         # The Acquire profile, not the live view's settings: this is the
         # image that gets kept, and it is worth the longer dwell.
         parameters = self.scan_parameters(profiles.ACQUIRE)
+        channels = list(self._scan_request[1])
         self._start_recording(
-            multichannel_scan_series(
-                scanner,
-                parameters,
-                1,
-                channels=list(self._scan_request[1]),
+            self._leased_frames(
+                [SCANNER_TARGET],
+                "acquiring a scan image",
+                lambda leased: multichannel_scan_series(
+                    leased.scanner(),
+                    parameters,
+                    1,
+                    channels=channels,
+                ),
             ),
             "scan-image",
         )
@@ -1599,12 +1678,16 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         if self._session is None:
             self._recording_status.setText(_NO_SESSION_MESSAGE)
             return
-        # Same one-driver-per-device rule as record_camera_frames.
-        if not self.stop_camera(binding.name):
-            self._recording_status.setText(_CAMERA_BUSY_MESSAGE)
-            return
+        parameters = self._image_parameters(binding)
         self._start_recording(
-            camera_image(binding.camera, self._image_parameters(binding)),
+            self._leased_frames(
+                [binding.name],
+                "acquiring a camera image",
+                lambda leased: camera_image(
+                    leased.camera(binding.name),
+                    parameters,
+                ),
+            ),
             "camera-image",
         )
 
@@ -1692,7 +1775,7 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         if readout == current.readout:
             return
         status = binding.status
-        if binding.loop is not None and binding.loop.is_running:
+        if self._is_live(binding.name):
             self._show_camera_readout(binding, current.readout)
             if status is not None:
                 status.setText(
@@ -1788,12 +1871,10 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         target = self._spectrum_image_target()
         if target is None:
             return
-        if not self.stop_scan():
-            self._recording_status.setText(_SCANNER_BUSY_MESSAGE)
-            return
-        if not self.stop_camera(target):
-            self._recording_status.setText(_CAMERA_BUSY_MESSAGE)
-            return
+        # No stopping either device here any more. The pass takes a lease
+        # on its own worker thread (see _run_spectrum_image), where
+        # waiting out a scan already in flight costs nothing but the
+        # wait - rather than refusing on the GUI thread because one was.
         self._run_spectrum_image(PassWriter, target)
 
     def _spectrum_image_target(self) -> str | None:
@@ -1885,9 +1966,29 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         watched: dict[str, progress.PassPreview] = {}
 
         def run() -> object:
-            with writer_class(path, parameters, **allocation) as writer:
+            # The lease is taken here, on the job's own thread, for the
+            # reason every other acquisition takes it there: granting one
+            # means waiting out the pass already in flight, and a pass is
+            # height x width x dwell - up to minutes on a large scan.
+            # Both targets in one lease, so the broker takes them in its
+            # own order: a scanner and a camera claimed separately are how
+            # two clients asking in opposite orders deadlock, and the
+            # scanner goes last so the probe stands still for the shortest
+            # interval the grant allows.
+            with (
+                self._broker.lease(
+                    SCANNER_TARGET,
+                    target,
+                    reason="spectrum image",
+                ) as leased,
+                writer_class(path, parameters, **allocation) as writer,
+            ):
                 watched.update(progress.previews(writer.destinations()))
-                result = scanner.scan_synchronised(
+                synchronised = typing.cast(
+                    "SynchronisedScanner",
+                    leased.scanner(),
+                )
+                result = synchronised.scan_synchronised(
                     parameters,
                     channels=channels,
                     targets=[target],
@@ -2076,6 +2177,55 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
             f"and has nowhere to put anything else"
         )
         raise RuntimeError(msg)
+
+    def _leased_frames(
+        self,
+        targets: Sequence[str],
+        reason: str,
+        produce: Callable[[LeasedDevices], Iterable[Frame]],
+    ) -> Iterator[Frame]:
+        """
+        Yield a series from inside a lease, taken on the consumer's thread.
+
+        The generator body does not run until the first ``next``, and
+        every acquisition here is consumed by a worker
+        (:class:`~miainwoodpecker.storage.session.RecordingJob`,
+        :class:`~miainwoodpecker.viewer.jobs.AnalysisJob`) — so the lease
+        is taken *there*, not in the click handler that built this.
+
+        That placement is the whole reason acquisition no longer freezes
+        the window. Taking a lease means waiting out the pass already in
+        flight, which is ``height x width x dwell``: a quarter of a
+        second on a small fast scan and 42 seconds at 2048x2048 and ten
+        microseconds. The old code called ``stop_scan`` on the GUI
+        thread and refused if it did not return in time, which is how a
+        long scan became "still busy - try again" rather than a wait.
+
+        The lease is renewed per frame rather than granted for a guessed
+        duration. A recording of a thousand frames outlives any fixed
+        time to live, and renewing as frames arrive means a job that
+        wedges stops renewing and lets the broker take the instrument
+        back — which is the behaviour a time to live is for.
+
+        Parameters
+        ----------
+        targets : Sequence[str]
+            The targets the series drives. Named together so the broker
+            takes them in its own order rather than this file's.
+        reason : str
+            What to show other clients while it is held.
+        produce : Callable[[LeasedDevices], Iterable[Frame]]
+            Builds the series from the leased devices.
+
+        Yields
+        ------
+        Frame
+            Each frame of the series.
+        """
+        with self._broker.lease(*targets, reason=reason) as leased:
+            for frame in produce(leased):
+                leased.renew()
+                yield frame
 
     def _start_recording(self, frames: Iterable[Frame], label: str) -> None:
         """
@@ -2394,10 +2544,23 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
             )
             return
 
-        if self._camera is None:  # pragma: no cover - callers check first
+        binding = self._first_binding()
+        if binding is None:  # pragma: no cover - callers check first
             msg = "no camera to acquire from and no file opened"
             raise RecordingReadError(msg)
-        frames = list(camera_series(self._camera, frame_count))
+        # On the analysis worker's thread, which is why the lease can be
+        # taken here at all: it waits out whatever exposure the live loop
+        # is in rather than refusing because there is one.
+        frames = list(
+            self._leased_frames(
+                [binding.name],
+                "analysis burst",
+                lambda leased: camera_series(
+                    leased.camera(binding.name),
+                    frame_count,
+                ),
+            ),
+        )
         acquired = _AnalysisInput(
             path=Path(), frame_count=len(frames), origin="a fresh burst"
         )
@@ -2472,22 +2635,10 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         if self._analysis_job is not None and self._analysis_job.is_running:
             status.setText("another analysis is running")
             return
-        binding = self._first_binding()
-        if (
-            binding is not None
-            and binding.loop is not None
-            and binding.loop.is_running
-            and not self.stop_camera(binding.name)
-        ):
-            # Refusing is the point rather than pessimism: an exposure
-            # still in flight means the live loop has not released the
-            # camera, and starting the burst anyway would drive one device
-            # from two threads - which tears a frame across the reused
-            # shared-memory segment instead of raising
-            # (docs/architecture-review.md, §1.2).
-            status.setText(_CAMERA_BUSY_MESSAGE)
-            return
-
+        # No stopping the camera here any more. The burst takes a lease
+        # on the worker thread (see _analysis_input), where waiting out
+        # an exposure costs nothing but the wait - rather than refusing
+        # on the GUI thread because the camera was mid-frame.
         existing, existing_frames = self._analysis_source()
         note = self._note_for_next_recording()
 
@@ -2784,11 +2935,21 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
             filename="py4dstem_analysis_frame.nxs",
         )
 
-    def _maybe_stop_timer(self) -> None:
-        scan_running = self._scan_loop is not None and self._scan_loop.is_running
+    def _maybe_stop_timer(
+        self,
+        states: Mapping[str, TargetState] | None = None,
+    ) -> None:
+        # Reuses the tick's own answer when it has one. Asking again is
+        # another entry to the broker and another loop lock, and this is
+        # called from every poller on every tick.
+        if states is None:
+            states = {
+                name: view.state for name, view in self._broker.snapshot().items()
+            }
+        scan_running = SCANNER_TARGET in states and states[SCANNER_TARGET].is_live
         camera_running = any(
-            binding.loop is not None and binding.loop.is_running
-            for binding in self._camera_bindings.values()
+            name in states and states[name].is_live
+            for name in self._camera_bindings
         )
         recording = self._recording_job is not None and self._recording_job.is_running
         loading = self._load_job is not None and self._load_job.is_running
@@ -2810,18 +2971,24 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         self._poll_load()
         self._poll_analysis()
         self._poll_pass()
-        if self._scan_loop is not None:
-            self._refresh_scan()
+        # One question per tick, not one per source plus one for the
+        # chrome. Each entry to the broker re-takes a loop lock that its
+        # acquisition worker is reacquiring on every grab, so polling in
+        # pieces means queueing behind the thread being watched.
+        views = self._broker.snapshot()
+        if SCANNER_TARGET in views:
+            self._refresh_scan(views[SCANNER_TARGET])
         for binding in self._camera_bindings.values():
-            if binding.loop is not None and binding.status is not None:
+            view = views.get(binding.name)
+            if view is not None and binding.status is not None:
                 self._refresh_source(
-                    binding.loop,
+                    view,
                     layer_name=binding.layer_name,
                     status_label=binding.status,
                     autocontrast_every_frame=False,
                 )
 
-    def _refresh_scan(self) -> None:
+    def _refresh_scan(self, view: TargetView) -> None:
         """
         Push the newest pass into one napari layer per enabled detector.
 
@@ -2830,15 +2997,26 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         them from separate reads would let HAADF advance a pass ahead of
         MAADF, and an operator differencing what they see would be
         differencing two probe positions.
+
+        Parameters
+        ----------
+        view : TargetView
+            The scanner's state and latest pass, read once per display
+            tick with every other target's, so a tick sees one
+            consistent answer.
         """
-        loop = self._scan_loop
-        if loop is None:
-            return
-        if loop.error is not None:
-            self._scan_status.setText(f"error: {loop.error}")
+        state = view.state
+        if state.error is not None:
+            self._scan_status.setText(f"error: {state.error}")
             self._maybe_stop_timer()
             return
-        frames = loop.latest_frames()
+        if state.lease is not None:
+            # Paused for an acquisition rather than idle, and saying so
+            # beats a status line that reads as if the scan had stopped
+            # on its own. The broker restarts it when the lease ends.
+            self._scan_status.setText(f"held: {state.lease.reason or 'acquiring'}")
+            return
+        frames = view.frames
         if not frames:
             return
         names = self._scan_request[2]
@@ -2848,8 +3026,8 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
                 layer_name=self._scan_layer_name(name),
                 autocontrast_every_frame=True,
             )
-        stats = loop.stats
-        self._scan_status.setText(f"running - {stats.fps:.1f} fps")
+        if state.stats is not None:
+            self._scan_status.setText(f"running - {state.stats.fps:.1f} fps")
 
     @staticmethod
     def _scan_layer_name(channel: str) -> str:
@@ -2885,28 +3063,32 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
 
     def _refresh_source(
         self,
-        loop: LiveAcquisition,
+        view: TargetView,
         *,
         layer_name: str,
         status_label: QtWidgets.QLabel,
         autocontrast_every_frame: bool,
     ) -> None:
-        if loop.error is not None:
-            status_label.setText(f"error: {loop.error}")
+        state = view.state
+        if state.error is not None:
+            status_label.setText(f"error: {state.error}")
             # A failed grab stops the worker but sets no stop event, so
             # without this the timer would run forever, reformatting the
             # same exception 30 times a second at full display cost.
             self._maybe_stop_timer()
             return
-        frame = loop.latest()
-        if frame is None:
+        if state.lease is not None:
+            status_label.setText(f"held: {state.lease.reason or 'acquiring'}")
             return
+        if not view.frames:
+            return
+        frame = view.frames[0]
         self._show_frame(
             frame,
             layer_name=layer_name,
             autocontrast_every_frame=autocontrast_every_frame,
         )
-        self._refresh_rate_label(loop, status_label)
+        self._refresh_rate_label(state, status_label)
 
     def _bring_to_front(self, layer_name: str) -> None:
         """
@@ -3027,7 +3209,7 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
 
     def _refresh_rate_label(
         self,
-        loop: LiveAcquisition,
+        state: TargetState,
         status_label: QtWidgets.QLabel,
     ) -> None:
         """
@@ -3037,9 +3219,9 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         runs for every source on every tick; the rate only moves in the
         first decimal a few times a second.
         """
-        if not loop.is_running:
+        if not state.is_live or state.stats is None:
             return
-        text = f"running - {loop.stats.fps:.1f} fps"
+        text = f"running - {state.stats.fps:.1f} fps"
         if status_label.text() != text:
             status_label.setText(text)
 
@@ -3075,13 +3257,20 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
             # is what produces an unreadable one.
             job.cancel()
             job.join()
-        self._quietly(self.stop_scan)
-        # Every camera by name, not one bare stop_camera(): with no
-        # argument it acts on the *first* binding, so a two-camera
-        # instrument left its second camera running after the window
-        # closed - a device held by a process on its way out.
-        for name in list(self._camera_bindings):
-            self._quietly(lambda bound=name: self.stop_camera(bound))
+        if self._owns_broker:
+            # This window built the broker, so this window closes it -
+            # which stops every loop and parks the instrument, exactly
+            # as closing the only program on an instrument should.
+            self._quietly(typing.cast("LocalBroker", self._broker).close)
+        # A broker that was *handed* to this window belongs to whoever
+        # made it, and closing this window touches none of it - not the
+        # loops, and certainly not the instrument. Stopping a shared
+        # scan on the way out would park the probe on one spot for
+        # whoever else is connected, which is the failure this project
+        # spends the most words avoiding; and a notebook watching the
+        # feed would have it go dark because somebody closed a window
+        # they were not using. The display timer stops with the Qt
+        # parts above, which is the whole of what leaving costs.
         # After the devices, and deliberately: a worker holds no hardware,
         # so nothing about the column depends on it going first, while
         # stopping the camera can take an exposure's worth of time and an

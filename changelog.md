@@ -303,6 +303,71 @@
 
 ### Changed
 
+- **The viewer is a client of the broker now, not the owner of the
+  instrument.** `viewer/live.py` used to enforce "one driver per device"
+  itself, in pieces: a `stop_scan` whose return value every caller had to
+  check, a stop-the-loop dance before each acquisition, and two "still
+  busy - try again" strings. That worked exactly as long as this window
+  was the only program touching the microscope, which is the assumption a
+  notebook or a dashboard breaks. The rule now lives in one place they
+  all share, and what is left in the window is a window: the live loops
+  are `start_live`/`stop_live`/`reconfigure_live`, a display tick is one
+  `snapshot()`, and every acquisition is a lease.
+  **No lease is taken on the GUI thread**, and that is the change an
+  operator will actually feel. Taking one means waiting out the pass
+  already in flight, and a pass is `height x width x dwell` - 262 ms at
+  512x512 and 1 microsecond, but 42 s at 2048x2048 and 10. The old code
+  called `stop_scan` in the click handler and refused if it did not
+  return promptly, so on a large scan "record" simply never worked. Every
+  acquisition now takes its lease *inside* the generator its worker
+  consumes, where waiting costs nothing but the wait; the lease is
+  renewed per frame, so a recording of any length outlives no deadline
+  and a wedged one still hands the instrument back. Preview and the
+  spectrum image still block, as they did before, and say so.
+  Two consequences are visible in the window. A paused source says who is
+  holding it (`held: recording 20 scan frames`) rather than looking
+  stopped, and the broker restarts it afterwards unasked. And **closing a
+  window that was given a shared broker touches nothing** - not the
+  loops, not the instrument. Stopping a shared scan on the way out would
+  park the probe on one spot for whoever else is connected, and a
+  notebook watching the feed would have it go dark because somebody
+  closed a window they were not using.
+  Passing devices still works and still builds a private broker, so every
+  existing caller is unchanged. One limit is worth stating rather than
+  discovering: the window still reads `channel_names` and `binning_values`
+  off its device handles directly, so it cannot yet be pointed at a
+  broker in *another process*. Those reads produce no frames and so
+  cannot interleave on the segment the arbitration protects; moving them
+  onto `TargetState` is what a second screen will need.
+- **`LocalBroker.snapshot()`, because a display tick is one question.**
+  Asking `targets()` and then `latest_frames()` per source re-enters the
+  broker once per call and re-takes each loop's lock once per call - and
+  that lock is being reacquired by the acquisition worker on every grab,
+  so a viewer polling at 30 Hz spends its time queueing behind the thread
+  it is trying to watch. `snapshot()` answers state and frames together,
+  under one acquisition of each. The remote version carries a health
+  warning in its docstring: it ships every target's pixels, so a
+  dashboard on another machine should keep asking `targets()` for the
+  chrome and `latest()` for the one source it is showing.
+- **A stopped live loop still answers with its last frame.** `latest()`
+  used to return `None` once a loop stopped, which blanked the display
+  the moment an operator stopped the scan to look at what they had.
+  Whether the picture is still *advancing* is `TargetState.is_live`'s
+  job. This is also what makes a lease invisible to a watcher: the
+  display holds the pre-lease frame while an acquisition runs instead of
+  flickering to nothing and back.
+- **The lease deadline is derived from the scan, not guessed.** It was a
+  flat five seconds, justified against a 512x512 scan at 1 microsecond
+  dwell. That justification does not survive contact with a real
+  instrument: the same arithmetic gives 42 s at 2048x2048 and 10
+  microseconds and nearly three minutes at 4096x4096, so every lease on a
+  large scan would have been refused, forever, with "still finishing a
+  scan - try again". The broker already holds the scan spec, so it
+  computes the pass and treats the caller's `timeout_s` as a *floor*
+  instead. A camera keeps the floor - its exposure lives on the device,
+  and asking for it would put a call on a connection whose loop is
+  mid-exposure - and a long-exposure detector is the case that will want
+  this next.
 - **Several detectors can be live at once, and the panel says so.** The
   Scan group offered a drop-down: a choice of *one* detector. That
   describes serial acquisition, which on a scanned instrument is the

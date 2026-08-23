@@ -22,6 +22,7 @@ import napari
 from qtpy import QtWidgets
 
 from miainwoodpecker.analysis import remote as analysis_remote
+from miainwoodpecker.broker.local import LocalBroker
 from miainwoodpecker.devices import CameraParameters, Frame, ScanParameters
 from miainwoodpecker.storage.calibration import AxisKind, FrameCalibration
 from miainwoodpecker.storage.nexus import (
@@ -443,10 +444,10 @@ def test_live_widget_updates_layers_from_both_sources():
         widget.start_camera()
         assert camera.started
         assert _wait_until(
-            lambda: widget._scan_loop.latest() is not None  # noqa: SLF001
+            lambda: widget._broker.latest("scanner") is not None  # noqa: SLF001
         )
         assert _wait_until(
-            lambda: widget._camera_loop.latest() is not None  # noqa: SLF001
+            lambda: widget._broker.latest("camera") is not None  # noqa: SLF001
         )
         widget.refresh_display()
 
@@ -663,7 +664,7 @@ def test_scan_settings_change_takes_effect_on_next_frames():
         _set_view_size(widget, 0)
         widget.start_scan()
         assert _wait_until(
-            lambda: widget._scan_loop.latest() is not None  # noqa: SLF001
+            lambda: widget._broker.latest("scanner") is not None  # noqa: SLF001
         )
         widget.refresh_display()
         small_shape = (128, 128)
@@ -738,7 +739,7 @@ def test_save_displayed_scan_frame_keeps_the_frame_on_screen(tmp_path):
         widget.set_session(Session(tmp_path / "shift", sample="Au on C"))
         widget.start_scan()
         assert _wait_until(
-            lambda: widget._scan_loop.latest() is not None  # noqa: SLF001
+            lambda: widget._broker.latest("scanner") is not None  # noqa: SLF001
         )
 
         widget.save_scan_frame()
@@ -746,7 +747,7 @@ def test_save_displayed_scan_frame_keeps_the_frame_on_screen(tmp_path):
 
         # Saving a frame already in hand needs no device access, so the
         # live loop is deliberately left running.
-        assert widget._scan_loop.is_running  # noqa: SLF001
+        assert widget._broker.targets()["scanner"].is_live  # noqa: SLF001
         (recording,) = widget.session.recordings()
         assert recording.frame_count == 1
         assert recording.readable
@@ -768,16 +769,27 @@ def test_record_scan_frames_writes_the_requested_count(tmp_path):
         widget.set_session(Session(tmp_path / "shift"))
         widget.start_scan()
         assert _wait_until(
-            lambda: widget._scan_loop.latest() is not None  # noqa: SLF001
+            lambda: widget._broker.latest("scanner") is not None  # noqa: SLF001
         )
 
         expected_count = 3
         widget._scan_count_spin.setValue(expected_count)  # noqa: SLF001 - user input
         widget.record_scan_frames()
         # A recording drives the same device as the live loop, so the loop
-        # must have been stopped: one driver per device.
-        assert not widget._scan_loop.is_running  # noqa: SLF001
+        # must be stopped for it: one driver per device. *Waited* for
+        # rather than asserted outright, because the lease that stops it
+        # is taken on the recording's own thread - the click handler
+        # returns immediately, which is what keeps a window responsive
+        # when stopping a loop means waiting out a 42-second pass.
+        assert _wait_until(
+            lambda: not widget._broker.targets()["scanner"].is_live,  # noqa: SLF001
+        )
         _finish_recording(widget)
+        # And the broker put it back afterwards, unasked: a scan left
+        # stopped is a probe parked on one spot.
+        assert _wait_until(
+            lambda: widget._broker.targets()["scanner"].is_live,  # noqa: SLF001
+        )
 
         (recording,) = widget.session.recordings()
         assert recording.frame_count == expected_count
@@ -1521,7 +1533,7 @@ def test_an_unchanged_frame_is_not_redrawn():
     try:
         widget.start_scan()
         assert _wait_until(
-            lambda: widget._scan_loop.latest() is not None  # noqa: SLF001
+            lambda: widget._broker.latest("scanner") is not None  # noqa: SLF001
         )
         assert widget.stop_scan()
         widget.refresh_display()
@@ -1545,7 +1557,7 @@ def test_a_new_frame_is_still_drawn_after_a_skipped_tick():
         _set_view_size(widget, 0)
         widget.start_scan()
         assert _wait_until(
-            lambda: widget._scan_loop.latest() is not None  # noqa: SLF001
+            lambda: widget._broker.latest("scanner") is not None  # noqa: SLF001
         )
         widget.refresh_display()
         widget.refresh_display()  # a skipped tick
@@ -1556,7 +1568,7 @@ def test_a_new_frame_is_still_drawn_after_a_skipped_tick():
         _set_view_size(widget, 1)
         larger = (256, 256)
         assert _wait_until(
-            lambda: widget._scan_loop.latest().data.shape == larger  # noqa: SLF001
+            lambda: widget._broker.latest("scanner").data.shape == larger  # noqa: SLF001
         )
         widget.refresh_display()
         assert viewer.layers["Scan (HAADF)"].data.shape == larger
@@ -1577,7 +1589,7 @@ def test_a_deleted_layer_comes_back_on_the_next_refresh():
     try:
         widget.start_scan()
         assert _wait_until(
-            lambda: widget._scan_loop.latest() is not None  # noqa: SLF001
+            lambda: widget._broker.latest("scanner") is not None  # noqa: SLF001
         )
         assert widget.stop_scan()
         widget.refresh_display()
@@ -1610,7 +1622,7 @@ def test_a_grab_error_stops_the_display_timer():
     try:
         widget.start_scan()
         assert _wait_until(
-            lambda: widget._scan_loop.error is not None  # noqa: SLF001
+            lambda: widget._broker.targets()["scanner"].error is not None  # noqa: SLF001
         )
         widget.refresh_display()
         assert not widget._timer.isActive()  # noqa: SLF001
@@ -1649,7 +1661,7 @@ def test_camera_only_instrument_builds_a_window_with_no_scan_group():
         widget.start_camera()
         assert camera.started
         assert _wait_until(
-            lambda: widget._camera_loop.latest() is not None  # noqa: SLF001
+            lambda: widget._broker.latest("camera") is not None  # noqa: SLF001
         )
         widget.refresh_display()
         camera_shape = (8, 8)
@@ -1676,7 +1688,8 @@ def test_scan_controls_are_inert_rather_than_raising_without_a_scanner():
     widget = LiveInstrumentWidget(viewer, None, camera=_FakeCamera())
     try:
         widget.start_scan()
-        assert widget._scan_loop is None  # noqa: SLF001
+        # Nothing was served under that name, so nothing could start.
+        assert "scanner" not in widget._broker.targets()  # noqa: SLF001
         assert widget.stop_scan() is True
         widget.save_scan_frame()
         widget.record_scan_frames()
@@ -1731,7 +1744,7 @@ def test_disk_warning_uses_the_camera_shape_when_there_is_no_scanner(
 
         widget.start_camera()
         assert _wait_until(
-            lambda: widget._camera_loop.latest() is not None  # noqa: SLF001
+            lambda: widget._broker.latest("camera") is not None  # noqa: SLF001
         )
         widget._refresh_session_labels()  # noqa: SLF001
 
@@ -1958,10 +1971,23 @@ class _FakeInstrument:
         self._refuse = refuse
         self.defocus = 0.0
         self.blanked = False
+        self.parked = 0
 
     def describe(self) -> dict[str, object]:
         """Report a backend and the targets served."""
         return {"backend": "simulated", "targets": ["camera"]}
+
+    def park(self) -> None:
+        """
+        Put the instrument in a safe unattended state.
+
+        Part of the ``InstrumentController`` protocol and missing here
+        until a broker closing a session actually called it - the same
+        shape of gap as ``_FakeScanner.scan_frames`` before it, and
+        completed rather than worked around for the same reason.
+        """
+        self.parked += 1
+        self.blanked = True
 
     def available_controls(self) -> typing.Sequence[str]:
         """Return the controls this instrument publishes."""
@@ -2097,3 +2123,73 @@ def test_the_blanker_writes_on_click_and_reports_both_directions():
     finally:
         widget.shutdown()
         viewer.close()
+
+
+def test_the_window_shares_an_instrument_with_another_client():
+    """
+    The point of the whole arrangement: this window is one client of many.
+
+    A notebook holding the same broker takes a lease; the window's live
+    scan stops for it and comes back afterwards, without the window
+    having been asked and without either side driving the scanner at the
+    same time. Before the broker existed this was not merely unhandled -
+    the two would have interleaved on one reused shared-memory segment
+    and produced a frame that was half of each, silently.
+    """
+    scanner = _FakeScanner()
+    broker = LocalBroker({"scanner": scanner}, holder="viewer")
+    viewer = napari.Viewer(show=False)
+    widget = LiveInstrumentWidget(viewer, scanner, broker=broker)
+    try:
+        widget.start_scan()
+        assert _wait_until(lambda: broker.latest("scanner") is not None)
+
+        # The other client - a notebook, a dashboard - takes the scanner.
+        with broker.lease("scanner", reason="notebook: focal series") as leased:
+            assert not broker.targets()["scanner"].is_live
+            elsewhere = ScanParameters(
+                height=64, width=64, pixel_time_us=1.0, fov_nm=10.0,
+            )
+            assert leased.scanner().scan_frame(elsewhere) is not None
+            # And the window says who has it rather than looking broken.
+            widget.refresh_display()
+            assert "notebook: focal series" in widget._scan_status.text()  # noqa: SLF001
+
+        assert _wait_until(lambda: broker.targets()["scanner"].is_live)
+    finally:
+        widget.shutdown()
+        viewer.close()
+        # Whoever built the broker closes it. Closing the *window* does
+        # not, deliberately - and a test that forgot this leaked a live
+        # loop that kept a fake scanner spinning flat out for the rest
+        # of the session, which read as the whole suite becoming slow.
+        broker.close()
+
+
+def test_closing_the_window_leaves_a_shared_broker_running():
+    """
+    A window that did not build the broker does not park the microscope.
+
+    Closing one client must not end the session for the others: the
+    notebook that was sharing this instrument keeps its live view, and
+    the beam is not blanked out from under it.
+    """
+    scanner = _FakeScanner()
+    instrument = _FakeInstrument([])
+    broker = LocalBroker(
+        {"scanner": scanner, "instrument": instrument},
+        holder="shared",
+    )
+    viewer = napari.Viewer(show=False)
+    widget = LiveInstrumentWidget(viewer, scanner, instrument=instrument, broker=broker)
+    try:
+        widget.start_scan()
+        assert _wait_until(lambda: broker.latest("scanner") is not None)
+    finally:
+        widget.shutdown()
+        viewer.close()
+
+    assert instrument.parked == 0
+    assert broker.targets()["scanner"].is_live
+    broker.close()
+    assert instrument.parked >= 1

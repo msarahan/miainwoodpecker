@@ -65,11 +65,13 @@ BROKER_TARGET = "broker"
 BROKER_METHODS = frozenset(
     {
         "targets",
+        "snapshot",
         "controls",
         "latest",
         "latest_frames",
         "stats",
         "start_live",
+        "reconfigure_live",
         "stop_live",
         "grant",
         "release",

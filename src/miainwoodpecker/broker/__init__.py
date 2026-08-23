@@ -24,6 +24,7 @@ from miainwoodpecker.broker.interface import (
     LeaseExpiredError,
     NotLiveError,
     TargetState,
+    TargetView,
     lease_order,
 )
 
@@ -39,5 +40,6 @@ __all__ = [
     "LeasedDevices",
     "NotLiveError",
     "TargetState",
+    "TargetView",
     "lease_order",
 ]

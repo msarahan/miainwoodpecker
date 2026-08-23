@@ -92,13 +92,27 @@ if typing.TYPE_CHECKING:
 
 DEFAULT_LEASE_TIMEOUT_S = 5.0
 """
-Seconds to wait for a target's live loop to stop before refusing a lease.
+Floor on how long to wait for a target's live loop to stop.
 
-Sized against what it is actually waiting for: one exposure, or one scan
-pass, to finish. A 512x512 scan at 1 microsecond dwell is 262 ms and a
-long camera exposure is a few hundred more, so five seconds is generous
-for the honest case and short enough that a wedged device is reported
-busy rather than hanging the caller.
+A **floor**, not a ceiling. What a lease waits for is the pass or
+exposure already in flight, and on a scan unit that is
+``height x width x dwell`` - 262 ms for 512x512 at 1 microsecond, but 42
+seconds for 2048x2048 at 10 microseconds, and nearly three minutes at
+4096x4096. A fixed five seconds would refuse every lease on exactly the
+instruments this project exists for, forever, with "still finishing a
+scan - try again".
+
+So a broker raises this to the pass it can see the loop running (see
+``LocalBroker._join_deadline``), and this value is what stands when
+there is no geometry to derive one from - a camera, or a loop that is
+not running. It is short enough that a wedged device is reported busy
+rather than hanging its caller.
+
+The consequence is worth stating where a caller will read it: **taking a
+lease can block for as long as a scan pass**, so it does not belong on a
+thread that must stay responsive. A GUI takes its leases the way it
+records - on a worker, reporting progress - rather than inside a click
+handler.
 """
 
 DEFAULT_LEASE_TTL_S = 300.0
@@ -324,6 +338,35 @@ class TargetState:
     error: str | None = None
 
 
+@dataclass(frozen=True)
+class TargetView:
+    """
+    One target's state *and* its latest frames, read together.
+
+    Exists because a display tick is one question, not seven. Asking
+    :meth:`InstrumentBroker.targets` and then
+    :meth:`InstrumentBroker.latest` per source re-enters the broker once
+    per call and re-takes each loop's own lock once per call - and that
+    lock is being reacquired by the acquisition worker on every single
+    grab. A viewer polling at 30 Hz against a fast source spends its
+    time queueing behind the thread it is trying to watch, which is a
+    contention problem rather than a correctness one and therefore shows
+    up as "why is everything slow" rather than as a failure.
+
+    Attributes
+    ----------
+    state : TargetState
+        What the target is doing.
+    frames : tuple[Frame, ...]
+        The latest pass's frames, empty if none has arrived. Read under
+        the same lock as :attr:`state`, so a tick cannot show a rate
+        from one pass beside pixels from another.
+    """
+
+    state: TargetState
+    frames: tuple[Frame, ...] = ()
+
+
 @typing.runtime_checkable
 class LeasedDevices(typing.Protocol):
     """
@@ -471,6 +514,27 @@ class InstrumentBroker(typing.Protocol):
             reported them.
         """
 
+    def snapshot(self) -> Mapping[str, TargetView]:
+        """
+        Return every target's state and latest frames, in one pass.
+
+        What a display tick should call, and the only watch method that
+        exists for a performance reason rather than a semantic one: it
+        answers in one entry to the broker what
+        :meth:`targets` plus a :meth:`latest_frames` per source answers
+        in many, against locks an acquisition worker is reacquiring on
+        every grab.
+
+        Frames travel with it, so a *remote* watcher that only needs
+        chrome - is it live, who holds it - should keep asking
+        :meth:`targets` and pull pixels for the one source it is showing.
+
+        Returns
+        -------
+        Mapping[str, TargetView]
+            Keyed by target name.
+        """
+
     def controls(self) -> Mapping[str, float | bool]:
         """
         Return the instrument controls' current values, read only.
@@ -507,9 +571,13 @@ class InstrumentBroker(typing.Protocol):
         Returns
         -------
         Frame | None
-            The latest frame, or None if the loop is not running or has
-            not produced one yet. A multichannel scan loop returns its
-            first requested channel here, matching
+            The latest frame, or None if none has ever arrived. A
+            *stopped* loop still answers with its last one - watching is
+            for putting a picture on a screen, and stopping the scan is
+            not a reason to blank it; whether the picture is still
+            advancing is :attr:`TargetState.is_live`'s job. A
+            multichannel scan loop returns its first requested channel
+            here, matching
             :meth:`~miainwoodpecker.acquisition.live.MultiChannelLiveAcquisition.latest`.
         """
 
@@ -584,6 +652,39 @@ class InstrumentBroker(typing.Protocol):
             every channel, rather than one loop per channel, because two
             loops would be twice the dose and would not share probe
             positions.
+        """
+
+    def reconfigure_live(
+        self,
+        target: str,
+        parameters: ScanParameters,
+        *,
+        channels: Sequence[int] = (0,),
+    ) -> None:
+        """
+        Change a running scan's geometry without stopping it.
+
+        Stop-and-restart is not a neutral pair of operations on a scan
+        unit: between them the probe stands still on one spot, and an
+        operator dragging a field of view would pay that every time.
+        Takes effect on the next pass; the one in flight finishes under
+        the settings it started with, since half a frame at one dwell
+        and half at another is not a frame of either.
+
+        A name this instrument does not serve raises ``KeyError``; a
+        target another client has leased raises
+        :class:`DeviceBusyError`; a target that is not a scan unit
+        raises ``ValueError``, because a camera's live settings are
+        exposure and binning rather than a property of the loop.
+
+        Parameters
+        ----------
+        target : str
+            The scan unit to reconfigure.
+        parameters : ScanParameters
+            The geometry and dwell to use from the next pass on.
+        channels : Sequence[int]
+            Which detectors to read out per pass.
         """
 
     def stop_live(self, target: str) -> bool:
