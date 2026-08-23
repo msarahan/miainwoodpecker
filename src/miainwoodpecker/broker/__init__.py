@@ -8,8 +8,11 @@ can all be clients of the same instrument. See
 :mod:`miainwoodpecker.broker.interface` for the two verbs - watch, and
 lease - and the reasoning behind each.
 
-Only the protocols and their data types live here so far; the in-process
-and remote implementations are not written yet.
+The protocols and their data types live here;
+:mod:`~miainwoodpecker.broker.local` is the in-process implementation and
+:mod:`~miainwoodpecker.broker.remote` the client half of the transport
+one, served by :mod:`~miainwoodpecker.broker.server` and run over a
+device session by :mod:`~miainwoodpecker.broker.app`.
 """
 
 from miainwoodpecker.broker.interface import (
@@ -23,6 +26,7 @@ from miainwoodpecker.broker.interface import (
     LeasedDevices,
     LeaseExpiredError,
     NotLiveError,
+    TargetDescription,
     TargetState,
     TargetView,
     lease_order,
@@ -39,6 +43,7 @@ __all__ = [
     "LeaseExpiredError",
     "LeasedDevices",
     "NotLiveError",
+    "TargetDescription",
     "TargetState",
     "TargetView",
     "lease_order",

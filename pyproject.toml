@@ -107,6 +107,26 @@ viewer = [
     # and most stable thing the package offers.
     "platformdirs>=3",
 ]
+# The browser dashboard - notebooks/instrument_dashboard.py - and nothing
+# else. marimo is a notebook whose file *is* a Python module: cells are
+# functions, the dependency graph is derived from them, and there is no
+# .ipynb full of stale outputs to diff. That is why the dashboard is
+# built on it rather than on Jupyter, and it is also why this extra is
+# small: marimo ships its own server and front end and pulls in no
+# scientific stack, so an operator installing it does not acquire a
+# second copy of anything the "viewer" or "analysis" extras already
+# bring.
+# Deliberately *not* a required dependency, and deliberately not implied
+# by anything: miainwoodpecker.dashboard - the judgement the app is built
+# on, and what the unit suite covers - imports marimo nowhere. A site
+# that wants the tiles installs this; a site that does not is unaffected,
+# and the tests run either way.
+# A loose ">=" bound, for the reason the "analysis" extra gives: one
+# package, and the surface used here (mo.md, mo.ui, mo.hstack/vstack,
+# mo.Html, mo.stop) is marimo's oldest and most public.
+dashboard = [
+    "marimo>=0.9",
+]
 # Phase 4 analysis integration - see docs/migration-plan.md section 5.
 # HyperSpy chosen for this extra: it is the lighter, more general option
 # and matches the plain scan/camera frame stacks this app produces today
@@ -339,6 +359,27 @@ exclude = [
     # each such call wrapped so a napari upgrade that renames them
     # degrades the chrome rather than failing to open a window.
     "SLF001",  # 'Private member accessed'
+]
+"notebooks/**/*.py" = [
+    # A marimo notebook IS a Python module, which is what makes it
+    # diffable and lintable at all - but its shape is marimo's, not
+    # ours, and marimo rewrites the parts below every time the file is
+    # saved from the editor. Fighting it here would mean a file that
+    # fails CI the first time an operator edits the notebook in the tool
+    # it exists to be edited in. Everything with a *decision* in it
+    # lives in src/miainwoodpecker/dashboard, which is linted normally.
+    "INP001",   # an app, deliberately not an importable package
+    "ANN202",   # cell signatures are generated; marimo owns them
+    "N803",     # a cell's parameters are the names it consumes, so an
+                # imported class arrives under the class's own name
+    "PLR0913",  # ditto: the acquire cell consumes a dozen controls, and
+    "PLR0917",  # that list is its dependency graph, not an argument list
+    "PLC0415",  # imports live in a cell so the graph knows what depends
+                # on them - a module-level import would belong to no cell
+    "B018",     # a bare expression is a cell's *output*. This is the
+                # whole display mechanism, not a forgotten statement
+    "PLR1711",  # the trailing `return` is marimo's serialization of
+                # which names a cell exports
 ]
 "src/miainwoodpecker/viewer/panels/*.py" = [
     # These modules ARE LiveInstrumentWidget's construction code; they
@@ -627,6 +668,13 @@ miainwoodpecker = { path = ".", editable = true, extras = ["viewer"] }
 [tool.pixi.feature.device.pypi-dependencies]
 miainwoodpecker = { path = ".", editable = true, extras = ["device"] }
 
+[tool.pixi.feature.dashboard.pypi-dependencies]
+# marimo from PyPI rather than conda-forge, and no conda dependencies
+# table beside it: it is pure Python with its own bundled front end, so
+# there is nothing compiled underneath for a conda build to make safer -
+# which is the only reason the features above name one.
+miainwoodpecker = { path = ".", editable = true, extras = ["dashboard"] }
+
 [tool.pixi.feature.replay.dependencies]
 # conda-forge's build, so the compiled readers underneath RosettaSciIO
 # (and the HDF5 it shares with h5py) come from one place rather than
@@ -680,7 +728,13 @@ default = { features = ["viewer", "test"], solve-group = "main" }
 replay = { features = ["viewer", "replay", "test"], solve-group = "main" }
 device = { features = ["viewer", "device", "test"], solve-group = "main" }
 analysis = { features = ["viewer", "analysis", "test"], solve-group = "main" }
-all = { features = ["viewer", "device", "analysis", "replay", "test"], solve-group = "main" }
+# The browser dashboard, and no viewer: it is the front end for people who
+# are *not* opening the Qt window, so pulling Qt in behind it would defeat
+# the point. It does need the device feature, because a dashboard with no
+# broker to connect to has nothing to show - and `pixi run -e dashboard`
+# is then one environment that can both serve an instrument and watch it.
+dashboard = { features = ["dashboard", "device", "test"], solve-group = "main" }
+all = { features = ["viewer", "device", "analysis", "replay", "dashboard", "test"], solve-group = "main" }
 style = { features = ["style"], no-default-feature = true }
 
 #--------------- Tasks ---------------#

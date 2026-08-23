@@ -339,6 +339,78 @@ class TargetState:
 
 
 @dataclass(frozen=True)
+class TargetDescription:
+    """
+    What a target *is*, as opposed to what it is doing.
+
+    The facts a client needs before it can offer any controls at all: how
+    many detectors a scan unit reads out and what they are called, which
+    binning factors a camera supports, which cameras can be synchronised
+    to the scan, which controls an instrument actually implements. A
+    window cannot build a detector checkbox or a binning menu without
+    them.
+
+    They live here because reading them off a device handle is a *device
+    call*, and a client in another process has no device handle to read.
+    That was the one thing keeping the Qt window from being pointed at a
+    broker somewhere else, and it is the same thing that would stop a
+    notebook or a dashboard offering more than a picture.
+
+    Read once, when the broker is built and nothing is running, and
+    cached from then on. Not because it is expensive - it is four calls -
+    but because it is the only honest moment: a read issued later would
+    be a second caller on a device whose live loop is mid-pass, which is
+    the interleaving the whole module exists to prevent.
+
+    Attributes
+    ----------
+    name : str
+        The target name.
+    kind : str
+        :func:`~miainwoodpecker.devices.rpc.target_kind` of the name.
+    label : str
+        What the device calls itself - a ``camera_id``, a ``scanner_id``
+        - so a client can name a detector by what it is rather than by
+        which slot it landed in. Falls back to the target name.
+    channel_names : tuple[str, ...]
+        The detectors a scan unit reads out, in channel order. Empty for
+        anything that is not a scan unit.
+    binning_values : tuple[int, ...]
+        The binning factors a camera supports, ascending. Empty for
+        anything that is not a camera.
+    synchronised_targets : tuple[str, ...]
+        The cameras this scan unit can drive a synchronised pass into.
+        Empty when the backend has no such wiring, which is a hardware
+        fact rather than a missing feature - see
+        :meth:`~miainwoodpecker.devices.interface.SynchronisedScanner.scan_synchronised`.
+    controls : tuple[str, ...]
+        The ``*_CONTROL`` names an instrument implements. Empty for
+        anything that is not an instrument controller.
+    error : str | None
+        Why this description is incomplete, when a device refused to
+        answer one of the questions above.
+
+        It exists because the empty tuple is otherwise ambiguous, and
+        ambiguous in a way that matters: "this camera supports no
+        binning but 1x" and "this camera would not say what binning it
+        supports" produce the same empty field and want opposite
+        responses from a client - offer the one value, or say the device
+        is not answering. A window that silently shows an empty menu for
+        the second case has turned a broken adapter into a UI that looks
+        merely poor.
+    """
+
+    name: str
+    kind: str
+    label: str
+    channel_names: tuple[str, ...] = ()
+    binning_values: tuple[int, ...] = ()
+    synchronised_targets: tuple[str, ...] = ()
+    controls: tuple[str, ...] = ()
+    error: str | None = None
+
+
+@dataclass(frozen=True)
 class TargetView:
     """
     One target's state *and* its latest frames, read together.
@@ -462,9 +534,12 @@ class LeasedDevices(typing.Protocol):
         """
         Extend the lease's deadline.
 
-        Called by the client transport on a timer for the ordinary case,
-        and explicitly by a caller about to do something slower than
-        :data:`DEFAULT_LEASE_TTL_S` inside one device call.
+        The caller's job: nothing renews on a timer, deliberately, since
+        a timer would keep a wedged client's hold alive precisely when it
+        should lapse. A caller whose work outlives
+        :data:`DEFAULT_LEASE_TTL_S` renews as that work completes - per
+        frame of a long recording, say - so that progress is what extends
+        the hold.
 
         A lease the broker has already reclaimed raises
         :class:`LeaseExpiredError`: renewal is not revival, because the
@@ -512,6 +587,22 @@ class InstrumentBroker(typing.Protocol):
         Mapping[str, TargetState]
             Keyed by target name, in the order the device server
             reported them.
+        """
+
+    def describe(self) -> Mapping[str, TargetDescription]:
+        """
+        Return what each target *is*, rather than what it is doing.
+
+        Static for the life of the instrument and cached, so a client
+        may call it as often as it likes. It is what makes a client in
+        another process able to offer controls rather than only a
+        picture: detector names, binning factors, which cameras the scan
+        unit can synchronise to, which controls exist.
+
+        Returns
+        -------
+        Mapping[str, TargetDescription]
+            Keyed by target name.
         """
 
     def snapshot(self) -> Mapping[str, TargetView]:

@@ -49,6 +49,7 @@ from miainwoodpecker.broker.interface import (
     Lease,
     LeaseExpiredError,
     NotLiveError,
+    TargetDescription,
     TargetState,
     TargetView,
     lease_order,
@@ -346,6 +347,8 @@ class LocalBroker:
         self._leases: dict[str, Lease] = {}
         self._claims: dict[str, str] = {}
         self._controls: dict[str, float | bool] = {}
+        # Last, and while nothing is running: see _describe_all.
+        self._descriptions = self._describe_all()
 
     # -- watching ---------------------------------------------------------
 
@@ -390,6 +393,114 @@ class LocalBroker:
         self._reclaim_expired()
         with self._lock:
             return {name: self._state(name) for name in self._targets}
+
+    def describe(self) -> Mapping[str, TargetDescription]:
+        """
+        Return what each target is, from the cache built at construction.
+
+        Returns
+        -------
+        Mapping[str, TargetDescription]
+            Keyed by target name.
+        """
+        return dict(self._descriptions)
+
+    def _describe_all(self) -> dict[str, TargetDescription]:
+        """
+        Read every target's static facts, once, before anything runs.
+
+        Called from ``__init__`` deliberately. These are device calls,
+        and this is the only moment at which making them is unambiguously
+        safe: no live loop exists yet, so there is no second caller to
+        interleave with. Reading them lazily on first use would put a
+        call on a device whose loop is mid-pass.
+
+        A device that does not answer a given question simply does not
+        have it - a detector-only server has no channel names, an
+        unsynchronised scan unit no targets - so each read is guarded
+        rather than required. A device that *raises* is treated the same
+        way: a description is chrome, and failing to build a window
+        because a camera would not list its binning factors would be a
+        poor trade.
+
+        Returns
+        -------
+        dict[str, TargetDescription]
+            Keyed by target name.
+        """
+        described: dict[str, TargetDescription] = {}
+        for name, device in self._targets.items():
+            refused: list[str] = []
+            described[name] = TargetDescription(
+                name=name,
+                kind=target_kind(name),
+                label=str(
+                    self._ask(device, "camera_id", refused)
+                    or self._ask(device, "scanner_id", refused)
+                    or self._ask(device, "detector_id", refused)
+                    or name,
+                ),
+                channel_names=tuple(
+                    self._ask(device, "channel_names", refused) or (),
+                ),
+                binning_values=tuple(
+                    self._ask(device, "binning_values", refused) or (),
+                ),
+                synchronised_targets=tuple(
+                    self._ask(device, "synchronised_targets", refused) or (),
+                ),
+                controls=tuple(
+                    self._ask(device, "available_controls", refused) or (),
+                ),
+                error=(
+                    f"{name} would not answer: {', '.join(refused)}"
+                    if refused
+                    else None
+                ),
+            )
+        return described
+
+    @staticmethod
+    def _ask(device: object, attribute: str, refused: list[str]) -> object:
+        """
+        Read one descriptive attribute, or None if the device lacks it.
+
+        Properties are read and methods are called, the same distinction
+        :func:`~miainwoodpecker.devices.serving.invoke` makes and for the
+        same reason: ``channel_names`` is a property and
+        ``available_controls`` is a method, and invoking the first would
+        call a tuple.
+
+        Parameters
+        ----------
+        device : object
+            The device handle.
+        attribute : str
+            What to read.
+        refused : list[str]
+            Appended to when the device *raises*, so the description can
+            say it is incomplete. A device that simply lacks the
+            attribute is not recorded here: "this is not a camera" is an
+            answer, and only "this camera would not say" is a gap.
+
+        Returns
+        -------
+        object
+            The value, or None if absent or unreadable.
+        """
+        try:
+            value = getattr(device, attribute, None)
+            return value() if callable(value) else value
+        except Exception as error:  # noqa: BLE001 - see the docstring
+            # Deliberately every exception. A description is chrome, and
+            # what a device raises when asked a question it half-supports
+            # is not something this can enumerate - a vendor adapter is
+            # free to raise anything at all. Losing a window because a
+            # camera would not list its binning factors is the worse
+            # outcome by a distance.
+            _LOGGER.warning("could not read %s from a device: %s", attribute, error)
+            refused.append(attribute)
+            return None
 
     def snapshot(self) -> Mapping[str, TargetView]:
         """
