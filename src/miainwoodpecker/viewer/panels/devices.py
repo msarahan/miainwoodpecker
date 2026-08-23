@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import typing
 
-from qtpy import QtCore, QtWidgets
+from qtpy import QtWidgets
 
 from miainwoodpecker.devices.interface import (
     READOUT_MODES,
@@ -17,7 +17,7 @@ from miainwoodpecker.devices.interface import (
 )
 from miainwoodpecker.devices.rpc import SCANNER_TARGET
 from miainwoodpecker.viewer import preferences, profiles
-from miainwoodpecker.viewer.panels import settings, toolbar
+from miainwoodpecker.viewer.panels import analysis, settings, toolbar
 from miainwoodpecker.viewer.panels.defaults import (
     _DEFAULT_FOV_NM,
     _DEFAULT_POSITIONS,
@@ -614,128 +614,6 @@ def _binning_combo(
     return combo
 
 
-def build_analysis_rows(
-    widget: LiveInstrumentWidget,
-    camera_group: QtWidgets.QWidget,
-    camera_form: QtWidgets.QFormLayout,
-) -> None:
-    """
-    Add a button per *installed* analysis extra, and name the rest.
-
-    A button for a library that is not installed is a button that
-    cannot work, and offering it teaches the operator that this
-    application's buttons sometimes do nothing. So each one is built
-    only when its extra is importable, and the extras that are not
-    take a single summary row instead — which is more useful than
-    three dead buttons, because it says what is installed as well as
-    what is missing.
-
-    The check is
-    :func:`~miainwoodpecker.analysis.remote.target_available`, which
-    resolves the module *spec* without executing it. Importing
-    py4DSTEM to discover whether py4DSTEM is installed would stall
-    building the window for seconds to answer a question with a cheap
-    answer.
-
-    This is a availability check, not a guarantee: a spec can resolve
-    for a half-installed distribution whose import then fails. Each
-    handler therefore keeps its own ``ImportError`` branch, and that
-    branch is reachable rather than dead code.
-
-    Parameters
-    ----------
-    widget : LiveInstrumentWidget
-        The widget that owns the resulting controls; every
-        ``_``-prefixed attribute set here belongs to it.
-    camera_group : QtWidgets.QWidget
-        The group the widgets are parented to.
-    camera_form : QtWidgets.QFormLayout
-        The layout the rows are added to.
-    """
-    from miainwoodpecker.analysis.remote import target_available  # noqa: PLC0415
-    from miainwoodpecker.analysis.transfer import (  # noqa: PLC0415
-        ANALYSIS_TARGETS,
-    )
-
-    specifications = (
-        ("hyperspy", "Analyze in HyperSpy", "Analysis"),
-        ("libertem", "Sum in LiberTEM", "LiberTEM"),
-        ("py4dstem", "Fit central disk (py4DSTEM)", "py4DSTEM"),
-    )
-    handlers = {
-        "hyperspy": widget._analyze_camera_in_hyperspy,
-        "libertem": widget._analyze_camera_in_libertem,
-        "py4dstem": widget._fit_central_disk_in_py4dstem,
-    }
-    attributes = {
-        "hyperspy": ("_analyze_button", "_analyze_status"),
-        "libertem": ("_libertem_button", "_libertem_status"),
-        "py4dstem": ("_py4dstem_button", "_py4dstem_status"),
-    }
-    for button_attribute, status_attribute in attributes.values():
-        setattr(widget, button_attribute, None)
-        setattr(widget, status_attribute, None)
-
-    enabled: list[str] = []
-    missing: list[str] = []
-    for name, text, row_label in specifications:
-        extra = ANALYSIS_TARGETS[name].extra
-        if not target_available(name):
-            missing.append(extra)
-            continue
-        enabled.append(extra)
-        button_attribute, status_attribute = attributes[name]
-        button = QtWidgets.QPushButton(text, camera_group)
-        camera_form.addRow(button)
-        status = QtWidgets.QLabel("", camera_group)
-        camera_form.addRow(row_label, status)
-        button.clicked.connect(handlers[name])
-        setattr(widget, button_attribute, button)
-        setattr(widget, status_attribute, status)
-
-    if missing:
-        camera_form.addRow(
-            "Analysis extras",
-            build_extras_summary(camera_group, enabled, missing),
-        )
-
-def build_extras_summary(
-    camera_group: QtWidgets.QWidget,
-    enabled: list[str],
-    missing: list[str],
-) -> QtWidgets.QLabel:
-    """
-    Describe which analysis extras are installed and which are not.
-
-    Names both halves rather than only the missing one, because "no
-    analysis buttons" and "analysis is installed but this build has
-    no camera" look identical from the outside, and an operator
-    deciding whether to install anything needs to see the whole set.
-
-    Parameters
-    ----------
-    camera_group : QtWidgets.QWidget
-        The group the label is parented to.
-    enabled : list[str]
-        Extras whose libraries are importable.
-    missing : list[str]
-        Extras whose libraries are not.
-
-    Returns
-    -------
-    QtWidgets.QLabel
-        A two-line summary, selectable so the install command can be
-        copied out of it.
-    """
-    lines = [f"enabled: {', '.join(enabled)}" if enabled else "enabled: none"]
-    lines.append(f"available: {', '.join(missing)}")
-    lines.append(f"pip install \"miainwoodpecker[{','.join(missing)}]\"")
-    label = QtWidgets.QLabel("\n".join(lines), camera_group)
-    label.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
-    label.setWordWrap(True)
-    return label
-
-
 def build_devices_panel(widget: LiveInstrumentWidget) -> QtWidgets.QGroupBox:
     """
     Build the Devices panel: one foldable section per device served.
@@ -766,6 +644,10 @@ def build_devices_panel(widget: LiveInstrumentWidget) -> QtWidgets.QGroupBox:
     if widget._has_scanner:
         built.append(("scanner", "Scan", build_scan_group(widget)))
     titles = _camera_section_titles(widget)
+    # Before the loop, and whether or not it runs: an instrument serving
+    # no camera gets no analysis buttons, and the handlers that read
+    # these attributes have to find None rather than nothing at all.
+    analysis.reset_analysis_controls(widget)
     for index, binding in enumerate(widget._camera_bindings.values()):
         group = build_camera_group(widget, binding)
         if index == 0:
@@ -773,7 +655,9 @@ def build_devices_panel(widget: LiveInstrumentWidget) -> QtWidgets.QGroupBox:
             # so they live in its section rather than being repeated in
             # every camera's, which would offer three buttons per camera
             # and no way to tell which burst you were about to take.
-            build_analysis_rows(widget, group, group.layout())
+            # What is *installed* is not a camera's property and is not
+            # here at all; see panels/analysis.py.
+            analysis.build_analysis_rows(widget, group, group.layout())
         built.append((binding.name, titles[binding.name], group))
 
     widget._device_sections = {}

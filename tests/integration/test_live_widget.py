@@ -282,9 +282,9 @@ def _finish_analysis(widget: LiveInstrumentWidget) -> None:
     assert _wait_until(done)
 
 
-def _analysis_extras_summary(widget: LiveInstrumentWidget) -> str | None:
+def _analysis_extras_label(widget: LiveInstrumentWidget) -> QtWidgets.QLabel | None:
     """
-    Return the camera group's analysis-extras summary text, if it is shown.
+    Return the analysis-extras summary label, if one was built.
 
     Found by its content rather than by holding a reference, so the test
     asserts on what an operator can actually read on the panel.
@@ -296,18 +296,37 @@ def _analysis_extras_summary(widget: LiveInstrumentWidget) -> str | None:
 
     Returns
     -------
-    str | None
-        The summary label's text, or None when no summary row was built.
+    QtWidgets.QLabel | None
+        The summary label, or None when no summary was built.
     """
     for label in widget.findChildren(QtWidgets.QLabel):
         if label.text().startswith("enabled:"):
-            return label.text()
+            return label
     return None
+
+
+def _analysis_extras_summary(widget: LiveInstrumentWidget) -> str | None:
+    """
+    Return the analysis-extras summary text, if it is shown.
+
+    Parameters
+    ----------
+    widget : LiveInstrumentWidget
+        The widget to search.
+
+    Returns
+    -------
+    str | None
+        The summary label's text, or None when no summary was built.
+    """
+    label = _analysis_extras_label(widget)
+    return None if label is None else label.text()
 
 
 def _widget_with_extras(
     monkeypatch: pytest.MonkeyPatch,
     available: set[str],
+    camera_count: int = 1,
 ) -> LiveInstrumentWidget:
     """
     Build a camera-only widget that believes exactly ``available`` is installed.
@@ -323,6 +342,9 @@ def _widget_with_extras(
         The patcher.
     available : set[str]
         Analysis target names to report as installed.
+    camera_count : int
+        How many cameras the widget serves, for the tests that care
+        where a control ended up rather than only that it exists.
 
     Returns
     -------
@@ -335,7 +357,8 @@ def _widget_with_extras(
         lambda name: name in available,
     )
     viewer = napari.Viewer(show=False)
-    return LiveInstrumentWidget(viewer, None, camera=_FakeCamera())
+    cameras = {f"camera{index}": _FakeCamera() for index in range(camera_count)}
+    return LiveInstrumentWidget(viewer, None, cameras=cameras)
 
 
 def test_analysis_buttons_are_absent_when_no_extra_is_installed(monkeypatch):
@@ -344,9 +367,9 @@ def test_analysis_buttons_are_absent_when_no_extra_is_installed(monkeypatch):
 
     A button for a library that is not installed cannot work, and
     offering it teaches the operator that this application's buttons
-    sometimes do nothing. The summary row replaces all three and names
-    every extra, so "nothing installed" is distinguishable from "this
-    build has no analysis at all".
+    sometimes do nothing. The Analysis extras section replaces all three
+    and names every extra, so "nothing installed" is distinguishable
+    from "this build has no analysis at all".
     """
     widget = _widget_with_extras(monkeypatch, set())
     try:
@@ -385,12 +408,39 @@ def test_only_installed_analysis_buttons_are_built(monkeypatch):
         widget.shutdown()
 
 
+def test_the_extras_summary_is_not_inside_any_camera_section(monkeypatch):
+    """
+    What is installed is a property of the installation, not of a camera.
+
+    The bug this pins down: the summary was a row in the first camera's
+    section, so a panel headed "Camera - usim_ronchigram_camera" said
+    "Analysis extras / enabled: none" underneath, which reads as this
+    camera having no analysis rather than this machine having no
+    libraries. It now has a section of its own, and the second camera is
+    here to make the point that the row did not simply move to another
+    camera either.
+    """
+    widget = _widget_with_extras(monkeypatch, set(), camera_count=2)
+    try:
+        label = _analysis_extras_label(widget)
+        assert label is not None
+        for section in widget._device_sections.values():  # noqa: SLF001
+            assert not section.isAncestorOf(label)
+
+        section = widget.panel_sections["analysis"]
+        assert section.isAncestorOf(label)
+        assert section.title == "Analysis extras"
+    finally:
+        widget.shutdown()
+
+
 def test_no_extras_summary_when_everything_is_installed(monkeypatch):
     """
     With all three installed there is nothing to report, so nothing is shown.
 
     The summary exists to stand in for missing buttons; with none missing
-    it would be clutter restating what the three buttons already say.
+    it would be a whole section restating what the three buttons already
+    say.
     """
     widget = _widget_with_extras(monkeypatch, {"hyperspy", "libertem", "py4dstem"})
     try:
