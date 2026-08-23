@@ -36,6 +36,7 @@ from miainwoodpecker.dashboard.connection import (
 )
 from miainwoodpecker.dashboard.images import (
     THUMBNAIL_MAX_EDGE,
+    TILE_EDGES,
     TILE_MAX_EDGE,
     greyscale_png,
     is_image,
@@ -63,6 +64,7 @@ __all__ = [
     "INVITATION_ENV_VAR",
     "METADATA_HIGHLIGHTS",
     "THUMBNAIL_MAX_EDGE",
+    "TILE_EDGES",
     "TILE_MAX_EDGE",
     "AcquisitionJob",
     "AcquisitionRequest",

@@ -12,12 +12,24 @@ docs/scripting-and-automation.md for the whole procedure, including
 where the invitation comes from.
 
 **This notebook is a client, not a driver.** Every tile is a *watch*:
-:meth:`~miainwoodpecker.broker.interface.InstrumentBroker.snapshot`
+:meth:`~miainwoodpecker.broker.interface.InstrumentBroker.previews`
 returns each target's state and its latest frames together, costs no
 device call, and cannot start or stop anything. The only thing here that
 drives is Acquire, and it does so inside a lease - which is the only way
 to acquire, and which the broker grants to one client at a time. Nothing
 in this file holds a device handle.
+
+**Pictures, not measurements, and the type says so.** ``previews`` is
+``snapshot`` with the pixels decimated in the process that holds the
+device, so what crosses the socket is what the browser draws - a 50-fold
+reduction on an ordinary instrument, which is the difference between two
+frames a second and marimo's ceiling of ten. What comes back is a
+:class:`~miainwoodpecker.devices.preview.FramePreview` rather than a
+:class:`~miainwoodpecker.devices.interface.Frame`, and deliberately:
+subsampled pixels have no calibration, so anything that measured off
+them would be wrong by the stride with nothing saying so. A tile does
+not measure. What Acquire records comes from a lease, at full size, and
+never passes through here.
 
 **Nothing here takes a lease on the cell that runs it.** Taking a lease
 means waiting out the pass already in flight, and a pass is ``height x
@@ -65,6 +77,8 @@ def _():
     import marimo as mo
 
     from miainwoodpecker.dashboard import (
+        TILE_EDGES,
+        TILE_MAX_EDGE,
         AcquisitionJob,
         SessionLog,
         camera_request,
@@ -82,6 +96,8 @@ def _():
     from miainwoodpecker.storage.session import Session
 
     return (
+        TILE_EDGES,
+        TILE_MAX_EDGE,
         AcquisitionJob,
         CameraParameters,
         ScanParameters,
@@ -165,31 +181,52 @@ def _(connect_dashboard, connection_form, mo):
 
 
 @app.cell
-def _(mo):
-    # The display tick, and the one control that decides what this costs
-    # the network.
+def _(TILE_EDGES, TILE_MAX_EDGE, mo):
+    # The display tick and the tile size: between them, everything this
+    # view costs and everything it is worth.
     #
-    # RemoteBroker.snapshot's own docstring says a remote watcher should
-    # prefer targets() for the chrome and latest() for the one source it
-    # is showing, because snapshot ships every target's pixels on every
-    # call. That advice is for a watcher showing *one* source. A grid
-    # draws all of them, so the pixels are wanted either way and
-    # snapshot is one round trip where the alternative is one plus one
-    # per tile - and, more importantly, it reads state and frames under
-    # the same lock, so a tile cannot show a rate from one pass beside
-    # pixels from another.
+    # **Why previews() and not snapshot().** Both read every target's
+    # state and pixels under one lock, which is the property that
+    # matters - a tile must not show a rate from one pass beside pixels
+    # from another. They differ in what crosses the socket. snapshot
+    # sends every frame at full size: on an instrument with a 2048x2048
+    # camera beside a scan unit that is 19 MB a call, so even the old
+    # one-second tick was 160 Mbit/s and ten a second is not possible on
+    # any ordinary network. previews decimates in the process that holds
+    # the device, so what crosses is what the browser draws - measured
+    # at 336 kB where snapshot was 17 MB, and 1.1 ms a call where
+    # snapshot was 24.5 ms.
     #
-    # What that leaves is bandwidth, and here the interval *is* the
-    # bandwidth. A tile is a preview - decimated, and the acquisition
-    # path never sees it - so backing off to 5 s on a slow link costs
-    # nothing that matters.
+    # Nothing is lost that this notebook had: it decimated every frame
+    # to a tile on arrival anyway, and dashboard.images renders a
+    # preview to the same bytes it renders the frame to. What *is* given
+    # up is the calibration, which decimation would make untrue and
+    # which a FramePreview therefore does not carry. A tile does not
+    # measure. An acquisition does, and takes a lease to do it.
+    #
+    # **0.1s is marimo's floor, not a round number.** Its front end
+    # clamps the interval to 0.1 s, so ten a second is the ceiling of
+    # this mechanism however fast the kernel answers. Measured end to
+    # end - timer to new pixels on screen - a three-tile grid runs at
+    # about 98 ms a tick with 256-pixel tiles and about 121 ms with
+    # 512-pixel ones. So the fastest setting is genuinely reachable, and
+    # which end of the tile menu you want decides whether you get it.
     refresh = mo.ui.refresh(
         label="Live update",
-        options=["0.5s", "1s", "2s", "5s", "10s"],
+        options=["0.1s", "0.2s", "0.5s", "1s", "2s", "5s", "10s"],
         default_interval="1s",
     )
-    refresh
-    return (refresh,)
+    # Not a constant, because the right answer is the operator's and
+    # changes with the screen and the link. It sets both halves at once
+    # - what the broker sends and what the browser is asked to draw -
+    # which is the whole reason it is one control rather than two.
+    tile_edge = mo.ui.dropdown(
+        label="Tile (px)",
+        options={str(edge): edge for edge in TILE_EDGES},
+        value=str(TILE_MAX_EDGE),
+    )
+    mo.hstack([refresh, tile_edge], justify="start", gap=1)
+    return refresh, tile_edge
 
 
 @app.cell
@@ -221,7 +258,7 @@ def _(log, refresh):
 
 
 @app.cell
-def _(channel_labels, is_image, mo, png_data_uri, tile_status):
+def _(channel_labels, is_image, mo, png_data_uri, tile_edge, tile_status):
     def blank(message):
         """Render a tile with no picture in it, saying why there is none."""
         return mo.Html(
@@ -241,12 +278,23 @@ def _(channel_labels, is_image, mo, png_data_uri, tile_status):
             picture = blank("1D readout - not an image")
             caption = ""
         elif tile.frames:
-            # image-rendering: pixelated on purpose. The frame has
-            # already been decimated to at most 512 px, and letting the
-            # browser smooth what is left would draw interpolated pixels
-            # over measured ones.
+            # image-rendering: pixelated on purpose. The pixels have
+            # already been decimated to the chosen edge - by the broker,
+            # before they crossed - and letting the browser smooth what
+            # is left would draw interpolated pixels over measured ones.
+            #
+            # The same edge is passed here as was asked of previews(),
+            # so this call finds nothing left to decimate. Passing it
+            # anyway is what keeps the tile right when the two can
+            # disagree: an in-process broker hands over full frames, and
+            # a preview that arrived before the operator changed the
+            # menu is a size this cell did not choose.
+            picture_uri = png_data_uri(
+                tile.frames[0].data,
+                max_edge=tile_edge.value,
+            )
             picture = mo.Html(
-                f'<img src="{png_data_uri(tile.frames[0].data)}" '
+                f'<img src="{picture_uri}" '
                 'style="width:100%;aspect-ratio:1;object-fit:contain;'
                 'background:#000;border-radius:4px;'
                 'image-rendering:pixelated;" />',
@@ -294,11 +342,15 @@ def _(channel_labels, is_image, mo, png_data_uri, tile_status):
 
 
 @app.cell
-def _(broker, described, frame_tiles, holder, refresh, tile_grid):
+def _(broker, described, frame_tiles, holder, refresh, tile_edge, tile_grid):
     # Referenced so that the timer re-runs this cell; the value itself
     # is not used. This is the whole polling loop.
     refresh
-    tiles = frame_tiles(described, broker.snapshot(), holder=holder)
+    tiles = frame_tiles(
+        described,
+        broker.previews(tile_edge.value),
+        holder=holder,
+    )
     tile_grid(tiles)
     return (tiles,)
 
@@ -313,8 +365,9 @@ def _(mo):
 def _(described, frame_sources, mo):
     # From describe(), NOT from the tiles - and the difference is a bug
     # rather than a nicety. The tiles are rebuilt on every poll, so a
-    # control that depended on them would be rebuilt once a second and
-    # would throw away whatever the operator had just typed into it.
+    # control that depended on them would be rebuilt as often as the
+    # display timer fires - ten times a second at the fastest setting -
+    # and would throw away whatever the operator had just typed into it.
     # describe() is static for the life of the instrument.
     sources = frame_sources(described)
     source = mo.ui.dropdown(

@@ -23,11 +23,25 @@ looking at, which is the more defensible statistic anyway. The
 acquisition path is untouched by any of this: what gets recorded is the
 frame, at full size, in its own dtype.
 
+**The order survives the decimation moving to the server.** A client
+polling
+:meth:`~miainwoodpecker.broker.interface.InstrumentBroker.previews`
+receives pixels that have already been reduced, and
+:func:`decimate` here then finds nothing left to do. What
+:func:`autoscale` sees is the same set of pixels either way - the ones
+about to be drawn - so the stretch a tile gets does not depend on which
+side of the socket the subsampling happened on. That is a property worth
+stating: it is what makes it safe for the dashboard to ask for previews
+over a wire and snapshots in process, and get the same picture.
+
 **Nearest-neighbour decimation, not a block mean.** Aliasing on a
 downsampled tile is visible and is the honest artefact of a preview; a
 block mean would be a *different image* from the one the file holds, at
 a cost paid on every tick. A tile is chrome. The measurement is the
-recording.
+recording. The decimation itself lives in
+:mod:`miainwoodpecker.devices.preview`, because the broker does it too
+and two implementations of "every nth pixel" would eventually disagree
+about the rounding.
 """
 
 from __future__ import annotations
@@ -39,18 +53,63 @@ import zlib
 
 import numpy as np
 
+from miainwoodpecker.devices.preview import decimate
+
 if typing.TYPE_CHECKING:
     import numpy.typing as npt
 
+__all__ = [
+    "DEFAULT_HIGH_PERCENTILE",
+    "DEFAULT_LOW_PERCENTILE",
+    "THUMBNAIL_MAX_EDGE",
+    "TILE_EDGES",
+    "TILE_MAX_EDGE",
+    "autoscale",
+    "decimate",
+    "greyscale_png",
+    "is_image",
+    "png_data_uri",
+]
+"""
+Re-exports :func:`~miainwoodpecker.devices.preview.decimate` deliberately.
+
+It was defined here first, and callers - the notebook among them - import
+it from here. Moving it to the device layer for the broker's sake should
+not move it out from under them, so the name stays.
+"""
+
 TILE_MAX_EDGE = 512
 """
-Longest edge, in pixels, a live tile is decimated to.
+Longest edge, in pixels, a live tile is decimated to by default.
 
-Chosen against the traffic rather than against a screen: a tile is a few
-hundred pixels wide in any browser window that holds several of them, and
-512 leaves room to enlarge one without re-fetching. At 8 bits it is at
-most 262 kB before zlib and roughly a tenth of that after, per tile per
-tick - which is what makes a one-second poll affordable over a socket.
+A default rather than a rule, and the frame rate is what it is traded
+against. A tile is a few hundred pixels wide in any browser window that
+holds several of them, so 512 leaves room to enlarge one without
+re-fetching - at 8 bits, 262 kB before zlib and roughly 300 kB once it
+is base64 in a ``data:`` URI, per tile per tick.
+
+Measured, on a three-tile grid: at 512 the whole round trip from the
+display timer to new pixels on screen is about 120 ms, and at 256 it is
+about 98 ms - which is marimo's own floor, since it clamps a refresh
+interval to 0.1 s. So the last of the frame rate costs half the tile's
+edge, and which of the two an operator wants depends on the screen and
+the link. The dashboard offers it as a control rather than choosing.
+"""
+
+TILE_EDGES = (128, 256, 512, 1024)
+"""
+The tile sizes a dashboard offers, ascending.
+
+Powers of two because the decimation is a stride and these are the
+values at which it divides a common detector evenly, so a 2048-pixel
+camera lands on an exact 8, 4 or 2 rather than on a ragged edge.
+
+The range is bounded at both ends by what the setting is *for*. Below
+128 a scan tile stops being readable as an image; above 1024 a tile is
+larger than the pane showing it, and the extra pixels are paid for on
+every tick by every watcher to be thrown away by the browser. 1024 is
+included for the one case that wants it - a single tile, enlarged, on a
+link that can afford it - and is not the default for the same reason.
 """
 
 THUMBNAIL_MAX_EDGE = 128
@@ -113,49 +172,6 @@ def is_image(data: npt.NDArray[typing.Any]) -> bool:
         True when the array is 2D.
     """
     return np.asarray(data).ndim == _EXPECTED_RANK
-
-
-def decimate(
-    data: npt.NDArray[typing.Any],
-    max_edge: int = TILE_MAX_EDGE,
-) -> npt.NDArray[typing.Any]:
-    """
-    Subsample a 2D array so that neither edge exceeds ``max_edge``.
-
-    Parameters
-    ----------
-    data : npt.NDArray[typing.Any]
-        The frame's pixels.
-    max_edge : int
-        Longest edge to allow, in pixels.
-
-    Returns
-    -------
-    npt.NDArray[typing.Any]
-        The array itself when it already fits - no copy, because the
-        caller only reads it - or a strided view taking every nth pixel.
-
-    Raises
-    ------
-    ValueError
-        If the array is not 2D, or ``max_edge`` is not positive. Both are
-        programming errors rather than instrument states: ``Frame.data``
-        is 2D by design, and a non-positive edge would divide by zero.
-    """
-    if max_edge < 1:
-        message = f"max_edge must be at least 1, got {max_edge!r}"
-        raise ValueError(message)
-    values = np.asarray(data)
-    if values.ndim != _EXPECTED_RANK:
-        message = f"a display tile needs a 2D frame, got shape {values.shape}"
-        raise ValueError(message)
-    longest = max(values.shape)
-    if longest <= max_edge:
-        return values
-    # Ceiling division: a stride that rounded down would leave the
-    # result one pixel over the limit on most shapes.
-    stride = -(-longest // max_edge)
-    return values[::stride, ::stride]
 
 
 def autoscale(

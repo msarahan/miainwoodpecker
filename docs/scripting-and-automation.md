@@ -306,9 +306,36 @@ is `TargetState.is_live`'s job.
 the broker, which is what an in-process display tick should call: asking
 `targets()` and then `latest_frames()` per source re-takes each loop's
 own lock once per call, against the worker that is reacquiring it on
-every grab. Over a socket it also ships every target's pixels on every
-call, so a *remote* dashboard should ask `targets()` for the chrome and
-`latest()` for the one source it is showing.
+every grab.
+
+`previews(max_edge)` is the same call for a display on the other end of a
+socket. It reads the same state under the same lock — so a tile still
+cannot show a rate from one pass beside pixels from another — but the
+frames are decimated *before* they are sent:
+
+```python
+for name, view in broker.previews(256).items():
+    if view.frames:
+        print(name, view.frames[0].data.shape, "stride", view.frames[0].stride)
+```
+
+The difference is not marginal. On a simulated instrument serving a
+2048×2048 camera beside a scan unit, one `snapshot()` is **19 MB** — 320
+Mbit/s at two frames a second, and a gigabit link saturated before five.
+The same view as `previews(256)` is 834 kB, and `previews(128)` is 210
+kB, which is 17 Mbit/s at ten frames a second. That is what makes a live
+view over an ordinary network possible at all.
+
+What comes back is a `FramePreview`, not a `Frame`, and the difference is
+deliberate rather than cosmetic. Subsampled pixels have no valid
+calibration — `metadata["calibration"]` is units *per pixel*, so carrying
+it past a stride of 8 would claim a pixel size eight times too small and
+every distance measured off it would be wrong with nothing saying so. So
+a preview carries no calibration, records the `stride` it was reduced by
+and the `source_shape` it came from, and cannot be mistaken for the
+measurement. **Look at previews; measure and record frames.** What an
+acquisition writes comes from a lease, at full size, and never passes
+through this path.
 
 ### A lease is the only way to acquire
 
@@ -499,17 +526,25 @@ the exact interleaving the broker exists to prevent.
 
 Three things about it are worth knowing before you change it:
 
-- **Every tile is a watch.** The poll is one `snapshot()` per tick, which
-  is one round trip for the whole grid rather than a `targets()` plus a
-  `latest()` per source. Over a socket that ships every source's pixels
-  every tick — the caveat [above](#watching-cannot-move-the-probe) — so
-  the refresh interval *is* the bandwidth, and it is a control on screen.
-  Frames are decimated to at most 512 px and sent as inline greyscale
-  PNGs; the tile is a preview, and the acquisition path never sees any of
-  it.
+- **Every tile is a watch.** The poll is one `previews(edge)` per tick,
+  which is one round trip for the whole grid rather than a `targets()`
+  plus a `latest()` per source, and which decimates in the process that
+  holds the device so that what crosses the socket is what the browser
+  draws. Two controls sit on screen and between them decide what the view
+  costs: the refresh interval, and the tile size. Frames arrive
+  subsampled and go out as inline greyscale PNGs; the tile is a picture,
+  and the acquisition path never sees any of it.
+
+  **How fast it goes, measured.** marimo's front end clamps a refresh
+  interval to 0.1 s, so ten a second is the ceiling of the mechanism
+  whatever the kernel does. Against the simulated instrument, a
+  three-tile grid at `0.1s` sustains about 9.7 fps with 128 px tiles, 9.0
+  with 256 px, and 7.0 with 512 px — where the shipped default before
+  this was `0.5s`, or two. If the numbers matter to you, the tile menu is
+  where you spend them.
 - **Acquire does not take its lease in the cell you pressed.** It starts
   an `AcquisitionJob`, which takes the lease on a worker thread and
-  renews it per frame; the same one-second poll that draws the tiles
+  renews it per frame; the same display poll that draws the tiles
   reports how it is going. A cell that leased inline would hold the
   kernel for as long as the pass in flight — up to minutes — and freeze
   every tile at the moment you most want to see them.

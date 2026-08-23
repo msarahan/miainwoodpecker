@@ -40,12 +40,14 @@ import typing
 from miainwoodpecker.broker.interface import (
     DEFAULT_LEASE_TIMEOUT_S,
     DEFAULT_LEASE_TTL_S,
+    DEFAULT_PREVIEW_EDGE,
     DeviceBusyError,
     Lease,
     LeaseExpiredError,
     NotLiveError,
 )
 from miainwoodpecker.broker.server import BROKER_TARGET
+from miainwoodpecker.devices.preview import decimation_stride
 from miainwoodpecker.devices.remote import (
     RemoteCamera,
     RemoteScanner,
@@ -66,6 +68,7 @@ if typing.TYPE_CHECKING:
     from miainwoodpecker.acquisition.live import LiveStats
     from miainwoodpecker.broker.interface import (
         TargetDescription,
+        TargetPreview,
         TargetState,
         TargetView,
     )
@@ -662,11 +665,17 @@ class RemoteBroker:
         Return every target's state and latest frames, in one pass.
 
         Note what this costs over a wire that :class:`LocalBroker` does
-        not pay: every target's pixels, pickled, on every call. It is
-        the right call for a viewer sharing a process with its broker
-        and the wrong one for a dashboard polling from another machine,
-        which should ask :meth:`targets` for the chrome and
-        :meth:`latest` for the one source it is showing.
+        not pay: every target's pixels, at full size, pickled, on every
+        call. It is the right call for a viewer sharing a process with
+        its broker, and for a client that wants the *measurement* -
+        calibrated pixels in the device's own dtype.
+
+        A client that wants a live *picture* wants :meth:`previews`,
+        which is this call with the decimation done before the pixels
+        are put on the wire rather than after they arrive. That is the
+        difference between roughly 19 MB and roughly 200 kB per poll on
+        an ordinary instrument, and therefore the difference between two
+        frames a second and ten.
 
         Returns
         -------
@@ -674,6 +683,44 @@ class RemoteBroker:
             Keyed by target name.
         """
         return typing.cast("Mapping[str, TargetView]", self.broker_call("snapshot"))
+
+    def previews(
+        self,
+        max_edge: int = DEFAULT_PREVIEW_EDGE,
+    ) -> Mapping[str, TargetPreview]:
+        """
+        Return every target's state and latest frames, as pictures.
+
+        The one watch call written for the wire rather than in spite of
+        it: the decimation happens in the server process, so what
+        crosses is what a tile draws. Everything :meth:`snapshot`
+        promises about reading state and frames together holds, because
+        the server answers this by calling
+        :meth:`~miainwoodpecker.broker.local.LocalBroker.previews` under
+        the same lock.
+
+        A ``max_edge`` below 1 raises ``ValueError`` **here**, before the
+        call is sent, rather than after a round trip: a caller that got
+        this wrong gets the same message whichever transport it is on,
+        and an instrument that is busy does not have to answer a call
+        that was never going to succeed.
+
+        Parameters
+        ----------
+        max_edge : int
+            Longest edge, in pixels, to reduce each frame to. Sent to
+            the server, which is where it takes effect.
+
+        Returns
+        -------
+        Mapping[str, TargetPreview]
+            Keyed by target name.
+        """
+        decimation_stride((1,), max_edge)
+        return typing.cast(
+            "Mapping[str, TargetPreview]",
+            self.broker_call("previews", (max_edge,)),
+        )
 
     def controls(self) -> Mapping[str, float | bool]:
         """

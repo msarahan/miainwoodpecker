@@ -25,6 +25,7 @@ from miainwoodpecker.acquisition.live import LiveStats
 from miainwoodpecker.broker.interface import (
     Lease,
     TargetDescription,
+    TargetPreview,
     TargetState,
     TargetView,
 )
@@ -45,6 +46,7 @@ from miainwoodpecker.dashboard.tiles import (
     tile_status,
 )
 from miainwoodpecker.devices.interface import Frame
+from miainwoodpecker.devices.preview import preview_of
 
 _PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 _IHDR_AT = len(_PNG_SIGNATURE) + 8
@@ -196,6 +198,134 @@ def test_a_projected_readout_is_recognised_as_not_an_image():
     assert not is_image(np.zeros(2048))
     with pytest.raises(ValueError, match="2D frame"):
         greyscale_png(np.zeros(2048))
+
+
+@pytest.mark.parametrize(
+    "shape",
+    [(2048, 2048), (512, 512), (100, 1340), (513, 513), (257, 100), (16, 16)],
+)
+@pytest.mark.parametrize("edge", [512, 256, 128])
+def test_decimating_early_draws_the_same_tile_as_decimating_late(
+    shape: tuple[int, int],
+    edge: int,
+) -> None:
+    """
+    A preview renders to the same bytes the full frame would have.
+
+    This is what makes it safe for the broker to reduce the pixels
+    before sending them. If the two routes disagreed, a dashboard would
+    show one picture in process and a different one over a socket, and
+    the difference would be invisible until somebody compared them side
+    by side.
+
+    Byte-for-byte on the encoded PNG rather than approximately, because
+    both routes take the *same* stride through the *same* array: the
+    early one has simply done it already. Anything less than equality
+    would mean a rounding difference between two implementations of
+    "every nth pixel", which is the bug this shares one function to
+    avoid.
+
+    Parameters
+    ----------
+    shape : tuple[int, int]
+        Frame size, including sizes the stride does not divide evenly.
+    edge : int
+        Longest edge to reduce to.
+    """
+    rng = np.random.default_rng(0)
+    frame = _frame(rng.normal(size=shape).astype(np.float32), channel_name="HAADF")
+
+    late = png_data_uri(frame.data, max_edge=edge)
+    early = png_data_uri(preview_of(frame, edge).data, max_edge=edge)
+
+    assert early == late
+
+
+def test_a_preview_drops_the_calibration_it_would_otherwise_lie_about():
+    """
+    Units per pixel do not survive a stride, so they do not travel.
+
+    A frame subsampled by 8 whose calibration came along unchanged
+    claims a pixel size eight times too small. Every distance measured
+    off it is then wrong by that factor, with nothing anywhere saying
+    so - which is why a preview is not a ``Frame`` and why this key is
+    named rather than filtered by guesswork.
+    """
+    frame = _frame(
+        np.zeros((2048, 2048), dtype=np.float32),
+        channel_name="HAADF",
+        calibration={"x": "nm per pixel, at the full size"},
+        fov_nm=100.0,
+    )
+
+    preview = preview_of(frame, 256)
+
+    assert "calibration" not in preview.metadata
+    # The detector's name describes the detector, not the pixel grid, so
+    # it survives - it is what captions a multichannel tile.
+    assert preview.metadata["channel_name"] == "HAADF"
+    # So does the field of view: decimation subsamples the same region,
+    # it does not crop it.
+    assert preview.metadata["fov_nm"] == 100.0  # noqa: PLR2004
+    assert preview.stride == 8  # noqa: PLR2004
+    assert preview.source_shape == (2048, 2048)
+
+
+def test_a_preview_of_a_projected_readout_is_a_preview_not_an_error():
+    """
+    A 1D frame reduces rather than raising, unlike ``decimate``.
+
+    A camera in projected readout is an ordinary instrument state, and
+    ``previews()`` covers every target at once - so raising on one would
+    take the whole grid down. The preview says it is 1D by being 1D, and
+    ``is_image`` is still the check a caller makes before encoding.
+    """
+    preview = preview_of(_frame(np.zeros(4096, dtype=np.float32)), 256)
+
+    assert preview.data.shape == (256,)
+    assert preview.stride == 16  # noqa: PLR2004
+    assert not is_image(preview.data)
+
+
+def test_a_tile_is_built_the_same_way_from_previews_as_from_frames():
+    """
+    Swapping the wire format does not change the grid or its chrome.
+
+    ``frame_tiles`` reads a state and some pixels, and both view types
+    carry exactly that. A dashboard moving to previews for the bandwidth
+    must not find tiles reordered, captions lost or a rate missing.
+    """
+    described = _described()
+    frames = (
+        _frame(np.zeros((512, 512), dtype=np.float32), channel_name="HAADF"),
+        _frame(np.zeros((512, 512), dtype=np.float32), channel_name="MAADF"),
+    )
+    state = TargetState(
+        name="scanner",
+        kind="scanner",
+        is_live=True,
+        stats=LiveStats(fps=12.0, frame_count=7),
+    )
+
+    from_frames = frame_tiles(described, {"scanner": TargetView(state, frames)})
+    from_previews = frame_tiles(
+        described,
+        {
+            "scanner": TargetPreview(
+                state,
+                tuple(preview_of(frame, 256) for frame in frames),
+            ),
+        },
+    )
+
+    assert [tile.name for tile in from_frames] == [
+        tile.name for tile in from_previews
+    ]
+    scan_frames, scan_previews = from_frames[0], from_previews[0]
+    assert scan_previews.is_live == scan_frames.is_live
+    assert scan_previews.fps == scan_frames.fps
+    assert channel_labels(scan_previews) == channel_labels(scan_frames)
+    assert channel_labels(scan_previews) == ("HAADF", "MAADF")
 
 
 def _described() -> dict[str, TargetDescription]:
