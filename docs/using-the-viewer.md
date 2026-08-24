@@ -56,7 +56,7 @@ for the window. Add `--publish ~/instrument` and a notebook can join the
 session while it runs; without it the connection details live in a
 temporary directory that goes away with the session.
 
-Three shapes, and which you want depends on how the microscope is being
+Four shapes, and which you want depends on how the microscope is being
 used rather than on the software:
 
 | Command | The session is |
@@ -64,6 +64,7 @@ used rather than on the software:
 | `pixi run instrument` | One sitting. A window, and the instrument put down when you close it. |
 | `pixi run dashboard` | The same, with the [browser dashboard](scripting-and-automation.md) as the front end instead of the window. |
 | `pixi run serve` | The instrument itself. No front end: it stays served while people attach and detach, and ends when you press Ctrl-C. |
+| `pixi run tray` | The same as `serve`, with somewhere to live: an icon in the notification area instead of a terminal to keep open. |
 
 `serve` is the one to reach for when the answer to "napari or the
 notebook?" is "both, and not yet". It publishes into the working
@@ -80,6 +81,34 @@ through the same leases everything else does. Under `pixi run
 instrument`, by contrast, closing the window ends the session for
 everyone — which is what you want for one sitting and not for a shared
 column.
+
+### The same thing, without a terminal to keep open
+
+`pixi run tray` serves the instrument exactly as `serve` does and puts
+the session in the notification area instead of in a console. Right-click
+the icon for:
+
+- **Open a viewer** — a window on this instrument, and another one after
+  that if you want two. They are ordinary clients, so closing one does
+  not end anything.
+- **Instrument health…** — one row per device, under the device server
+  that was supposed to bring it, saying whether it is answering, what it
+  is acquiring and at what rate, and who is holding it. It is read from
+  the broker rather than by poking the hardware, so opening it cannot
+  disturb an acquisition — and so a device it calls "answering" is one
+  that has not reported itself broken rather than one that has been
+  tested.
+- **Quit and stop the instrument** — the windows, then the broker, then
+  the column parked. It asks first, and the question lists what is
+  running at the moment you ask it, because this ends everybody's
+  session and not only yours.
+
+It publishes to `~/.miainwoodpecker` by default, which is where a
+notebook or a dashboard looks when it is told nothing at all, so
+`miainwoodpecker-viewer --broker ~/.miainwoodpecker` joins from anywhere
+else on the machine. It takes the same options as the commands above,
+including `--config` for a microscope that is more than one device
+server — see [Instrument configuration](instrument-configuration.md).
 
 The window is the same window: the same panels, the same detectors, the
 same controls, built from what the broker reports rather than from

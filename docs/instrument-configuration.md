@@ -36,6 +36,28 @@ broker, the device layer and this file's schema are all working, and
 anything that then goes wrong with a hardware file is about the
 hardware.
 
+### Starting it without a terminal
+
+A control computer is not a terminal somebody is watching, and "close
+the black window" is a thing that happens. `pixi run tray` serves the
+same instrument from the notification area instead:
+
+```
+miainwoodpecker-tray --config $HOME/.miainwoodpecker/instrument.toml
+```
+
+Right-clicking the icon opens a window on the instrument, or stops
+everything — asking first, because that ends the session of every
+notebook and dashboard connected too, not only this machine's windows.
+
+It also reads this file for a second purpose: the **Instrument health**
+panel groups each device under the server that was supposed to bring it,
+so "did the spectrometer come up?" is a heading rather than a name you
+have to recognise in a flat list. Without a `--config` there is one
+heading, which is the truth for a broker over a single adapter. See
+[Using the viewer](using-the-viewer.md) for what the panel does and does
+not claim.
+
 ## Why there is a file at all
 
 An instrument is not one device server. SuperSTEM 3 is a Nion column

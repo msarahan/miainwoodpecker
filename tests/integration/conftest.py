@@ -30,6 +30,11 @@ _NATIVE_WINDOW_SERVER_PLATFORMS = ("darwin", "win32")
 # the guard below checks for. Listed rather than detected: a module that
 # forgets to add itself fails loudly on a headless machine, which is the
 # safe direction for a guard whose other failure mode is silence.
+#
+# ``test_tray`` is in the list for a different reason and skips the same
+# way: it builds no canvas, but a QApplication cannot be constructed at
+# all without a display, so the guard has to run before the test's own
+# "is there a notification area?" check gets a chance to skip politely.
 _VIEWER_TEST_MODULES = (
     "test_live_widget",
     "test_preview_window",
@@ -41,6 +46,7 @@ _VIEWER_TEST_MODULES = (
     "test_panel_density",
     "test_documents",
     "test_window_on_a_remote_broker",
+    "test_tray",
 )
 
 

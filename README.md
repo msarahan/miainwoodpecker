@@ -33,6 +33,12 @@ The project is early. What exists today:
   acquisition rate from display rate, and
 * a **live viewer** (`miainwoodpecker.viewer`) — a napari + PySide6 dock
   widget with the live scan/camera feed and scan controls,
+* a **broker** (`miainwoodpecker.broker`) that serves one instrument to
+  every client at once — a window, a notebook, a dashboard — arbitrating
+  who drives, with a **system-tray application**
+  (`miainwoodpecker.tray`) that holds one open on a control computer:
+  right-click for a window on it, for how each device server is doing,
+  or to stop the lot and park the column,
 * **acquisition sequences** (`miainwoodpecker.acquisition`) that stream to
   disk as they run, and
 * **NeXus/HDF5 storage** (`miainwoodpecker.storage`), including an importer

@@ -112,7 +112,7 @@ this variable, and a script somebody writes next month can read it too
 without this module learning about it.
 """
 
-_INVITATION_TIMEOUT_S = 120.0
+INVITATION_TIMEOUT_S = 120.0
 """
 How long to wait for the broker to publish where it is listening.
 
@@ -394,7 +394,7 @@ def stop(process: subprocess.Popen, timeout_s: float = _STOP_TIMEOUT_S) -> int |
 def wait_for_invitation(
     process: subprocess.Popen,
     invitation: Path,
-    timeout_s: float = _INVITATION_TIMEOUT_S,
+    timeout_s: float = INVITATION_TIMEOUT_S,
 ) -> None:
     """
     Wait until the broker has published where it is listening.
@@ -629,6 +629,18 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--config",
+        default=None,
+        metavar="PATH",
+        help=(
+            "instrument configuration enumerating this microscope's hardware "
+            "and the servers that drive it; a directory gets instrument.toml "
+            "inside it. Passed to the broker, which starts every adapter the "
+            "file lists - so it replaces --backend, --plugin and "
+            "--server-module rather than combining with them"
+        ),
+    )
+    parser.add_argument(
         "--backend",
         choices=(SIMULATED_BACKEND, HARDWARE_BACKEND),
         default=None,
@@ -720,14 +732,20 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def _broker_arguments(args: argparse.Namespace, publish: Path) -> list[str]:
+def broker_arguments(args: argparse.Namespace, publish: Path) -> list[str]:
     """
     Build the broker's command line from what was passed through.
 
     Only what was actually given, so the broker's own defaults stay the
     broker's - this command has no opinion about which backend is the
     safe one, and repeating that opinion here would be a second place to
-    change it.
+    change it. That includes the contradictions: ``--config`` with
+    ``--backend`` is refused by the broker's own parser, in the one
+    message that can explain why, rather than being caught twice.
+
+    Public because :mod:`miainwoodpecker.tray` is the other supervisor
+    over the same broker and passes the same flags through. Both parsers
+    define these arguments; this builds the command line from either.
 
     Parameters
     ----------
@@ -742,12 +760,59 @@ def _broker_arguments(args: argparse.Namespace, publish: Path) -> list[str]:
         Arguments for :data:`BROKER_MODULE`.
     """
     arguments = ["--publish", str(publish)]
-    for name in ("backend", "server_module", "host"):
-        value = getattr(args, name)
+    for name in ("config", "backend", "server_module", "host"):
+        value = getattr(args, name, None)
         if value is not None:
             arguments += [f"--{name.replace('_', '-')}", str(value)]
-    for plugin in args.plugin or ():
+    for plugin in getattr(args, "plugin", None) or ():
         arguments += ["--plugin", plugin]
+    return arguments
+
+
+def viewer_command(
+    publish: Path,
+    *,
+    session: str | None = None,
+    operator: str | None = None,
+    sample: str | None = None,
+    notes: str | None = None,
+) -> list[str]:
+    """
+    Build the command that opens a window on a broker that is running.
+
+    ``-m`` rather than the ``miainwoodpecker-viewer`` script, for the
+    reason :mod:`miainwoodpecker.__main__` gives: the module path works
+    in an environment whose entry-point scripts are missing or stale,
+    and this is spawned into an environment that may not be this one.
+
+    Parameters
+    ----------
+    publish : Path
+        Where the broker published its invitation.
+    session : str | None
+        Session directory for recordings, or None for the viewer's own
+        default.
+    operator : str | None
+        Who is on the instrument.
+    sample : str | None
+        Sample identifier.
+    notes : str | None
+        Free-text session notes.
+
+    Returns
+    -------
+    list[str]
+        The argv to run.
+    """
+    arguments = [sys.executable, "-m", VIEWER_MODULE, "--broker", str(publish)]
+    for name, value in (
+        ("session", session),
+        ("operator", operator),
+        ("sample", sample),
+        ("notes", notes),
+    ):
+        if value is not None:
+            arguments += [f"--{name}", str(value)]
     return arguments
 
 
@@ -770,12 +835,13 @@ def _front_end_command(args: argparse.Namespace, publish: Path) -> list[str]:
     given = [argument for argument in args.front_end if argument != "--"]
     if given:
         return given
-    arguments = [sys.executable, "-m", VIEWER_MODULE, "--broker", str(publish)]
-    for name in ("session", "operator", "sample", "notes"):
-        value = getattr(args, name)
-        if value is not None:
-            arguments += [f"--{name}", str(value)]
-    return arguments
+    return viewer_command(
+        publish,
+        session=args.session,
+        operator=args.operator,
+        sample=args.sample,
+        notes=args.notes,
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -852,7 +918,7 @@ def main(argv: list[str] | None = None) -> int:
     requested = stop_requests()
     broker = spawn(
         child_command(
-            [sys.executable, "-m", BROKER_MODULE, *_broker_arguments(args, publish)],
+            [sys.executable, "-m", BROKER_MODULE, *broker_arguments(args, publish)],
             broker_environment,
         ),
         env={**os.environ, **broker_environment},

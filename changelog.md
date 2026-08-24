@@ -4,6 +4,72 @@
 
 ### Added
 
+- **The instrument as an application in the notification area: right-click
+  to open a window on it, to see how its device servers are doing, or to
+  stop everything.** `pixi run serve` already holds a microscope open for
+  whoever connects. What it also does is occupy a terminal and end when
+  that terminal is closed — a poor fit for the machine it is meant to run
+  on, where the instrument is served all day, the person at the console is
+  not the person who started it, and "close the black window" is a thing
+  that happens. `pixi run tray` (`miainwoodpecker-tray`) is the same
+  session with somewhere to live: the broker outlives every window, and
+  the things anybody needs are on a right-click. It publishes to
+  `~/.miainwoodpecker` by default — beside the instrument configuration,
+  where a notebook already looks when it is told nothing at all — because
+  an instrument held open for people to join has to be findable, which is
+  the same reason `--serve` refuses a temporary directory.
+  **The broker is still a subprocess, and that is not an implementation
+  detail.** Everything `miainwoodpecker.launcher` says about it applies
+  unchanged: the vendor device stack is GPL-3.0 and lives in its own pixi
+  environment, and parking the column depends on the broker exiting
+  cleanly under a signal it handles rather than being killed. A tray icon
+  that imported the device layer would give up both. So this process
+  spawns, watches and asks — it never opens a device — and `--broker-env`
+  and `--ui-env` still put the two children wherever they belong.
+  **Quitting asks first, and the question is not a formality.** That one
+  menu item ends everybody's session: a notebook halfway through a
+  spectrum image and a dashboard on a wall are clients of this broker and
+  neither gets a say. The confirmation therefore names what is running at
+  the moment it is asked — read from the broker, not from what this
+  process happens to have spawned — says where the instrument is
+  published, and defaults to Cancel. Confirmed, it stops the windows,
+  then the broker, and the column is parked, in that order, because a
+  probe must not be parked out from under a window still driving it.
+  **Health, and what it can honestly claim.** A broker over a configured
+  microscope is a broker over several device servers — a Nion column, a
+  DECTRIS ELA on the spectrometer, a camera server — and from outside
+  them the only evidence that the spectrometer did not come up is a menu
+  one item short. The health panel puts one row per device under the
+  server that was supposed to bring it, from three things the broker
+  already knows: `describe()`, whose per-target `error` is an adapter
+  half-answering; `targets()`, whose `error` is a live loop that died
+  mid-session and left a tile blank; and the instrument configuration,
+  which is the only thing that knows which target came from which
+  process. **Nothing polls the hardware, deliberately.** The obvious
+  health check — ask each detector for a frame every few seconds — is a
+  second caller on a device whose live loop may be mid-pass, which is the
+  interleaving the broker exists to prevent, and it would need a lease or
+  fail for want of one. So the strongest claim made anywhere in the panel
+  is "the broker says it is there and nothing has reported it broken",
+  and the wording sticks to it.
+  **Split by what needs a display, so the interesting parts are testable
+  without one.** `tray/session.py` supervises the broker and the windows
+  and imports no Qt: the launcher's blocking sequence turned inside out,
+  so `start()` returns immediately and `poll()` reports what changed —
+  because the caller is an event loop that must keep drawing a menu while
+  a cold device server spends tens of seconds importing a vendor stack.
+  `tray/health.py` turns two broker reads into a per-server verdict and
+  imports no Qt either. Both have unit tests that run on a machine with
+  no display, against real child processes rather than fakes, since
+  everything at stake is process lifetime. `tray/app.py` is the icon, and
+  its integration tests drive a real tray over a real broker over the
+  camera server's synthetic instrument.
+  **The launcher gained `--config` on the way past.** The tray and the
+  launcher build the broker's command line with one shared function, and
+  the launcher could not previously start a configured instrument at all
+  — so `pixi run instrument --config …` now works for the same reason the
+  tray does.
+
 - **A live view that keeps up: 2 fps to 10, which is the ceiling of the
   thing it runs in.** The browser dashboard's fastest refresh option was
   `0.5s`, so two frames a second was not what the stack managed — it was
