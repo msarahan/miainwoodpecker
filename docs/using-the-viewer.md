@@ -88,14 +88,27 @@ column.
 the session in the notification area instead of in a console. Right-click
 the icon for:
 
-- **Open a viewer** — a window on this instrument, and another one after
-  that if you want two. They are ordinary clients, so closing one does
-  not end anything.
+- **Open a viewer** — a window on this instrument. It is an ordinary
+  client, so closing it does not end anything.
 - **Open a dashboard** — the [browser dashboard](scripting-and-automation.md)
   on the same instrument, in its own environment: it wants marimo and no
   Qt, which is why it is a separate entry rather than a mode of the
-  window. Both can be open at once, and each is counted separately on
-  its own entry.
+  window. Both can be open at once.
+
+Once one is running its entry says **Show the viewer** (or **Show the
+dashboard**) instead, and that is what the click does: the window is
+brought to the front, and the dashboard's address is opened again — which
+your browser will usually answer by focusing the tab that already has it.
+The tray keeps one of each rather than starting a second, because an
+entry pressed again because a window went behind a browser is not a
+request for two windows. If you genuinely want a second, start it
+yourself against the published invitation; it joins like any other
+client.
+
+On Linux and macOS there is no portable way for one process to raise
+another's window, so there the tray says a viewer is already open and
+leaves you to find it. The dashboard works the same everywhere, since
+opening an address is all it ever needed.
 - **Instrument health…** — one row per device, under the device server
   that was supposed to bring it, saying whether it is answering, what it
   is acquiring and at what rate, and who is holding it. It is read from

@@ -14,12 +14,22 @@ are on a right-click.
 cannot be done from anywhere else:
 
 - *Open a viewer*, because the window is a client rather than the
-  application - it joins the instrument the way a notebook does, and
-  more than one may be open at once.
+  application - it joins the instrument the way a notebook does.
 - *Open a dashboard*, when a command for one was given, because the
   browser dashboard is the other front end this project has and it is
   not a variant of the window: it wants marimo and no Qt, so it runs in
   its own environment and gets its own entry.
+
+Both of those become *Show the ...* once one is running, and that is a
+deliberate reading of what the second click means. An entry pressed
+again because a window went behind a browser is not a request for a
+second window, and answering it with one is how a column ends up with
+four viewers on it by four o'clock. So the tray keeps one of each kind
+and goes and finds it instead - see :mod:`miainwoodpecker.tray.raising`
+for how, and for the two ways that can honestly fail. Anyone who
+genuinely wants a second window still starts one by hand, against the
+same published invitation; what this declines to do is start one by
+accident.
 - *Instrument health*, because a broker over a configured microscope is
   a broker over several device servers, and from outside them the only
   evidence of a spectrometer that did not come up is a menu that is one
@@ -73,8 +83,14 @@ from miainwoodpecker.launcher import (
     stop_requests,
     viewer_command,
 )
+from miainwoodpecker.tray import raising
 from miainwoodpecker.tray.health import Condition, InstrumentHealth
-from miainwoodpecker.tray.session import FrontEnd, InstrumentSession, SessionState
+from miainwoodpecker.tray.session import (
+    FrontEnd,
+    InstrumentSession,
+    Opened,
+    SessionState,
+)
 
 if typing.TYPE_CHECKING:
     from miainwoodpecker.instrument_config import InstrumentConfig
@@ -322,7 +338,7 @@ class TrayInstrument(QtCore.QObject):
         self._menu.addSeparator()
         self._open: dict[str, QtWidgets.QAction] = {}
         for front_end in self._session.openable:
-            action = self._menu.addAction(_opens(front_end.label, 0))
+            action = self._menu.addAction(_opens(front_end.label, running=False))
             # Bound rather than closed over the loop variable, which
             # would give every entry the last front end's label.
             action.triggered.connect(
@@ -371,7 +387,9 @@ class TrayInstrument(QtCore.QObject):
         self._show_health.setEnabled(serving)
         for label, action in self._open.items():
             action.setEnabled(serving)
-            action.setText(_opens(label, self._session.open_count(label)))
+            action.setText(
+                _opens(label, running=self._session.running(label) is not None),
+            )
         if not status.changed:
             return
         if serving:
@@ -461,13 +479,41 @@ class TrayInstrument(QtCore.QObject):
             None for the first one offered, which is what a double-click
             on the icon gets.
         """
-        if self._session.open_front_end(label) is None:
+        opened = self._session.open_front_end(label)
+        if opened is Opened.UNAVAILABLE:
             self._icon.showMessage(
                 APPLICATION_NAME,
                 "The instrument is not being served yet, so there is nothing "
                 "for a client to connect to.",
                 QtWidgets.QSystemTrayIcon.MessageIcon.Warning,
             )
+        elif opened is Opened.ALREADY_OPEN:
+            self._show_running(label or self._session.openable[0].label)
+
+    def _show_running(self, label: str) -> None:
+        """
+        Bring the client of one kind that is already up to the front.
+
+        Parameters
+        ----------
+        label : str
+            Which kind - a
+            :attr:`~miainwoodpecker.tray.session.FrontEnd.label`.
+        """
+        process = self._session.running(label)
+        if process is not None and raising.show(process, self._session.url(label)):
+            return
+        # Not an error, and said as a notification rather than a dialog:
+        # what happened is that the operator's window is somewhere this
+        # process cannot reach, and the useful part of the answer is
+        # that they already have one.
+        self._icon.showMessage(
+            APPLICATION_NAME,
+            f"A {label} is already open on this instrument. This desktop "
+            f"would not bring it to the front - look for it among your "
+            f"windows.",
+            QtWidgets.QSystemTrayIcon.MessageIcon.Information,
+        )
 
     def open_health_window(self) -> None:
         """Show the health panel, with a reading no older than this click."""
@@ -618,31 +664,29 @@ def confirm(question: str, detail: str) -> bool:
     return box.exec() == QtWidgets.QMessageBox.StandardButton.Yes
 
 
-def _opens(label: str, open_now: int) -> str:
+def _opens(label: str, *, running: bool) -> str:
     """
-    Write what a front end's menu entry says, given how many are open.
+    Write what a front end's menu entry says, given whether one is up.
 
-    The count is in the entry rather than beside it because it changes
-    what the entry *does*: "Open a viewer" and "Open another viewer (2
-    open)" are the same click, and an operator who has lost a window
-    behind a browser needs to know which of the two they are about to
-    do.
+    In the entry rather than beside it, because it is not a status: it
+    is what the click will *do*. "Open a viewer" starts one and "Show
+    the viewer" goes and finds the one that exists, and an operator who
+    has lost a window behind a browser should be able to read which of
+    those they are about to get.
 
     Parameters
     ----------
     label : str
         The front end's label - "viewer", "dashboard".
-    open_now : int
-        How many of that kind are open.
+    running : bool
+        Whether one of that kind is already up.
 
     Returns
     -------
     str
         The menu text.
     """
-    if open_now == 0:
-        return f"Open a {label}"
-    return f"Open another {label} ({open_now} open)"
+    return f"Show the {label}" if running else f"Open a {label}"
 
 
 def _colour(condition: Condition) -> QtGui.QColor:

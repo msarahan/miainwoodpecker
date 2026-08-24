@@ -344,6 +344,8 @@ def child_command(
 def spawn(
     command: Sequence[str],
     env: dict[str, str] | None = None,
+    *,
+    capture: bool = False,
 ) -> subprocess.Popen:
     """
     Start one child, in its own process group.
@@ -360,6 +362,14 @@ def spawn(
         The argv to run.
     env : dict[str, str] | None
         The child's environment, or None to inherit this one's.
+    capture : bool
+        Whether to pipe the child's output back rather than letting it
+        through to this process's console. For a supervisor that has no
+        console - :mod:`miainwoodpecker.tray` - where the alternative
+        is a front end's traceback going nowhere at all. **A caller
+        that asks for this must read the pipe**, on a thread or
+        otherwise: a child whose output nobody reads blocks once the
+        buffer fills.
 
     Returns
     -------
@@ -367,9 +377,20 @@ def spawn(
         The running child.
     """
     _LOGGER.info("starting: %s", " ".join(command))
+    piped = (
+        {
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.STDOUT,
+            "text": True,
+            "bufsize": 1,
+        }
+        if capture
+        else {}
+    )
     return subprocess.Popen(  # noqa: S603 - argv built here, no shell
         list(command),
         env=env,
+        **piped,
         **own_process_group(),
     )
 

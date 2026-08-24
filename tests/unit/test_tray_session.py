@@ -25,7 +25,12 @@ import typing
 import pytest
 
 from miainwoodpecker.broker.invitation import DEFAULT_FILENAME, BrokerInvitation
-from miainwoodpecker.tray.session import FrontEnd, InstrumentSession, SessionState
+from miainwoodpecker.tray.session import (
+    FrontEnd,
+    InstrumentSession,
+    Opened,
+    SessionState,
+)
 
 if typing.TYPE_CHECKING:
     from pathlib import Path
@@ -33,7 +38,7 @@ if typing.TYPE_CHECKING:
 _DEADLINE_S = 30.0
 _SLEEPER = "import time; time.sleep(60)"
 _PUBLISHED_PORT = 65000
-_WINDOWS = 2
+_BOTH_KINDS = 2
 
 
 def _sleeping() -> list[str]:
@@ -231,24 +236,58 @@ def test_a_broker_that_dies_while_serving_is_a_fault_rather_than_an_ending(tmp_p
 
 def test_a_window_cannot_be_opened_before_there_is_one_to_open(tmp_path):
     """
-    And once there is, more than one may be: the broker arbitrates.
+    And asking again once one is up is a request to see it, not a second.
 
-    Two windows on one column - one per detector, or one per person - is
-    a thing people do, and refusing the second would be this process
-    inventing a restriction the broker does not have.
+    An entry pressed twice because the window went behind a browser is
+    not an ask for two windows. The session says which of the two
+    happened and leaves the showing to the part that can reach a
+    desktop.
     """
     session = _session(tmp_path)
     session.start()
     try:
-        assert session.open_front_end() is None
+        assert session.open_front_end() is Opened.UNAVAILABLE
         assert session.front_ends == 0
 
         _publish(tmp_path)
         session.poll()
 
-        assert session.open_front_end() is not None
-        assert session.open_front_end() is not None
-        assert session.poll().front_ends == _WINDOWS
+        assert session.open_front_end() is Opened.STARTED
+        assert session.open_front_end() is Opened.ALREADY_OPEN
+        assert session.poll().front_ends == 1
+        assert session.running("viewer") is not None
+    finally:
+        session.shutdown()
+
+
+def test_a_client_that_has_gone_is_started_again_rather_than_shown(tmp_path):
+    """
+    "One of each" is about what is running, not about what once ran.
+
+    Closing the window and asking for it again is the ordinary way a
+    session goes, and a tray that answered the second ask by trying to
+    raise a process that has exited would leave an operator with a menu
+    entry that does nothing at all.
+    """
+    session = InstrumentSession(
+        _sleeping(),
+        _viewer([sys.executable, "-c", "pass"]),
+        tmp_path,
+    )
+    session.start()
+    try:
+        _publish(tmp_path)
+        session.poll()
+        assert session.open_front_end() is Opened.STARTED
+
+        deadline = time.monotonic() + _DEADLINE_S
+        while session.running("viewer") is not None:
+            if time.monotonic() > deadline:
+                pytest.fail("the stand-in front end never exited")
+            time.sleep(0.05)
+        session.poll()
+
+        assert session.open_front_end() is Opened.STARTED
     finally:
         session.shutdown()
 
@@ -276,21 +315,23 @@ def test_each_kind_of_client_is_opened_and_counted_on_its_own(tmp_path):
         _publish(tmp_path)
         session.poll()
 
-        assert session.open_front_end("viewer") is not None
-        assert session.open_front_end("viewer") is not None
-        assert session.open_front_end("dashboard") is not None
+        assert session.open_front_end("viewer") is Opened.STARTED
+        assert session.open_front_end("dashboard") is Opened.STARTED
         session.poll()
 
-        assert session.open_count("viewer") == _WINDOWS
+        assert session.open_count("viewer") == 1
         assert session.open_count("dashboard") == 1
-        assert session.front_ends == _WINDOWS + 1
+        assert session.front_ends == _BOTH_KINDS
+        # One of each is one *of each*: a dashboard being up says
+        # nothing about whether a viewer is.
+        assert session.open_front_end("viewer") is Opened.ALREADY_OPEN
+        assert session.running("viewer") is not session.running("dashboard")
         # And a kind nobody offered opens nothing rather than the first
         # one that happened to be there.
-        assert session.open_front_end("notebook") is None
+        assert session.open_front_end("notebook") is Opened.UNAVAILABLE
         # No label means the first offered, which is what a double-click
-        # on the icon gets.
-        assert session.open_front_end() is not None
-        assert session.open_count("viewer") == _WINDOWS + 1
+        # on the icon gets - and that one is already up.
+        assert session.open_front_end() is Opened.ALREADY_OPEN
     finally:
         session.shutdown()
 
@@ -312,7 +353,8 @@ def test_a_window_that_closes_on_its_own_stops_being_counted(tmp_path):
     try:
         _publish(tmp_path)
         session.poll()
-        opened = session.open_front_end()
+        assert session.open_front_end() is Opened.STARTED
+        opened = session.running("viewer")
         assert opened is not None
         opened.wait(timeout=_DEADLINE_S)
 
@@ -354,11 +396,103 @@ def test_a_window_is_told_where_the_broker_is(tmp_path):
     try:
         _publish(tmp_path)
         session.poll()
-        window = session.open_front_end()
+        assert session.open_front_end() is Opened.STARTED
+        window = session.running("viewer")
         assert window is not None
         window.wait(timeout=_DEADLINE_S)
 
         assert report.read_text(encoding="utf-8") == str(tmp_path)
+    finally:
+        session.shutdown()
+
+
+def test_the_address_a_client_prints_is_how_it_is_reopened(tmp_path):
+    """
+    A dashboard is a page, not a window, so "show it" means its address.
+
+    Nothing else knows that address: marimo picks a port and mints an
+    access token at startup and announces both, and a link without the
+    token opens a login page rather than the instrument. So the tray
+    reads what its children say - which it has to do anyway, having no
+    console for them to print to.
+    """
+    said = (
+        "\\x1b[32m  URL\\x1b[0m: "
+        "http://localhost:2718?access_token=abc123\\n"
+        "not a url at all\\n"
+    )
+    session = InstrumentSession(
+        _sleeping(),
+        [
+            FrontEnd(
+                label="dashboard",
+                command=(
+                    sys.executable,
+                    "-c",
+                    (
+                        f"import sys, time; sys.stdout.write('{said}'); "
+                        f"sys.stdout.flush(); time.sleep(60)"
+                    ),
+                ),
+            ),
+        ],
+        tmp_path,
+    )
+    session.start()
+    try:
+        _publish(tmp_path)
+        session.poll()
+        assert session.open_front_end("dashboard") is Opened.STARTED
+
+        deadline = time.monotonic() + _DEADLINE_S
+        while session.url("dashboard") is None:
+            if time.monotonic() > deadline:
+                pytest.fail("the address it printed was never noticed")
+            time.sleep(0.05)
+
+        # The token is part of it, and the colour codes around it are
+        # not: an escape left on the end makes a link that 404s.
+        assert session.url("dashboard") == "http://localhost:2718?access_token=abc123"
+    finally:
+        session.shutdown()
+
+
+def test_an_address_does_not_outlive_the_client_that_printed_it(tmp_path):
+    """
+    The next dashboard picks another port and another token.
+
+    Kept, the old link would open a page that does not answer — which is
+    a worse answer than opening a new dashboard, because it looks like
+    the instrument is broken rather than like nothing was running.
+    """
+    session = InstrumentSession(
+        _sleeping(),
+        [
+            FrontEnd(
+                label="dashboard",
+                command=(
+                    sys.executable,
+                    "-c",
+                    "print('http://localhost:2718')",
+                ),
+            ),
+        ],
+        tmp_path,
+    )
+    session.start()
+    try:
+        _publish(tmp_path)
+        session.poll()
+        session.open_front_end("dashboard")
+
+        deadline = time.monotonic() + _DEADLINE_S
+        while session.running("dashboard") is not None or session.url("dashboard"):
+            if time.monotonic() > deadline:
+                pytest.fail("the address outlived the dashboard that printed it")
+            session.poll()
+            time.sleep(0.05)
+
+        assert session.url("dashboard") is None
     finally:
         session.shutdown()
 
@@ -397,7 +531,8 @@ def test_shutting_down_stops_the_windows_and_then_the_broker(tmp_path):
     try:
         _publish(tmp_path)
         session.poll()
-        window = session.open_front_end()
+        assert session.open_front_end() is Opened.STARTED
+        window = session.running("viewer")
         assert window is not None
 
         session.shutdown()

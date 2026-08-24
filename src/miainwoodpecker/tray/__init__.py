@@ -27,6 +27,7 @@ from miainwoodpecker.tray.health import (
 from miainwoodpecker.tray.session import (
     FrontEnd,
     InstrumentSession,
+    Opened,
     SessionState,
     SessionStatus,
 )
@@ -36,6 +37,7 @@ __all__ = [
     "FrontEnd",
     "InstrumentHealth",
     "InstrumentSession",
+    "Opened",
     "ServerHealth",
     "SessionState",
     "SessionStatus",

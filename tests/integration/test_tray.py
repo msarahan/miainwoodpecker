@@ -36,13 +36,13 @@ from miainwoodpecker.tray.health import Condition
 from miainwoodpecker.tray.session import FrontEnd, InstrumentSession, SessionState
 
 if typing.TYPE_CHECKING:
+    import subprocess
     from collections.abc import Iterator
     from pathlib import Path
 
 _CAMERA_SERVER = "miainwoodpecker.devices.camera_server"
 _DEADLINE_S = 120.0
 _SLEEPER = "import time; time.sleep(60)"
-_WINDOWS = 2
 
 
 def _front_ends() -> list[FrontEnd]:
@@ -259,22 +259,74 @@ def test_the_tray_serves_an_instrument_and_opens_windows_on_it(tray):
     assert (session.publish / DEFAULT_FILENAME).exists()
 
     instrument.open_viewer()
+    instrument.tick()
+
+    assert session.open_count("viewer") == 1
+    assert _entry(instrument, "viewer").text() == "Show the viewer"
+
+
+def test_asking_again_shows_the_client_that_is_up_rather_than_a_second(
+    tray,
+    monkeypatch,
+):
+    """
+    A menu entry pressed twice is not a request for two windows.
+
+    It is "where did mine go?", and answering it with a second process
+    is how a column ends up with four viewers on it by four o'clock -
+    each holding its own session directory, and one of them the one
+    somebody was recording into.
+
+    The raise itself is stood in for: bringing another process's window
+    forward is the platform's business and the stand-in front end here
+    has no window at all. What is being pinned is that the tray asked
+    for the running one to be shown instead of starting another.
+    """
+    instrument, session = tray
+    shown = []
+
+    def show(process: subprocess.Popen, url: str | None = None) -> bool:
+        """
+        Stand in for the platform, and say the window was raised.
+
+        Parameters
+        ----------
+        process : subprocess.Popen
+            The client that was already running.
+        url : str | None
+            Where it serves a page, if it does.
+
+        Returns
+        -------
+        bool
+            True, always.
+        """
+        shown.append((process.pid, url))
+        return True
+
+    monkeypatch.setattr(tray_app.raising, "show", show)
+    instrument.open_viewer()
+    instrument.tick()
+    first = session.running("viewer")
+    assert first is not None
+
     instrument.open_viewer()
     instrument.tick()
 
-    assert session.front_ends == _WINDOWS
-    # Two windows on one column is not an accident: arbitrating between
-    # clients is what the broker underneath this is for.
-    assert "2 open" in _entry(instrument, "viewer").text()
+    assert session.open_count("viewer") == 1
+    assert session.running("viewer") is first
+    # And what it did instead was go and find that one.
+    assert shown == [(first.pid, None)]
 
 
 def test_the_window_and_the_dashboard_are_separate_entries(tray):
     """
-    Two front ends, two entries, and neither counted as the other.
+    Two front ends, two entries, and one of each rather than one in all.
 
     They are separate programs wanting separate environments — Qt in
     one, marimo and no Qt in the other — so a single "open the front
-    end" entry could only ever offer one of them.
+    end" entry could only ever offer one of them, and a dashboard being
+    up must not make the viewer's entry say the viewer is.
     """
     instrument, session = tray
 
@@ -283,7 +335,7 @@ def test_the_window_and_the_dashboard_are_separate_entries(tray):
 
     assert session.open_count("dashboard") == 1
     assert session.open_count("viewer") == 0
-    assert "1 open" in _entry(instrument, "dashboard").text()
+    assert _entry(instrument, "dashboard").text() == "Show the dashboard"
     # The viewer's entry is untouched by a dashboard being open.
     assert _entry(instrument, "viewer").text() == "Open a viewer"
 

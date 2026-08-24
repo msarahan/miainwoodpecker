@@ -42,6 +42,8 @@ import contextlib
 import enum
 import logging
 import os
+import re
+import threading
 import time
 import typing
 from dataclasses import dataclass, field
@@ -66,6 +68,26 @@ if typing.TYPE_CHECKING:
     from miainwoodpecker.instrument_config import InstrumentConfig
 
 _LOGGER = logging.getLogger("miainwoodpecker.tray.session")
+
+_URL = re.compile(r"https?://[^\s\"'<>|]+")
+"""
+The first address a front end prints, which is how it is reopened.
+
+Marimo announces where it is listening and includes the access token in
+the query string, so what this catches is a link that works rather than
+a bare host and port that would land on a login page. Deliberately
+greedy about the query string and stopped by whitespace, quotes and the
+box-drawing bars marimo frames its banner with.
+"""
+
+_ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+"""
+Colour codes, removed before a line is logged or searched.
+
+A front end writing to a pipe should not be colouring anything, and
+marimo does anyway; left in, the escape that follows a URL becomes part
+of the URL.
+"""
 
 
 class SessionState(enum.Enum):
@@ -125,6 +147,24 @@ class SessionStatus:
     front_ends: int
     invitation: BrokerInvitation | None = None
     changed: bool = False
+
+
+class Opened(enum.Enum):
+    """
+    What came of asking for a client, which is three things and not two.
+
+    ``STARTED`` is a new one running. ``ALREADY_OPEN`` is one of that
+    kind up already, and is not a refusal: it is the caller's cue to
+    show what is there, which is a window raised or a browser tab
+    opened rather than a message about why nothing happened.
+    ``UNAVAILABLE`` is nothing to open it on - an instrument still
+    starting, or a kind this session was never given a command for -
+    and is the only one worth telling the operator about in words.
+    """
+
+    STARTED = "started"
+    ALREADY_OPEN = "already open"
+    UNAVAILABLE = "unavailable"
 
 
 @dataclass(frozen=True)
@@ -212,6 +252,7 @@ class InstrumentSession:
         self._invitation_path = self._publish / DEFAULT_FILENAME
         self._broker: subprocess.Popen | None = None
         self._running: list[tuple[str, subprocess.Popen]] = []
+        self._urls: dict[str, str] = {}
         self._invitation: BrokerInvitation | None = None
         self._watcher: RemoteBroker | None = None
         self._state = SessionState.STARTING
@@ -361,6 +402,12 @@ class InstrumentSession:
             for label, process in self._running
             if process.poll() is None
         ]
+        alive = {label for label, _ in self._running}
+        for label in [label for label in self._urls if label not in alive]:
+            # A dashboard that has gone takes its address with it: the
+            # next one picks another port and another access token, and
+            # an old link would open a page that does not answer.
+            self._urls.pop(label, None)
         if self._state is SessionState.STARTING:
             self._poll_starting()
         elif self._state is SessionState.SERVING:
@@ -473,15 +520,21 @@ class InstrumentSession:
             changed=changed,
         )
 
-    def open_front_end(self, label: str | None = None) -> subprocess.Popen | None:
+    def open_front_end(self, label: str | None = None) -> Opened:
         """
-        Open a client on the instrument, if there is one to open it on.
+        Start a client on the instrument, unless that kind is already up.
 
-        More than one is allowed and is not an accident: arbitrating
-        between clients is what the broker is for, and two windows on
-        one column - one per detector, or one per person - is a thing
-        people do. So is a window and a dashboard at once, which is why
-        the kind is a parameter rather than a mode.
+        One of each kind, and the second click is a request to *look at*
+        the one that exists rather than to have another. That is the
+        judgement an operator actually makes at a tray icon: a menu
+        entry pressed twice because the window went behind a browser is
+        not an ask for two windows, and answering it with two is how a
+        column ends up with four viewers on it by four o'clock.
+
+        The broker itself has no such restriction and neither does this:
+        a second window started by hand joins the same instrument the
+        way a notebook does. What this declines to do is start one *by
+        accident*.
 
         Parameters
         ----------
@@ -491,20 +544,22 @@ class InstrumentSession:
 
         Returns
         -------
-        subprocess.Popen | None
-            The client, or None if the instrument is not being served
-            yet or nothing of that kind is offered, in which case
-            nothing was spawned.
+        Opened
+            What came of asking. :attr:`Opened.ALREADY_OPEN` is the
+            caller's cue to raise what :meth:`running` returns rather
+            than to report anything.
         """
         if self._state is not SessionState.SERVING:
-            return None
+            return Opened.UNAVAILABLE
         front_end = (
             self._openable.get(label)
             if label is not None
             else next(iter(self._openable.values()), None)
         )
         if front_end is None:
-            return None
+            return Opened.UNAVAILABLE
+        if self.running(front_end.label) is not None:
+            return Opened.ALREADY_OPEN
         process = spawn(
             front_end.command,
             env={
@@ -512,9 +567,107 @@ class InstrumentSession:
                 **front_end.environment,
                 BROKER_ENV_VAR: str(self._publish),
             },
+            capture=True,
         )
         self._running.append((front_end.label, process))
-        return process
+        self._read_output(front_end.label, process)
+        return Opened.STARTED
+
+    def running(self, label: str) -> subprocess.Popen | None:
+        """
+        Return the client of one kind that is up, if one is.
+
+        Parameters
+        ----------
+        label : str
+            The kind - a :attr:`FrontEnd.label`.
+
+        Returns
+        -------
+        subprocess.Popen | None
+            The process, or None if none of that kind is running.
+        """
+        for opened, process in self._running:
+            if opened == label and process.poll() is None:
+                return process
+        return None
+
+    def url(self, label: str) -> str | None:
+        """
+        Return the address one kind of client printed as it started, if any.
+
+        The dashboard is a server with a page on it rather than a window
+        on this desktop, so "show me the one that is already running"
+        means opening its address - and the only thing that knows that
+        address is the process itself, which prints it. A front end that
+        prints no URL has none, which is every window.
+
+        Parameters
+        ----------
+        label : str
+            The kind - a :attr:`FrontEnd.label`.
+
+        Returns
+        -------
+        str | None
+            The first address it printed, or None.
+        """
+        return self._urls.get(label)
+
+    def _read_output(self, label: str, process: subprocess.Popen) -> None:
+        """
+        Follow a client's output on a thread, for the log and for its URL.
+
+        Read at all because a tray application has no console: without
+        this, whatever a front end says on its way up - a traceback, a
+        port it chose - goes nowhere. Read on a *thread* because the
+        pipe has to be drained whether anybody is interested or not; a
+        child whose output nobody reads blocks once the buffer fills,
+        which for marimo is a few seconds in.
+
+        Parameters
+        ----------
+        label : str
+            The kind, for the log line and for recording its URL.
+        process : subprocess.Popen
+            The client, spawned with its output captured.
+        """
+        if process.stdout is None:
+            return
+        thread = threading.Thread(
+            target=self._follow,
+            args=(label, process),
+            name=f"tray-{label}-output",
+            daemon=True,
+        )
+        thread.start()
+
+    def _follow(self, label: str, process: subprocess.Popen) -> None:
+        """
+        Log a client's output until it ends, noting the first URL in it.
+
+        Parameters
+        ----------
+        label : str
+            The kind.
+        process : subprocess.Popen
+            The client being followed.
+        """
+        with contextlib.suppress(OSError, ValueError):
+            for line in process.stdout:
+                said = _ANSI.sub("", line).rstrip()
+                if not said:
+                    continue
+                _LOGGER.info("%s: %s", label, said)
+                if label in self._urls:
+                    continue
+                found = _URL.search(said)
+                if found is not None:
+                    # One assignment into a dict, read from the main
+                    # thread and never mutated in place, which needs no
+                    # lock of its own.
+                    self._urls[label] = found.group(0)
+                    _LOGGER.info("the %s is at %s", label, found.group(0))
 
     def health(self) -> health_report.InstrumentHealth:
         """

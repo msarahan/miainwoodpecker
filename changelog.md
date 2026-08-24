@@ -20,7 +20,24 @@
   separate programs wanting separate environments — Qt in one, marimo
   and no Qt in the other — so `pixi run tray` runs three: the vendor
   stack in one, the window in another that demonstrably does not contain
-  it, and marimo in a third that contains neither. It publishes to
+  it, and marimo in a third that contains neither.
+  **One of each kind, and the second click goes and finds it.** An entry
+  pressed again because a window went behind a browser is not a request
+  for two windows, and answering it with one is how a column ends up
+  with four viewers on it by four o'clock — each with its own session
+  directory, one of them the one somebody was recording into. So the
+  entry reads "Show the viewer" once one is up, and does: on Windows,
+  the window is found by process id and brought to the front; a
+  dashboard is a page rather than a window, so its address is opened
+  again and the browser focuses the tab that already has it. That
+  address is read from what the process printed on its way up — nothing
+  else knows the port marimo chose or the access token it minted, and a
+  link without the token opens a login page. Where a platform has no way
+  to raise another process's window, which is everywhere but Windows,
+  the tray says a viewer is already open rather than pretending. Anyone
+  who wants a second window still starts one by hand against the
+  published invitation; what this declines to do is start one by
+  accident. It publishes to
   `~/.miainwoodpecker` by default — beside the instrument configuration,
   where a notebook already looks when it is told nothing at all — because
   an instrument held open for people to join has to be findable, which is
