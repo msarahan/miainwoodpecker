@@ -19,9 +19,15 @@ cannot be done from anywhere else:
   browser dashboard is the other front end this project has and it is
   not a variant of the window: it wants marimo and no Qt, so it runs in
   its own environment and gets its own entry.
+- *Instrument health*, because a broker over a configured microscope is
+  a broker over several device servers, and from outside them the only
+  evidence of a spectrometer that did not come up is a menu that is one
+  item short. See :mod:`miainwoodpecker.tray.health`.
+- *Quit*, which stops the windows, stops the broker, and parks the
+  instrument - in that order, and asking rather than killing.
 
-Both of those become *Show the ...* once one is running, and that is a
-deliberate reading of what the second click means. An entry pressed
+**The first two become "Show the ..." once one is running**, and that is
+a deliberate reading of what the second click means. An entry pressed
 again because a window went behind a browser is not a request for a
 second window, and answering it with one is how a column ends up with
 four viewers on it by four o'clock. So the tray keeps one of each kind
@@ -30,12 +36,6 @@ for how, and for the two ways that can honestly fail. Anyone who
 genuinely wants a second window still starts one by hand, against the
 same published invitation; what this declines to do is start one by
 accident.
-- *Instrument health*, because a broker over a configured microscope is
-  a broker over several device servers, and from outside them the only
-  evidence of a spectrometer that did not come up is a menu that is one
-  item short. See :mod:`miainwoodpecker.tray.health`.
-- *Quit*, which stops the windows, stops the broker, and parks the
-  instrument - in that order, and asking rather than killing.
 
 **Quitting asks first, and the question is not a formality.** This one
 menu item ends everybody's session, not just the session of whoever
