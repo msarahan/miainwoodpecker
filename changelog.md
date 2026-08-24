@@ -4,6 +4,35 @@
 
 ### Added
 
+- **A pass reads back in HyperSpy as what it is: a scan position over a
+  diffraction pattern.** The pass writer's `NXdata` groups carried no
+  `interpretation`, so — measured against RosettaSciIO 0.14.0 — a 4D cube
+  arrived with all four axes marked navigation, which is a shapeless
+  stack rather than a cube, and HyperSpy built a `BaseSignal` where a
+  `Signal2D` was wanted. All three kinds now say what they are: `"image"`
+  for the diffraction cube and for a scan channel, `"spectrum"` for a
+  spectrum image. The cube now reads as two navigation axes over two
+  signal axes, which is also the shape py4DSTEM's `DataCube` is.
+- **The cube is published a second time where NXem documents an image.**
+  `measurement/eventID/<detector>` is an `NXimage` holding an `image_4d`
+  `NXdata` in NeXus's own vocabulary — `intensity`, `axis_m` down to
+  `axis_i` — every dataset a **hard link** to the plottable group, so the
+  bytes are written once and the descriptive axis names (`scan_y`,
+  `det_x`) survive where a person reads them. Same trade `entry/data`
+  already makes against `entry/data_<name>`.
+  **Named for the detector rather than `imageID`, which was measured.**
+  NXem declares both a named `imageID` concept and, through
+  `NXem_event_data`, an unnamed `NXimage` one. A group called `imageID`
+  matches the former, and pynxtools then demands an `@AXISNAME_indices`
+  attribute no instantiated file can supply — the same
+  NXDL-template-versus-instance confusion `interpretation` ran into
+  ([pynxtools#834](https://github.com/FAIRmat-NFDI/pynxtools/issues/834)).
+  Named for the camera it matches the unnamed concept, validates clean,
+  and answers "which detector is this" without opening a second group.
+  Checked, so the claim is not larger than it is: a `signal` attribute
+  pointing at a dataset that is not there **is** caught there; a detector
+  axis labelled in kilograms is **not**.
+
 - **The instrument as an application in the notification area: right-click
   to open a window on it, to see how its device servers are doing, or to
   stop everything.** `pixi run serve` already holds a microscope open for

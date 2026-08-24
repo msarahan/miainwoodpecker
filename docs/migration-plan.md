@@ -832,6 +832,57 @@ problem — read their source and docs before designing our own adapters:
     of `nxdata_only=True`, `use_default=True` (which our root `@default` then
     steers), or `dataset_path="/entry/data"` returns exactly the one — and
     `dataset_path` needs the leading slash or it silently matches nothing.
+- [x] Publish a pass's 4D cube where NXem documents an image, and decide
+  what to do about `NXspectrum` — **NXimage adopted, NXspectrum declined
+  for now**, on measurement rather than taste. Prompted by
+  [pynxtools#834](https://github.com/FAIRmat-NFDI/pynxtools/issues/834),
+  where a maintainer noted that NXem "typically uses specializations of
+  `NXdata` like NXspectrum and NXimage".
+  - **What NXem actually models, read out of the NXDL shipped in
+    `pynxtools` 0.15 rather than from the manual.** `NXimage` defines
+    `image_1d` through `image_4d` and `stack_1d` through `stack_3d`;
+    `NXspectrum` defines `spectrum_0d` through `spectrum_3d` and
+    `stack_0d`/`stack_2d`/`stack_3d`. So a 4D-STEM cube is `image_4d`
+    `(n_m, n_k, n_j, n_i)`, an EELS or EDS map is `spectrum_2d`
+    `(n_j, n_i, n_energy)` — which is already the layout
+    `storage/spectra.py` writes — and 4D spectral data would be
+    `spectrum_3d`. The concern that 4D fits neither class does not hold.
+    What the classes do **not** carry is the difference between a
+    real-space scan axis and a reciprocal-space detector axis; `image_4d`
+    calls them slowest to fastest and nothing more, so the unit string
+    stays the whole carrier, exactly as the axis-calibration work found.
+  - **The placement rule, re-measured.** NXem documents `NXimage` at
+    `measurement/eventID/imageID`, `simulation/results` and `roiID/img`,
+    and `NXspectrum` at `measurement/eventID/spectrumID`. An `NXimage`
+    put at `/entry/img` is reported invalid. A plain `NXdata` at
+    `entry/data` is documented by `NXentry` itself, which is why this
+    project's files validate today and why they were written that way.
+  - **The name matters more than the place.** A group named `imageID`
+    matches NXem's *named* concept and pynxtools then requires an
+    `@AXISNAME_indices` attribute that no instantiated file can supply —
+    the NXDL-template-versus-instance confusion again. A group named for
+    the detector matches the *unnamed* `NXimage` in `NXem_event_data` and
+    validates with zero problems. So `storage/passes.py` writes
+    `measurement/eventID/<detector>`, hard-linked to the plottable group.
+    That validation is shallow, and it was checked how shallow: a
+    dangling `signal` attribute is caught, a detector axis labelled in
+    kilograms is not.
+  - **`NXspectrum` declined, because it would cost a reader something and
+    buy nothing.** The deciding criterion is a seamless path into HyperSpy
+    and py4DSTEM, and neither library looks for `NXspectrum`; both reach
+    the data through `NXdata`, which spectrum recordings already spell in
+    `NXspectrum`'s field names. Adding the class as a second group would
+    add one more signal to a bare `file_reader` — measured: 17 signals
+    become 22 for a pass file — for no reader-side gain. The vocabulary
+    stays; the class waits for someone who consumes NXem.
+  - **What a pass file would still need before it could claim NXem**,
+    measured by claiming it and reading the complaints: `interpretation`
+    (nine of sixteen problems, and the subject of the upstream issue),
+    this project's own `pass_id` and `camera_id` attributes, which are
+    undocumented concepts wherever they sit, and `intensity/@units`,
+    since `NXimage` declares the signal `NX_UNITLESS` while the same
+    hard-linked dataset says `counts` for the reader's benefit. None of
+    it bites today: `PassWriter` claims no application definition.
 - [x] Per-axis calibration for camera frames, configurable per acquisition —
   [`src/miainwoodpecker/storage/calibration.py`](../src/miainwoodpecker/storage/calibration.py).
   Closes the gap §7 recorded: camera frames used to fall back to `"pixel"`
