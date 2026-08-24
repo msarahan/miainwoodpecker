@@ -77,6 +77,63 @@
   — so `pixi run instrument --config …` now works for the same reason the
   tray does.
 
+- **A spectrometer's readout, displayed as a spectrum.** Every panel in
+  this application was an array on a napari canvas, and a projecting
+  detector's readout is not one: it is counts against energy, and the
+  two things a display of it must do — put a number on a *y* axis and
+  label the *x* axis in electronvolts — are the two an image layer
+  cannot. Pushed into one, an EEL spectrum is a picture one pixel high.
+  It never got that far. A napari layer is added with a
+  `FrameCalibration`, which is exactly two axes, so the viewer's own
+  helper raised `ValueError: not enough values to unpack` on the first
+  rank-1 frame that reached it — putting a spectrometer into `projected`
+  and starting it was a way to stop the live view.
+  **`viewer/plots.py` is a pyqtgraph curve**, and
+  `documents.PanelDocument` is what puts a plain widget into the same
+  MDI area the napari viewers live in, so the spectrum is a panel like
+  any other: it tiles, closes, raises and takes the View menu's "Fit
+  panel to data" alongside the images. Which display a frame gets is
+  decided by the **rank of the array and nothing else** — a camera's
+  readout mode changes it between one frame and the next, so the shape
+  is the fact where the detector's label would be a guess — and a camera
+  switched between imaging and projecting keeps one window rather than
+  accumulating two.
+  **`axes.spectrum_axis` is the 1D answer to the question
+  `axes.frame_calibration` cannot be asked.** It reads the dispersion
+  from where a projecting detector already writes it, and reports
+  anything that is *not* an energy axis as bare channels: one axis of
+  counts against a real-space ruler is not a spectrum, and labelling it
+  in electronvolts it never had would be worse than saying "channel".
+  **The unit is the detector's, and is not re-prefixed.** pyqtgraph
+  reads a unit as a base SI quantity and adds a prefix to keep tick
+  numbers small, which is right for volts and wrong for two of the three
+  spellings this project accepts for energy. A real monochromated EELS
+  spectrum calibrated in meV came back labelled `energy (kmeV)` —
+  kilo-milli-electronvolts — with its axis divided by a thousand to
+  match. Auto-prefixing is off; an adapter converts units once, on the
+  way in.
+- **A spectrum image, watched in the dimension it is acquired in.** A
+  pass already opened a panel showing a virtual-detector image as it
+  filled, which is one number per beam position — and that is the whole
+  of what it can be. A spectrometer parked off the edge of the loss, or
+  a drift tube that never moved, produces a map indistinguishable from a
+  good acquisition: every pixel sums to a plausible number. Minutes
+  later there is a file, and the acquisition has to be done again.
+  `PassPreview` now keeps the **last 1D readout written and the beam
+  position it came from**, and a second panel draws it as a curve
+  captioned `position 23, 17 of 64x64`. It costs no device change and no
+  second write: the preview already tees `scan_synchronised`'s
+  destinations, so this is the same write, on the same thread, reduced a
+  second way. Rank 1 only — a spectrum is a few kilobytes and copying one
+  per position is a memcpy nobody can measure, where a 512x512
+  diffraction pattern is a megabyte and doing the same would be a
+  gigabyte a second to feed a preview; a 4D pass therefore gets no
+  spectrum panel, reported by the readout being absent rather than by the
+  display second-guessing the mode the operator set.
+  The copy is taken **at write time**, so what is drawn is one position's
+  readout rather than whatever a device's scratch buffer holds by the
+  time the display gets to it.
+
 - **A live view that keeps up: 2 fps to 10, which is the ceiling of the
   thing it runs in.** The browser dashboard's fastest refresh option was
   `0.5s`, so two frames a second was not what the stack managed — it was
@@ -124,6 +181,62 @@
   the kernel for as long as it runs, so every other cell — Acquire
   included — is frozen until it stops. Measured: a button pressed two
   seconds into a twenty-second stream did not respond for thirty.
+- **Every dashboard log entry says where its data is, and can put it
+  somewhere if it is nowhere.** The session log recorded one path per
+  acquisition and, for anything acquired with no session directory,
+  nothing at all: the frames went into a thumbnail and were released, so
+  the shot that turned out to matter could not be rescued. Now an entry
+  carries one row per **signal**, each with its own picture, its own
+  metadata and its own answer to "where is it" — a path if it was
+  written, a **Save** button if it was not.
+  **An entry is an item, and an item is several signals — one file
+  each.** The unit an operator thinks in is not one array: it is a
+  spectrum image *with* the survey that says where it was taken and the
+  follow-up image that says what the beam did to the specimen while the
+  map ran, or one scan pass read out on HAADF and BF at once.
+  `Session.record_datasets` writes each of those to its own NeXus file,
+  streaming all of them at once so nothing is buffered waiting for a
+  sibling to finish, and the files of one item share a sequence number
+  and timestamp — `0007-scan-haadf-…nxs` beside `0007-scan-bf-…nxs`.
+  Separate files rather than one combined entry, which the format would
+  allow (`storage/passes.py` does it for a pass, whose signals are
+  pixel-aligned by construction): an item's parts are acquired at
+  different times with different geometry, a person opens one at a time,
+  and `hs.load`, a NeXus viewer and a file manager all take a file and
+  give back a signal. It makes "send me the HAADF" a copy rather than an
+  extraction. Each file also records `session_dataset`, so one renamed
+  or copied out of the session still says which signal it is.
+  **The acquisition names its own signals**, so nothing in the log or
+  the storage layer had to learn what a recipe is.
+  `AcquisitionRequest.build` yields `(name, frame)` pairs; `by_channel`
+  splits a simultaneous multi-detector series by the detector each frame
+  reports, and `named` labels a step, so a survey → SI → follow-up
+  recipe is `itertools.chain` of three `named` calls and lands as one
+  item with three files. Beside the frame rather than in its metadata,
+  because frame metadata is the *device's* vocabulary and a survey HAADF
+  and a follow-up HAADF carry byte-identical `channel_name`.
+  **`dashboard.saving` is the way out for data with no file.** One
+  signal at a time through the browser (`mo.download` over a NeXus file
+  rendered on demand — a callable, so nothing is encoded on the display
+  tick, which the live view now runs at up to ten a second, for a button
+  nobody pressed), or every held signal at once into a directory named
+  at the bottom of the page. The flush
+  opens that directory as a session, so what comes out is
+  indistinguishable from data acquired into it in the first place, and
+  stamps each file with the time the data was *acquired* rather than the
+  time it was saved — an 18:00 flush of an afternoon's work must not
+  collapse its only ordering. Writing a signal releases its frames,
+  which is also how a long shift stops filling the kernel up.
+  **Failures are per signal.** A projected frame carrying no energy
+  calibration cannot be stored as a spectrum, and that is no reason to
+  lose the HAADF acquired beside it; each signal of an item is written
+  on its own into a shared item, so the report names what went and what
+  did not, and anything that failed is still in memory to try elsewhere.
+  `SessionLog` gains exactly one mutation for this, `mark_stored`, which
+  can only move a signal from memory to a path and can say nothing about
+  what was acquired — where the bytes live is not part of the account of
+  the shift, and a log that could not record a save would go on telling
+  an operator their data was unsaved after they had saved it.
 
 - **A file per microscope that says what hardware it has, and starts
   it.** An instrument is not one device server: SuperSTEM 3 is a Nion
@@ -329,6 +442,30 @@
 
 ### Changed
 
+- **`acquisition.record` is now a loop over a `FrameSink`, and the sink
+  is public.** Same file either way — it dispatches on the first frame's
+  rank exactly as before, so a projected readout still lands in
+  `NXspectrum`'s layout and an empty series still writes the empty,
+  finalized frame file. What is new is that the loop can be turned
+  inside out: a caller may hold *several* recordings open and push
+  frames at whichever one each belongs to, which is what writing a
+  simultaneous two-detector scan to two files requires. `record` still
+  pulls its first frame before the sink exists, so a device that fails
+  on its very first frame leaves no file at all.
+- **`Session` gained `open_item`, `record_datasets` and `reserve_named`,
+  and `storage.nexus.DEFAULT_FLUSH_EVERY` is public.** The first three
+  are the multi-signal write path above; the last removes a duplicated
+  constant — the flush interval was spelled separately in `nexus.py` and
+  `spectra.py` with one measurement behind both, and `sequence.py` now
+  needs it too.
+- **The dashboard's `AcquisitionRequest.build` yields `(name, frame)`
+  pairs rather than frames**, and `SessionLogEntry` carries
+  `datasets: tuple[LoggedDataset, ...]` in place of its single `shape`,
+  `dtype`, `thumbnail`, `metadata` and `recording_path` fields.
+  `highlights()` takes a `LoggedDataset` rather than an entry. A
+  multi-detector scan is now labelled `scan` with a signal per detector,
+  where it used to be one entry called `scan-HAADF-MAADF` holding both
+  detectors' frames interleaved in one stack.
 - **The live view refreshes at 60 fps, up from 30.** The display timer
   was a hard-coded 33 ms with nothing behind the number. Measured end to
   end — through `refresh_display`, the document board and napari, with a
@@ -410,6 +547,14 @@
   `pixi lock`.
 
 ### Fixed
+
+- **A pass's display stopped one tick short of the end.** `_poll_pass`
+  drew the previews and *then* asked whether the worker was still
+  running, so the acquisition that finished in between was drawn from
+  the state it had a few beam positions earlier — and nothing drew again,
+  because the next poll returns at the top. The finished map was missing
+  its last positions and the spectrum was from the second-to-last one.
+  Asked first, drawn second.
 
 - **A device server that lost its port could be reported as one that
   was running and wedged.** The client bounds every connection attempt
@@ -701,6 +846,17 @@
   one sitting and wrong for a shared microscope. `pixi run serve` is
   that with the vendor environment chosen and the invitation published
   into the working directory, where a notebook looks by default.
+  **A front end is given five seconds to close, not thirty.** Found by
+  an operator pressing Ctrl-C a second after the window was launched:
+  "pid 24332 did not stop within 30s; terminating it", with the
+  instrument sitting unparked behind a front end that was never going
+  to answer. Measured afterwards - a napari process asked to stop
+  during its own startup stops responding to console control events
+  altogether, and keeps not responding however many times it is asked,
+  while the same window once it is up closes in 0.1s. The thirty
+  seconds belong to the broker, which spends them parking; a window has
+  nothing to park, and the worst it loses by being terminated is a
+  recording the storage layer already reports as unfinalized.
   The launcher installs the same three signal handlers the broker does
   (`SIGINT`, `SIGTERM`, `SIGBREAK`), because a supervisor stopping a
   process whose defaults terminate the interpreter without unwinding

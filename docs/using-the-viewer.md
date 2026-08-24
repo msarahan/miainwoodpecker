@@ -504,6 +504,20 @@ why. That is not a bug to work around: summing one axis of a Ronchigram
 gives a line of numbers on an *angular* axis, which is not a spectrum,
 and the file it landed in would be a spectrum recording that is not one.
 
+**A projecting detector's panel is a plot, not a picture.** Counts run
+up the y axis and the detector's own energy calibration along the x —
+in electronvolts, so the zero-loss peak sits at 0 and an edge is where
+the edge is. It is an ordinary panel otherwise: it tiles, closes and
+raises with the images, and **Fit panel to data** (Ctrl+0) brings the
+whole spectrum back after you have zoomed into part of it. Drag to pan
+and scroll to zoom, on either axis; right-click for pyqtgraph's own
+menu.
+
+A detector that reports no dispersion still plots — against channel
+number, labelled as such. That is the honest answer rather than an
+error, and it is also the visible sign that the calibration did not
+arrive.
+
 ### Acquiring a spectrum image
 
 **Acquire spectrum image** drives the probe over a grid of
@@ -536,6 +550,18 @@ the signal summed at each position, formed the same way one is formed
 offline. That is what makes it worth looking at rather than a progress
 bar — drift, contamination, or a probe scanning vacuum are all visible
 in it, minutes before the file exists.
+
+**And you can watch the spectrum.** A second panel,
+`Acquiring (…): spectrum`, shows the spectrum at the beam position the
+probe has just left, captioned with that position —
+`position 23, 17 of 64x64`. The two answer different questions and the
+map cannot answer this one: it is one number per position, so a
+spectrometer left on the wrong energy offset, or a drift tube that never
+moved, produces a map that looks exactly like a good acquisition. On the
+curve it is obvious in the first second rather than at analysis time.
+
+A pass keeping whole detector images gets no spectrum panel, because
+there is no spectrum in a 4D stack.
 
 The window stays live throughout. The pass runs on its own thread and
 the screen samples it, so the live view keeps running, the panels still

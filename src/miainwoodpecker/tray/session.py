@@ -51,6 +51,7 @@ from miainwoodpecker.broker.invitation import DEFAULT_FILENAME, BrokerInvitation
 from miainwoodpecker.broker.remote import connect_broker
 from miainwoodpecker.launcher import (
     BROKER_ENV_VAR,
+    FRONT_END_TIMEOUT_S,
     INVITATION_TIMEOUT_S,
     spawn,
     stop,
@@ -633,7 +634,12 @@ class InstrumentSession:
         # holding a connection to a broker it is about to ask to stop.
         self._close_watch()
         for _, process in self._running:
-            stop(process)
+            # The front end's timeout rather than the broker's, for the
+            # reason :data:`~miainwoodpecker.launcher.FRONT_END_TIMEOUT_S`
+            # measures - and more so here, where several may be open and
+            # the broker is not asked to park until the last of them has
+            # been dealt with.
+            stop(process, FRONT_END_TIMEOUT_S)
         self._running.clear()
         if self._broker is not None:
             _LOGGER.info("stopping the broker; the instrument will be parked")

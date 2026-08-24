@@ -26,6 +26,19 @@ one-window-per-dataset arrangement in ``viewer/documents.py`` is not a
 preference this feature works around but the thing that makes it
 possible at all.
 
+
+A spectrum has no layer, and is here anyway
+-------------------------------------------
+:func:`spectrum_axis` answers the same question for a rank-1 readout,
+whose display is a plot rather than a napari layer (see
+:mod:`miainwoodpecker.viewer.plots`). It lives here because the question
+is this module's — "what does this axis measure, and what should the
+display say it is" — and because the alternative was for the plot to
+open ``storage/calibration.py`` itself and re-decide it. The 2D path
+answers with layer keywords and the 1D path with an axis, for the plain
+reason that a curve has no ``scale``: it is drawn *at* its coordinates
+rather than stretched to them.
+
 Geometry is applied only where the axes are commensurable
 ---------------------------------------------------------
 ``layer.scale`` is a *geometric* claim: it says how long each pixel is,
@@ -124,6 +137,63 @@ def frame_calibration(
     """
     height, width = data.shape[-2:]
     return resolve_frame_calibration((height, width), metadata=metadata)
+
+
+def spectrum_axis(
+    data: np.ndarray,
+    metadata: Mapping[str, object] | None,
+) -> AxisCalibration:
+    """
+    Resolve the axis a spectrum's counts are plotted against.
+
+    The 1D counterpart of :func:`frame_calibration`, and it exists
+    because that function cannot be it: a
+    :class:`~miainwoodpecker.storage.calibration.FrameCalibration` is
+    exactly two axes, so asking it about a rank-1 readout raises rather
+    than answering. A projecting detector delivers one axis of counts,
+    and this says what that axis measures.
+
+    **The dispersion is read from where a projecting detector already
+    writes it** — ``metadata["calibration"]["x"]`` — by resolving the
+    readout as the single row it is. That is not a convention invented
+    here: a detector that sums its non-dispersive direction keeps the
+    fast axis, which is ``x``, and leaves ``y`` uncalibrated.
+
+    **An axis that is not energy is reported as bare channels**, rather
+    than as whatever else it claims to be. One axis of counts against a
+    real-space or angular ruler is not a spectrum — it is the "line of
+    numbers on an angular axis" a projected Ronchigram would give, which
+    :class:`~miainwoodpecker.devices.interface.Spectrum` refuses to be
+    built from — so plotting it against electronvolts it never had would
+    put an energy label on a number that is not one. Channels are the
+    honest fallback and they are still a usable x-axis.
+
+    Parameters
+    ----------
+    data : np.ndarray
+        The spectrum, with counts on its **last** axis — the invariant
+        :class:`~miainwoodpecker.devices.interface.Spectrum` states, so
+        this is equally the right question to ask of a rank-1 readout
+        and of one position taken out of a spectrum image.
+    metadata : Mapping[str, object] | None
+        The frame's acquisition metadata.
+
+    Returns
+    -------
+    AxisCalibration
+        The dispersive axis, or the uncalibrated channel axis when the
+        metadata describes no energy calibration.
+    """
+    length = int(data.shape[-1])
+    # Resolved as a one-row frame: the calibration model's smallest unit
+    # is a pair of axes, and a height of 1 is what a projected readout
+    # is. Only a 'centered' spec consults a length, and the length that
+    # matters - the dispersive one - is passed truthfully.
+    calibration = resolve_frame_calibration((1, length), metadata=metadata)
+    energy = calibration.energy_axis_name()
+    if energy is None:
+        return AxisCalibration()
+    return calibration.axis(energy)
 
 
 def commensurable(calibration: FrameCalibration) -> bool:
