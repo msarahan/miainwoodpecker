@@ -103,6 +103,20 @@ line names what actually landed — leave the spectrometer imaging and you
 get a 4D stack instead, which is a real experiment rather than a
 mistake, and the line says so.
 
+**Two panels open while it runs**, and they answer different questions.
+`Acquiring (eels_camera)` is the virtual-detector map — one number per
+beam position, which is where drift, contamination and vacuum show up.
+`Acquiring (eels_camera): spectrum` is the spectrum at the position the
+probe is on, captioned with that position, which is where "the
+spectrometer is not on the loss I set it to" shows up. A map cannot say
+that: a spectrometer parked off the edge sums to a perfectly plausible
+number at every pixel.
+
+You can also just start the spectrometer with **Detector readout** on
+`projected` and no pass at all. Its panel is then a plot rather than a
+picture, which is what a 1D readout is; see "A spectrum is a plot"
+below.
+
 **What the spectrum contains, and why each part is there.** A zero-loss
 peak at 0 eV, silicon and amorphous-carbon plasmons, the power-law
 background every EELS quantification fits and subtracts, and the
@@ -171,6 +185,37 @@ uses — `add_image`, `add_shapes`, and membership, lookup and deletion on
 `napari.Viewer` still works wherever the board does, which is why every
 widget test constructs one directly and why a single-canvas window
 remains a supported way to run the application.
+
+### A spectrum is a plot, and napari has no plot
+
+`viewer/plots.py` is a pyqtgraph curve in a `QWidget`, and
+`documents.PanelDocument` is what puts a plain widget into the same MDI
+area the napari viewers live in. A projecting detector's readout goes
+there instead of into an image layer, decided by the **rank of the
+array** and nothing else — a camera's readout mode can change between
+one frame and the next, so the shape is the fact and the label would be
+a guess.
+
+Before this existed, a 1D frame did not merely display badly: it could
+not be displayed at all. `axes.frame_calibration` unpacks a height and a
+width from `data.shape[-2:]`, and a spectrum has one axis, so putting a
+spectrometer into `projected` and starting it raised `ValueError` out of
+the display timer. `axes.spectrum_axis` is the 1D answer to the same
+question, and it reports anything that is not an energy axis as bare
+channels rather than labelling counts with a ruler they were not
+measured against.
+
+Two things worth knowing before editing it:
+
+- **The colours come from the Qt palette**, not from a constant here.
+  napari sets that palette from its theme for the whole application, so
+  the curve and axes follow light or dark without this module knowing
+  napari exists.
+- **The plot is a document like any other.** Tiling, closing, raising
+  and the View menu all work on it, which is why `DocumentArea` holds
+  `Document | PanelDocument` and the View menu dispatches by method
+  *name*: a plot has no "actual resolution" and answers by doing
+  nothing, rather than by the menu changing as panels come and go.
 
 **Qt does not promise when move, resize and zoom events arrive**, and
 this module reads all three to tell the operator's actions from its own.

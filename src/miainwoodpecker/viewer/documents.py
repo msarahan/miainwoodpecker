@@ -69,6 +69,23 @@ so every existing test that builds the widget against one keeps passing
 and a single-canvas window remains a supported way to run this
 application.
 
+Not every dataset is a layer
+----------------------------
+A spectrometer's projected readout is one axis of counts, and nothing
+napari draws can display it (see :mod:`miainwoodpecker.viewer.plots`).
+It is a dataset all the same, so it gets a window like the rest:
+:class:`PanelDocument` holds a plain widget instead of a viewer,
+:meth:`DocumentArea.open_panel` opens one, and
+:meth:`DocumentBoard.panel` is how the live display reaches it. Tiling,
+placement, raising and closing are shared, because none of those care
+what is inside a window — only the layer routing does, and it asks
+:func:`_layers_of` rather than assuming there are any.
+
+A camera keeps its name across that boundary: a spectrometer switched
+between imaging and projecting is one dataset that changed shape, so the
+window is replaced in place rather than a second one opening beside it
+under the same title.
+
 One behaviour a plain viewer has no opinion about is asked for through
 ``metadata``, which napari accepts and ignores on any layer:
 :data:`ATTACHED_TO` names the layer an annotation belongs to, so
@@ -141,6 +158,14 @@ _PACK_SHRINK = 0.15
 
 _MIN_DOCUMENT_WIDTH = 320
 _MIN_DOCUMENT_HEIGHT = 240
+
+# The shape a plot opens at: wide, and half as tall. A spectrum is long
+# in one direction and read across, so a panel as tall as it is wide
+# spends its screen on empty counts above the curve. Two to one is what
+# DigitalMicrograph and HyperSpy both open a spectrum in.
+_PLOT_WIDTH = 640
+_PLOT_ASPECT = 2.0
+
 #: Candidate positions tried per axis when placing a document into a
 #: hand-arranged area. Coarse on purpose: this picks a clear spot, it
 #: does not solve a packing problem.
@@ -556,6 +581,183 @@ class Document:
             self.viewer.close()
 
 
+class PanelDocument:
+    """
+    A document whose content is a plain widget rather than a viewer.
+
+    The spectrum plot is one (see :mod:`miainwoodpecker.viewer.plots`),
+    and it is here because a spectrometer's readout is a dataset like any
+    other: it deserves a window of its own, tiled beside the images, and
+    closing it should mean the same thing as closing theirs. What it does
+    not have is a napari viewer, a camera, layers, or a picture with an
+    aspect ratio — so this implements the same small protocol
+    :class:`DocumentArea` drives every document through, and answers the
+    parts that do not apply by saying so rather than by pretending.
+
+    **Duck-typed rather than a shared base class**, for the reason the
+    module docstring gives about :class:`DocumentBoard`: the two have a
+    protocol in common and nothing else, and a base class holding one
+    would be a place for napari behaviour to leak into a widget that has
+    none.
+
+    Parameters
+    ----------
+    name : str
+        The dataset's name; the window title, and the key the area holds
+        it under.
+    widget : QtWidgets.QWidget
+        The widget filling the window.
+    window : QtWidgets.QMdiSubWindow
+        The sub-window it was put into.
+    """
+
+    def __init__(
+        self,
+        name: str,
+        widget: QtWidgets.QWidget,
+        window: QtWidgets.QMdiSubWindow,
+    ) -> None:
+        self.name = name
+        self.widget = widget
+        self.window = window
+        self.expected_geometry: QtCore.QRect | None = None
+
+    @property
+    def scaled_by_hand(self) -> bool:
+        """
+        Whether the operator chose this panel's scale themselves.
+
+        Always False. There is no scale to choose: a plot has no pixels
+        that could be shown one for one, and re-applying its one natural
+        shape when the area re-tiles gives the same answer every time.
+        Zooming *inside* the plot is pyqtgraph's own and survives all of
+        this untouched, because nothing here touches its view.
+
+        Returns
+        -------
+        bool
+            False.
+        """
+        return False
+
+    def size_to_content(self, available: QtCore.QSize) -> None:
+        """
+        Give the window the shape a curve is read in.
+
+        A plot has no content size the way an image does — no pixel count
+        to show one for one and no aspect ratio the data asserts — so it
+        gets a shape chosen for what it is: wide, because a spectrum is
+        long in one direction and an energy axis is read across, and only
+        as wide as there is room for.
+
+        Parameters
+        ----------
+        available : QtCore.QSize
+            The most canvas this window may take.
+        """
+        canvas = self.widget
+        if canvas.width() <= 0:
+            # Never laid out. The chrome below is measured as "whatever
+            # the window is bigger than its canvas by", and against a
+            # zero-width canvas that is the entire window - so the panel
+            # would open at its own width plus the default window's, and
+            # keep growing every time the area re-tiled.
+            return
+        margin_x = self.window.width() - canvas.width()
+        margin_y = self.window.height() - canvas.height()
+        width = max(_MIN_DOCUMENT_WIDTH, min(_PLOT_WIDTH, available.width()))
+        height = max(
+            _MIN_DOCUMENT_HEIGHT,
+            min(round(width / _PLOT_ASPECT), available.height()),
+        )
+        self.window.resize(width + margin_x, height + margin_y)
+
+    def refit(self) -> None:
+        """
+        Do nothing; the plot fits itself.
+
+        An image has to be re-fitted when its window changes size,
+        because the view transform that filled the old one clips or
+        letterboxes the new one. A pyqtgraph view has no such transform
+        to go stale: it holds a data *range*, and redraws it into
+        whatever rectangle it is given.
+        """
+
+    def show_at_actual_resolution(self) -> None:
+        """
+        Do nothing; there is no such thing here.
+
+        Offered on every document by the View menu, and meaningless for
+        this one: "one screen pixel per acquired pixel" is a question
+        about a picture, and a spectrum's channels are not pixels. It
+        answers by leaving the plot alone rather than by being absent
+        from the menu, which would make the menu change as panels came
+        and went.
+        """
+
+    def fit_to_panel(self) -> None:
+        """
+        Show the whole spectrum again, undoing a zoom.
+
+        The View menu's "Fit panel to data" does have a meaning here, and
+        it is pyqtgraph's own auto-range: the counterpart of taking an
+        image's whole extent back into view.
+        """
+        with contextlib.suppress(Exception):
+            self.widget.fit_to_panel()
+
+    def set_chrome_visible(self, *, visible: bool) -> None:
+        """
+        Do nothing; a panel document has no napari chrome to show.
+
+        Parameters
+        ----------
+        visible : bool
+            Ignored. The setting is napari's layer controls, and this
+            window holds no layers.
+        """
+
+    def raise_to_front(self) -> None:
+        """Bring this panel out from under whatever is covering it."""
+        with contextlib.suppress(Exception):
+            if self.window.isMinimized():
+                self.window.showNormal()
+            self.window.raise_()
+
+    def close(self) -> None:
+        """Close the window, and with it the widget it holds."""
+        with contextlib.suppress(RuntimeError):
+            self.window.close()
+
+
+#: What the area holds. Two kinds, because a dataset's window is
+#: whichever kind of window that dataset needs — see
+#: :class:`PanelDocument`.
+AnyDocument = Document | PanelDocument
+
+
+def _layers_of(document: AnyDocument) -> object:
+    """
+    Return a document's napari layers, or nothing for a panel document.
+
+    Every layer lookup on the board runs through here, because a plot
+    document holds no layers and answering "none" is the truthful
+    version of the ``AttributeError`` the alternative raises.
+
+    Parameters
+    ----------
+    document : AnyDocument
+        The document to ask.
+
+    Returns
+    -------
+    object
+        Its ``viewer.layers``, or an empty tuple.
+    """
+    viewer = getattr(document, "viewer", None)
+    return () if viewer is None else viewer.layers
+
+
 class DocumentArea(QtWidgets.QMdiArea):
     """
     The MDI area the documents live in.
@@ -568,7 +770,7 @@ class DocumentArea(QtWidgets.QMdiArea):
 
     def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
         super().__init__(parent)
-        self._documents: dict[str, Document] = {}
+        self._documents: dict[str, AnyDocument] = {}
         self._auto_arrange = True
         # A depth, not a flag: placing a document tiles the area, so the
         # guard nests and an inner exit must not lower an outer one's.
@@ -682,18 +884,18 @@ class DocumentArea(QtWidgets.QMdiArea):
         else:
             self.keep_all_inside()
 
-    def documents(self) -> tuple[Document, ...]:
+    def documents(self) -> tuple[AnyDocument, ...]:
         """
         Return every open document.
 
         Returns
         -------
-        tuple[Document, ...]
+        tuple[AnyDocument, ...]
             Every open document, in the order it was opened.
         """
         return tuple(self._documents.values())
 
-    def document(self, name: str) -> Document | None:
+    def document(self, name: str) -> AnyDocument | None:
         """
         Return one document by name.
 
@@ -704,7 +906,7 @@ class DocumentArea(QtWidgets.QMdiArea):
 
         Returns
         -------
-        Document | None
+        AnyDocument | None
             The document, or None if nothing by that name is open.
         """
         return self._documents.get(name)
@@ -719,13 +921,13 @@ class DocumentArea(QtWidgets.QMdiArea):
         self._auto_arrange = True
         self._tile()
 
-    def active_document(self) -> Document | None:
+    def active_document(self) -> AnyDocument | None:
         """
         Return the document whose window is in front, if any.
 
         Returns
         -------
-        Document | None
+        AnyDocument | None
             The active document, or None when the area holds none or
             nothing is focused.
         """
@@ -762,7 +964,7 @@ class DocumentArea(QtWidgets.QMdiArea):
             document.raise_to_front()
             self.setActiveSubWindow(document.window)
 
-    def settle(self, document: Document, *, opened: bool) -> None:
+    def settle(self, document: AnyDocument, *, opened: bool) -> None:
         """
         Size a document to the data it has just been given.
 
@@ -780,7 +982,7 @@ class DocumentArea(QtWidgets.QMdiArea):
 
         Parameters
         ----------
-        document : Document
+        document : AnyDocument
             The document whose data just changed.
         opened : bool
             Whether this call follows the document being created, as
@@ -882,8 +1084,16 @@ class DocumentArea(QtWidgets.QMdiArea):
             The document, newly opened or already there.
         """
         existing = self._documents.get(name)
-        if existing is not None:
+        if isinstance(existing, Document):
             return existing
+        if existing is not None:
+            # A dataset that used to be a plot and is now an image: a
+            # spectrometer put back into an imaging readout is exactly
+            # this. The window is replaced rather than reused, because
+            # the two hold different widgets - and closed here rather
+            # than left for the operator to find, since two windows with
+            # one name is the ambiguity the naming exists to prevent.
+            self.close_document(name)
         viewer = napari.Viewer(show=False, title=name)
         window = self._reparent(viewer, name=name)
         document = Document(name, viewer, window)
@@ -906,6 +1116,73 @@ class DocumentArea(QtWidgets.QMdiArea):
             )
             window.show()
             self._place(window)
+        if name in self._pending_raise:
+            self._pending_raise.discard(name)
+            self.raise_document(name)
+        return document
+
+    def open_panel(
+        self,
+        name: str,
+        widget: QtWidgets.QWidget,
+    ) -> PanelDocument:
+        """
+        Open a document holding a plain widget, or return the one open.
+
+        The counterpart of :meth:`open` for a dataset whose display is
+        not a napari canvas — today a spectrum plot. Everything after
+        the widget is the same: the window is placed and tiled with the
+        others, closing it means what closing theirs means, and the
+        widget is what the caller pushes data into afterwards.
+
+        **The widget is only used when a document is actually opened.**
+        A caller asking for a panel that already exists gets the one
+        that is there and the widget it passed is dropped, so building
+        one per frame would be wasteful rather than wrong — see
+        :meth:`DocumentBoard.panel`, which is how this is reached and
+        which builds one only when it has to.
+
+        Parameters
+        ----------
+        name : str
+            The dataset's name; becomes the window title.
+        widget : QtWidgets.QWidget
+            The widget to fill the window with.
+
+        Returns
+        -------
+        PanelDocument
+            The document, newly opened or already there.
+        """
+        existing = self._documents.get(name)
+        if isinstance(existing, PanelDocument):
+            return existing
+        if existing is not None:
+            # The mirror of open()'s case: a camera that was imaging and
+            # is now projecting keeps its name and stops being a picture.
+            self.close_document(name)
+        window = self.addSubWindow(widget)
+        window.setWindowTitle(name)
+        document = PanelDocument(name, widget, window)
+        self._documents[name] = document
+        window.installEventFilter(_WindowWatcher(self, document))
+        with self._own_arrangement():
+            # Shown before placed, for the reason open() gives. Sized
+            # *after* showing rather than before, which is the one thing
+            # this does differently: a plot has its shape from the start
+            # and could be sized immediately, but a widget Qt has not
+            # laid out yet reports no width, and the sizing measures the
+            # window's chrome against it.
+            window.resize(
+                max(_MIN_DOCUMENT_WIDTH, self.width() // 2),
+                max(_MIN_DOCUMENT_HEIGHT, self.height() // 2),
+            )
+            window.show()
+            self._place(window)
+            document.size_to_content(self.available_canvas())
+            self.keep_inside(window)
+        if self._auto_arrange:
+            self._tile()
         if name in self._pending_raise:
             self._pending_raise.discard(name)
             self.raise_document(name)
@@ -1150,13 +1427,13 @@ class DocumentArea(QtWidgets.QMdiArea):
         if self._auto_arrange and self._documents:
             self._tile()
 
-    def forget(self, document: Document) -> None:
+    def forget(self, document: AnyDocument) -> None:
         """
         Drop a document the operator closed with its own close button.
 
         Parameters
         ----------
-        document : Document
+        document : AnyDocument
             The document whose window is going away.
         """
         self._pending_raise.discard(document.name)
@@ -1164,8 +1441,10 @@ class DocumentArea(QtWidgets.QMdiArea):
             return
         if self.on_document_closed is not None:
             self.on_document_closed(document.name)
-        with contextlib.suppress(Exception):
-            document.viewer.close()
+        viewer = getattr(document, "viewer", None)
+        if viewer is not None:
+            with contextlib.suppress(Exception):
+                viewer.close()
         if self._auto_arrange and self._documents:
             self._tile()
 
@@ -1209,11 +1488,11 @@ class _WindowWatcher(QtCore.QObject):
     ----------
     area : DocumentArea
         The area to report to.
-    document : Document
+    document : AnyDocument
         The document this watches over.
     """
 
-    def __init__(self, area: DocumentArea, document: Document) -> None:
+    def __init__(self, area: DocumentArea, document: AnyDocument) -> None:
         super().__init__(area)
         self._area = area
         self._document = document
@@ -1349,7 +1628,7 @@ class _LayerIndex:
             Each layer, document by document.
         """
         for document in self._board.area.documents():
-            yield from document.viewer.layers
+            yield from _layers_of(document)
 
     def __len__(self) -> int:
         """
@@ -1361,7 +1640,7 @@ class _LayerIndex:
             How many layers are open across all documents.
         """
         return sum(
-            len(document.viewer.layers)
+            len(_layers_of(document))
             for document in self._board.area.documents()
         )
 
@@ -1443,6 +1722,53 @@ class DocumentBoard:
         self._dismissed.discard(name)
         self.area.raise_document(self._homes.get(name, name))
 
+    def panel(
+        self,
+        name: str,
+        factory: Callable[[], QtWidgets.QWidget],
+    ) -> QtWidgets.QWidget | None:
+        """
+        Return the widget in a panel document, opening it if need be.
+
+        The one route to a display that is not a napari layer — today a
+        spectrum plot. It is a *method on the board and not on*
+        :class:`napari.Viewer`, like :meth:`raise_document`, which is
+        what makes it optional: a widget running against a plain
+        single-canvas viewer asks for it by name, does not find it, and
+        falls back to whatever it can do there.
+
+        The widget is built by ``factory`` only when a document actually
+        has to be opened, so a caller may ask on every frame — which is
+        exactly how the live display uses this — without building a
+        pyqtgraph plot sixty times a second.
+
+        A panel the operator has closed stays closed, and answers None,
+        for the reason :meth:`add_image` drops a layer whose panel was
+        dismissed: the next frame is 16 ms away and would otherwise make
+        the close button a blink. :meth:`raise_document` asks it back.
+
+        Parameters
+        ----------
+        name : str
+            The dataset's name, which is its document's.
+        factory : Callable[[], QtWidgets.QWidget]
+            Builds the widget, called only when opening.
+
+        Returns
+        -------
+        QtWidgets.QWidget | None
+            The widget to push data into, or None when the operator has
+            closed this panel and has not asked for it back.
+        """
+        if name in self._dismissed:
+            return None
+        existing = self.area.document(name)
+        if isinstance(existing, PanelDocument):
+            return existing.widget
+        document = self.area.open_panel(name, factory())
+        self._homes[name] = name
+        return document.widget
+
     def find(self, name: str) -> Layer | None:
         """
         Return a layer by name, from whichever document holds it.
@@ -1460,9 +1786,10 @@ class DocumentBoard:
         document = self.area.document(self._homes.get(name, name))
         if document is None:
             return None
-        if name not in document.viewer.layers:
+        layers = _layers_of(document)
+        if name not in layers:
             return None
-        return document.viewer.layers[name]
+        return layers[name]
 
     def remove(self, name: str) -> bool:
         """
@@ -1480,11 +1807,14 @@ class DocumentBoard:
         """
         home = self._homes.get(name, name)
         document = self.area.document(home)
-        if document is None or name not in document.viewer.layers:
+        if document is None:
             return False
-        del document.viewer.layers[name]
+        layers = _layers_of(document)
+        if name not in layers:
+            return False
+        del layers[name]
         self._homes.pop(name, None)
-        if not len(document.viewer.layers):
+        if not len(layers):
             self.area.close_document(home)
         return True
 
@@ -1617,11 +1947,11 @@ class DocumentWindow(QtWidgets.QMainWindow):
         actual = view.addAction("&Actual resolution")
         actual.setShortcut("Ctrl+1")
         actual.triggered.connect(
-            lambda: self._on_active(Document.show_at_actual_resolution)
+            lambda: self._on_active("show_at_actual_resolution")
         )
         fit = view.addAction("&Fit panel to data")
         fit.setShortcut("Ctrl+0")
-        fit.triggered.connect(lambda: self._on_active(Document.fit_to_panel))
+        fit.triggered.connect(lambda: self._on_active("fit_to_panel"))
         view.addSeparator()
         controls = view.addAction("Show &layer controls")
         controls.setCheckable(True)
@@ -1630,19 +1960,30 @@ class DocumentWindow(QtWidgets.QMainWindow):
             lambda shown: self.area.set_chrome_visible(visible=shown)
         )
 
-    def _on_active(self, action: Callable[[Document], None]) -> None:
+    def _on_active(self, action: str) -> None:
         """
         Apply a view action to whichever panel is in front.
 
+        **Dispatched by name**, so the menu works on any kind of
+        document. A plot has no "actual resolution" and a picture has no
+        auto-range, and each answers what it can — see
+        :class:`PanelDocument`. Naming the method rather than passing an
+        unbound :class:`Document` one is what lets both be in the area
+        at once; the alternative applies a napari document's method to a
+        widget that is not one.
+
         Parameters
         ----------
-        action : Callable[[Document], None]
-            The :class:`Document` method to run, or nothing if the area
-            has no active panel.
+        action : str
+            The document method to run. Nothing happens if the area has
+            no active panel, or if that panel does not offer it.
         """
         document = self.area.active_document()
-        if document is not None:
-            action(document)
+        if document is None:
+            return
+        method = getattr(document, action, None)
+        if method is not None:
+            method()
 
     def set_panel(self, panel: QtWidgets.QWidget, *, name: str = "Instrument") -> None:
         """

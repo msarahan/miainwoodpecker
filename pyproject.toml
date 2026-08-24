@@ -111,6 +111,20 @@ viewer = [
     # loose bound: this uses only user_config_dir, which is the oldest
     # and most stable thing the package offers.
     "platformdirs>=3",
+    # The 1D display, because napari has no plot. napari draws arrays on
+    # a canvas: an EEL spectrum pushed into an image layer is a picture
+    # one pixel high, which says where the counts are bright and not
+    # what they are - and the display path could not even reach that,
+    # since a frame calibration is two axes and a spectrum has one.
+    # pyqtgraph is a plotting widget over the same Qt this application
+    # already runs, so the spectrum panel is a QWidget beside the napari
+    # ones rather than a second toolkit's window, and it is built for
+    # exactly the case here: one curve replaced at display rate while an
+    # acquisition fills in behind it.
+    # A loose ">=" bound, for the reason the "analysis" extra gives: one
+    # package, and the surface used here (PlotWidget, one PlotDataItem,
+    # setData, setLabel) is the oldest and most public it has.
+    "pyqtgraph>=0.13",
 ]
 # The browser dashboard - notebooks/instrument_dashboard.py - and nothing
 # else. marimo is a notebook whose file *is* a Python module: cells are
@@ -630,6 +644,10 @@ miainwoodpecker = { path = ".", editable = true }
 pyside6 = "*"
 napari = ">=0.5"
 platformdirs = ">=3"
+# The spectrum panel's plot. Named here as well as in the extra for the
+# reason pyside6 is: conda-forge has a build, and satisfying it from
+# there keeps the Qt underneath one stack rather than two.
+pyqtgraph = ">=0.13"
 
 [tool.pixi.feature.viewer.pypi-dependencies]
 miainwoodpecker = { path = ".", editable = true, extras = ["viewer"] }

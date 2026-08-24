@@ -133,7 +133,7 @@ from miainwoodpecker.devices.rpc import (
     SCANNER_TARGET,
     target_kind,
 )
-from miainwoodpecker.storage.calibration import FrameCalibration
+from miainwoodpecker.storage.calibration import AxisCalibration, FrameCalibration
 from miainwoodpecker.storage.nexus import write_frames
 from miainwoodpecker.storage.session import (
     LoadJob,
@@ -147,7 +147,7 @@ from miainwoodpecker.storage.session import (
     format_bytes,
     free_space,
 )
-from miainwoodpecker.viewer import axes, preferences, profiles, progress
+from miainwoodpecker.viewer import axes, plots, preferences, profiles, progress
 from miainwoodpecker.viewer import jobs as jobs_module
 from miainwoodpecker.viewer.documents import ATTACHED_TO
 from miainwoodpecker.viewer.jobs import AnalysisJob
@@ -604,6 +604,10 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         self._analysis_job: AnalysisJob | None = None
         self._pass_job: jobs_module.PassJob | None = None
         self._pass_preview: dict[str, progress.PassPreview] = {}
+        # The dispersive axis of each target reading out spectra in the
+        # running pass, so the plot watching it build is labelled in the
+        # detector's own electronvolts rather than in channels.
+        self._pass_dispersion: dict[str, AxisCalibration] = {}
         self._pass_target: str | None = None
         self._pass_path: Path | None = None
         self._pass_positions = ""
@@ -2223,6 +2227,13 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         # Built on the GUI thread and read from it, so the worker only
         # ever writes through them. See viewer/progress.py.
         watched: dict[str, progress.PassPreview] = {}
+        # The detector's energy axis, filled by the worker when it sizes
+        # the file and read by the display timer to label the plot. Same
+        # arrangement as `watched` above, and for the same reason: one
+        # assignment of one object into a dict the GUI thread reads, and
+        # a display that has not seen it yet draws nothing rather than
+        # something wrong.
+        dispersion: dict[str, AxisCalibration] = {}
 
         def run() -> object:
             # The lease is taken here, on the job's own thread, for the
@@ -2247,7 +2258,12 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
                 # possible at all when the instrument is elsewhere. A
                 # failure here now reaches the operator through the job,
                 # in the same words: see _poll_pass.
-                allocation = self._pass_allocation(target, leased.camera(target))
+                allocation, axis = self._pass_allocation(
+                    target,
+                    leased.camera(target),
+                )
+                if axis is not None:
+                    dispersion[target] = axis
                 with writer_class(path, parameters, **allocation) as writer:
                     watched.update(progress.previews(writer.destinations()))
                     # Cast rather than checked: whether the scan unit has
@@ -2269,6 +2285,7 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
 
         self._pass_job = jobs_module.PassJob(run)
         self._pass_preview = watched
+        self._pass_dispersion = dispersion
         self._pass_target = target
         self._pass_path = path
         self._pass_positions = positions
@@ -2291,9 +2308,17 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         job = self._pass_job
         if job is None:
             return
+        # Read *before* drawing, and that order is the whole reason this
+        # is a variable. Drawing first and asking afterwards ends the
+        # acquisition on a display built from the state a few writes
+        # short of the end: the job finishes in between, and nothing
+        # draws again because the next poll returns at the top. Asked
+        # first, a False here means the worker had already finished, so
+        # the draw below sees the completed pass.
+        running = job.is_running
         for name, preview in self._pass_preview.items():
             self._show_pass_preview(name, preview)
-        if job.is_running:
+        if running:
             done = sum(preview.positions for preview in self._pass_preview.values())
             total = sum(preview.total for preview in self._pass_preview.values())
             if total:
@@ -2337,6 +2362,7 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         """
         if not preview.positions:
             return
+        self._show_pass_spectrum(target, preview)
         layer_name = f"Acquiring ({target})"
         if layer_name not in self._viewer.layers:
             self._bring_to_front(layer_name)
@@ -2352,6 +2378,54 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         limits = preview.limits
         if limits is not None:
             layer.contrast_limits = limits
+
+    def _show_pass_spectrum(
+        self,
+        target: str,
+        preview: progress.PassPreview,
+    ) -> None:
+        """
+        Draw the spectrum at the beam position the probe has just left.
+
+        The other half of watching a spectrum image build, and the half
+        the map cannot be. A virtual-detector image is one number per
+        position: it shows drift, contamination and vacuum, and it shows
+        a spectrometer parked off the edge of the loss exactly the same
+        way it shows a good acquisition — as a plausible brightness.
+        The curve is where that is visible, in the first second rather
+        than at analysis time.
+
+        Nothing is drawn for a pass keeping whole detector images: there
+        is no spectrum in a 4D stack, and
+        :attr:`~miainwoodpecker.viewer.progress.PassPreview.latest_spectrum`
+        says so by being None rather than by this checking the readout
+        mode the operator set.
+
+        Parameters
+        ----------
+        target : str
+            The detector being read out at each beam position.
+        preview : progress.PassPreview
+            Its live map, which is also where the last spectrum is kept.
+        """
+        latest = preview.latest_spectrum
+        if latest is None:
+            return
+        position, counts = latest
+        axis = self._pass_dispersion.get(target)
+        if axis is None:
+            return
+        # grid, not shape[:2]: shape asks the destination, and by the
+        # time the finished pass is drawn one last time that destination
+        # is a closed HDF5 dataset.
+        rows, columns = preview.grid
+        where = ", ".join(str(index) for index in position)
+        self._show_spectrum(
+            counts,
+            axis,
+            layer_name=f"Acquiring ({target}): spectrum",
+            title=f"position {where} of {rows}x{columns}",
+        )
 
     def _pass_parameters(self) -> ScanParameters:
         """
@@ -2393,7 +2467,10 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         )
 
     @staticmethod
-    def _pass_allocation(target: str, camera: Camera) -> dict[str, dict]:
+    def _pass_allocation(
+        target: str,
+        camera: Camera,
+    ) -> tuple[dict[str, dict], AxisCalibration | None]:
         """
         Return the ``PassWriter`` allocation this detector's readout needs.
 
@@ -2424,9 +2501,10 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
 
         Returns
         -------
-        dict[str, dict]
+        tuple[dict[str, dict], AxisCalibration | None]
             Keyword arguments for :class:`PassWriter` — ``cubes`` or
-            ``spectra``, with one entry.
+            ``spectra``, with one entry — and the detector's dispersive
+            axis, or None when it is not producing spectra at all.
 
         Raises
         ------
@@ -2436,13 +2514,22 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         """
         camera.start()
         try:
-            shape = tuple(np.asarray(camera.acquire_frame().data).shape)
+            frame = camera.acquire_frame()
+            data = np.asarray(frame.data)
+            shape = tuple(data.shape)
+            metadata = frame.metadata
         finally:
             camera.stop()
         if len(shape) == _SPECTRUM_READOUT_RANK:
-            return {"spectra": {target: shape[0]}}
+            # The one frame that sized the file is also the only place
+            # the pass's energy axis is available on this side of the
+            # device: the destinations the probe writes into are bare
+            # arrays, and the Spectrum that carries the dispersion is
+            # not built until the pass finishes. Read here, kept, and
+            # used to label the plot that watches the pass build.
+            return {"spectra": {target: shape[0]}}, axes.spectrum_axis(data, metadata)
         if len(shape) == _IMAGE_READOUT_RANK:
-            return {"cubes": {target: shape}}
+            return {"cubes": {target: shape}}, None
         msg = (
             f"{target} produces a {len(shape)}D readout of shape {shape}; a "
             f"pass keeps a 1D spectrum or a 2D image at each beam position, "
@@ -3395,11 +3482,19 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         autocontrast_every_frame: bool,
     ) -> None:
         """
-        Put one frame into its napari layer, skipping an unchanged redraw.
+        Put one frame into its panel, skipping an unchanged redraw.
 
         Split out of :meth:`_refresh_source` so the scan can drive it
         once per enabled detector from a single pass, rather than each
         detector polling its own loop.
+
+        **The rank decides the display, and nothing else does.** Two axes
+        are a picture and go into a napari image layer; one axis is a
+        spectrum and goes into a plot (:meth:`_show_spectrum`). The
+        detector is not asked which it is — a camera's *readout mode* is
+        what changes the rank, an operator can change it between one
+        frame and the next, and the shape of the array is the fact where
+        the label would be a guess.
 
         Parameters
         ----------
@@ -3410,6 +3505,20 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         autocontrast_every_frame : bool
             Whether to restretch the contrast limits to this frame.
         """
+        if frame.data.ndim == _SPECTRUM_READOUT_RANK:
+            # A projecting detector, and there is no image layer to put
+            # this in - one axis of counts is a curve. Routed here at the
+            # top rather than inside the layer code below, because
+            # everything below this line assumes two axes: the very first
+            # call, axes.frame_calibration, unpacks a height and a width
+            # and raised on the first spectrum that ever reached it.
+            self._show_spectrum(
+                frame.data,
+                axes.spectrum_axis(frame.data, frame.metadata),
+                layer_name=layer_name,
+            )
+            self._displayed[layer_name] = frame
+            return
         if frame is self._displayed.get(layer_name) and layer_name in (
             self._viewer.layers
         ):
@@ -3440,6 +3549,55 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
             )
             self._calibrated[layer_name] = calibration
         self._displayed[layer_name] = frame
+
+    def _show_spectrum(
+        self,
+        counts: np.ndarray,
+        axis: AxisCalibration,
+        *,
+        layer_name: str,
+        title: str = "",
+    ) -> None:
+        """
+        Draw one spectrum in the panel belonging to its detector.
+
+        The 1D counterpart of :meth:`_show_frame`'s layer handling, and
+        it goes through the display rather than around it: the panel is
+        asked for by the same name a picture from this detector would
+        use, so a spectrometer that switches between imaging and
+        projecting keeps one window rather than accumulating two.
+
+        **Nothing happens when the display is a single shared canvas**
+        rather than a set of documents, for the same reason
+        :meth:`_bring_to_front` does nothing there: a plain
+        :class:`napari.Viewer` has no plot to put this in, and the
+        alternative — an image layer one pixel high — is not a display
+        of a spectrum but a picture of one. So this asks the display
+        whether it can, which is what keeps ``DocumentBoard`` duck-typed
+        to a viewer rather than required by this file.
+
+        Parameters
+        ----------
+        counts : np.ndarray
+            The spectrum, one value per channel.
+        axis : AxisCalibration
+            What its channels measure. Passed in rather than resolved
+            here because the two callers know it differently: a live
+            frame carries its calibration in its own metadata, and a
+            pass has one axis for the whole acquisition, read once when
+            the file was sized.
+        layer_name : str
+            The detector's panel name, as an image from it would use.
+        title : str
+            A line above the plot — the beam position during a pass.
+        """
+        panel = getattr(self._viewer, "panel", None)
+        if panel is None:
+            return
+        plot = panel(layer_name, plots.SpectrumPlot)
+        if plot is None:
+            return
+        plot.show_spectrum(counts, axis, title=title)
 
     def _recalibrate(
         self,

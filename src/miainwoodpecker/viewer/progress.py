@@ -32,6 +32,20 @@ Any adapter honouring the documented contract gets this for free, which
 is why it is done here rather than by adding a progress callback that
 every future adapter would have to remember to fire.
 
+Two views of one pass, from the same tee
+-----------------------------------------
+The map is a *reduction*: one number per beam position, which is what
+makes a whole spectrum image watchable in a panel a few hundred pixels
+wide. It is also the only thing it can be, and it throws away the axis
+the acquisition exists to measure — a spectrum image whose every
+position summed to a plausible number would look perfectly healthy on it
+with the spectrometer parked off the edge entirely.
+
+So the tee keeps the last 1D readout as well (:attr:`PassPreview.
+latest_spectrum`), which the display draws as a curve beside the map.
+Same write, same thread, no device change: one is where the probe has
+been, the other is what it is seeing now.
+
 The reduction is cheap on purpose
 ---------------------------------
 At 2250 positions a second a full sum over a 512x512 diffraction pattern
@@ -68,6 +82,14 @@ if typing.TYPE_CHECKING:
 #: and cheap enough not to slow a fast pass down.
 _MAX_SUMMARY_SAMPLES = 4096
 
+#: The rank of a readout this keeps a copy of, as
+#: :attr:`PassPreview.latest_spectrum`. One: a spectrum is a few
+#: kilobytes and copying it per beam position costs a memcpy nobody can
+#: measure, where a 512x512 diffraction pattern is a megabyte and doing
+#: the same would be a gigabyte a second of copying to feed a preview.
+#: The 2D case already has its display — that is what the map is.
+_SPECTRUM_RANK = 1
+
 
 class PassPreview:
     """
@@ -98,6 +120,13 @@ class PassPreview:
         # majority early on and would drive everything real to white.
         self._low = float("inf")
         self._high = float("-inf")
+        # The most recent 1D readout and the position it was written at,
+        # as **one tuple**. Two attributes would be assigned one after
+        # the other, and the GUI thread reading between the two would
+        # get a spectrum labelled with the previous position - a caption
+        # off by one beam position, which is worse than no caption. One
+        # assignment of one object cannot be read half-done.
+        self._latest: tuple[tuple[int, ...], npt.NDArray[np.float32]] | None = None
 
     @property
     def limits(self) -> tuple[float, float] | None:
@@ -120,12 +149,34 @@ class PassPreview:
         """
         The real destination's shape, which is what the device checks.
 
+        **Asked of the destination every time**, because that is what an
+        adapter validating against it needs — and so this is only
+        answerable while the destination is open. A display drawing
+        after the pass has finished has a closed HDF5 dataset behind it
+        and gets an exception; :attr:`grid` is the question it wants.
+
         Returns
         -------
         tuple[int, ...]
             The wrapped destination's shape, unchanged.
         """
         return tuple(int(size) for size in self._destination.shape)
+
+    @property
+    def grid(self) -> tuple[int, ...]:
+        """
+        The beam positions this pass covers, as rows and columns.
+
+        Read once when the destination was wrapped and kept, so it can
+        be asked after the file is closed — which the display does,
+        drawing the finished acquisition one last time.
+
+        Returns
+        -------
+        tuple[int, ...]
+            The pass's ``(rows, columns)``.
+        """
+        return self._grid
 
     def __getattr__(self, name: str) -> object:
         """
@@ -213,6 +264,31 @@ class PassPreview:
         return int(self._grid[0] * self._grid[1])
 
     @property
+    def latest_spectrum(self) -> tuple[tuple[int, ...], npt.NDArray[np.float32]] | None:
+        """
+        The last spectrum written, and the beam position it came from.
+
+        The other half of watching a spectrum image build. The map says
+        *where* the probe has been and how much signal it found there;
+        this is what it actually saw at the position it is on now — the
+        edge, the shape of the background, whether the spectrometer is
+        even on the loss the operator set it to. Neither answers the
+        other's question, and until this existed a pass could only be
+        watched as a brightness.
+
+        A copy, taken at write time, so what a display draws is one
+        position's readout rather than a buffer an adapter may since
+        have reused. Only for a 1D readout: see :data:`_SPECTRUM_RANK`.
+
+        Returns
+        -------
+        tuple[tuple[int, ...], npt.NDArray[np.float32]] | None
+            The beam position and its spectrum, or None when nothing 1D
+            has been written yet — which is the whole of a 4D-STEM pass.
+        """
+        return self._latest
+
+    @property
     def map(self) -> npt.NDArray[np.float32]:
         """
         The virtual-detector image built so far.
@@ -262,10 +338,13 @@ class PassPreview:
         try:
             if not isinstance(key, tuple) or len(key) != len(self._grid):
                 return
-            summary = _summarise(value)
+            array = np.asarray(value)
+            summary = _summarise(array)
             self._map[key] = summary
             self._low = min(self._low, summary)
             self._high = max(self._high, summary)
+            if array.ndim == _SPECTRUM_RANK:
+                self._latest = (key, np.array(array, dtype=np.float32))
         except (IndexError, TypeError, ValueError):
             return
         finally:

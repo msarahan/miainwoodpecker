@@ -41,6 +41,7 @@ _VIEWER_TEST_MODULES = (
     "test_panel_density",
     "test_documents",
     "test_window_on_a_remote_broker",
+    "test_spectrum_plot",
 )
 
 
