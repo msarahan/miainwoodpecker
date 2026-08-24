@@ -110,7 +110,10 @@ from miainwoodpecker.storage.calibration import (
     FrameCalibration,
     resolve_axis_calibration,
 )
-from miainwoodpecker.storage.nexus import DEFAULT_FLUSH_EVERY
+from miainwoodpecker.storage.nexus import (
+    DEFAULT_FLUSH_EVERY,
+    reject_unwritable_chunk,
+)
 
 if typing.TYPE_CHECKING:
     import os
@@ -476,13 +479,20 @@ class SpectrumWriter:
         self._energy = energy
         data_group = self._file["entry"].create_group("data")
         data_group.attrs["NX_class"] = "NXdata"
+        dtype = self._dtype if self._dtype is not None else spectrum.data.dtype
+        filter_kwargs = self._filter_kwargs()
+        # Same precondition NexusWriter applies, and imported rather than
+        # respelled: a short spectrum is the one shape in this package that
+        # can genuinely land under the floor without anyone contriving it -
+        # a 64-channel float32 spot spectrum is a 256-byte chunk.
+        reject_unwritable_chunk(filter_kwargs, chunks, dtype)
         self._data = data_group.create_dataset(
             "intensity",
             shape=shape,
             maxshape=maxshape,
-            dtype=self._dtype if self._dtype is not None else spectrum.data.dtype,
+            dtype=dtype,
             chunks=chunks,
-            **self._filter_kwargs(),
+            **filter_kwargs,
         )
         self._data.attrs["long_name"] = "Counts"
         collection = self._metadata_group()
@@ -626,14 +636,21 @@ class SpectrumWriter:
                     sort_keys=True,
                 )
         finally:
-            self._file.close()
-            self._file = None
-            self._data = None
-            self._metadata_column = None
-            self._count = 0
-            self._layout = None
-            self._energy = None
-            self._first_metadata = None
+            # Reset even if close() raises, for the reason
+            # :meth:`~miainwoodpecker.storage.nexus.NexusWriter.close`
+            # records: h5py closes the open dataset ids first, which pushes
+            # their dirty chunks through the filter pipeline, so this step
+            # can fail and leave the writer wedged half-finalized.
+            try:
+                self._file.close()
+            finally:
+                self._file = None
+                self._data = None
+                self._metadata_column = None
+                self._count = 0
+                self._layout = None
+                self._energy = None
+                self._first_metadata = None
 
     def _write_axes(self, entry: h5py.Group) -> None:
         """
