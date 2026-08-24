@@ -142,7 +142,11 @@ viewer = [
 # and the tests run either way.
 # A loose ">=" bound, for the reason the "analysis" extra gives: one
 # package, and the surface used here (mo.md, mo.ui, mo.hstack/vstack,
-# mo.Html, mo.stop) is marimo's oldest and most public.
+# mo.Html, mo.stop, mo.download) is marimo's oldest and most public.
+# mo.download is given a *callable* rather than bytes, which is its
+# documented lazy form and the difference between encoding an HDF5 file
+# per unsaved signal per display tick - ten a second at the dashboard's
+# fastest setting - and encoding one when somebody presses Save.
 dashboard = [
     "marimo>=0.9",
 ]

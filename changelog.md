@@ -108,6 +108,62 @@
   the kernel for as long as it runs, so every other cell — Acquire
   included — is frozen until it stops. Measured: a button pressed two
   seconds into a twenty-second stream did not respond for thirty.
+- **Every dashboard log entry says where its data is, and can put it
+  somewhere if it is nowhere.** The session log recorded one path per
+  acquisition and, for anything acquired with no session directory,
+  nothing at all: the frames went into a thumbnail and were released, so
+  the shot that turned out to matter could not be rescued. Now an entry
+  carries one row per **signal**, each with its own picture, its own
+  metadata and its own answer to "where is it" — a path if it was
+  written, a **Save** button if it was not.
+  **An entry is an item, and an item is several signals — one file
+  each.** The unit an operator thinks in is not one array: it is a
+  spectrum image *with* the survey that says where it was taken and the
+  follow-up image that says what the beam did to the specimen while the
+  map ran, or one scan pass read out on HAADF and BF at once.
+  `Session.record_datasets` writes each of those to its own NeXus file,
+  streaming all of them at once so nothing is buffered waiting for a
+  sibling to finish, and the files of one item share a sequence number
+  and timestamp — `0007-scan-haadf-…nxs` beside `0007-scan-bf-…nxs`.
+  Separate files rather than one combined entry, which the format would
+  allow (`storage/passes.py` does it for a pass, whose signals are
+  pixel-aligned by construction): an item's parts are acquired at
+  different times with different geometry, a person opens one at a time,
+  and `hs.load`, a NeXus viewer and a file manager all take a file and
+  give back a signal. It makes "send me the HAADF" a copy rather than an
+  extraction. Each file also records `session_dataset`, so one renamed
+  or copied out of the session still says which signal it is.
+  **The acquisition names its own signals**, so nothing in the log or
+  the storage layer had to learn what a recipe is.
+  `AcquisitionRequest.build` yields `(name, frame)` pairs; `by_channel`
+  splits a simultaneous multi-detector series by the detector each frame
+  reports, and `named` labels a step, so a survey → SI → follow-up
+  recipe is `itertools.chain` of three `named` calls and lands as one
+  item with three files. Beside the frame rather than in its metadata,
+  because frame metadata is the *device's* vocabulary and a survey HAADF
+  and a follow-up HAADF carry byte-identical `channel_name`.
+  **`dashboard.saving` is the way out for data with no file.** One
+  signal at a time through the browser (`mo.download` over a NeXus file
+  rendered on demand — a callable, so nothing is encoded on the display
+  tick, which the live view now runs at up to ten a second, for a button
+  nobody pressed), or every held signal at once into a directory named
+  at the bottom of the page. The flush
+  opens that directory as a session, so what comes out is
+  indistinguishable from data acquired into it in the first place, and
+  stamps each file with the time the data was *acquired* rather than the
+  time it was saved — an 18:00 flush of an afternoon's work must not
+  collapse its only ordering. Writing a signal releases its frames,
+  which is also how a long shift stops filling the kernel up.
+  **Failures are per signal.** A projected frame carrying no energy
+  calibration cannot be stored as a spectrum, and that is no reason to
+  lose the HAADF acquired beside it; each signal of an item is written
+  on its own into a shared item, so the report names what went and what
+  did not, and anything that failed is still in memory to try elsewhere.
+  `SessionLog` gains exactly one mutation for this, `mark_stored`, which
+  can only move a signal from memory to a path and can say nothing about
+  what was acquired — where the bytes live is not part of the account of
+  the shift, and a log that could not record a save would go on telling
+  an operator their data was unsaved after they had saved it.
 
 - **A file per microscope that says what hardware it has, and starts
   it.** An instrument is not one device server: SuperSTEM 3 is a Nion
@@ -313,6 +369,30 @@
 
 ### Changed
 
+- **`acquisition.record` is now a loop over a `FrameSink`, and the sink
+  is public.** Same file either way — it dispatches on the first frame's
+  rank exactly as before, so a projected readout still lands in
+  `NXspectrum`'s layout and an empty series still writes the empty,
+  finalized frame file. What is new is that the loop can be turned
+  inside out: a caller may hold *several* recordings open and push
+  frames at whichever one each belongs to, which is what writing a
+  simultaneous two-detector scan to two files requires. `record` still
+  pulls its first frame before the sink exists, so a device that fails
+  on its very first frame leaves no file at all.
+- **`Session` gained `open_item`, `record_datasets` and `reserve_named`,
+  and `storage.nexus.DEFAULT_FLUSH_EVERY` is public.** The first three
+  are the multi-signal write path above; the last removes a duplicated
+  constant — the flush interval was spelled separately in `nexus.py` and
+  `spectra.py` with one measurement behind both, and `sequence.py` now
+  needs it too.
+- **The dashboard's `AcquisitionRequest.build` yields `(name, frame)`
+  pairs rather than frames**, and `SessionLogEntry` carries
+  `datasets: tuple[LoggedDataset, ...]` in place of its single `shape`,
+  `dtype`, `thumbnail`, `metadata` and `recording_path` fields.
+  `highlights()` takes a `LoggedDataset` rather than an entry. A
+  multi-detector scan is now labelled `scan` with a signal per detector,
+  where it used to be one entry called `scan-HAADF-MAADF` holding both
+  detectors' frames interleaved in one stack.
 - **The live view refreshes at 60 fps, up from 30.** The display timer
   was a hard-coded 33 ms with nothing behind the number. Measured end to
   end — through `refresh_display`, the document board and napari, with a
