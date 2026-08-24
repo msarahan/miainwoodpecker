@@ -174,3 +174,78 @@ def test_a_frame_reporting_nothing_is_uncalibrated_not_an_error():
     """A device that reports no calibration displays in honest pixels."""
     assert axes.frame_calibration(np.zeros((8, 8)), None).is_calibrated is False
     assert axes.frame_calibration(np.zeros((8, 8)), {}).is_calibrated is False
+
+
+class TestTheAxisOfASpectrum:
+    """
+    The rank-1 case, which the two-axis model cannot answer at all.
+
+    A projecting detector delivers one axis of counts, and asking
+    :func:`axes.frame_calibration` about it raises rather than answering
+    — which is exactly what happened to the first spectrum that reached
+    the display. These pin what the 1D path answers instead.
+    """
+
+    def test_the_dispersion_comes_off_the_frames_own_metadata(self):
+        """
+        A projected readout keeps the fast axis, so its axis is ``x``.
+
+        Not a convention invented for the display: it is where a
+        detector summing its non-dispersive direction already writes the
+        dispersion, and the values here are the preview spectrometer's
+        own.
+        """
+        data = np.zeros(1340, dtype=np.float32)
+        axis = axes.spectrum_axis(
+            data,
+            {
+                "calibration": {
+                    "y": {"kind": "uncalibrated"},
+                    "x": {"kind": "energy", "scale": 0.5, "offset": -20.0,
+                          "units": "eV"},
+                },
+            },
+        )
+
+        assert axis.kind is AxisKind.ENERGY
+        assert axis.units == "eV"
+        assert axis.scale == pytest.approx(0.5)
+        assert axis.values(1340)[0] == pytest.approx(-20.0)
+
+    def test_an_uncalibrated_readout_is_channels_rather_than_an_error(self):
+        """A detector that reports no dispersion still plots, in channels."""
+        axis = axes.spectrum_axis(np.zeros(512), None)
+
+        assert axis.is_calibrated is False
+        assert np.array_equal(axis.values(4), [0.0, 1.0, 2.0, 3.0])
+
+    def test_a_scan_calibration_does_not_become_an_energy_axis(self):
+        """
+        One axis of counts against nanometres is not a spectrum.
+
+        A pass's metadata carries the *scan* geometry, and resolving a
+        rank-1 readout through it would hand the plot a real-space ruler
+        to label energies with. Channels are the honest answer, and they
+        are still a usable axis.
+        """
+        axis = axes.spectrum_axis(np.zeros(64), {"fov_size_nm": (15.0, 15.0)})
+
+        assert axis.is_calibrated is False
+
+    def test_one_position_of_a_spectrum_image_asks_the_same_question(self):
+        """
+        Energy is the last axis whatever the rank, so this reads it there.
+
+        That invariant is NeXus's, RosettaSciIO's and HyperSpy's before
+        it is this project's, which is why the 1D helper can be asked
+        about a cube's slice without being told which axis to look at.
+        """
+        cube = np.zeros((4, 4, 200), dtype=np.float32)
+        axis = axes.spectrum_axis(
+            cube,
+            {"calibration": {"x": {"kind": "energy", "scale": 2.0,
+                                   "units": "eV"}}},
+        )
+
+        assert axis.kind is AxisKind.ENERGY
+        assert axis.values(200)[-1] == pytest.approx(398.0)

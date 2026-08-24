@@ -4,6 +4,63 @@
 
 ### Added
 
+- **A spectrometer's readout, displayed as a spectrum.** Every panel in
+  this application was an array on a napari canvas, and a projecting
+  detector's readout is not one: it is counts against energy, and the
+  two things a display of it must do — put a number on a *y* axis and
+  label the *x* axis in electronvolts — are the two an image layer
+  cannot. Pushed into one, an EEL spectrum is a picture one pixel high.
+  It never got that far. A napari layer is added with a
+  `FrameCalibration`, which is exactly two axes, so the viewer's own
+  helper raised `ValueError: not enough values to unpack` on the first
+  rank-1 frame that reached it — putting a spectrometer into `projected`
+  and starting it was a way to stop the live view.
+  **`viewer/plots.py` is a pyqtgraph curve**, and
+  `documents.PanelDocument` is what puts a plain widget into the same
+  MDI area the napari viewers live in, so the spectrum is a panel like
+  any other: it tiles, closes, raises and takes the View menu's "Fit
+  panel to data" alongside the images. Which display a frame gets is
+  decided by the **rank of the array and nothing else** — a camera's
+  readout mode changes it between one frame and the next, so the shape
+  is the fact where the detector's label would be a guess — and a camera
+  switched between imaging and projecting keeps one window rather than
+  accumulating two.
+  **`axes.spectrum_axis` is the 1D answer to the question
+  `axes.frame_calibration` cannot be asked.** It reads the dispersion
+  from where a projecting detector already writes it, and reports
+  anything that is *not* an energy axis as bare channels: one axis of
+  counts against a real-space ruler is not a spectrum, and labelling it
+  in electronvolts it never had would be worse than saying "channel".
+  **The unit is the detector's, and is not re-prefixed.** pyqtgraph
+  reads a unit as a base SI quantity and adds a prefix to keep tick
+  numbers small, which is right for volts and wrong for two of the three
+  spellings this project accepts for energy. A real monochromated EELS
+  spectrum calibrated in meV came back labelled `energy (kmeV)` —
+  kilo-milli-electronvolts — with its axis divided by a thousand to
+  match. Auto-prefixing is off; an adapter converts units once, on the
+  way in.
+- **A spectrum image, watched in the dimension it is acquired in.** A
+  pass already opened a panel showing a virtual-detector image as it
+  filled, which is one number per beam position — and that is the whole
+  of what it can be. A spectrometer parked off the edge of the loss, or
+  a drift tube that never moved, produces a map indistinguishable from a
+  good acquisition: every pixel sums to a plausible number. Minutes
+  later there is a file, and the acquisition has to be done again.
+  `PassPreview` now keeps the **last 1D readout written and the beam
+  position it came from**, and a second panel draws it as a curve
+  captioned `position 23, 17 of 64x64`. It costs no device change and no
+  second write: the preview already tees `scan_synchronised`'s
+  destinations, so this is the same write, on the same thread, reduced a
+  second way. Rank 1 only — a spectrum is a few kilobytes and copying one
+  per position is a memcpy nobody can measure, where a 512x512
+  diffraction pattern is a megabyte and doing the same would be a
+  gigabyte a second to feed a preview; a 4D pass therefore gets no
+  spectrum panel, reported by the readout being absent rather than by the
+  display second-guessing the mode the operator set.
+  The copy is taken **at write time**, so what is drawn is one position's
+  readout rather than whatever a device's scratch buffer holds by the
+  time the display gets to it.
+
 - **A live view that keeps up: 2 fps to 10, which is the ceiling of the
   thing it runs in.** The browser dashboard's fastest refresh option was
   `0.5s`, so two frames a second was not what the stack managed — it was
@@ -337,6 +394,14 @@
   `pixi lock`.
 
 ### Fixed
+
+- **A pass's display stopped one tick short of the end.** `_poll_pass`
+  drew the previews and *then* asked whether the worker was still
+  running, so the acquisition that finished in between was drawn from
+  the state it had a few beam positions earlier — and nothing drew again,
+  because the next poll returns at the top. The finished map was missing
+  its last positions and the spectrum was from the second-to-last one.
+  Asked first, drawn second.
 
 - **A device server that lost its port could be reported as one that
   was running and wedged.** The client bounds every connection attempt

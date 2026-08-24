@@ -180,3 +180,60 @@ def test_wrapping_a_whole_pass_keeps_its_target_names(destination):
     assert set(wrapped) == {"eels_camera"}
     assert isinstance(wrapped["eels_camera"], PassPreview)
     assert wrapped["eels_camera"].shape == destination.shape
+
+
+def test_the_last_spectrum_written_is_kept_with_its_position(destination):
+    """
+    The map's blind spot, covered from the same write.
+
+    A virtual-detector image is one number per position, so a
+    spectrometer parked off the edge of the loss produces a map that
+    looks exactly like a good acquisition. The spectrum is where that is
+    visible, and it is available mid-pass for the same reason the map is.
+    """
+    preview = PassPreview(destination)
+    spectrum = np.arange(_CHANNELS, dtype=np.float32)
+
+    assert preview.latest_spectrum is None
+    preview[5, 1] = spectrum
+
+    position, kept = preview.latest_spectrum
+    assert position == (5, 1)
+    assert np.array_equal(kept, spectrum)
+
+
+def test_the_kept_spectrum_is_a_copy_of_what_was_written(destination):
+    """
+    A buffer the adapter reuses cannot change what a display drew.
+
+    An adapter is free to write out of one scratch array — nothing in
+    the destination contract forbids it, because the destination has
+    copied the values by the time it returns. A preview holding the
+    array itself would show whatever the next position overwrote it
+    with, one frame late and attributed to the wrong pixel.
+    """
+    preview = PassPreview(destination)
+    scratch = np.ones(_CHANNELS, dtype=np.float32)
+
+    preview[0, 0] = scratch
+    scratch[:] = 99.0
+
+    _, kept = preview.latest_spectrum
+    assert np.all(kept == 1.0)
+
+
+def test_a_diffraction_pass_keeps_no_spectrum():
+    """
+    Nothing 1D is written, so there is nothing to say it saw.
+
+    Reported by being absent rather than by the display checking which
+    readout mode the operator set: the rank of what arrives is a fact,
+    and a 512x512 pattern copied per position would cost a gigabyte a
+    second to feed a curve that could not be drawn from it anyway.
+    """
+    cube = np.zeros((2, 2, 64, 64), dtype=np.float32)
+    preview = PassPreview(cube)
+
+    preview[0, 0] = np.ones((64, 64), dtype=np.float32)
+
+    assert preview.latest_spectrum is None
