@@ -176,6 +176,33 @@ def test_a_spectrum_file_claiming_nxem_leaves_the_reader_hint_out(tmp_path):
         assert "interpretation" not in handle[layout.SPECTRUM_INTENSITY].attrs
 
 
+def test_the_axis_index_attributes_are_unsigned_in_either_layout(tmp_path):
+    """
+    ``NX_UINT``, for the reason the frame writer's twin test gives.
+
+    Both layouts, because they write the attribute from different
+    branches and only one of them would be caught by a single check.
+    """
+    series = tmp_path / "eds.nxs"
+    write_spectra(series, [_spectrum(index) for index in range(_SPECTRA)])
+    height, width = _MAP_SHAPE
+    spectrum_image = tmp_path / "map.nxs"
+    write_spectra(
+        spectrum_image,
+        [_spectrum(0, data=np.ones((height, width, _CHANNELS), dtype="uint32"))],
+    )
+
+    expected = {
+        series: ("indices_spectrum_indices", "axis_energy_indices"),
+        spectrum_image: ("axis_j_indices", "axis_i_indices", "axis_energy_indices"),
+    }
+    for path, names in expected.items():
+        with h5py.File(path, "r") as handle:
+            attrs = handle[layout.SPECTRUM_DATA_GROUP].attrs
+            for name in names:
+                assert attrs[name].dtype.kind == "u", f"{path.name}:{name}"
+
+
 def test_one_spectrum_is_stored_the_same_way_as_many(tmp_path):
     """
     A stack of one, not ``spectrum_0d``, so a reader never branches on count.

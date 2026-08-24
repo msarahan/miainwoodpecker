@@ -511,7 +511,8 @@ class PassWriter:
         group.attrs["signal"] = _IMAGE_SIGNAL
         group.attrs["axes"] = [*_NAVIGATION_AXES, *_DETECTOR_AXES]
         for index, axis in enumerate([*_NAVIGATION_AXES, *_DETECTOR_AXES]):
-            group.attrs[f"{axis}_indices"] = index
+            # Unsigned for the reason storage/nexus.py's _write_nxdata gives.
+            group.attrs.create(f"{axis}_indices", index, dtype="uint32")
         group[_IMAGE_SIGNAL].attrs["units"] = "counts"
         group.attrs["camera_id"] = stack.camera_id
 
@@ -597,7 +598,8 @@ class PassWriter:
         group.attrs["signal"] = _SPECTRUM_SIGNAL
         group.attrs["axes"] = axes
         for index, axis in enumerate(axes):
-            group.attrs[f"{axis}_indices"] = index
+            # Unsigned for the reason storage/nexus.py's _write_nxdata gives.
+            group.attrs.create(f"{axis}_indices", index, dtype="uint32")
         group[_SPECTRUM_SIGNAL].attrs["long_name"] = "Counts"
         identifier = spectrum.metadata.get("device_id")
         if identifier is not None:
@@ -631,7 +633,8 @@ class PassWriter:
         group.attrs["signal"] = "data"
         group.attrs["axes"] = list(_IMAGE_AXES)
         for axis_index, axis in enumerate(_IMAGE_AXES):
-            group.attrs[f"{axis}_indices"] = axis_index
+            # Unsigned for the reason storage/nexus.py's _write_nxdata gives.
+            group.attrs.create(f"{axis}_indices", axis_index, dtype="uint32")
 
     @staticmethod
     def _write_axis(

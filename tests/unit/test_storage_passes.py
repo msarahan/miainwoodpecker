@@ -197,6 +197,12 @@ class TestLayout:
             assert len(axes) == _FOUR_AXES
             assert group.attrs["scan_y_indices"] == 0
             assert group.attrs["det_x_indices"] == _FOUR_AXES - 1
+            # NX_UINT, and h5py would write a bare Python int as a
+            # signed int64 - which pynxtools rejects on type. The
+            # values above pass either way, so the dtype is what
+            # actually pins it.
+            for name in ("scan_y_indices", "det_x_indices"):
+                assert group.attrs[name].dtype.kind == "u", name
 
     def test_the_navigation_axes_are_calibrated_from_the_scan(self, tmp_path):
         """

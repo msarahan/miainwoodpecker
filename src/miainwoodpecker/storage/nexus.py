@@ -741,9 +741,17 @@ class NexusWriter:
 
         data_group.attrs["signal"] = "data"
         data_group.attrs["axes"] = ["frame_time", "y", "x"]
-        data_group.attrs["frame_time_indices"] = 0
-        data_group.attrs["y_indices"] = 1
-        data_group.attrs["x_indices"] = 2
+        # Unsigned, and this is not pedantry about a zero. ``NXdata``
+        # declares ``AXISNAME_indices`` as ``NX_UINT``; h5py stores a bare
+        # Python ``int`` as *signed* ``int64``; and ``pynxtools`` rejects
+        # the type outright - measured, an otherwise-valid file fails on
+        # this alone. It is also the truer description: an axis index is a
+        # position in a shape, and there is no such thing as a negative
+        # one. The other two writers spell it the same way, for the same
+        # reason - see storage/spectra.py and storage/passes.py.
+        data_group.attrs.create("frame_time_indices", 0, dtype="uint32")
+        data_group.attrs.create("y_indices", 1, dtype="uint32")
+        data_group.attrs.create("x_indices", 2, dtype="uint32")
 
 
 def _version() -> str:
