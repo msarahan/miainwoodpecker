@@ -58,6 +58,12 @@ miainwoodpecker-broker = "miainwoodpecker.broker.app:main"
 # it". Needs whatever its two children need and nothing of its own -
 # it spawns them and never imports either. See src/miainwoodpecker/launcher.py.
 miainwoodpecker-instrument = "miainwoodpecker.launcher:main"
+# The same session held open from the notification area instead of from a
+# terminal: right-click to open a window on the instrument, to see how the
+# device servers underneath it are doing, or to stop the lot. Needs the
+# "viewer" extra for Qt - the icon and its menu - and, like the launcher,
+# whatever its children need. See src/miainwoodpecker/tray/.
+miainwoodpecker-tray = "miainwoodpecker.tray.app:main"
 
 [project.urls]
 Homepage = "https://github.com/msarahan/miainwoodpecker"
@@ -803,6 +809,25 @@ dashboard = { cmd = "miainwoodpecker-instrument --broker-env device --ui-env das
 # Publishes into the working directory, which is where a notebook looks
 # when it is told nothing else.
 serve = { cmd = "miainwoodpecker-instrument --serve --publish . --broker-env device", description = "Hold the instrument open for clients to come and go" }
+# The same thing as `serve`, with somewhere to live. A control computer
+# is not a terminal somebody is watching: the instrument is served all
+# day, and the person at the console did not start it. This puts the
+# session in the notification area instead, where a right-click opens a
+# window on it, shows how each device server is doing, and stops
+# everything - and where closing a stray console window cannot end a
+# session by accident.
+#
+# Publishes to $HOME/.miainwoodpecker by default, beside the instrument
+# configuration, so a notebook or a dashboard needs to be told nothing.
+# Add --config $HOME/.miainwoodpecker/instrument.toml for a microscope
+# that is more than one device server.
+#
+# Three environments, and that is the point rather than an accident: the
+# vendor stack in one, the Qt window in another that demonstrably does
+# not contain it, and marimo in a third that contains neither. The
+# command after -- is what the dashboard entry on the menu runs; drop it
+# and its environment to have a menu with only the window on it.
+tray = { cmd = "miainwoodpecker-tray --broker-env device --ui-env default --dashboard-env dashboard -- marimo run notebooks/instrument_dashboard.py", description = "Hold the instrument open from the system tray" }
 # Unit tests only. They need no display and no devices, which is what makes
 # them the default: a check that cannot run on the machine in front of you
 # is not a check.

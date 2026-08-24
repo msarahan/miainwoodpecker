@@ -73,7 +73,7 @@ going to answer: a napari process signalled during its own startup
 stops responding to console control events altogether, measured, for as
 long as anyone cares to keep asking. The broker is worth thirty seconds
 because parking is worth thirty seconds. A window is worth five, after
-which it is terminated - see :data:`_FRONT_END_TIMEOUT_S`.
+which it is terminated - see :data:`FRONT_END_TIMEOUT_S`.
 """
 
 from __future__ import annotations
@@ -122,7 +122,7 @@ this variable, and a script somebody writes next month can read it too
 without this module learning about it.
 """
 
-_INVITATION_TIMEOUT_S = 120.0
+INVITATION_TIMEOUT_S = 120.0
 """
 How long to wait for the broker to publish where it is listening.
 
@@ -143,7 +143,7 @@ takes to reach a safe state. Worth waiting out, because the alternative
 to a parked instrument is a stationary probe.
 """
 
-_FRONT_END_TIMEOUT_S = 5.0
+FRONT_END_TIMEOUT_S = 5.0
 """
 How long a front end gets, which is much less, and deliberately.
 
@@ -161,6 +161,12 @@ to the same window once it is up ends it in 0.1s. So the case this
 timeout is sized for is not a slow shutdown, it is a front end that will
 never shut down, and thirty seconds of an operator watching a terminal
 buys nothing over five.
+
+Public because :mod:`miainwoodpecker.tray` stops the same front ends in
+the same order and would otherwise reintroduce the wait this exists to
+remove - and there it is worse, since the tray may have several windows
+open and would spend this on each of them before the broker is asked to
+park anything.
 """
 
 _KILL_GRACE_S = 5.0
@@ -338,6 +344,8 @@ def child_command(
 def spawn(
     command: Sequence[str],
     env: dict[str, str] | None = None,
+    *,
+    capture: bool = False,
 ) -> subprocess.Popen:
     """
     Start one child, in its own process group.
@@ -354,6 +362,14 @@ def spawn(
         The argv to run.
     env : dict[str, str] | None
         The child's environment, or None to inherit this one's.
+    capture : bool
+        Whether to pipe the child's output back rather than letting it
+        through to this process's console. For a supervisor that has no
+        console - :mod:`miainwoodpecker.tray` - where the alternative
+        is a front end's traceback going nowhere at all. **A caller
+        that asks for this must read the pipe**, on a thread or
+        otherwise: a child whose output nobody reads blocks once the
+        buffer fills.
 
     Returns
     -------
@@ -361,9 +377,20 @@ def spawn(
         The running child.
     """
     _LOGGER.info("starting: %s", " ".join(command))
+    piped = (
+        {
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.STDOUT,
+            "text": True,
+            "bufsize": 1,
+        }
+        if capture
+        else {}
+    )
     return subprocess.Popen(  # noqa: S603 - argv built here, no shell
         list(command),
         env=env,
+        **piped,
         **own_process_group(),
     )
 
@@ -388,7 +415,7 @@ def stop(process: subprocess.Popen, timeout_s: float = _STOP_TIMEOUT_S) -> int |
     timeout_s : float
         How long to wait for it to go on its own. The default is the
         broker's, which is the child worth waiting for; a front end is
-        given :data:`_FRONT_END_TIMEOUT_S` instead, because one that has
+        given :data:`FRONT_END_TIMEOUT_S` instead, because one that has
         not answered in five seconds has been measured not to answer at
         all.
 
@@ -429,7 +456,7 @@ def stop(process: subprocess.Popen, timeout_s: float = _STOP_TIMEOUT_S) -> int |
 def wait_for_invitation(
     process: subprocess.Popen,
     invitation: Path,
-    timeout_s: float = _INVITATION_TIMEOUT_S,
+    timeout_s: float = INVITATION_TIMEOUT_S,
 ) -> None:
     """
     Wait until the broker has published where it is listening.
@@ -528,14 +555,14 @@ def _supervise(
                     "the broker exited with status %s; stopping the front end",
                     status,
                 )
-                stop(front_end, _FRONT_END_TIMEOUT_S)
+                stop(front_end, FRONT_END_TIMEOUT_S)
                 return status or 1
             time.sleep(_POLL_S)
     except KeyboardInterrupt:
         # Only reachable where the handlers could not be installed.
         _LOGGER.info("interrupted")
     _LOGGER.info("asked to stop; stopping the front end, then the broker")
-    stop(front_end, _FRONT_END_TIMEOUT_S)
+    stop(front_end, FRONT_END_TIMEOUT_S)
     stop(broker)
     # The conventional status for "ended from outside", and not zero:
     # this command was asked to run a session and the session did not
@@ -664,6 +691,18 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--config",
+        default=None,
+        metavar="PATH",
+        help=(
+            "instrument configuration enumerating this microscope's hardware "
+            "and the servers that drive it; a directory gets instrument.toml "
+            "inside it. Passed to the broker, which starts every adapter the "
+            "file lists - so it replaces --backend, --plugin and "
+            "--server-module rather than combining with them"
+        ),
+    )
+    parser.add_argument(
         "--backend",
         choices=(SIMULATED_BACKEND, HARDWARE_BACKEND),
         default=None,
@@ -755,14 +794,20 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def _broker_arguments(args: argparse.Namespace, publish: Path) -> list[str]:
+def broker_arguments(args: argparse.Namespace, publish: Path) -> list[str]:
     """
     Build the broker's command line from what was passed through.
 
     Only what was actually given, so the broker's own defaults stay the
     broker's - this command has no opinion about which backend is the
     safe one, and repeating that opinion here would be a second place to
-    change it.
+    change it. That includes the contradictions: ``--config`` with
+    ``--backend`` is refused by the broker's own parser, in the one
+    message that can explain why, rather than being caught twice.
+
+    Public because :mod:`miainwoodpecker.tray` is the other supervisor
+    over the same broker and passes the same flags through. Both parsers
+    define these arguments; this builds the command line from either.
 
     Parameters
     ----------
@@ -777,12 +822,59 @@ def _broker_arguments(args: argparse.Namespace, publish: Path) -> list[str]:
         Arguments for :data:`BROKER_MODULE`.
     """
     arguments = ["--publish", str(publish)]
-    for name in ("backend", "server_module", "host"):
-        value = getattr(args, name)
+    for name in ("config", "backend", "server_module", "host"):
+        value = getattr(args, name, None)
         if value is not None:
             arguments += [f"--{name.replace('_', '-')}", str(value)]
-    for plugin in args.plugin or ():
+    for plugin in getattr(args, "plugin", None) or ():
         arguments += ["--plugin", plugin]
+    return arguments
+
+
+def viewer_command(
+    publish: Path,
+    *,
+    session: str | None = None,
+    operator: str | None = None,
+    sample: str | None = None,
+    notes: str | None = None,
+) -> list[str]:
+    """
+    Build the command that opens a window on a broker that is running.
+
+    ``-m`` rather than the ``miainwoodpecker-viewer`` script, for the
+    reason :mod:`miainwoodpecker.__main__` gives: the module path works
+    in an environment whose entry-point scripts are missing or stale,
+    and this is spawned into an environment that may not be this one.
+
+    Parameters
+    ----------
+    publish : Path
+        Where the broker published its invitation.
+    session : str | None
+        Session directory for recordings, or None for the viewer's own
+        default.
+    operator : str | None
+        Who is on the instrument.
+    sample : str | None
+        Sample identifier.
+    notes : str | None
+        Free-text session notes.
+
+    Returns
+    -------
+    list[str]
+        The argv to run.
+    """
+    arguments = [sys.executable, "-m", VIEWER_MODULE, "--broker", str(publish)]
+    for name, value in (
+        ("session", session),
+        ("operator", operator),
+        ("sample", sample),
+        ("notes", notes),
+    ):
+        if value is not None:
+            arguments += [f"--{name}", str(value)]
     return arguments
 
 
@@ -805,12 +897,13 @@ def _front_end_command(args: argparse.Namespace, publish: Path) -> list[str]:
     given = [argument for argument in args.front_end if argument != "--"]
     if given:
         return given
-    arguments = [sys.executable, "-m", VIEWER_MODULE, "--broker", str(publish)]
-    for name in ("session", "operator", "sample", "notes"):
-        value = getattr(args, name)
-        if value is not None:
-            arguments += [f"--{name}", str(value)]
-    return arguments
+    return viewer_command(
+        publish,
+        session=args.session,
+        operator=args.operator,
+        sample=args.sample,
+        notes=args.notes,
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -887,7 +980,7 @@ def main(argv: list[str] | None = None) -> int:
     requested = stop_requests()
     broker = spawn(
         child_command(
-            [sys.executable, "-m", BROKER_MODULE, *_broker_arguments(args, publish)],
+            [sys.executable, "-m", BROKER_MODULE, *broker_arguments(args, publish)],
             broker_environment,
         ),
         env={**os.environ, **broker_environment},

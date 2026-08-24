@@ -56,7 +56,7 @@ for the window. Add `--publish ~/instrument` and a notebook can join the
 session while it runs; without it the connection details live in a
 temporary directory that goes away with the session.
 
-Three shapes, and which you want depends on how the microscope is being
+Four shapes, and which you want depends on how the microscope is being
 used rather than on the software:
 
 | Command | The session is |
@@ -64,6 +64,7 @@ used rather than on the software:
 | `pixi run instrument` | One sitting. A window, and the instrument put down when you close it. |
 | `pixi run dashboard` | The same, with the [browser dashboard](scripting-and-automation.md) as the front end instead of the window. |
 | `pixi run serve` | The instrument itself. No front end: it stays served while people attach and detach, and ends when you press Ctrl-C. |
+| `pixi run tray` | The same as `serve`, with somewhere to live: an icon in the notification area instead of a terminal to keep open. |
 
 `serve` is the one to reach for when the answer to "napari or the
 notebook?" is "both, and not yet". It publishes into the working
@@ -80,6 +81,65 @@ through the same leases everything else does. Under `pixi run
 instrument`, by contrast, closing the window ends the session for
 everyone — which is what you want for one sitting and not for a shared
 column.
+
+### The same thing, without a terminal to keep open
+
+`pixi run tray` serves the instrument exactly as `serve` does and puts
+the session in the notification area instead of in a console. Right-click
+the icon for:
+
+- **Open a viewer** — a window on this instrument. It is an ordinary
+  client, so closing it does not end anything.
+- **Open a dashboard** — the [browser dashboard](scripting-and-automation.md)
+  on the same instrument, in its own environment: it wants marimo and no
+  Qt, which is why it is a separate entry rather than a mode of the
+  window. Both can be open at once.
+
+Once one is running its entry says **Show the viewer** (or **Show the
+dashboard**) instead, and that is what the click does: the window is
+brought to the front, and the dashboard's address is opened again — which
+your browser will usually answer by focusing the tab that already has it.
+The tray keeps one of each rather than starting a second, because an
+entry pressed again because a window went behind a browser is not a
+request for two windows. If you genuinely want a second, start it
+yourself against the published invitation; it joins like any other
+client.
+
+On Linux and macOS there is no portable way for one process to raise
+another's window, so there the tray says a viewer is already open and
+leaves you to find it. The dashboard works the same everywhere, since
+opening an address is all it ever needed.
+- **Instrument health…** — one row per device, under the device server
+  that was supposed to bring it, saying whether it is answering, what it
+  is acquiring and at what rate, and who is holding it. It is read from
+  the broker rather than by poking the hardware, so opening it cannot
+  disturb an acquisition — and so a device it calls "answering" is one
+  that has not reported itself broken rather than one that has been
+  tested.
+- **Quit and stop the instrument** — the windows, then the broker, then
+  the column parked. It asks first, and the question lists what is
+  running at the moment you ask it, because this ends everybody's
+  session and not only yours.
+
+It publishes to `~/.miainwoodpecker` by default, which is where a
+notebook or a dashboard looks when it is told nothing at all, so
+`miainwoodpecker-viewer --broker ~/.miainwoodpecker` joins from anywhere
+else on the machine. It takes the same options as the commands above,
+including `--config` for a microscope that is more than one device
+server — see [Instrument configuration](instrument-configuration.md).
+
+The dashboard entry appears only when you say what opens it, which is
+anything after `--`:
+
+```shell
+miainwoodpecker-tray --dashboard-env dashboard -- marimo run notebooks/instrument_dashboard.py
+```
+
+`pixi run tray` already passes that, along with `--broker-env device`
+and `--ui-env default` — three environments, which is the point rather
+than an accident: the vendor stack in one, the Qt window in another that
+demonstrably does not contain it, and marimo in a third that contains
+neither.
 
 The window is the same window: the same panels, the same detectors, the
 same controls, built from what the broker reports rather than from
