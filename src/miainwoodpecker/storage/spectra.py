@@ -687,9 +687,10 @@ class SpectrumWriter:
                 axis.attrs["units"] = calibration.units
                 axis.attrs["long_name"] = calibration.long_name
             data_group.attrs["axes"] = ["axis_j", "axis_i", "axis_energy"]
-            data_group.attrs["axis_j_indices"] = 0
-            data_group.attrs["axis_i_indices"] = 1
-            data_group.attrs["axis_energy_indices"] = 2
+            # Unsigned for the reason storage/nexus.py's _write_nxdata gives.
+            data_group.attrs.create("axis_j_indices", 0, dtype="uint32")
+            data_group.attrs.create("axis_i_indices", 1, dtype="uint32")
+            data_group.attrs.create("axis_energy_indices", 2, dtype="uint32")
         else:
             # stack_0d, even for a single spot spectrum. NXspectrum does
             # define spectrum_0d for exactly one, and writing that instead
@@ -710,8 +711,9 @@ class SpectrumWriter:
                 index_axis = data_group.create_dataset(name, data=values)
                 index_axis.attrs["long_name"] = f"{label} identifier"
             data_group.attrs["axes"] = ["indices_spectrum", "axis_energy"]
-            data_group.attrs["indices_spectrum_indices"] = 0
-            data_group.attrs["axis_energy_indices"] = 1
+            # Unsigned for the reason storage/nexus.py's _write_nxdata gives.
+            data_group.attrs.create("indices_spectrum_indices", 0, dtype="uint32")
+            data_group.attrs.create("axis_energy_indices", 1, dtype="uint32")
 
         # Why this exists and why it is written twice: see the matching
         # pair in :meth:`miainwoodpecker.storage.nexus.NexusWriter._write_nxdata`.

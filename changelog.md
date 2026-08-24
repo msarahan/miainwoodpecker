@@ -686,6 +686,21 @@
   plumbing. `tests/unit/test_analysis_connect.py` pins both halves — a
   never-accepting socket for the bound, a `Client` that never answers
   over a worker that exits for the poll.
+- **Axis index attributes are unsigned, which is what `NXdata` says they
+  are.** `AXISNAME_indices` is declared `NX_UINT`, and h5py stores a bare
+  Python `int` as a *signed* `int64` — so every `*_indices` attribute this
+  project has ever written was the wrong type. Measured with `pynxtools`:
+  wherever the schema actually checks that attribute, the type alone is
+  enough to make an otherwise-valid file invalid. It went unnoticed here
+  because our `NXdata` sits at `entry/data`, where the application
+  definition does not check it; it surfaced while measuring what adopting
+  `NXimage` would cost, which does.
+  All three writers — frames, spectra, and the four-axis diffraction cube
+  in `storage/passes.py` — now state the type to h5py rather than letting
+  it infer one, and the tests assert the dtype rather than the value,
+  since `0 == 0` whichever way it is stored. Unsigned is also the truer
+  description: an axis index is a position in a shape, and there is no
+  negative one.
 
 - **The out-of-tree adapter stand-in did not survive losing a port, so
   the test file that documents the adapter contract was intermittent.**
