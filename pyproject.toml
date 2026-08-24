@@ -799,7 +799,13 @@ serve = { cmd = "miainwoodpecker-instrument --serve --publish . --broker-env dev
 # configuration, so a notebook or a dashboard needs to be told nothing.
 # Add --config $HOME/.miainwoodpecker/instrument.toml for a microscope
 # that is more than one device server.
-tray = { cmd = "miainwoodpecker-tray --broker-env device --ui-env default", description = "Hold the instrument open from the system tray" }
+#
+# Three environments, and that is the point rather than an accident: the
+# vendor stack in one, the Qt window in another that demonstrably does
+# not contain it, and marimo in a third that contains neither. The
+# command after -- is what the dashboard entry on the menu runs; drop it
+# and its environment to have a menu with only the window on it.
+tray = { cmd = "miainwoodpecker-tray --broker-env device --ui-env default --dashboard-env dashboard -- marimo run notebooks/instrument_dashboard.py", description = "Hold the instrument open from the system tray" }
 # Unit tests only. They need no display and no devices, which is what makes
 # them the default: a check that cannot run on the machine in front of you
 # is not a check.

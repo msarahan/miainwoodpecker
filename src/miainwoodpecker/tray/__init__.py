@@ -25,6 +25,7 @@ from miainwoodpecker.tray.health import (
     unreachable,
 )
 from miainwoodpecker.tray.session import (
+    FrontEnd,
     InstrumentSession,
     SessionState,
     SessionStatus,
@@ -32,6 +33,7 @@ from miainwoodpecker.tray.session import (
 
 __all__ = [
     "Condition",
+    "FrontEnd",
     "InstrumentHealth",
     "InstrumentSession",
     "ServerHealth",

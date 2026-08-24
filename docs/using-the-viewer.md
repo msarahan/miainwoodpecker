@@ -91,6 +91,11 @@ the icon for:
 - **Open a viewer** — a window on this instrument, and another one after
   that if you want two. They are ordinary clients, so closing one does
   not end anything.
+- **Open a dashboard** — the [browser dashboard](scripting-and-automation.md)
+  on the same instrument, in its own environment: it wants marimo and no
+  Qt, which is why it is a separate entry rather than a mode of the
+  window. Both can be open at once, and each is counted separately on
+  its own entry.
 - **Instrument health…** — one row per device, under the device server
   that was supposed to bring it, saying whether it is answering, what it
   is acquiring and at what rate, and who is holding it. It is read from
@@ -109,6 +114,19 @@ notebook or a dashboard looks when it is told nothing at all, so
 else on the machine. It takes the same options as the commands above,
 including `--config` for a microscope that is more than one device
 server — see [Instrument configuration](instrument-configuration.md).
+
+The dashboard entry appears only when you say what opens it, which is
+anything after `--`:
+
+```shell
+miainwoodpecker-tray --dashboard-env dashboard -- marimo run notebooks/instrument_dashboard.py
+```
+
+`pixi run tray` already passes that, along with `--broker-env device`
+and `--ui-env default` — three environments, which is the point rather
+than an accident: the vendor stack in one, the Qt window in another that
+demonstrably does not contain it, and marimo in a third that contains
+neither.
 
 The window is the same window: the same panels, the same detectors, the
 same controls, built from what the broker reports rather than from

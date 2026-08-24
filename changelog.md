@@ -13,7 +13,14 @@
   not the person who started it, and "close the black window" is a thing
   that happens. `pixi run tray` (`miainwoodpecker-tray`) is the same
   session with somewhere to live: the broker outlives every window, and
-  the things anybody needs are on a right-click. It publishes to
+  the things anybody needs are on a right-click — a window on the
+  instrument, the browser dashboard on it, how its device servers are
+  doing, and stopping the lot. The window and the dashboard are separate
+  entries rather than a choice made at startup, because they are
+  separate programs wanting separate environments — Qt in one, marimo
+  and no Qt in the other — so `pixi run tray` runs three: the vendor
+  stack in one, the window in another that demonstrably does not contain
+  it, and marimo in a third that contains neither. It publishes to
   `~/.miainwoodpecker` by default — beside the instrument configuration,
   where a notebook already looks when it is told nothing at all — because
   an instrument held open for people to join has to be findable, which is

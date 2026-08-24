@@ -37,8 +37,8 @@ The project is early. What exists today:
   every client at once — a window, a notebook, a dashboard — arbitrating
   who drives, with a **system-tray application**
   (`miainwoodpecker.tray`) that holds one open on a control computer:
-  right-click for a window on it, for how each device server is doing,
-  or to stop the lot and park the column,
+  right-click for a window on it, for the browser dashboard, for how
+  each device server is doing, or to stop the lot and park the column,
 * **acquisition sequences** (`miainwoodpecker.acquisition`) that stream to
   disk as they run, and
 * **NeXus/HDF5 storage** (`miainwoodpecker.storage`), including an importer

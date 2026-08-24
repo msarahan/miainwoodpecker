@@ -33,7 +33,7 @@ from qtpy import QtWidgets
 from miainwoodpecker.broker.invitation import DEFAULT_FILENAME
 from miainwoodpecker.tray import app as tray_app
 from miainwoodpecker.tray.health import Condition
-from miainwoodpecker.tray.session import InstrumentSession, SessionState
+from miainwoodpecker.tray.session import FrontEnd, InstrumentSession, SessionState
 
 if typing.TYPE_CHECKING:
     from collections.abc import Iterator
@@ -43,6 +43,24 @@ _CAMERA_SERVER = "miainwoodpecker.devices.camera_server"
 _DEADLINE_S = 120.0
 _SLEEPER = "import time; time.sleep(60)"
 _WINDOWS = 2
+
+
+def _front_ends() -> list[FrontEnd]:
+    """
+    Return a viewer and a dashboard, both stood in for by a sleeper.
+
+    Both, because the menu has an entry per front end and the point of
+    several tests below is that the two are offered and counted apart.
+
+    Returns
+    -------
+    list[FrontEnd]
+        In menu order.
+    """
+    return [
+        FrontEnd(label="viewer", command=(sys.executable, "-c", _SLEEPER)),
+        FrontEnd(label="dashboard", command=(sys.executable, "-c", _SLEEPER)),
+    ]
 
 
 @pytest.fixture(name="application")
@@ -100,7 +118,7 @@ def _tray(
             "--publish",
             str(published),
         ],
-        [sys.executable, "-c", _SLEEPER],
+        _front_ends(),
         published,
     )
     instrument = tray_app.TrayInstrument(session)
@@ -205,7 +223,7 @@ def test_the_menu_offers_an_instrument_only_once_there_is_one(tmp_path, applicat
     published = tmp_path / "published"
     session = InstrumentSession(
         [sys.executable, "-c", _SLEEPER],
-        [sys.executable, "-c", _SLEEPER],
+        _front_ends(),
         published,
     )
     tray = tray_app.TrayInstrument(session)
@@ -237,6 +255,7 @@ def test_the_tray_serves_an_instrument_and_opens_windows_on_it(tray):
     instrument, session = tray
 
     assert _entry(instrument, "viewer").isEnabled()
+    assert _entry(instrument, "dashboard").isEnabled()
     assert (session.publish / DEFAULT_FILENAME).exists()
 
     instrument.open_viewer()
@@ -247,6 +266,26 @@ def test_the_tray_serves_an_instrument_and_opens_windows_on_it(tray):
     # Two windows on one column is not an accident: arbitrating between
     # clients is what the broker underneath this is for.
     assert "2 open" in _entry(instrument, "viewer").text()
+
+
+def test_the_window_and_the_dashboard_are_separate_entries(tray):
+    """
+    Two front ends, two entries, and neither counted as the other.
+
+    They are separate programs wanting separate environments — Qt in
+    one, marimo and no Qt in the other — so a single "open the front
+    end" entry could only ever offer one of them.
+    """
+    instrument, session = tray
+
+    instrument.open_viewer("dashboard")
+    instrument.tick()
+
+    assert session.open_count("dashboard") == 1
+    assert session.open_count("viewer") == 0
+    assert "1 open" in _entry(instrument, "dashboard").text()
+    # The viewer's entry is untouched by a dashboard being open.
+    assert _entry(instrument, "viewer").text() == "Open a viewer"
 
 
 def test_the_health_report_names_what_the_broker_is_wrapping(tray):
@@ -327,6 +366,7 @@ def test_quitting_asks_first_and_a_refused_question_changes_nothing(
 
     monkeypatch.setattr(tray_app, "confirm", refuse)
     instrument.open_viewer()
+    instrument.open_viewer("dashboard")
     instrument.tick()
 
     instrument.confirm_quit()
@@ -336,9 +376,10 @@ def test_quitting_asks_first_and_a_refused_question_changes_nothing(
     question, detail = asked[0]
     assert "everyone connected to it" in question
     # And it says what stopping would cost, in the terms an operator
-    # can check: where the instrument is published, and what is open.
+    # can check: where the instrument is published, and what is open -
+    # counted per kind, since "2 clients" would not say which two.
     assert str(session.publish) in detail
-    assert "1 window" in detail
+    assert "1 viewer and 1 dashboard" in detail
 
 
 def test_confirming_stops_the_windows_the_broker_and_the_instrument(
@@ -388,7 +429,7 @@ def test_a_broker_that_dies_is_reported_rather_than_left_looking_healthy(
     published = tmp_path / "published"
     session = InstrumentSession(
         [sys.executable, "-c", "raise SystemExit(4)"],
-        [sys.executable, "-c", _SLEEPER],
+        _front_ends(),
         published,
     )
     tray = tray_app.TrayInstrument(session)

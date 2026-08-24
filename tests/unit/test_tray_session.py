@@ -25,7 +25,7 @@ import typing
 import pytest
 
 from miainwoodpecker.broker.invitation import DEFAULT_FILENAME, BrokerInvitation
-from miainwoodpecker.tray.session import InstrumentSession, SessionState
+from miainwoodpecker.tray.session import FrontEnd, InstrumentSession, SessionState
 
 if typing.TYPE_CHECKING:
     from pathlib import Path
@@ -48,6 +48,23 @@ def _sleeping() -> list[str]:
     return [sys.executable, "-c", _SLEEPER]
 
 
+def _viewer(command: list[str] | None = None) -> list[FrontEnd]:
+    """
+    Return the one front end most of these tests need.
+
+    Parameters
+    ----------
+    command : list[str] | None
+        What opening it runs, or None for a child that stays up.
+
+    Returns
+    -------
+    list[FrontEnd]
+        A single "viewer".
+    """
+    return [FrontEnd(label="viewer", command=tuple(command or _sleeping()))]
+
+
 def _session(tmp_path: Path, **kwargs: object) -> InstrumentSession:
     """
     Build a session whose broker and window both merely stay alive.
@@ -65,7 +82,7 @@ def _session(tmp_path: Path, **kwargs: object) -> InstrumentSession:
     InstrumentSession
         Built, not started.
     """
-    return InstrumentSession(_sleeping(), _sleeping(), tmp_path, **kwargs)
+    return InstrumentSession(_sleeping(), _viewer(), tmp_path, **kwargs)
 
 
 def _publish(directory: Path, port: int = _PUBLISHED_PORT) -> BrokerInvitation:
@@ -157,7 +174,7 @@ def test_a_broker_that_exits_before_publishing_is_reported_rather_than_waited_ou
     """
     session = InstrumentSession(
         [sys.executable, "-c", "raise SystemExit(3)"],
-        _sleeping(),
+        _viewer(),
         tmp_path,
     )
     session.start()
@@ -199,7 +216,7 @@ def test_a_broker_that_dies_while_serving_is_a_fault_rather_than_an_ending(tmp_p
     """
     session = InstrumentSession(
         [sys.executable, "-c", "import time; time.sleep(0.2)"],
-        _sleeping(),
+        _viewer(),
         tmp_path,
     )
     session.start()
@@ -236,6 +253,48 @@ def test_a_window_cannot_be_opened_before_there_is_one_to_open(tmp_path):
         session.shutdown()
 
 
+def test_each_kind_of_client_is_opened_and_counted_on_its_own(tmp_path):
+    """
+    A window and a dashboard at once, and neither counted as the other.
+
+    They are separate programs wanting separate environments — Qt in
+    one, marimo and no Qt in the other — so the menu offers them
+    separately, and an entry that said "Open another viewer (2 open)"
+    about one viewer and one dashboard would be counting the wrong
+    thing.
+    """
+    session = InstrumentSession(
+        _sleeping(),
+        [
+            FrontEnd(label="viewer", command=tuple(_sleeping())),
+            FrontEnd(label="dashboard", command=tuple(_sleeping())),
+        ],
+        tmp_path,
+    )
+    session.start()
+    try:
+        _publish(tmp_path)
+        session.poll()
+
+        assert session.open_front_end("viewer") is not None
+        assert session.open_front_end("viewer") is not None
+        assert session.open_front_end("dashboard") is not None
+        session.poll()
+
+        assert session.open_count("viewer") == _WINDOWS
+        assert session.open_count("dashboard") == 1
+        assert session.front_ends == _WINDOWS + 1
+        # And a kind nobody offered opens nothing rather than the first
+        # one that happened to be there.
+        assert session.open_front_end("notebook") is None
+        # No label means the first offered, which is what a double-click
+        # on the icon gets.
+        assert session.open_front_end() is not None
+        assert session.open_count("viewer") == _WINDOWS + 1
+    finally:
+        session.shutdown()
+
+
 def test_a_window_that_closes_on_its_own_stops_being_counted(tmp_path):
     """
     The count is of windows that are still there, not of ones ever opened.
@@ -246,7 +305,7 @@ def test_a_window_that_closes_on_its_own_stops_being_counted(tmp_path):
     """
     session = InstrumentSession(
         _sleeping(),
-        [sys.executable, "-c", "pass"],
+        _viewer([sys.executable, "-c", "pass"]),
         tmp_path,
     )
     session.start()
@@ -277,16 +336,18 @@ def test_a_window_is_told_where_the_broker_is(tmp_path):
     report = tmp_path / "seen.txt"
     session = InstrumentSession(
         _sleeping(),
-        [
-            sys.executable,
-            "-c",
-            (
-                "import os, pathlib; pathlib.Path("
-                f"{str(report)!r}"
-                ").write_text(os.environ['MIAINWOODPECKER_BROKER'], "
-                "encoding='utf-8')"
-            ),
-        ],
+        _viewer(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import os, pathlib; pathlib.Path("
+                    f"{str(report)!r}"
+                    ").write_text(os.environ['MIAINWOODPECKER_BROKER'], "
+                    "encoding='utf-8')"
+                ),
+            ],
+        ),
         tmp_path,
     )
     session.start()
@@ -435,7 +496,7 @@ def test_the_published_invitation_is_where_clients_are_told_to_look(tmp_path):
     variable holds, and what the confirmation dialog prints.
     """
     published = tmp_path / "instrument"
-    session = InstrumentSession(_sleeping(), _sleeping(), published)
+    session = InstrumentSession(_sleeping(), _viewer(), published)
     session.start()
     try:
         assert session.publish == published

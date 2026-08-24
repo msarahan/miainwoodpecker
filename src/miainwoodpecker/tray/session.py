@@ -44,7 +44,7 @@ import logging
 import os
 import time
 import typing
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from miainwoodpecker.broker.invitation import DEFAULT_FILENAME, BrokerInvitation
@@ -126,6 +126,40 @@ class SessionStatus:
     changed: bool = False
 
 
+@dataclass(frozen=True)
+class FrontEnd:
+    """
+    One thing the menu can open on the served instrument.
+
+    There is more than one because the project has more than one, and
+    they are not variants of each other: the Qt window and the browser
+    dashboard are separate programs, wanting separate environments -
+    Qt in one, marimo and no Qt in the other - and both are ordinary
+    clients of the broker rather than the application it belongs to.
+    Carrying the environment here rather than one per session is what
+    lets the tray offer both at once.
+
+    Attributes
+    ----------
+    label : str
+        What it is, in one word, and what the menu says: "viewer" gets
+        "Open a viewer" and "Open another viewer (2 open)". Also the
+        identity a count is kept against, so two dashboards do not read
+        as two windows.
+    command : tuple[str, ...]
+        The argv to run, already resolved for whichever environment it
+        belongs in - see
+        :func:`~miainwoodpecker.launcher.child_command`.
+    environment : dict[str, str]
+        Variables to add to its environment, from
+        :func:`~miainwoodpecker.launcher.resolve_environment`.
+    """
+
+    label: str
+    command: tuple[str, ...]
+    environment: dict[str, str] = field(default_factory=dict)
+
+
 class InstrumentSession:
     """
     One broker, the windows opened on it, and the order they stop in.
@@ -141,16 +175,15 @@ class InstrumentSession:
         The argv that runs the broker, already resolved for whichever
         environment it belongs in - see
         :func:`~miainwoodpecker.launcher.child_command`.
-    front_end_command : Sequence[str]
-        The argv that opens a window on it, likewise resolved.
+    front_ends : Sequence[FrontEnd]
+        What can be opened on it, in menu order. The first is what a
+        double-click opens.
     publish : Path
         Where the broker publishes its invitation, and where clients
         look for it. Created if it does not exist.
     broker_environment : dict[str, str] | None
         Variables to add to the broker's environment, from
         :func:`~miainwoodpecker.launcher.resolve_environment`.
-    front_end_environment : dict[str, str] | None
-        The same for a window.
     config : InstrumentConfig | None
         The instrument this broker was started from, when it was started
         from a file. Read only to say which device server each target
@@ -162,24 +195,22 @@ class InstrumentSession:
     def __init__(  # noqa: PLR0913 - one construction site, everything named
         self,
         broker_command: Sequence[str],
-        front_end_command: Sequence[str],
+        front_ends: Sequence[FrontEnd],
         publish: Path,
         *,
         broker_environment: dict[str, str] | None = None,
-        front_end_environment: dict[str, str] | None = None,
         config: InstrumentConfig | None = None,
         timeout_s: float = INVITATION_TIMEOUT_S,
     ) -> None:
         self._broker_command = list(broker_command)
-        self._front_end_command = list(front_end_command)
+        self._openable = {front_end.label: front_end for front_end in front_ends}
         self._publish = Path(publish)
         self._broker_environment = dict(broker_environment or {})
-        self._front_end_environment = dict(front_end_environment or {})
         self._config = config
         self._timeout_s = timeout_s
         self._invitation_path = self._publish / DEFAULT_FILENAME
         self._broker: subprocess.Popen | None = None
-        self._front_ends: list[subprocess.Popen] = []
+        self._running: list[tuple[str, subprocess.Popen]] = []
         self._invitation: BrokerInvitation | None = None
         self._watcher: RemoteBroker | None = None
         self._state = SessionState.STARTING
@@ -239,14 +270,47 @@ class InstrumentSession:
     @property
     def front_ends(self) -> int:
         """
-        Return how many windows this session opened and still has.
+        Return how many clients this session opened and still has.
 
         Returns
         -------
         int
             The count, as of the last poll.
         """
-        return len(self._front_ends)
+        return len(self._running)
+
+    @property
+    def openable(self) -> tuple[FrontEnd, ...]:
+        """
+        Return what can be opened on this instrument, in menu order.
+
+        Returns
+        -------
+        tuple[FrontEnd, ...]
+            As given at construction.
+        """
+        return tuple(self._openable.values())
+
+    def open_count(self, label: str | None = None) -> int:
+        """
+        Return how many of one kind of client are open, or of every kind.
+
+        Per kind because the menu counts per entry: two dashboards must
+        not read as two windows on an entry that opens windows.
+
+        Parameters
+        ----------
+        label : str | None
+            The kind to count, or None for all of them.
+
+        Returns
+        -------
+        int
+            The count, as of the last poll.
+        """
+        if label is None:
+            return len(self._running)
+        return sum(1 for opened, _ in self._running if opened == label)
 
     def start(self) -> None:
         """
@@ -291,8 +355,10 @@ class InstrumentSession:
         """
         if self._state in (SessionState.FAILED, SessionState.STOPPED):
             return self._status()
-        self._front_ends = [
-            process for process in self._front_ends if process.poll() is None
+        self._running = [
+            (label, process)
+            for label, process in self._running
+            if process.poll() is None
         ]
         if self._state is SessionState.STARTING:
             self._poll_starting()
@@ -401,37 +467,52 @@ class InstrumentSession:
         return SessionStatus(
             state=self._state,
             message=self._message,
-            front_ends=len(self._front_ends),
+            front_ends=len(self._running),
             invitation=self._invitation,
             changed=changed,
         )
 
-    def open_front_end(self) -> subprocess.Popen | None:
+    def open_front_end(self, label: str | None = None) -> subprocess.Popen | None:
         """
-        Open a window on the instrument, if there is one to open it on.
+        Open a client on the instrument, if there is one to open it on.
 
         More than one is allowed and is not an accident: arbitrating
         between clients is what the broker is for, and two windows on
         one column - one per detector, or one per person - is a thing
-        people do.
+        people do. So is a window and a dashboard at once, which is why
+        the kind is a parameter rather than a mode.
+
+        Parameters
+        ----------
+        label : str | None
+            Which kind to open, or None for the first one offered -
+            what a double-click on the icon gets.
 
         Returns
         -------
         subprocess.Popen | None
-            The window, or None if the instrument is not being served
-            yet, in which case nothing was spawned.
+            The client, or None if the instrument is not being served
+            yet or nothing of that kind is offered, in which case
+            nothing was spawned.
         """
         if self._state is not SessionState.SERVING:
             return None
+        front_end = (
+            self._openable.get(label)
+            if label is not None
+            else next(iter(self._openable.values()), None)
+        )
+        if front_end is None:
+            return None
         process = spawn(
-            self._front_end_command,
+            front_end.command,
             env={
                 **os.environ,
-                **self._front_end_environment,
+                **front_end.environment,
                 BROKER_ENV_VAR: str(self._publish),
             },
         )
-        self._front_ends.append(process)
+        self._running.append((front_end.label, process))
         return process
 
     def health(self) -> health_report.InstrumentHealth:
@@ -538,7 +619,7 @@ class InstrumentSession:
 
     def shutdown(self) -> None:
         """
-        Stop the windows, then the broker, and park the instrument.
+        Stop the clients, then the broker, and park the instrument.
 
         Blocks until both have gone, which is the point: the caller is
         on its way out and the instrument has to be put down before it
@@ -551,9 +632,9 @@ class InstrumentSession:
         # Before the front ends, so that this process is not still
         # holding a connection to a broker it is about to ask to stop.
         self._close_watch()
-        for process in self._front_ends:
+        for _, process in self._running:
             stop(process)
-        self._front_ends.clear()
+        self._running.clear()
         if self._broker is not None:
             _LOGGER.info("stopping the broker; the instrument will be parked")
             stop(self._broker)

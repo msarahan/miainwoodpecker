@@ -10,12 +10,16 @@ happens. This is the same session with a tray icon instead of a console:
 the broker outlives every window, and the only two things anybody needs
 are on a right-click.
 
-**Three things on the menu**, and each is here because it is the thing
-that cannot be done from anywhere else:
+**What is on the menu**, and each is here because it is the thing that
+cannot be done from anywhere else:
 
 - *Open a viewer*, because the window is a client rather than the
   application - it joins the instrument the way a notebook does, and
   more than one may be open at once.
+- *Open a dashboard*, when a command for one was given, because the
+  browser dashboard is the other front end this project has and it is
+  not a variant of the window: it wants marimo and no Qt, so it runs in
+  its own environment and gets its own entry.
 - *Instrument health*, because a broker over a configured microscope is
   a broker over several device servers, and from outside them the only
   evidence of a spectrometer that did not come up is a menu that is one
@@ -61,6 +65,7 @@ from miainwoodpecker.instrument_config import (
     load_instrument_config,
 )
 from miainwoodpecker.launcher import (
+    BROKER_ENV_VAR,
     BROKER_MODULE,
     broker_arguments,
     child_command,
@@ -69,7 +74,7 @@ from miainwoodpecker.launcher import (
     viewer_command,
 )
 from miainwoodpecker.tray.health import Condition, InstrumentHealth
-from miainwoodpecker.tray.session import InstrumentSession, SessionState
+from miainwoodpecker.tray.session import FrontEnd, InstrumentSession, SessionState
 
 if typing.TYPE_CHECKING:
     from miainwoodpecker.instrument_config import InstrumentConfig
@@ -303,6 +308,10 @@ class TrayInstrument(QtCore.QObject):
         shape while the instrument is starting as it does once it has
         started - an operator wondering whether the viewer entry exists
         yet is an operator who cannot tell "starting" from "broken".
+
+        One entry per front end the session was given, in its order, so
+        that a session started without a dashboard command simply has no
+        dashboard entry rather than one that fails when it is used.
         """
         self._menu = QtWidgets.QMenu()
         self._state_line = self._menu.addAction("starting the instrument...")
@@ -311,9 +320,16 @@ class TrayInstrument(QtCore.QObject):
         self._health_line.setEnabled(False)
         self._health_line.setVisible(False)
         self._menu.addSeparator()
-        self._open = self._menu.addAction("Open a viewer")
-        self._open.triggered.connect(self.open_viewer)
-        self._open.setEnabled(False)
+        self._open: dict[str, QtWidgets.QAction] = {}
+        for front_end in self._session.openable:
+            action = self._menu.addAction(_opens(front_end.label, 0))
+            # Bound rather than closed over the loop variable, which
+            # would give every entry the last front end's label.
+            action.triggered.connect(
+                lambda _checked=False, label=front_end.label: self.open_viewer(label),
+            )
+            action.setEnabled(False)
+            self._open[front_end.label] = action
         self._show_health = self._menu.addAction("Instrument health...")
         self._show_health.triggered.connect(self.open_health_window)
         self._show_health.setEnabled(False)
@@ -352,13 +368,10 @@ class TrayInstrument(QtCore.QObject):
         """
         self._state_line.setText(status.message)
         serving = status.state is SessionState.SERVING
-        self._open.setEnabled(serving)
         self._show_health.setEnabled(serving)
-        self._open.setText(
-            "Open a viewer"
-            if status.front_ends == 0
-            else f"Open another viewer ({status.front_ends} open)",
-        )
+        for label, action in self._open.items():
+            action.setEnabled(serving)
+            action.setText(_opens(label, self._session.open_count(label)))
         if not status.changed:
             return
         if serving:
@@ -436,13 +449,23 @@ class TrayInstrument(QtCore.QObject):
         if reason is QtWidgets.QSystemTrayIcon.ActivationReason.DoubleClick:
             self.open_viewer()
 
-    def open_viewer(self) -> None:
-        """Open a viewer on the instrument, or say why there is not one."""
-        if self._session.open_front_end() is None:
+    def open_viewer(self, label: str | None = None) -> None:
+        """
+        Open a client on the instrument, or say why there is not one.
+
+        Parameters
+        ----------
+        label : str | None
+            Which kind to open - a
+            :attr:`~miainwoodpecker.tray.session.FrontEnd.label` - or
+            None for the first one offered, which is what a double-click
+            on the icon gets.
+        """
+        if self._session.open_front_end(label) is None:
             self._icon.showMessage(
                 APPLICATION_NAME,
                 "The instrument is not being served yet, so there is nothing "
-                "for a window to connect to.",
+                "for a client to connect to.",
                 QtWidgets.QSystemTrayIcon.MessageIcon.Warning,
             )
 
@@ -595,6 +618,33 @@ def confirm(question: str, detail: str) -> bool:
     return box.exec() == QtWidgets.QMessageBox.StandardButton.Yes
 
 
+def _opens(label: str, open_now: int) -> str:
+    """
+    Write what a front end's menu entry says, given how many are open.
+
+    The count is in the entry rather than beside it because it changes
+    what the entry *does*: "Open a viewer" and "Open another viewer (2
+    open)" are the same click, and an operator who has lost a window
+    behind a browser needs to know which of the two they are about to
+    do.
+
+    Parameters
+    ----------
+    label : str
+        The front end's label - "viewer", "dashboard".
+    open_now : int
+        How many of that kind are open.
+
+    Returns
+    -------
+    str
+        The menu text.
+    """
+    if open_now == 0:
+        return f"Open a {label}"
+    return f"Open another {label} ({open_now} open)"
+
+
 def _colour(condition: Condition) -> QtGui.QColor:
     """
     Return the colour that stands for a condition.
@@ -651,12 +701,16 @@ def _what_stops(session: InstrumentSession, busy: tuple[str, ...]) -> str:
         The dialog's informative text.
     """
     lines = [f"The instrument is published at {session.publish}."]
-    windows = session.front_ends
-    if windows:
-        lines.append(
-            f"{windows} window{'s' if windows != 1 else ''} opened from here "
-            f"will be closed.",
+    opened = [
+        f"{count} {label}{'s' if count != 1 else ''}"
+        for label, count in (
+            (front_end.label, session.open_count(front_end.label))
+            for front_end in session.openable
         )
+        if count
+    ]
+    if opened:
+        lines.append(f"{' and '.join(opened)} opened from here will be stopped.")
     if busy:
         lines.append("Running right now:")
         lines += [f"  - {line}" for line in busy]
@@ -761,6 +815,28 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         metavar="NAME",
         help="pixi environment to run each window in",
     )
+    parser.add_argument(
+        "--dashboard-env",
+        default=None,
+        metavar="NAME",
+        help=(
+            "pixi environment to run the browser dashboard in. Its own, and "
+            "not --ui-env: the dashboard needs marimo and no Qt, which is the "
+            "whole reason that environment exists"
+        ),
+    )
+    parser.add_argument(
+        "dashboard",
+        nargs=argparse.REMAINDER,
+        metavar="-- COMMAND",
+        help=(
+            "a command that opens the browser dashboard on this instrument - "
+            "'-- marimo run notebooks/instrument_dashboard.py'. It gets an "
+            "'Open a dashboard' entry on the menu, and $"
+            f"{BROKER_ENV_VAR} is set for it. Without one there is no such "
+            "entry, rather than one that fails when it is used"
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -816,6 +892,61 @@ def _load_config(path: str | None) -> InstrumentConfig | None:
         raise SystemExit(str(error)) from error
 
 
+def _front_ends(args: argparse.Namespace, publish: Path) -> list[FrontEnd]:
+    """
+    Build the list of things the menu can open, in the order it shows them.
+
+    The viewer is always there; the dashboard is there when a command
+    for it was given, in its own environment. Both are resolved for
+    that environment here rather than at spawn time, so a dashboard
+    that is not installed where it was told to run fails at startup
+    with a message naming the environment, rather than on a click.
+
+    Parameters
+    ----------
+    args : argparse.Namespace
+        The parsed arguments.
+    publish : Path
+        Where the broker will publish, which is what each client is
+        pointed at.
+
+    Returns
+    -------
+    list[FrontEnd]
+        One entry per menu item.
+    """
+    viewer_environment = resolve_environment(args.ui_env)
+    front_ends = [
+        FrontEnd(
+            label="viewer",
+            command=tuple(
+                child_command(
+                    viewer_command(
+                        publish,
+                        session=args.session,
+                        operator=args.operator,
+                        sample=args.sample,
+                        notes=args.notes,
+                    ),
+                    viewer_environment,
+                ),
+            ),
+            environment=viewer_environment,
+        ),
+    ]
+    given = [argument for argument in args.dashboard if argument != "--"]
+    if given:
+        dashboard_environment = resolve_environment(args.dashboard_env)
+        front_ends.append(
+            FrontEnd(
+                label="dashboard",
+                command=tuple(child_command(given, dashboard_environment)),
+                environment=dashboard_environment,
+            ),
+        )
+    return front_ends
+
+
 def _build_session(args: argparse.Namespace, publish: Path) -> InstrumentSession:
     """
     Assemble the session from the command line.
@@ -833,25 +964,14 @@ def _build_session(args: argparse.Namespace, publish: Path) -> InstrumentSession
         Built, not started.
     """
     broker_environment = resolve_environment(args.broker_env)
-    front_end_environment = resolve_environment(args.ui_env)
     return InstrumentSession(
         child_command(
             [sys.executable, "-m", BROKER_MODULE, *broker_arguments(args, publish)],
             broker_environment,
         ),
-        child_command(
-            viewer_command(
-                publish,
-                session=args.session,
-                operator=args.operator,
-                sample=args.sample,
-                notes=args.notes,
-            ),
-            front_end_environment,
-        ),
+        _front_ends(args, publish),
         publish,
         broker_environment=broker_environment,
-        front_end_environment=front_end_environment,
         config=_load_config(args.config),
     )
 
