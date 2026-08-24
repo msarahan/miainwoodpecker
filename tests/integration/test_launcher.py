@@ -235,6 +235,41 @@ def _listening(port: int) -> bool:
         return probe.connect_ex(("localhost", port)) == 0
 
 
+def test_a_child_that_will_not_answer_is_terminated_rather_than_waited_on():
+    """
+    The wait is bounded, and the bound is the caller's to set.
+
+    Written after an operator watched "pid 24332 did not stop within
+    30s" with an unparked instrument behind it: a napari front end
+    signalled during its own startup answers nothing, ever, so the
+    thirty seconds the *broker* deserves for parking were being spent on
+    a window that was never going to close. The front end is given five
+    now - and what this asserts is the mechanism underneath that
+    choice, on a child that ignores the ask by construction rather than
+    by accident of timing.
+    """
+    ignoring = (
+        "import signal, sys, time;"
+        "signal.signal("
+        "signal.SIGBREAK if sys.platform == 'win32' else signal.SIGTERM,"
+        " signal.SIG_IGN);"
+        "time.sleep(300)"
+    )
+    deaf = spawn([sys.executable, "-c", ignoring])
+    started = time.monotonic()
+    try:
+        status = stop(deaf, 1.0)
+    finally:
+        stop(deaf, 1.0)
+    waited = time.monotonic() - started
+
+    # Terminated, so a status rather than a hang - and promptly, which
+    # is the whole point: the caller said one second.
+    assert status is not None
+    assert deaf.poll() is not None
+    assert waited < _DEADLINE_S / 4
+
+
 def test_serving_without_somewhere_to_publish_is_refused(tmp_path):
     """
     A held-open instrument nobody can find is not a held-open instrument.

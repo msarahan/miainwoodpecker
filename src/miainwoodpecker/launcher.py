@@ -64,6 +64,16 @@ must be asked last, after whatever was using it has gone. That is what
 children are each put in their own process group: a Ctrl-C in this
 terminal reaches this process alone, and the orderly sequence happens
 here rather than three processes racing each other to die.
+
+**The two children are not owed the same patience, and finding that out
+cost an operator thirty seconds.** A Ctrl-C a second after the window
+was launched produced "pid 24332 did not stop within 30s; terminating
+it", and the instrument sat unparked behind a front end that was never
+going to answer: a napari process signalled during its own startup
+stops responding to console control events altogether, measured, for as
+long as anyone cares to keep asking. The broker is worth thirty seconds
+because parking is worth thirty seconds. A window is worth five, after
+which it is terminated - see :data:`_FRONT_END_TIMEOUT_S`.
 """
 
 from __future__ import annotations
@@ -125,11 +135,32 @@ exits, and says so.
 
 _STOP_TIMEOUT_S = 30.0
 """
-How long a child gets to shut down after being asked, before it is made to.
+How long the broker gets to shut down after being asked, before it is made to.
 
-Sized for the broker, which is the one that has anything to do: it stops
-live loops, parks the instrument and closes a device server, and parking
-is bounded by whatever the hardware takes to reach a safe state.
+Sized for what it has to do: stop live loops, park the instrument and
+close a device server, with parking bounded by whatever the hardware
+takes to reach a safe state. Worth waiting out, because the alternative
+to a parked instrument is a stationary probe.
+"""
+
+_FRONT_END_TIMEOUT_S = 5.0
+"""
+How long a front end gets, which is much less, and deliberately.
+
+A window has nothing to park. What it can lose by being terminated is a
+recording in flight, which the storage layer already treats as a case
+rather than a catastrophe - an unfinalized file displays and will not
+analyze, and says so.
+
+Against that: **a napari front end asked to stop during its own startup
+may answer nothing at all, ever.** Measured, on Windows, against a
+window opened by this launcher - a console control event delivered a
+second after the process starts leaves it neither dead nor started, and
+it then ignores twenty more over the next forty seconds; the same event
+to the same window once it is up ends it in 0.1s. So the case this
+timeout is sized for is not a slow shutdown, it is a front end that will
+never shut down, and thirty seconds of an operator watching a terminal
+buys nothing over five.
 """
 
 _KILL_GRACE_S = 5.0
@@ -355,7 +386,11 @@ def stop(process: subprocess.Popen, timeout_s: float = _STOP_TIMEOUT_S) -> int |
     process : subprocess.Popen
         The child to stop.
     timeout_s : float
-        How long to wait for it to go on its own.
+        How long to wait for it to go on its own. The default is the
+        broker's, which is the child worth waiting for; a front end is
+        given :data:`_FRONT_END_TIMEOUT_S` instead, because one that has
+        not answered in five seconds has been measured not to answer at
+        all.
 
     Returns
     -------
@@ -493,14 +528,14 @@ def _supervise(
                     "the broker exited with status %s; stopping the front end",
                     status,
                 )
-                stop(front_end)
+                stop(front_end, _FRONT_END_TIMEOUT_S)
                 return status or 1
             time.sleep(_POLL_S)
     except KeyboardInterrupt:
         # Only reachable where the handlers could not be installed.
         _LOGGER.info("interrupted")
     _LOGGER.info("asked to stop; stopping the front end, then the broker")
-    stop(front_end)
+    stop(front_end, _FRONT_END_TIMEOUT_S)
     stop(broker)
     # The conventional status for "ended from outside", and not zero:
     # this command was asked to run a session and the session did not
