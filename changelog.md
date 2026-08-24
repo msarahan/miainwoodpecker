@@ -482,6 +482,65 @@
   because the next poll returns at the top. The finished map was missing
   its last positions and the spectrum was from the second-to-last one.
   Asked first, drawn second.
+- **A frame too small for blosc2 took the interpreter down, several
+  test files later.** `tests/unit/test_storage_nexus.py`'s plugin-codec
+  test failed in the `replay` environment with `Unable to synchronously
+  flush file (buffer size is too small after filter callback)`, and the
+  process then died of a Windows access violation inside an unrelated
+  test that ran afterwards — from a handle the garbage collector
+  happened to reach there. The two symptoms are one bug and neither is
+  an environment mismatch: `pixi list` shows `default` and `replay` on
+  **byte-identical** hdf5 2.2.0, h5py 3.16.0, blosc 1.21.6 and numpy
+  builds, as their shared `solve-group` requires. The only difference is
+  that `replay` has `hdf5plugin` at all, pulled in beside RosettaSciIO,
+  so `default` never ran the test — `importorskip` skipped it.
+  **A blosc2 chunk is a self-contained cframe, and its container costs
+  ~304 bytes whatever the payload is.** Measured with hdf5plugin 7.0.0
+  on constant float32 data, where the ideal ratio is unbounded: a
+  336-byte chunk stores as 309 bytes, a 512-byte one as 304, a 16 KiB
+  one as 307. The floor is flat, so below roughly 336 bytes the
+  "compressed" chunk is *larger* than the raw one, and hdf5plugin's
+  filter does not grow HDF5's pipeline buffer to fit it. The test wrote
+  4×6 float32 frames — 96-byte chunks, an order of magnitude under.
+  Bisected, 332 bytes fails and 336 passes; the exact edge drifts a few
+  bytes with `cname` and `filters`, and 336 is the smallest size at
+  which every combination measured succeeded. It is specific to blosc2:
+  `hdf5plugin.Blosc` (blosc1), `Bitshuffle`, `Zstd` and the built-in
+  `gzip` all round-trip the same 96-byte chunk.
+  **The filter error cannot be recovered from, which is why the fix is a
+  precondition rather than a `try`.** It surfaces on flush, and the
+  chunk stays dirty and unwritable afterwards, so every route that later
+  releases the dataset id runs the filter again and faults the process.
+  An explicit `File.close()`, a bare `id.close()`, closing the dataset
+  id first, dropping the last reference and collecting, holding a strong
+  reference forever, and plain interpreter shutdown were each measured
+  to end in an access violation — on a backing-store file and on an
+  in-memory `driver="core"` one alike. There is nothing left to catch by
+  then. `storage.nexus.reject_unwritable_chunk` therefore refuses such a
+  dataset *before* `create_dataset`, raising a `ValueError` that names
+  the chunk size, the floor and the codecs that do not have one; both
+  writers call it, `spectra.py` by importing it rather than respelling
+  it, because a short spectrum is the one shape in this project that can
+  land under the floor without anyone contriving it — a 64-channel
+  float32 spot spectrum is a 256-byte chunk. The guard is deliberately
+  narrow: rejecting every plugin codec at that size would refuse three
+  that work to stop one that does not.
+  The plugin-codec test now uses a 32×32 frame, since what it exists to
+  pin is that an `hdf5plugin` filter object passes straight through as a
+  `compression=` mapping, not that blosc2 works on 96-byte chunks. Two
+  tests were added beside it, for the refusal and for the guard's
+  narrowness.
+- **A writer whose `close()` raised stayed wedged half-finalized.**
+  Both `NexusWriter.close` and `SpectrumWriter.close` reset their
+  per-acquisition state in a `finally`, but with `self._file.close()` on
+  the line above the reset rather than in a nested `try` — and h5py's
+  `File.close()` closes the open dataset ids first, which pushes their
+  dirty chunks through the filter pipeline, so it is a step that can
+  genuinely fail. When it did, the writer kept a non-`None` handle and
+  every other field stale, the file stayed locked, and the frames
+  already on disk were unreachable through an object that looked open.
+  Found while chasing the blosc2 fault above, and fixed independently of
+  it: any raise from `close()` now leaves the writer reset.
 
 - **A device server that lost its port could be reported as one that
   was running and wedged.** The client bounds every connection attempt

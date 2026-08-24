@@ -150,9 +150,11 @@ from __future__ import annotations
 
 import datetime
 import json
+import math
 import typing
 
 import h5py
+import numpy as np
 
 from miainwoodpecker.devices.interface import HIGH_TENSION_V_KEY
 from miainwoodpecker.storage import layout
@@ -168,7 +170,6 @@ if typing.TYPE_CHECKING:
     import os
     from collections.abc import Iterable, Iterator, Mapping
 
-    import numpy as np
     import numpy.typing as npt
 
     from miainwoodpecker.devices.interface import Frame
@@ -180,6 +181,42 @@ _DEFAULT_COMPRESSION_LEVEL = 4
 # built-in compressors. Blosc2/bitshuffle shuffle internally, so stacking
 # this filter ahead of them costs a pass over the data and buys nothing.
 _SHUFFLE_BENEFITING_FILTERS = frozenset({"gzip", "lzf"})
+# hdf5plugin's blosc2 filter, named by its HDF5 filter id rather than
+# imported: hdf5plugin is an optional extra, and this guard has to hold
+# for a caller who has it installed without dragging it into the import
+# graph of a module that must work without it.
+BLOSC2_FILTER_ID = 32026
+BLOSC2_MIN_CHUNK_BYTES = 336
+"""
+Smallest chunk blosc2 can be asked to compress without faulting HDF5.
+
+A blosc2 chunk is a self-contained *cframe*, and its header and trailer
+cost about 304 bytes whatever the payload is. Measured with hdf5plugin
+7.0.0 and HDF5 2.2.0 on constant float32 data, where the ideal ratio is
+unbounded: a 336-byte chunk stores as 309 bytes, a 512-byte one as 304,
+a 16 KiB one as 307. The floor is flat, so below roughly 336 bytes the
+"compressed" chunk is *larger* than the raw one, and hdf5plugin's filter
+does not grow HDF5's pipeline buffer to fit it. H5Z then rejects the
+callback with ``buffer size is too small after filter callback``.
+
+**That error is not survivable, which is why this is a precondition and
+not a ``try``.** It surfaces on flush, and the chunk stays dirty and
+unwritable afterwards, so every route that later releases the dataset id
+runs the filter again and faults the process. An explicit
+``File.close()``, a bare ``id.close()``, dropping the last reference and
+collecting, and plain interpreter shutdown were each measured to end in
+a Windows access violation - on a backing-store file and on an in-memory
+``driver="core"`` one alike. There is nothing left to catch by then, so
+the only defence is to refuse to create the dataset.
+
+The exact threshold drifts a few bytes with ``cname`` and ``filters``
+(320-byte chunks pass for lz4+bitshuffle and fail for zstd+bitshuffle);
+336 is the smallest size at which every combination measured succeeded.
+Nothing this project records comes close to it - 336 bytes is a 9x9
+float32 frame, and the smallest real detector frame is thousands of
+times larger - so the guard costs nothing but a clear error for a test
+or a benchmark that shrinks its data too far.
+"""
 # The NXdata layout this writer builds names exactly two frame axes, so a
 # frame is 2D. Enforced at append() rather than discovered at close().
 _FRAME_RANK = 2
@@ -219,6 +256,54 @@ def _iso(timestamp: datetime.datetime) -> str:
 def _json_default(value: object) -> str:
     """Stringify values that are not natively JSON serializable."""
     return str(value)
+
+
+def reject_unwritable_chunk(
+    filter_kwargs: Mapping[str, typing.Any],
+    chunks: tuple[int, ...],
+    dtype: npt.DTypeLike,
+) -> None:
+    """
+    Refuse a chunk too small for the configured codec to compress into.
+
+    Called before ``create_dataset`` by both writers in this package,
+    because the failure it prevents cannot be recovered from once the
+    dataset exists - see :data:`BLOSC2_MIN_CHUNK_BYTES` for the
+    measurement and for what "cannot" means here.
+
+    Parameters
+    ----------
+    filter_kwargs : Mapping[str, typing.Any]
+        The ``create_dataset`` filter arguments about to be used, as
+        ``_filter_kwargs`` builds them.
+    chunks : tuple[int, ...]
+        The chunk shape about to be requested.
+    dtype : npt.DTypeLike
+        The dataset's element type, which with ``chunks`` fixes the
+        number of bytes a single chunk hands the filter.
+
+    Raises
+    ------
+    ValueError
+        If the codec is blosc2 and one chunk is smaller than
+        :data:`BLOSC2_MIN_CHUNK_BYTES`.
+    """
+    if filter_kwargs.get("compression") != BLOSC2_FILTER_ID:
+        return
+    chunk_bytes = math.prod(chunks) * np.dtype(dtype).itemsize
+    if chunk_bytes >= BLOSC2_MIN_CHUNK_BYTES:
+        return
+    msg = (
+        f"a blosc2 chunk of {chunk_bytes} bytes (chunk shape {chunks} of "
+        f"{np.dtype(dtype)}) is below the {BLOSC2_MIN_CHUNK_BYTES}-byte "
+        f"floor blosc2's own container overhead imposes: the filter would "
+        f"produce more bytes than it was given, which HDF5 rejects and "
+        f"cannot then recover from. Use a larger frame, a larger chunk, or "
+        f"one of the codecs without a fixed per-chunk container - "
+        f"hdf5plugin.Blosc(), hdf5plugin.Bitshuffle(), hdf5plugin.Zstd() "
+        f"and the built-in 'gzip' all round-trip chunks this small."
+    )
+    raise ValueError(msg)
 
 
 class NexusWriter:
@@ -515,13 +600,20 @@ class NexusWriter:
             )
             self._frame_zero = frame.timestamp
             detector = self._file["entry/instrument/detector"]
+            dtype = self._dtype if self._dtype is not None else frame.data.dtype
+            chunks = (1, *frame.data.shape)
+            filter_kwargs = self._filter_kwargs()
+            # Before create_dataset, not after the first append: a codec
+            # that cannot fit this chunk takes the process down with it
+            # rather than raising something catchable.
+            reject_unwritable_chunk(filter_kwargs, chunks, dtype)
             self._data = detector.create_dataset(
                 "data",
                 shape=(0, *frame.data.shape),
                 maxshape=(None, *frame.data.shape),
-                dtype=self._dtype if self._dtype is not None else frame.data.dtype,
-                chunks=(1, *frame.data.shape),
-                **self._filter_kwargs(),
+                dtype=dtype,
+                chunks=chunks,
+                **filter_kwargs,
             )
             self._data.attrs["units"] = "counts"
             self._times = detector.create_dataset(
@@ -625,19 +717,27 @@ class NexusWriter:
                     sort_keys=True,
                 )
         finally:
-            self._file.close()
-            # Reset every piece of per-acquisition state, not just the
-            # handles. Leaving _count behind made a reused writer resize to
-            # count+1 and write at count, so frames 0..count-1 were HDF5
-            # fill values indistinguishable from real data.
-            self._file = None
-            self._data = None
-            self._times = None
-            self._frame_metadata = None
-            self._count = 0
-            self._first_metadata = None
-            self._resolved_calibration = None
-            self._frame_zero = None
+            # The reset runs even if close() itself raises. h5py's
+            # File.close() closes the open dataset ids first, which flushes
+            # their dirty chunks through the filter pipeline, so it is a
+            # step that *can* fail; when it did, the old code left
+            # ``self._file`` non-None and every other field stale, and the
+            # writer stayed wedged half-finalized with the file locked.
+            try:
+                self._file.close()
+            finally:
+                # Reset every piece of per-acquisition state, not just the
+                # handles. Leaving _count behind made a reused writer resize
+                # to count+1 and write at count, so frames 0..count-1 were
+                # HDF5 fill values indistinguishable from real data.
+                self._file = None
+                self._data = None
+                self._times = None
+                self._frame_metadata = None
+                self._count = 0
+                self._first_metadata = None
+                self._resolved_calibration = None
+                self._frame_zero = None
 
     def _write_source(self, entry: h5py.Group) -> None:
         """

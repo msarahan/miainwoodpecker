@@ -522,6 +522,15 @@ def test_explicit_dtype_stores_narrower_frames(tmp_path):
         assert handle["entry/instrument/detector/data"].dtype == np.float64
 
 
+# 32x32 float32 is 4096 bytes a chunk. Deliberately not the 4x6 the rest
+# of this file uses: blosc2 writes each chunk as a self-contained cframe
+# whose header and trailer cost ~304 bytes whatever the payload, so a
+# 96-byte chunk "compresses" to more bytes than it was given and HDF5
+# rejects the filter callback. See BLOSC2_MIN_CHUNK_BYTES for the
+# measurement, and the test below for what the writer does about it.
+_PLUGIN_CODEC_SHAPE = (32, 32)
+
+
 def test_plugin_codecs_are_accepted_as_a_filter_mapping(tmp_path):
     """
     An hdf5plugin filter object can be passed straight to `compression`.
@@ -537,7 +546,7 @@ def test_plugin_codecs_are_accepted_as_a_filter_mapping(tmp_path):
     path = tmp_path / "blosc2.nxs"
     write_frames(
         path,
-        [_frame(index) for index in range(2)],
+        [_frame(index, shape=_PLUGIN_CODEC_SHAPE) for index in range(2)],
         compression=hdf5plugin.Blosc2(
             cname="zstd",
             clevel=5,
@@ -549,9 +558,62 @@ def test_plugin_codecs_are_accepted_as_a_filter_mapping(tmp_path):
     recovered = list(read_series(path))
     expected_count = 2
     assert len(recovered) == expected_count
-    assert np.array_equal(recovered[1][0], np.full((4, 6), 1, dtype=np.float32))
+    assert np.array_equal(
+        recovered[1][0],
+        np.full(_PLUGIN_CODEC_SHAPE, 1, dtype=np.float32),
+    )
     with h5py.File(path, "r") as handle:
         assert handle["entry/instrument/detector/data"].shuffle is False
+
+
+def test_a_frame_too_small_for_blosc2_is_refused_before_it_can_crash(tmp_path):
+    """
+    A sub-floor blosc2 chunk raises, rather than faulting the interpreter.
+
+    This is a precondition and not a caught exception because by the time
+    HDF5 reports the filter failure there is nothing left to recover. The
+    chunk stays dirty and unwritable, so every route that later releases
+    the dataset id runs the filter again and dies: File.close(),
+    id.close(), garbage collection and interpreter shutdown were each
+    measured to end in an access violation, in-memory files included. The
+    original symptom was exactly that - this test's own 4x6 frame took the
+    whole pytest process down several files later, inside an unrelated
+    test, from a handle the garbage collector happened to reach there.
+    """
+    hdf5plugin = pytest.importorskip(
+        "hdf5plugin",
+        reason="requires the 'compression' extra",
+    )
+    with pytest.raises(ValueError, match=r"below the \d+-byte floor"):
+        write_frames(
+            tmp_path / "too-small.nxs",
+            [_frame(0)],
+            compression=hdf5plugin.Blosc2(cname="zstd", clevel=5),
+        )
+
+
+def test_the_blosc2_floor_only_applies_to_blosc2(tmp_path):
+    """
+    Codecs without a fixed per-chunk container keep taking tiny chunks.
+
+    The guard is deliberately narrow. Measured on the same 96-byte chunk
+    that blosc2 refuses, hdf5plugin's Blosc (blosc1), Bitshuffle and Zstd
+    filters all round-trip it, so rejecting every plugin codec at this
+    size would refuse three that work to stop one that does not.
+    """
+    hdf5plugin = pytest.importorskip(
+        "hdf5plugin",
+        reason="requires the 'compression' extra",
+    )
+    for name, codec in (
+        ("blosc1", hdf5plugin.Blosc(cname="zstd", clevel=5)),
+        ("bitshuffle", hdf5plugin.Bitshuffle()),
+        ("zstd", hdf5plugin.Zstd()),
+    ):
+        path = tmp_path / f"{name}.nxs"
+        write_frames(path, [_frame(0)], compression=codec)
+        recovered = list(read_series(path))
+        assert np.array_equal(recovered[0][0], np.zeros((4, 6), dtype=np.float32))
 
 
 def test_every_frames_metadata_is_kept_not_just_the_firsts(tmp_path):
