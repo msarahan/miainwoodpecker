@@ -833,8 +833,9 @@ problem — read their source and docs before designing our own adapters:
     steers), or `dataset_path="/entry/data"` returns exactly the one — and
     `dataset_path` needs the leading slash or it silently matches nothing.
 - [x] Publish a pass's 4D cube where NXem documents an image, and decide
-  what to do about `NXspectrum` — **NXimage adopted, NXspectrum declined
-  for now**, on measurement rather than taste. Prompted by
+  what to do about `NXspectrum` — **both adopted**, on measurement
+  rather than taste, and the second only after the first answer here was
+  wrong. Prompted by
   [pynxtools#834](https://github.com/FAIRmat-NFDI/pynxtools/issues/834),
   where a maintainer noted that NXem "typically uses specializations of
   `NXdata` like NXspectrum and NXimage".
@@ -867,14 +868,34 @@ problem — read their source and docs before designing our own adapters:
     That validation is shallow, and it was checked how shallow: a
     dangling `signal` attribute is caught, a detector axis labelled in
     kilograms is not.
-  - **`NXspectrum` declined, because it would cost a reader something and
-    buy nothing.** The deciding criterion is a seamless path into HyperSpy
-    and py4DSTEM, and neither library looks for `NXspectrum`; both reach
-    the data through `NXdata`, which spectrum recordings already spell in
-    `NXspectrum`'s field names. Adding the class as a second group would
-    add one more signal to a bare `file_reader` — measured: 17 signals
-    become 22 for a pass file — for no reader-side gain. The vocabulary
-    stays; the class waits for someone who consumes NXem.
+  - **`NXspectrum` adopted too, after the first answer here was wrong.**
+    This note originally declined it, on the grounds that neither HyperSpy
+    nor py4DSTEM looks for the class. The second half of that is true and
+    the conclusion did not follow: measured, RosettaSciIO reads a spectrum
+    that lives *inside* an `NXspectrum` perfectly well - it finds `NXdata`
+    groups wherever they are, and `spectrum_2d` is one - so the class
+    neither helps nor hinders a HyperSpy user, and the decision was never
+    a reader question at all. What the class does add is a
+    machine-checkable type (find the spectra by asking for `NXspectrum`,
+    rather than by recognising a field called `axis_energy`), documented
+    slots beside the data that our own JSON metadata blob currently
+    holds, and the event. `storage/spectra.py` and `storage/passes.py`
+    both write the view, hard-linked, named for the detector.
+  - **The event is the part that is more than decoration.** A pass
+    acquires its cube, its spectrum image and its scan channels at the
+    same beam positions, and that they were taken *together* is
+    otherwise stated only by their sitting in one file - a convention a
+    reader has to be told. Both views hang off one `eventID`, which is
+    where `NXem` puts that fact, and a test acquires a pass carrying both
+    kinds to pin it.
+  - **What the view costs a reader, measured rather than asserted.** A
+    bare `file_reader` on a spectrum recording returns 9 signals where it
+    returned 5, and on a pass file 22 where it returned 17 - the linked
+    arrays appear at their second path too. `use_default=True` returns
+    exactly the plottable one in both cases, steered by the `@default`
+    chain this project already writes, and `nxdata_only=True` returns the
+    plottable groups plus the views. Nothing a reader gets is wrong; the
+    default listing is longer.
   - **What a pass file would still need before it could claim NXem**,
     measured by claiming it and reading the complaints: `interpretation`
     (nine of sixteen problems, and the subject of the upstream issue),

@@ -246,6 +246,16 @@ class SpectrumWriter:
     instrument : str | None
         Which microscope this came from, written as
         ``/entry/instrument/name``.
+    fabrication : Mapping[str, object] | None
+        ``vendor`` and ``model`` of the instrument, written into
+        ``NXfabrication`` under ``measurement/instrument`` - which
+        ``NXem`` requires as soon as a ``measurement`` group exists at
+        all, measured through ``pynxtools``. Only consulted when
+        ``definition`` claims an application definition, since nothing is
+        required of a file that claims none. A missing value is written
+        as ``"unknown"`` rather than guessed: the schema demands the
+        field, and an admission is not the same kind of thing as the
+        invented specimen facts ``sample`` exists to refuse.
     notes : str | None
         Free-text session notes, written as ``description`` inside an
         ``NXnote`` group at ``/entry/notes``.
@@ -283,6 +293,7 @@ class SpectrumWriter:
         sample: Mapping[str, object] | None = None,
         user: Mapping[str, object] | None = None,
         instrument: str | None = None,
+        fabrication: Mapping[str, object] | None = None,
         notes: str | None = None,
         navigation: FrameCalibration | None = None,
         compression: object = _DEFAULT_COMPRESSION,
@@ -296,6 +307,7 @@ class SpectrumWriter:
         self._sample = sample
         self._user = user
         self._instrument = instrument
+        self._fabrication = fabrication
         self._notes = notes
         self._navigation = navigation
         self._compression = compression
@@ -627,6 +639,7 @@ class SpectrumWriter:
             entry["end_time"] = _iso(datetime.datetime.now(tz=datetime.UTC))
             if self._data is not None:
                 self._write_axes(entry)
+                self._write_nxem_view(entry)
             self._write_detector(entry)
             self._write_source(entry)
             if self._first_metadata:
@@ -736,6 +749,96 @@ class SpectrumWriter:
         # does not define. A reader recovers the same fact from the rank,
         # so this is a convenience and never the source of truth.
         self._metadata_group()["nxspectrum_layout"] = self._layout
+
+    def _write_nxem_view(self, entry: h5py.Group) -> None:
+        """
+        Publish the spectra where ``NXem`` documents a spectrum, as links.
+
+        Two paths, one array. ``entry/data`` stays the group a reader
+        plots and the group this project's own reader opens; ``NXem``
+        documents spectra under ``measurement/eventID``, inside an
+        ``NXspectrum``. Every dataset here is a hard link, so the view
+        costs a group and no bytes.
+
+        **What the class adds over the ``NXdata`` alone**, since the
+        field names are already ``NXspectrum``'s: a machine-checkable
+        type, so a tool can find the spectra in a file by class rather
+        than by recognising a field called ``axis_energy``; and the
+        event, which is what says a spectrum and an image were acquired
+        together rather than merely stored together.
+
+        **Named after the detector rather than ``spectrumID``**, for the
+        reason measured in
+        :meth:`~miainwoodpecker.storage.passes.PassWriter._write_nxem_image`:
+        the appdef's own name matches a stricter concept that pynxtools
+        then cannot be satisfied on, while any other name matches the
+        unnamed ``NXspectrum`` in ``NXem_event_data`` and validates
+        clean.
+
+        Parameters
+        ----------
+        entry : h5py.Group
+            The file's ``NXentry`` group.
+        """
+        source = entry["data"]
+        detector = str((self._first_metadata or {}).get("device_id") or "detector")
+        measurement = entry.require_group("measurement")
+        measurement.attrs["NX_class"] = "NXem_measurement"
+        self._write_nxem_instrument(measurement)
+        event = measurement.require_group("eventID")
+        event.attrs["NX_class"] = "NXem_event_data"
+        spectrum = event.require_group(detector)
+        spectrum.attrs["NX_class"] = "NXspectrum"
+        if self._layout == MAP_LAYOUT:
+            layout_name = "spectrum_2d"
+            axes = ["axis_j", "axis_i", "axis_energy"]
+            extra = ()
+        else:
+            layout_name = "stack_0d"
+            axes = ["indices_spectrum", "axis_energy"]
+            extra = ("indices_group",)
+        data = spectrum.create_group(layout_name)
+        data.attrs["NX_class"] = "NXdata"
+        for name in ("intensity", *axes, *extra):
+            data[name] = source[name]
+        data.attrs["signal"] = "intensity"
+        data.attrs["axes"] = axes
+        for index, name in enumerate(axes):
+            data.attrs.create(f"{name}_indices", index, dtype="uint32")
+        if self._definition is None:
+            # Withheld from a file claiming an application definition,
+            # for the reason storage/nexus.py's _write_nxdata records.
+            data.attrs["interpretation"] = "spectrum"
+
+    def _write_nxem_instrument(self, measurement: h5py.Group) -> None:
+        """
+        Write what ``NXem`` requires of a ``measurement`` that exists.
+
+        Measured with ``pynxtools``: creating ``measurement`` at all makes
+        ``measurement/instrument`` required, which makes ``ebeam_column``
+        and ``fabrication`` required, which makes ``vendor`` and ``model``
+        required. A file claiming no application definition is asked for
+        none of it, so none of it is written - the view above is then
+        structure for a reader rather than a claim to satisfy.
+
+        Parameters
+        ----------
+        measurement : h5py.Group
+            The ``NXem_measurement`` group to complete.
+        """
+        if self._definition is None:
+            return
+        instrument = measurement.require_group("instrument")
+        instrument.attrs["NX_class"] = "NXem_instrument"
+        column = instrument.require_group("ebeam_column")
+        column.attrs["NX_class"] = "NXebeam_column"
+        fabrication = instrument.require_group("fabrication")
+        fabrication.attrs["NX_class"] = "NXfabrication"
+        supplied = dict(self._fabrication or {})
+        for field in ("vendor", "model"):
+            fabrication[field] = supplied.pop(field, "unknown")
+        for name, value in supplied.items():
+            fabrication[name] = value
 
     def _navigation_axes(self) -> FrameCalibration:
         """

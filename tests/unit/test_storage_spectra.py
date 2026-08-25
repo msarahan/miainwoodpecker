@@ -203,6 +203,86 @@ def test_the_axis_index_attributes_are_unsigned_in_either_layout(tmp_path):
                 assert attrs[name].dtype.kind == "u", f"{path.name}:{name}"
 
 
+def test_a_recording_is_published_where_nxem_documents_a_spectrum(tmp_path):
+    """
+    An ``NXspectrum`` under ``measurement/eventID``, hard-linked.
+
+    The field names were already NXspectrum's, so what the view adds is
+    the class and the placement: a tool can find the spectra in this file
+    by asking for ``NXspectrum`` rather than by recognising a field
+    called ``axis_energy``, and NXem documents them nowhere else.
+    Asserted by identity, since a copy would pass a value check and
+    double the file.
+    """
+    series = tmp_path / "eds.nxs"
+    write_spectra(series, [_spectrum(index) for index in range(_SPECTRA)])
+    height, width = _MAP_SHAPE
+    spectrum_image = tmp_path / "map.nxs"
+    write_spectra(
+        spectrum_image,
+        [_spectrum(0, data=np.ones((height, width, _CHANNELS), dtype="uint32"))],
+    )
+
+    expected = {
+        series: ("stack_0d", ["indices_spectrum", "axis_energy"]),
+        spectrum_image: ("spectrum_2d", ["axis_j", "axis_i", "axis_energy"]),
+    }
+    for path, (layout_name, axes) in expected.items():
+        with h5py.File(path, "r") as handle:
+            group = handle["entry/measurement/eventID/simulated_sdd"]
+            assert group.attrs["NX_class"] == "NXspectrum"
+            data = group[layout_name]
+            assert data.attrs["NX_class"] == "NXdata"
+            assert data.attrs["signal"] == "intensity"
+            assert list(data.attrs["axes"]) == axes
+            assert data["intensity"] == handle[layout.SPECTRUM_INTENSITY]
+            assert data["axis_energy"] == handle[layout.SPECTRUM_ENERGY_AXIS]
+
+
+def test_claiming_nxem_writes_what_a_measurement_group_then_requires(tmp_path):
+    """
+    ``instrument``, ``ebeam_column`` and ``fabrication``, or the claim fails.
+
+    Measured with ``pynxtools``: creating ``measurement`` at all makes
+    ``measurement/instrument`` required, which makes ``ebeam_column`` and
+    ``fabrication`` required, which makes ``vendor`` and ``model``
+    required. A file claiming nothing is asked for none of it, so it gets
+    none of it — the view is then structure rather than a claim to
+    satisfy.
+    """
+    claimed = tmp_path / "claimed.nxs"
+    write_spectra(
+        claimed,
+        [_spectrum(0)],
+        definition="NXem",
+        sample={"is_simulation": True, "atom_types": "Si,O"},
+        fabrication={"vendor": "Nion"},
+    )
+    unclaimed = tmp_path / "unclaimed.nxs"
+    write_spectra(unclaimed, [_spectrum(0)])
+
+    with h5py.File(claimed, "r") as handle:
+        instrument = handle["entry/measurement/instrument"]
+        assert instrument.attrs["NX_class"] == "NXem_instrument"
+        assert instrument["ebeam_column"].attrs["NX_class"] == "NXebeam_column"
+        fabrication = instrument["fabrication"]
+        assert fabrication.attrs["NX_class"] == "NXfabrication"
+        assert fabrication["vendor"][()].decode() == "Nion"
+        # Required by the schema and not known here: said rather than
+        # guessed, which is not the same kind of thing as inventing the
+        # specimen facts `sample` exists to refuse.
+        assert fabrication["model"][()].decode() == "unknown"
+        # The appdef rejects `interpretation`, so a claiming file goes
+        # without it - the rule storage/nexus.py already applies.
+        view = handle["entry/measurement/eventID/simulated_sdd/stack_0d"]
+        assert "interpretation" not in view.attrs
+
+    with h5py.File(unclaimed, "r") as handle:
+        assert "instrument" not in handle["entry/measurement"]
+        view = handle["entry/measurement/eventID/simulated_sdd/stack_0d"]
+        assert view.attrs["interpretation"] == "spectrum"
+
+
 def test_one_spectrum_is_stored_the_same_way_as_many(tmp_path):
     """
     A stack of one, not ``spectrum_0d``, so a reader never branches on count.

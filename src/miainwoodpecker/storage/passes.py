@@ -580,11 +580,7 @@ class PassWriter:
         camera_id : str
             The detector's own id, recorded beside the links.
         """
-        measurement = self._entry.require_group("measurement")
-        measurement.attrs["NX_class"] = "NXem_measurement"
-        event = measurement.require_group("eventID")
-        event.attrs["NX_class"] = "NXem_event_data"
-        image = event.create_group(name)
+        image = self._nxem_event().create_group(name)
         image.attrs["NX_class"] = "NXimage"
         image.attrs["camera_id"] = camera_id
         data = image.create_group("image_4d")
@@ -600,6 +596,67 @@ class PassWriter:
         data.attrs["signal"] = _NXEM_IMAGE_SIGNAL
         data.attrs["axes"] = list(_NXEM_IMAGE_AXES)
         data.attrs["interpretation"] = "image"
+
+    def _nxem_event(self) -> h5py.Group:
+        """
+        Return the one ``NXem_event_data`` group this pass's signals share.
+
+        One event, deliberately: a pass acquires its cube, its spectrum
+        image and its scan channels at the same beam positions, and that
+        they were taken *together* is a fact the file otherwise states
+        only by co-location. ``NXem`` has somewhere to put it, so it goes
+        there.
+
+        Returns
+        -------
+        h5py.Group
+            The event group, created on first use.
+        """
+        measurement = self._entry.require_group("measurement")
+        measurement.attrs["NX_class"] = "NXem_measurement"
+        event = measurement.require_group("eventID")
+        event.attrs["NX_class"] = "NXem_event_data"
+        return event
+
+    def _write_nxem_spectrum(
+        self,
+        name: str,
+        group: h5py.Group,
+        detector_id: object,
+    ) -> None:
+        """
+        Publish the spectrum image where NXem documents a spectrum.
+
+        The spectrum-side twin of :meth:`_write_nxem_image`, and simpler:
+        the plottable group is already spelled in ``NXspectrum``'s own
+        field names (``intensity``, ``axis_j``, ``axis_i``,
+        ``axis_energy``), so the view is those datasets hard-linked under
+        a group of the right class rather than a second vocabulary.
+
+        Parameters
+        ----------
+        name : str
+            The spectrometer's target name, which names the group.
+        group : h5py.Group
+            The plottable ``NXdata`` holding the spectrum image.
+        detector_id : object
+            The detector's own id where it reported one.
+        """
+        spectrum = self._nxem_event().create_group(name)
+        spectrum.attrs["NX_class"] = "NXspectrum"
+        if detector_id is not None:
+            spectrum.attrs["detector_id"] = str(detector_id)
+        data = spectrum.create_group("spectrum_2d")
+        data.attrs["NX_class"] = "NXdata"
+        axes = [*_SPECTRUM_SPATIAL_AXES, _SPECTRUM_ENERGY_AXIS]
+        # Hard links, so the spectra are never written twice.
+        data[_SPECTRUM_SIGNAL] = group[_SPECTRUM_SIGNAL]
+        for index, axis in enumerate(axes):
+            data[axis] = group[axis]
+            data.attrs.create(f"{axis}_indices", index, dtype="uint32")
+        data.attrs["signal"] = _SPECTRUM_SIGNAL
+        data.attrs["axes"] = axes
+        data.attrs["interpretation"] = "spectrum"
 
     def _stack_calibration(self, stack: object) -> FrameCalibration:
         """
@@ -693,6 +750,7 @@ class PassWriter:
         identifier = spectrum.metadata.get("device_id")
         if identifier is not None:
             group.attrs["detector_id"] = str(identifier)
+        self._write_nxem_spectrum(name, group, identifier)
 
     def _write_image(self, index: int, frame: object) -> None:
         """

@@ -4,6 +4,35 @@
 
 ### Added
 
+- **Spectra are published where NXem documents a spectrum, too.** Both
+  writers — `storage/spectra.py`'s recordings and `storage/passes.py`'s
+  spectrum images — now put an `NXspectrum` at
+  `measurement/eventID/<detector>`, holding `stack_0d` or `spectrum_2d`,
+  every dataset a hard link to the plottable group. The field names were
+  already NXspectrum's; what the class adds is a machine-checkable type
+  (find the spectra by asking for `NXspectrum`, not by recognising a
+  field called `axis_energy`) and documented slots beside the data.
+  **One event for a whole pass.** A pass acquires its cube, its spectrum
+  image and its scan channels at the same beam positions, and that they
+  were taken *together* was previously stated only by their sitting in
+  one file. Both views now hang off one `eventID`, which is where NXem
+  puts that fact.
+  **What it costs a reader, measured**: a bare `file_reader` returns 9
+  signals for a spectrum recording where it returned 5, and 22 for a pass
+  file where it returned 17, since the linked arrays appear at their
+  second path as well. `use_default=True` still returns exactly the
+  plottable signal, steered by the `@default` chain this project already
+  writes.
+  **`SpectrumWriter(fabrication=...)` is new**, and only consulted when
+  the file claims an application definition. Measured with `pynxtools`:
+  creating a `measurement` group at all makes `measurement/instrument`
+  required, which makes `ebeam_column` and `fabrication` required, which
+  makes `vendor` and `model` required. A missing one is written as
+  `"unknown"` — the schema demands the field, and saying so is not the
+  same kind of thing as inventing the specimen facts `sample` exists to
+  refuse. A file claiming nothing is asked for none of it and gets none
+  of it.
+
 - **A pass reads back in HyperSpy as what it is: a scan position over a
   diffraction pattern.** The pass writer's `NXdata` groups carried no
   `interpretation`, so — measured against RosettaSciIO 0.14.0 — a 4D cube

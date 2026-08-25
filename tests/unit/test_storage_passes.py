@@ -46,6 +46,9 @@ _FOUR_AXES = 4
 _TWO_CAMERAS = 2
 # Where NXspectrum puts the energy axis: last, always.
 _ENERGY_AXIS_INDEX = 2
+# The preview serves two cameras under these names; a pass carrying both
+# kinds of per-position readout is what pins the shared event.
+_RONCHIGRAM_TARGET = "ronchigram_camera"
 
 
 def _text(value: object) -> str:
@@ -562,6 +565,75 @@ class TestSpectrumImages:
             slow = handle[f"entry/data_{_EELS_TARGET}/axis_j"]
             assert _text(slow.attrs["units"]) == "nm"
             assert len(slow) == _A_GRID.height
+
+    def test_the_spectra_are_published_where_nxem_documents_a_spectrum(
+        self, tmp_path,
+    ):
+        """
+        An ``NXspectrum`` beside the plottable group, hard-linked to it.
+
+        The spectrum-side twin of the cube's NXimage view, and simpler:
+        the plottable group is already spelled in ``NXspectrum``'s own
+        field names, so the view is a class and a placement rather than a
+        second vocabulary.
+        """
+        path = tmp_path / "si.nxs"
+        _acquire_spectrum_image(path)
+        with h5py.File(path, "r") as handle:
+            spectrum = handle[f"entry/measurement/eventID/{_EELS_TARGET}"]
+            assert _text(spectrum.attrs["NX_class"]) == "NXspectrum"
+            data = spectrum["spectrum_2d"]
+            assert _text(data.attrs["NX_class"]) == "NXdata"
+            assert _text(data.attrs["signal"]) == "intensity"
+            assert [_text(axis) for axis in data.attrs["axes"]] == [
+                "axis_j", "axis_i", "axis_energy",
+            ]
+            plottable = handle[f"entry/data_{_EELS_TARGET}"]
+            assert data["intensity"] == plottable["intensity"]
+            assert data["axis_energy"] == plottable["axis_energy"]
+
+    def test_a_cube_and_a_spectrum_image_share_one_event(self, tmp_path):
+        """
+        One ``eventID`` for both, because one pass took both.
+
+        This is the reason the NXem view is more than decoration. That a
+        diffraction cube and a spectrum image were acquired at the *same
+        beam positions* is otherwise stated only by their sitting in the
+        same file, which is a convention a reader has to be told. NXem
+        has somewhere to put it, so both views hang off one event.
+        """
+        path = tmp_path / "both.nxs"
+        devices = build_preview_devices(
+            scan=True, camera=True, camera_count=_TWO_CAMERAS,
+        )
+        eels = devices.cameras[_EELS_TARGET]
+        eels.configure(
+            dataclasses.replace(eels.parameters(), readout=PROJECTED_READOUT),
+        )
+        ronchigram = devices.cameras[_RONCHIGRAM_TARGET]
+        ronchigram.configure(
+            CameraParameters(exposure_ms=10.0, binning=_A_BINNING),
+        )
+        with PassWriter(
+            path,
+            _A_GRID,
+            cubes={_RONCHIGRAM_TARGET: ronchigram.readout_shape},
+            spectra={_EELS_TARGET: eels.channel_count},
+        ) as writer:
+            result = devices.scanner.scan_synchronised(
+                _A_GRID,
+                channels=[0, 1],
+                targets=[_RONCHIGRAM_TARGET, _EELS_TARGET],
+                into=writer.destinations(),
+            )
+            writer.finish(result)
+
+        with h5py.File(path, "r") as handle:
+            event = handle["entry/measurement/eventID"]
+            assert _text(event.attrs["NX_class"]) == "NXem_event_data"
+            assert _text(event[_RONCHIGRAM_TARGET].attrs["NX_class"]) == "NXimage"
+            assert _text(event[_EELS_TARGET].attrs["NX_class"]) == "NXspectrum"
+
 
     def test_read_pass_reports_it_beside_the_image_channels(self, tmp_path):
         """
