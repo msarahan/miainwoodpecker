@@ -4,6 +4,64 @@
 
 ### Added
 
+- **Spectra are published where NXem documents a spectrum, too.** Both
+  writers — `storage/spectra.py`'s recordings and `storage/passes.py`'s
+  spectrum images — now put an `NXspectrum` at
+  `measurement/eventID/<detector>`, holding `stack_0d` or `spectrum_2d`,
+  every dataset a hard link to the plottable group. The field names were
+  already NXspectrum's; what the class adds is a machine-checkable type
+  (find the spectra by asking for `NXspectrum`, not by recognising a
+  field called `axis_energy`) and documented slots beside the data.
+  **One event for a whole pass.** A pass acquires its cube, its spectrum
+  image and its scan channels at the same beam positions, and that they
+  were taken *together* was previously stated only by their sitting in
+  one file. Both views now hang off one `eventID`, which is where NXem
+  puts that fact.
+  **What it costs a reader, measured**: a bare `file_reader` returns 9
+  signals for a spectrum recording where it returned 5, and 22 for a pass
+  file where it returned 17, since the linked arrays appear at their
+  second path as well. `use_default=True` still returns exactly the
+  plottable signal, steered by the `@default` chain this project already
+  writes.
+  **`SpectrumWriter(fabrication=...)` is new**, and only consulted when
+  the file claims an application definition. Measured with `pynxtools`:
+  creating a `measurement` group at all makes `measurement/instrument`
+  required, which makes `ebeam_column` and `fabrication` required, which
+  makes `vendor` and `model` required. A missing one is written as
+  `"unknown"` — the schema demands the field, and saying so is not the
+  same kind of thing as inventing the specimen facts `sample` exists to
+  refuse. A file claiming nothing is asked for none of it and gets none
+  of it.
+
+- **A pass reads back in HyperSpy as what it is: a scan position over a
+  diffraction pattern.** The pass writer's `NXdata` groups carried no
+  `interpretation`, so — measured against RosettaSciIO 0.14.0 — a 4D cube
+  arrived with all four axes marked navigation, which is a shapeless
+  stack rather than a cube, and HyperSpy built a `BaseSignal` where a
+  `Signal2D` was wanted. All three kinds now say what they are: `"image"`
+  for the diffraction cube and for a scan channel, `"spectrum"` for a
+  spectrum image. The cube now reads as two navigation axes over two
+  signal axes, which is also the shape py4DSTEM's `DataCube` is.
+- **The cube is published a second time where NXem documents an image.**
+  `measurement/eventID/<detector>` is an `NXimage` holding an `image_4d`
+  `NXdata` in NeXus's own vocabulary — `intensity`, `axis_m` down to
+  `axis_i` — every dataset a **hard link** to the plottable group, so the
+  bytes are written once and the descriptive axis names (`scan_y`,
+  `det_x`) survive where a person reads them. Same trade `entry/data`
+  already makes against `entry/data_<name>`.
+  **Named for the detector rather than `imageID`, which was measured.**
+  NXem declares both a named `imageID` concept and, through
+  `NXem_event_data`, an unnamed `NXimage` one. A group called `imageID`
+  matches the former, and pynxtools then demands an `@AXISNAME_indices`
+  attribute no instantiated file can supply — the same
+  NXDL-template-versus-instance confusion `interpretation` ran into
+  ([pynxtools#834](https://github.com/FAIRmat-NFDI/pynxtools/issues/834)).
+  Named for the camera it matches the unnamed concept, validates clean,
+  and answers "which detector is this" without opening a second group.
+  Checked, so the claim is not larger than it is: a `signal` attribute
+  pointing at a dataset that is not there **is** caught there; a detector
+  axis labelled in kilograms is **not**.
+
 - **The instrument as an application in the notification area: right-click
   to open a window on it, to see how its device servers are doing, or to
   stop everything.** `pixi run serve` already holds a microscope open for
@@ -686,6 +744,21 @@
   plumbing. `tests/unit/test_analysis_connect.py` pins both halves — a
   never-accepting socket for the bound, a `Client` that never answers
   over a worker that exits for the poll.
+- **Axis index attributes are unsigned, which is what `NXdata` says they
+  are.** `AXISNAME_indices` is declared `NX_UINT`, and h5py stores a bare
+  Python `int` as a *signed* `int64` — so every `*_indices` attribute this
+  project has ever written was the wrong type. Measured with `pynxtools`:
+  wherever the schema actually checks that attribute, the type alone is
+  enough to make an otherwise-valid file invalid. It went unnoticed here
+  because our `NXdata` sits at `entry/data`, where the application
+  definition does not check it; it surfaced while measuring what adopting
+  `NXimage` would cost, which does.
+  All three writers — frames, spectra, and the four-axis diffraction cube
+  in `storage/passes.py` — now state the type to h5py rather than letting
+  it infer one, and the tests assert the dtype rather than the value,
+  since `0 == 0` whichever way it is stored. Unsigned is also the truer
+  description: an axis index is a position in a shape, and there is no
+  negative one.
 
 - **The out-of-tree adapter stand-in did not survive losing a port, so
   the test file that documents the adapter contract was intermittent.**

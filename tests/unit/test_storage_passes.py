@@ -46,6 +46,9 @@ _FOUR_AXES = 4
 _TWO_CAMERAS = 2
 # Where NXspectrum puts the energy axis: last, always.
 _ENERGY_AXIS_INDEX = 2
+# The preview serves two cameras under these names; a pass carrying both
+# kinds of per-position readout is what pins the shared event.
+_RONCHIGRAM_TARGET = "ronchigram_camera"
 
 
 def _text(value: object) -> str:
@@ -197,6 +200,65 @@ class TestLayout:
             assert len(axes) == _FOUR_AXES
             assert group.attrs["scan_y_indices"] == 0
             assert group.attrs["det_x_indices"] == _FOUR_AXES - 1
+            # NX_UINT, and h5py would write a bare Python int as a
+            # signed int64 - which pynxtools rejects on type. The
+            # values above pass either way, so the dtype is what
+            # actually pins it.
+            for name in ("scan_y_indices", "det_x_indices"):
+                assert group.attrs[name].dtype.kind == "u", name
+
+    def test_each_signal_says_which_of_its_axes_are_the_picture(self, tmp_path):
+        """
+        ``interpretation``, so a reader gets a cube rather than a heap.
+
+        Measured against RosettaSciIO 0.14.0: without it every axis comes
+        back as navigation, so a 4D cube reaches HyperSpy as a shapeless
+        stack rather than as scan-position-over-diffraction-pattern —
+        which is also the shape py4DSTEM's ``DataCube`` is. With it, the
+        last two axes of the cube and both axes of a scan channel are the
+        signal, and a spectrum image's fastest axis (energy) is.
+        """
+        path = tmp_path / "pass.nxs"
+        _acquire(path)
+        with h5py.File(path, "r") as handle:
+            cube = handle["entry/data_camera"]
+            assert _text(cube.attrs["interpretation"]) == "image"
+            assert _text(cube["data"].attrs["interpretation"]) == "image"
+            channel = handle["entry/data_HAADF"]
+            assert _text(channel.attrs["interpretation"]) == "image"
+
+    def test_the_cube_is_also_published_where_nxem_documents_an_image(
+        self, tmp_path,
+    ):
+        """
+        A second path to the same bytes, in ``NXimage``'s own vocabulary.
+
+        NXem documents an image only under ``measurement/eventID``, and
+        only in ``NXimage``'s fixed field names, while the plottable
+        group keeps the descriptive ones a person reads. Hard links are
+        what make publishing both cost a group and no bytes — asserted by
+        identity rather than by comparing values, since a copy would pass
+        a value check and silently double the file.
+
+        The group is named for the detector rather than ``imageID``: see
+        ``PassWriter._write_nxem_image`` for the measurement behind that.
+        """
+        path = tmp_path / "pass.nxs"
+        _acquire(path)
+        with h5py.File(path, "r") as handle:
+            image = handle["entry/measurement/eventID/camera"]
+            assert _text(image.attrs["NX_class"]) == "NXimage"
+            data = image["image_4d"]
+            assert _text(data.attrs["NX_class"]) == "NXdata"
+            assert _text(data.attrs["signal"]) == "intensity"
+            assert [_text(axis) for axis in data.attrs["axes"]] == [
+                "axis_m", "axis_k", "axis_j", "axis_i",
+            ]
+            assert data.attrs["axis_i_indices"].dtype.kind == "u"
+            assert data["intensity"] == handle["entry/data_camera/data"]
+            assert data["axis_m"] == handle["entry/data_camera/scan_y"]
+            assert data["axis_i"] == handle["entry/data_camera/det_x"]
+
 
     def test_the_navigation_axes_are_calibrated_from_the_scan(self, tmp_path):
         """
@@ -456,6 +518,21 @@ class TestSpectrumImages:
             ]
             assert group.attrs["axis_energy_indices"] == _ENERGY_AXIS_INDEX
 
+    def test_the_spectrum_image_says_its_energy_axis_is_the_signal(self, tmp_path):
+        """
+        ``interpretation = "spectrum"``, so energy is the signal axis.
+
+        The spectrum-image half of the frame writer's twin assertion; see
+        the cube's test for what a reader does without it.
+        """
+        path = tmp_path / "si.nxs"
+        _acquire_spectrum_image(path)
+        with h5py.File(path, "r") as handle:
+            group = handle[f"entry/data_{_EELS_TARGET}"]
+            assert _text(group.attrs["interpretation"]) == "spectrum"
+            assert _text(group["intensity"].attrs["interpretation"]) == "spectrum"
+
+
     def test_the_energy_axis_is_the_one_the_acquisition_ran_at(self, tmp_path):
         """
         Taken from the spectrum rather than from anything requested.
@@ -488,6 +565,75 @@ class TestSpectrumImages:
             slow = handle[f"entry/data_{_EELS_TARGET}/axis_j"]
             assert _text(slow.attrs["units"]) == "nm"
             assert len(slow) == _A_GRID.height
+
+    def test_the_spectra_are_published_where_nxem_documents_a_spectrum(
+        self, tmp_path,
+    ):
+        """
+        An ``NXspectrum`` beside the plottable group, hard-linked to it.
+
+        The spectrum-side twin of the cube's NXimage view, and simpler:
+        the plottable group is already spelled in ``NXspectrum``'s own
+        field names, so the view is a class and a placement rather than a
+        second vocabulary.
+        """
+        path = tmp_path / "si.nxs"
+        _acquire_spectrum_image(path)
+        with h5py.File(path, "r") as handle:
+            spectrum = handle[f"entry/measurement/eventID/{_EELS_TARGET}"]
+            assert _text(spectrum.attrs["NX_class"]) == "NXspectrum"
+            data = spectrum["spectrum_2d"]
+            assert _text(data.attrs["NX_class"]) == "NXdata"
+            assert _text(data.attrs["signal"]) == "intensity"
+            assert [_text(axis) for axis in data.attrs["axes"]] == [
+                "axis_j", "axis_i", "axis_energy",
+            ]
+            plottable = handle[f"entry/data_{_EELS_TARGET}"]
+            assert data["intensity"] == plottable["intensity"]
+            assert data["axis_energy"] == plottable["axis_energy"]
+
+    def test_a_cube_and_a_spectrum_image_share_one_event(self, tmp_path):
+        """
+        One ``eventID`` for both, because one pass took both.
+
+        This is the reason the NXem view is more than decoration. That a
+        diffraction cube and a spectrum image were acquired at the *same
+        beam positions* is otherwise stated only by their sitting in the
+        same file, which is a convention a reader has to be told. NXem
+        has somewhere to put it, so both views hang off one event.
+        """
+        path = tmp_path / "both.nxs"
+        devices = build_preview_devices(
+            scan=True, camera=True, camera_count=_TWO_CAMERAS,
+        )
+        eels = devices.cameras[_EELS_TARGET]
+        eels.configure(
+            dataclasses.replace(eels.parameters(), readout=PROJECTED_READOUT),
+        )
+        ronchigram = devices.cameras[_RONCHIGRAM_TARGET]
+        ronchigram.configure(
+            CameraParameters(exposure_ms=10.0, binning=_A_BINNING),
+        )
+        with PassWriter(
+            path,
+            _A_GRID,
+            cubes={_RONCHIGRAM_TARGET: ronchigram.readout_shape},
+            spectra={_EELS_TARGET: eels.channel_count},
+        ) as writer:
+            result = devices.scanner.scan_synchronised(
+                _A_GRID,
+                channels=[0, 1],
+                targets=[_RONCHIGRAM_TARGET, _EELS_TARGET],
+                into=writer.destinations(),
+            )
+            writer.finish(result)
+
+        with h5py.File(path, "r") as handle:
+            event = handle["entry/measurement/eventID"]
+            assert _text(event.attrs["NX_class"]) == "NXem_event_data"
+            assert _text(event[_RONCHIGRAM_TARGET].attrs["NX_class"]) == "NXimage"
+            assert _text(event[_EELS_TARGET].attrs["NX_class"]) == "NXspectrum"
+
 
     def test_read_pass_reports_it_beside_the_image_channels(self, tmp_path):
         """

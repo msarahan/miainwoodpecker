@@ -832,6 +832,78 @@ problem — read their source and docs before designing our own adapters:
     of `nxdata_only=True`, `use_default=True` (which our root `@default` then
     steers), or `dataset_path="/entry/data"` returns exactly the one — and
     `dataset_path` needs the leading slash or it silently matches nothing.
+- [x] Publish a pass's 4D cube where NXem documents an image, and decide
+  what to do about `NXspectrum` — **both adopted**, on measurement
+  rather than taste, and the second only after the first answer here was
+  wrong. Prompted by
+  [pynxtools#834](https://github.com/FAIRmat-NFDI/pynxtools/issues/834),
+  where a maintainer noted that NXem "typically uses specializations of
+  `NXdata` like NXspectrum and NXimage".
+  - **What NXem actually models, read out of the NXDL shipped in
+    `pynxtools` 0.15 rather than from the manual.** `NXimage` defines
+    `image_1d` through `image_4d` and `stack_1d` through `stack_3d`;
+    `NXspectrum` defines `spectrum_0d` through `spectrum_3d` and
+    `stack_0d`/`stack_2d`/`stack_3d`. So a 4D-STEM cube is `image_4d`
+    `(n_m, n_k, n_j, n_i)`, an EELS or EDS map is `spectrum_2d`
+    `(n_j, n_i, n_energy)` — which is already the layout
+    `storage/spectra.py` writes — and 4D spectral data would be
+    `spectrum_3d`. The concern that 4D fits neither class does not hold.
+    What the classes do **not** carry is the difference between a
+    real-space scan axis and a reciprocal-space detector axis; `image_4d`
+    calls them slowest to fastest and nothing more, so the unit string
+    stays the whole carrier, exactly as the axis-calibration work found.
+  - **The placement rule, re-measured.** NXem documents `NXimage` at
+    `measurement/eventID/imageID`, `simulation/results` and `roiID/img`,
+    and `NXspectrum` at `measurement/eventID/spectrumID`. An `NXimage`
+    put at `/entry/img` is reported invalid. A plain `NXdata` at
+    `entry/data` is documented by `NXentry` itself, which is why this
+    project's files validate today and why they were written that way.
+  - **The name matters more than the place.** A group named `imageID`
+    matches NXem's *named* concept and pynxtools then requires an
+    `@AXISNAME_indices` attribute that no instantiated file can supply —
+    the NXDL-template-versus-instance confusion again. A group named for
+    the detector matches the *unnamed* `NXimage` in `NXem_event_data` and
+    validates with zero problems. So `storage/passes.py` writes
+    `measurement/eventID/<detector>`, hard-linked to the plottable group.
+    That validation is shallow, and it was checked how shallow: a
+    dangling `signal` attribute is caught, a detector axis labelled in
+    kilograms is not.
+  - **`NXspectrum` adopted too, after the first answer here was wrong.**
+    This note originally declined it, on the grounds that neither HyperSpy
+    nor py4DSTEM looks for the class. The second half of that is true and
+    the conclusion did not follow: measured, RosettaSciIO reads a spectrum
+    that lives *inside* an `NXspectrum` perfectly well - it finds `NXdata`
+    groups wherever they are, and `spectrum_2d` is one - so the class
+    neither helps nor hinders a HyperSpy user, and the decision was never
+    a reader question at all. What the class does add is a
+    machine-checkable type (find the spectra by asking for `NXspectrum`,
+    rather than by recognising a field called `axis_energy`), documented
+    slots beside the data that our own JSON metadata blob currently
+    holds, and the event. `storage/spectra.py` and `storage/passes.py`
+    both write the view, hard-linked, named for the detector.
+  - **The event is the part that is more than decoration.** A pass
+    acquires its cube, its spectrum image and its scan channels at the
+    same beam positions, and that they were taken *together* is
+    otherwise stated only by their sitting in one file - a convention a
+    reader has to be told. Both views hang off one `eventID`, which is
+    where `NXem` puts that fact, and a test acquires a pass carrying both
+    kinds to pin it.
+  - **What the view costs a reader, measured rather than asserted.** A
+    bare `file_reader` on a spectrum recording returns 9 signals where it
+    returned 5, and on a pass file 22 where it returned 17 - the linked
+    arrays appear at their second path too. `use_default=True` returns
+    exactly the plottable one in both cases, steered by the `@default`
+    chain this project already writes, and `nxdata_only=True` returns the
+    plottable groups plus the views. Nothing a reader gets is wrong; the
+    default listing is longer.
+  - **What a pass file would still need before it could claim NXem**,
+    measured by claiming it and reading the complaints: `interpretation`
+    (nine of sixteen problems, and the subject of the upstream issue),
+    this project's own `pass_id` and `camera_id` attributes, which are
+    undocumented concepts wherever they sit, and `intensity/@units`,
+    since `NXimage` declares the signal `NX_UNITLESS` while the same
+    hard-linked dataset says `counts` for the reader's benefit. None of
+    it bites today: `PassWriter` claims no application definition.
 - [x] Per-axis calibration for camera frames, configurable per acquisition —
   [`src/miainwoodpecker/storage/calibration.py`](../src/miainwoodpecker/storage/calibration.py).
   Closes the gap §7 recorded: camera frames used to fall back to `"pixel"`
