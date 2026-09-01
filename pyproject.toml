@@ -78,7 +78,7 @@ dev = [
     # Pinned exactly: with ruff's select = ["ALL"], a minor upgrade enables
     # newly added rules and can fail CI with no change of ours. Dependabot
     # bumps this as a reviewable PR.
-    "ruff==0.16.2",
+    "ruff==0.16.5",
 ]
 tests = [
     "pytest>=8.4.2",
@@ -554,7 +554,7 @@ description = """Check the style of the codebase."""
 dependencies = [
     "pydoclint",
     # Keep in step with the pin in the "dev" extra above.
-    "ruff==0.16.2",
+    "ruff==0.16.5",
 ]
 detached = true
 
