@@ -17,7 +17,9 @@ description = """\
 Nion UltraSTEM 100 with a Gatan UHV Enfina EEL spectrometer and a Bruker \
 XFlash 6T-100 silicon drift detector. The Enfina and the SDD run \
 together - confirmed by the facility - so this is a column that can \
-collect EELS and EDX in the same pass.\
+collect EELS and EDX in the same pass. Gatan's software here is \
+DigitalMicrograph 2.x, which has no Python: if the Enfina is not Nion's \
+eels_camera, the inbound Gatan bridge is not an option on this machine.\
 """
 
 # ---------------------------------------------------------------------

@@ -451,7 +451,10 @@ Proposed for [the hardware validation checklist](../hardware-validation-checklis
    controller with its own interface, or something site-specific.
 3. Confirm GMS's embedded Python version (`import sys; sys.version` in
    DM's Python window) and whether `pip install miainwoodpecker` is
-   possible in `GMS_VENV_PYTHON`.
+   possible in `GMS_VENV_PYTHON`. **Known already for SuperSTEM 1 and
+   2: there is none.** They run DigitalMicrograph 1.x and 2.x, and
+   embedded Python arrived with GMS 3.4. This bridge cannot run on
+   either machine; the survey's first run decides whether it needs to.
 4. Run the bridge's `simulated` backend *inside GMS* against a client on
    the same network. This tests the transport, the pickle cap and the
    authkey across the real interpreter pair, with no hardware at risk.
