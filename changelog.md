@@ -1,5 +1,23 @@
 # Change Log
 
+## 0.1.1 — 2026-09-24
+
+0.1.0 with a working one-line installer. The application is unchanged;
+everything under 0.1.0 below applies.
+
+### Fixed
+
+- **The one-line install found nothing to download.** v0.1.0 was
+  published without `woodpecker.ps1` attached, and this repository's
+  immutable releases refused the release workflow's attempt to attach it
+  afterwards (HTTP 422). So `releases/latest/download/woodpecker.ps1`
+  answered 404. Releases are now published with the script attached in
+  the same command (`gh release create <tag> woodpecker.ps1`), which
+  uploads to a draft before publishing. The workflow's upload job is now
+  a check that fails loudly when a release lacks the script or carries a
+  different one than its tag. See "Making a release" in
+  [`docs/installing.md`](docs/installing.md).
+
 ## 0.1.0 — 2026-09-24
 
 The first release. Everything in it has been built and tested against
