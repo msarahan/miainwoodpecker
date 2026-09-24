@@ -77,3 +77,23 @@ jobs:
         # Only publish to real PyPI on release
         if: github.event_name == 'release'
         uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
+
+  # The one-line installer in docs/installing.md downloads
+  # releases/latest/download/woodpecker.ps1, so every release carries the
+  # script it was tagged with. "latest" skips pre-releases, which makes a
+  # first installation always a stable one; a canary is chosen afterwards,
+  # on purpose, with `woodpecker update canary`.
+  attach-installer:
+    name: Attach woodpecker.ps1 to the release
+    if: github.repository_owner == 'msarahan' && github.event_name == 'release'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write  # to upload a release asset
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+      - name: Upload
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: gh release upload "$TAG" scripts/woodpecker.ps1 --clobber

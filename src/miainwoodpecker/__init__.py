@@ -28,3 +28,13 @@ Built as a thin glue layer over existing open source projects; see
 docs/migration-plan.md for the architecture. The device layer lives in
 :mod:`miainwoodpecker.devices`.
 """
+
+try:
+    # Written by hatch-vcs at build time, editable builds included, and
+    # read from the file rather than from installed metadata on purpose:
+    # every pixi environment of one checkout shares this one file, so the
+    # broker in `device` and the window in `default` agree on what they
+    # are even when their dist-info was built at different times.
+    from miainwoodpecker._version import __version__
+except ImportError:  # pragma: no cover - a source tree no build has touched
+    __version__ = "0+unknown"

@@ -4,6 +4,23 @@
 
 ### Added
 
+- **One-line installation on a Windows control computer, with
+  side-by-side releases for canaries and rollback.**
+  `scripts/woodpecker.ps1` (`irm .../woodpecker.ps1 | iex`, no
+  administrator needed) installs each release into a directory of its
+  own and starts whichever one a pointer names. So `woodpecker update
+  canary` tries a new release and `woodpecker rollback` goes back,
+  offline, by rewriting one small file. A release cannot be chosen until
+  all three of its environments have installed, agree on their version,
+  and passed the unit suite on that computer. A switch never touches a
+  running session; it takes effect at the next start. pixi is pinned
+  and checksummed, and no git is needed on the microscope. Stable and
+  canary are GitHub releases, a pre-release being a canary. The broker
+  now writes its release into `broker.json`, and a client of a
+  different release is refused with both versions named, rather than
+  meeting it halfway through a scan. See
+  [`docs/installing.md`](docs/installing.md).
+
 - **A survey of where the three basic acquisitions stand, and a survey
   script that asks the instruments what that survey could not.**
   [`docs/acquisition-ux-survey.md`](docs/acquisition-ux-survey.md) reads
