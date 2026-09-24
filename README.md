@@ -42,6 +42,19 @@ The project is early. What exists today:
 * **NeXus/HDF5 storage** (`miainwoodpecker.storage`), including an importer
   for legacy Nion Swift `.ndata` files.
 
+### Install it on a microscope control computer
+
+On Windows, from a PowerShell prompt, with no administrator and nothing
+else installed first:
+
+```powershell
+irm https://github.com/msarahan/miainwoodpecker/releases/latest/download/woodpecker.ps1 | iex
+```
+
+Releases install side by side, so trying a canary is `woodpecker update
+canary` and going back is `woodpecker rollback`, neither of which touches
+a running session. See [`docs/installing.md`](docs/installing.md).
+
 ### Try it without a microscope
 
 With [pixi](https://pixi.sh) installed, from a fresh clone:

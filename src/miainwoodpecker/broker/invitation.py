@@ -23,6 +23,8 @@ import stat
 import typing
 from dataclasses import dataclass
 
+from miainwoodpecker import __version__
+
 if typing.TYPE_CHECKING:
     import os
 
@@ -37,6 +39,17 @@ watching a timeout with no idea why.
 
 DEFAULT_FILENAME = "broker.json"
 """The conventional name for a published invitation."""
+
+
+class BrokerVersionMismatchError(ValueError):
+    """
+    A broker and a client that are not the same release of this project.
+
+    A ``ValueError`` like every other reason an invitation is refused, so
+    a caller that already reports those reports this too - with a message
+    that names both versions, which is the whole of what an operator needs
+    to know which one to change.
+    """
 
 
 @dataclass(frozen=True)
@@ -56,11 +69,21 @@ class BrokerInvitation:
     authkey : bytes
         The shared secret both ends pass to
         ``multiprocessing.connection``.
+    software_version : str
+        The release of miainwoodpecker the broker is. Read back and
+        compared with the reader's own, and refused if they differ: the
+        broker and its clients exchange pickled objects of this project's
+        own classes, and nothing promises those keep their shape between
+        releases. Without the check, a notebook left open across an
+        update - or started from the version that was just rolled back -
+        would meet the broker and fail somewhere in the middle of a scan,
+        rather than at the door with both versions named.
     """
 
     host: str
     port: int
     authkey: bytes
+    software_version: str = __version__
 
     def address(self) -> tuple[str, int]:
         """
@@ -88,6 +111,7 @@ class BrokerInvitation:
             "host": self.host,
             "port": self.port,
             "authkey": self.authkey.hex(),
+            "software_version": self.software_version,
         }
 
     @classmethod
@@ -113,6 +137,9 @@ class BrokerInvitation:
         ValueError
             If the version is not one this code understands, or a
             required field is missing or malformed.
+        BrokerVersionMismatchError
+            If the broker is a different release of miainwoodpecker from
+            this one. See :attr:`software_version`.
         """
         version = config.get("version")
         if version != CONFIG_VERSION:
@@ -122,7 +149,7 @@ class BrokerInvitation:
             )
             raise ValueError(message)
         try:
-            return cls(
+            invitation = cls(
                 host=str(config["host"]),
                 port=int(typing.cast("int", config["port"])),
                 authkey=bytes.fromhex(str(config["authkey"])),
@@ -130,6 +157,27 @@ class BrokerInvitation:
         except (KeyError, TypeError) as error:
             message = f"broker invitation is missing or malformed: {error}"
             raise ValueError(message) from error
+        # After the fields, so a malformed file is reported as malformed
+        # rather than as a version question it cannot answer.
+        software = config.get("software_version")
+        if software != __version__:
+            theirs = (
+                f"miainwoodpecker {software}"
+                if software is not None
+                # Invitations did not carry a release until this check
+                # existed, so its absence is itself an answer.
+                else "a miainwoodpecker release from before brokers said which"
+            )
+            message = (
+                f"the broker at {invitation.host}:{invitation.port} is {theirs}, "
+                f"and this is miainwoodpecker {__version__}. A client has to be "
+                "the same release as the broker it joins: start it from the "
+                "installation the broker runs from ('woodpecker list' names the "
+                "current one on a control computer), or restart the broker from "
+                "this one"
+            )
+            raise BrokerVersionMismatchError(message)
+        return invitation
 
     def write_to(self, path: str | os.PathLike[str]) -> pathlib.Path:
         """

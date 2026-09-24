@@ -15,8 +15,13 @@ import sys
 
 import pytest
 
+from miainwoodpecker import __version__
 from miainwoodpecker.broker.app import instrument_targets, serve_instrument
-from miainwoodpecker.broker.invitation import DEFAULT_FILENAME, BrokerInvitation
+from miainwoodpecker.broker.invitation import (
+    DEFAULT_FILENAME,
+    BrokerInvitation,
+    BrokerVersionMismatchError,
+)
 from miainwoodpecker.broker.remote import connect_broker
 
 
@@ -220,4 +225,43 @@ def test_a_stale_invitation_file_is_refused_rather_than_guessed_at(tmp_path):
         encoding="utf-8",
     )
     with pytest.raises(ValueError, match="version"):
+        BrokerInvitation.read_from(path)
+
+
+def test_an_invitation_names_the_release_that_wrote_it(tmp_path):
+    """The file says which miainwoodpecker the broker is, and reads back."""
+    invitation = BrokerInvitation(host="localhost", port=1, authkey=b"k")
+    path = invitation.write_to(tmp_path)
+    written = json.loads(path.read_text(encoding="utf-8"))
+    assert written["software_version"] == __version__
+    assert BrokerInvitation.read_from(path) == invitation
+
+
+def test_a_broker_of_another_release_is_refused_naming_both(tmp_path):
+    """
+    A client meets a broker of another release at the door, not mid-scan.
+
+    Which is the case a rollback creates: a notebook left open across it
+    is the old release, and the broker it would join is the new one.
+    """
+    BrokerInvitation(
+        host="localhost",
+        port=1,
+        authkey=b"k",
+        software_version="0.0.1",
+    ).write_to(tmp_path)
+    with pytest.raises(BrokerVersionMismatchError) as refused:
+        BrokerInvitation.read_from(tmp_path)
+    assert "0.0.1" in str(refused.value)
+    assert __version__ in str(refused.value)
+
+
+def test_an_invitation_from_before_releases_were_stamped_is_refused(tmp_path):
+    """No stamp at all is an answer too: it predates the check."""
+    path = pathlib.Path(tmp_path) / DEFAULT_FILENAME
+    path.write_text(
+        json.dumps({"version": 1, "host": "localhost", "port": 1, "authkey": "00"}),
+        encoding="utf-8",
+    )
+    with pytest.raises(BrokerVersionMismatchError, match="from before"):
         BrokerInvitation.read_from(path)

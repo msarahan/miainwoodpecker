@@ -41,6 +41,11 @@ decisions still rest on guesses about the instruments themselves; the
 [instrument survey runbook](superstem-survey.md) is a read-only script
 and a procedure for settling them at the facility.
 
+To put it on a microscope's control computer, see
+[installing](installing.md): one command to install, and side-by-side
+releases so a canary can be tried and a bad release rolled back without
+reinstalling anything.
+
 ## For developers
 
 The design history is documented unusually thoroughly, decisions and
@@ -82,6 +87,7 @@ measurements included:
 :maxdepth: 2
 :hidden:
 
+Installing <installing>
 Using the viewer <using-the-viewer>
 Scripting and automation <scripting-and-automation>
 Instrument configuration <instrument-configuration>

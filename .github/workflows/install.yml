@@ -1,0 +1,57 @@
+# The control-computer installer (scripts/woodpecker.ps1), exercised the
+# way a microscope uses it: install a release, install a second, switch,
+# roll back - under Windows PowerShell 5.1, which is what those computers
+# have, rather than the PowerShell 7 a workflow gets by default.
+#
+# Both "releases" are this checkout installed under two names with -From,
+# so this tests the script and the checkout's ability to be installed
+# without git, not GitHub's release API. The second install costs little:
+# pixi hard-links it out of the cache the first one filled.
+name: Installer
+
+on:
+  pull_request:
+    paths:
+      - 'scripts/woodpecker.ps1'
+      - 'pyproject.toml'
+      - 'pixi.lock'
+      - '.github/workflows/install.yml'
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  install:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: powershell  # 5.1, deliberately; see above
+    env:
+      WOODPECKER_HOME: ${{ runner.temp }}\wph
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+
+      - name: Install a first release
+        run: .\scripts\woodpecker.ps1 install 0.0.1 -From .
+
+      - name: Install a second as a canary, and switch to it
+        run: .\scripts\woodpecker.ps1 update 0.0.2rc1 -From .
+
+      - name: Roll back
+        run: .\scripts\woodpecker.ps1 rollback
+
+      - name: The pointer says what the commands did
+        run: |
+          .\scripts\woodpecker.ps1 list
+          $state = Get-Content -Raw "$env:WOODPECKER_HOME\state.json" | ConvertFrom-Json
+          if ($state.current -ne '0.0.1' -or $state.previous -ne '0.0.2rc1') {
+            throw "expected current 0.0.1 and previous 0.0.2rc1, got $($state | ConvertTo-Json -Compress)"
+          }
+          $said = & "$env:WOODPECKER_HOME\bin\pixi.exe" run --frozen `
+            --manifest-path "$env:WOODPECKER_HOME\versions\0.0.2rc1\pyproject.toml" -e device `
+            python -c "import miainwoodpecker; print(miainwoodpecker.__version__)"
+          if ("$said".Trim() -ne '0.0.2rc1') { throw "the 0.0.2rc1 release reports itself as '$said'" }
