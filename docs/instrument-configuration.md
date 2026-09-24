@@ -64,10 +64,12 @@ An instrument is not one device server. SuperSTEM 3 is a Nion column
 whose scan unit and Ronchigram camera come out of Nion's stack, plus a
 DECTRIS ELA on the spectrometer that speaks SIMPLON over HTTP and knows
 nothing about Nion. Each adapter is a separate process — that is the
-shape of `miainwoodpecker.devices`, and the [license
-boundary](migration-plan.md) is part of why. Before this file the broker
-could start exactly one of them, named on its command line, so an
-instrument with two adapters could not be served whole at all.
+shape of `miainwoodpecker.devices`, partly because it keeps each vendor
+stack's own licensing (a GPL-3.0 dependency, say) separate from this
+MIT-licensed process. A file that enumerates every adapter is what lets
+the broker start all of them together, so an instrument with more than
+one adapter can be served as a whole instead of one adapter at a time
+from the command line.
 
 The file is also the only place that knows what the microscope *has*. A
 device server reports what it found; nothing above it can tell "this

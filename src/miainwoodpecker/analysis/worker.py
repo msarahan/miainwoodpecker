@@ -14,10 +14,9 @@ MIT, and MIT is GPL-compatible, so nothing here is *forbidden* in either
 arrangement — the question is only what licence governs a combination
 when one is conveyed. This module lets the viewer's analysis buttons run
 without those libraries ever being imported into the application's own
-interpreter, which is the same shape
-[docs/migration-plan.md §6](../../../docs/migration-plan.md) chose for the
-device layer. It does **not** settle the licence question, and
-docs/analysis-isolation.md is explicit about why: this project's
+interpreter, which is the same shape README.md's "A note on licensing"
+section chose for the device layer. It does **not** settle the licence
+question, and docs/analysis-isolation.md is explicit about why: this project's
 *documented* analysis API (``load_as_hyperspy_signal`` and its siblings)
 returns live library objects to the caller's own process by design, and
 no process boundary can change that without destroying what the API is

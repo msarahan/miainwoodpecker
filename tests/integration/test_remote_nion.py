@@ -5,8 +5,8 @@ Unlike ``tests/integration/test_nion_server.py`` (which imports the
 GPL-3.0 server module directly, in-process), these tests drive it the
 same way the shipped application does: through
 :mod:`miainwoodpecker.devices.remote`, which imports nothing from
-``nion.*`` and spawns the server as a subprocess (see
-docs/migration-plan.md, §6, for why).
+``nion.*`` and spawns the server as a subprocess (see README.md's "A note
+on licensing" section, for why).
 
 A module-scoped fixture spawns one subprocess for the whole file rather
 than one per test, since subprocess startup (~1-2s to launch and connect
@@ -1639,9 +1639,9 @@ def test_an_orphaned_server_parks_itself_and_exits(monkeypatch, spawned_servers)
     Simulated by closing every connection without the shutdown
     handshake, which is what a crashed client looks like from the
     server's side. "All connections gone" is a sound signal here
-    specifically because reconnect is deliberately unsupported (migration
-    plan, §6), so a live client holds its connections for its whole life
-    - an *idle* client is still a connected one, and cannot trip this.
+    specifically because reconnect is deliberately unsupported, so a
+    live client holds its connections for its whole life - an *idle*
+    client is still a connected one, and cannot trip this.
     """
     monkeypatch.setenv("MIAINWOODPECKER_ENABLE_TEST_HOOKS", "1")
     monkeypatch.setenv("MIAINWOODPECKER_ORPHAN_GRACE_S", "1.0")

@@ -1,14 +1,13 @@
 """
 Confirm that Nion's STEM device layer can be driven headlessly.
 
-Phase 0 groundwork check (see docs/migration-plan.md), outside Swift's
-own process/UI.
+Phase 0 groundwork check, outside Swift's own process/UI.
 
 This talks directly to the `nion.device_kit` camera/scan device objects
 that `nionswift-usim` builds (the same objects Swift's own hardware source
 panels drive), with no `nion.swift.Application`/`DocumentController`
-involved. That's the low-risk reuse path described in migration-plan.md
-section 2: this device layer is kept, not rewritten.
+involved. That's the low-risk reuse path: this device layer is kept, not
+rewritten.
 
 Run with: uv run --extra device python scripts/phase0_usim_smoke_test.py
 """

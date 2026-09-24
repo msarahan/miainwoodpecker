@@ -368,11 +368,10 @@ def test_per_spectrum_metadata_is_kept_per_spectrum(tmp_path):
     """
     One JSON object each, not just the first one's.
 
-    The frame writer learned this the hard way (architecture review,
-    §1.4): keeping only the first frame's metadata silently threw away
-    exactly what a parameter sweep varies. The same applies here and more
-    so, because live time and dead time genuinely differ spectrum to
-    spectrum on a real detector.
+    The frame writer learned this the hard way: keeping only the first
+    frame's metadata silently threw away exactly what a parameter sweep
+    varies. The same applies here and more so, because live time and
+    dead time genuinely differ spectrum to spectrum on a real detector.
     """
     path = tmp_path / "eds.nxs"
     write_spectra(

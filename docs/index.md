@@ -54,10 +54,6 @@ measurements included:
   microscope that enumerates its hardware and tells the broker which
   device servers to start, with worked examples for the SuperSTEM
   instruments and the simulator.
-- [Migration plan](migration-plan.md) — the architecture, why each
-  piece was built or adopted, and the phased record of getting here.
-- [Architecture review](architecture-review.md) — a full-stack audit of
-  the implementation, findings and fixes.
 - [Other vendors](vendor-support.md) — what Thermo Fisher, JEOL, Zeiss,
   Hitachi and Bruker actually expose, and what a second device adapter
   would cost.
@@ -88,8 +84,6 @@ measurements included:
 
 Using the viewer <using-the-viewer>
 Scripting and automation <scripting-and-automation>
-Migration plan <migration-plan>
-Architecture review <architecture-review>
 Instrument configuration <instrument-configuration>
 Hardware validation checklist <hardware-validation-checklist>
 Instrument survey runbook <superstem-survey>

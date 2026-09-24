@@ -68,10 +68,10 @@ disk — from this session or any path — into a napari layer, and can point
 the three analysis buttons at that file instead of a fresh burst. Loading
 runs on a :class:`~miainwoodpecker.storage.session.LoadJob` for the same
 reason recording runs on a ``RecordingJob``: decompressing tens of
-megabytes must not freeze the window. The two degraded files the migration
-plan's Phase 3 interruption table measured are reported in words rather
-than discovered as a traceback — an unfinalized recording displays but
-will not analyze, and a hard-killed one does neither.
+megabytes must not freeze the window. The two degraded states are
+reported in words rather than discovered as a traceback — an unfinalized
+recording displays but will not analyze, and a hard-killed one does
+neither.
 
 Analyzing an opened file reads it once, not twice. The load that displayed
 it already decompressed every frame, so those frames — with the axis
@@ -82,9 +82,9 @@ difference between one 16.8MB-per-frame read and two.
 Importing this module requires the ``viewer`` optional dependency group.
 The camera group's "Analyze in HyperSpy", "Sum in LiberTEM", and "Fit
 central disk (py4DSTEM)" buttons additionally need the ``analysis``,
-``libertem``, and ``py4dstem`` groups respectively (migration plan,
-Phase 4). All three libraries are imported lazily, so this module still
-imports without them — and **each button is built only when its own
+``libertem``, and ``py4dstem`` groups respectively. All three libraries
+are imported lazily, so this module still imports without them — and
+**each button is built only when its own
 extra is installed**, with a single row naming the enabled and available
 extras standing in for the ones that are not. A button that cannot work
 is worse than an absent one: it teaches the operator that this
@@ -397,8 +397,7 @@ def _condition(recording: Recording) -> str:
     """
     Describe a recording's state in the words an operator needs.
 
-    The three states come straight from the migration plan's Phase 3
-    interruption table, measured rather than reasoned about: a finalized
+    The three states are measured rather than reasoned about: a finalized
     file, a file whose writer was abandoned (all frames present, no
     ``/entry/data``), and a file whose process was killed outright (does not
     open at all).
@@ -1601,9 +1600,8 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         Repopulate the Recordings combo, keeping the operator's choice if it survives.
 
         Each entry says what the file is *now*, including the two degraded
-        states the migration plan's Phase 3 interruption table measured, so
-        an operator sees why a file will not analyze before clicking rather
-        than after.
+        states, so an operator sees why a file will not analyze before
+        clicking rather than after.
 
         The newest recording is preselected when the operator has not chosen
         otherwise, because "open the file I just took" is the request this
@@ -2676,8 +2674,7 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         HDF5 — so the read runs on a
         :class:`~miainwoodpecker.storage.session.LoadJob` worker and the
         result is collected by the display timer, exactly as recording
-        already works in the other direction (Phase 2's thread-safety
-        contract).
+        already works in the other direction.
 
         A file that will not open at all is reported as a sentence, not a
         traceback: the load job captures the failure and
@@ -2721,7 +2718,7 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         A multi-frame recording goes in as the ``(frames, height, width)``
         stack it is, because napari renders a 3D array with a frame slider
         natively — reimplementing stack navigation to show one frame at a
-        time would be exactly the kind of bespoke UI §3 adopts napari to
+        time would be exactly the kind of bespoke UI napari exists to
         delete. A single-frame recording is squeezed to 2D, since a slider
         with one position is furniture, not information.
 
@@ -2817,9 +2814,9 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         For case 1 the file is checked *before* the adapter sees it. The
         Phase 4 adapters read ``/entry/data`` and raise "it recorded no
         frames" when it is absent, which is precisely wrong for the
-        abandoned-writer file from the Phase 3 interruption table: every
-        frame is present and readable, only the finalization is missing. So
-        that case is refused here with a sentence saying so.
+        abandoned-writer file: every frame is present and readable, only
+        the finalization is missing. So that case is refused here with a
+        sentence saying so.
 
         Case 1 is also where the file gets read *once* rather than twice.
         Opening it already read every frame to display them, so those
@@ -3217,8 +3214,8 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         """
         Round-trip one real camera frame through the py4DSTEM adapter.
 
-        Demonstrates the py4DSTEM follow-up to Phase 4 (migration plan,
-        §5) end to end: stop the live camera loop if running, get a NeXus
+        Demonstrates the py4DSTEM follow-up to Phase 4 end to end: stop
+        the live camera loop if running, get a NeXus
         file from :meth:`_analysis_input` — one freshly acquired frame, or
         a recording already on disk if the operator opened one and ticked
         the Recordings checkbox, in which case the frames already read to

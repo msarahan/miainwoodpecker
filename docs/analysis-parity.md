@@ -1,11 +1,11 @@
 # Analysis parity: what Swift computes, and what the rest costs
 
-[Phase 4](migration-plan.md) wired three analysis libraries in and left
-one item open: *port Swift-specific analyses not already covered
-upstream, as small adapter functions.* This page is that audit. It is
-deliberately not the port — nothing here is implemented, and the point of
-writing it first was to find out whether "small adapter functions" is
-even the right shape for the answer.
+This project wires in three analysis libraries and leaves one item open:
+*port Swift-specific analyses not already covered upstream, as small
+adapter functions.* This page is that audit. It is deliberately not the
+port — nothing here is implemented, and the point of writing it first was
+to find out whether "small adapter functions" is even the right shape for
+the answer.
 
 **It mostly is not.** The single largest finding is a licence fact rather
 than a capability one: the library that implements almost all of Swift's
@@ -20,9 +20,9 @@ with: nothing here is a commitment to build any of it. This is the map.
 
 Everything in Nion Swift proper is GPL-3.0, and this project is MIT. The
 rule this document works under is the one
-[pre-hardware work](pre-hardware-work.md) already established and
-[migration plan §6](migration-plan.md) draws: **read their code, port
-their behaviour, take none of their text.** Every operation below is
+[pre-hardware work](pre-hardware-work.md) already established:
+**read their code, port their behaviour, take none of their text.**
+Every operation below is
 named and described from the outside — what it does, what it takes, what
 comes out — and no Swift source, docstring, or algorithm body is
 reproduced here or anywhere in this repository.
@@ -47,9 +47,9 @@ numpy==2.4.6
 scipy==1.17.1
 ```
 
-**Four packages.** Measured the same way [Phase 4](migration-plan.md)
-measured the others — HyperSpy ~35, py4DSTEM 65, LiberTEM ~102 — which
-makes it by a wide margin the lightest analysis dependency on the table.
+**Four packages.** Measured the same way as the other analysis
+dependencies — HyperSpy ~35, py4DSTEM 65, LiberTEM ~102 — which makes it
+by a wide margin the lightest analysis dependency on the table.
 It also runs standalone, verified rather than assumed: in exactly that
 four-package venv — no Swift, no GUI, no HyperSpy, nothing GPL-3.0 —
 wrapping a plain NumPy array in `DataAndMetadata` with `nm` axes and
@@ -82,19 +82,19 @@ though it is not what it was scoped to find. Checked on PyPI:
 
 Two of the three analysis extras this project already ships are GPL-3.0,
 and `viewer/live.py` imports them **in the application's own process** —
-inside the button handlers, but in-process. That is the same shape §6
-went to considerable trouble to avoid for the device layer.
+inside the button handlers, but in-process. That is the same shape the
+device layer's process boundary goes to considerable trouble to avoid.
 
 This document does not resolve that, and should not: it is a pre-existing
-decision, it predates this audit, and the reasoning that would settle it
-(an optional extra the *user* installs is arguably not something this
-project distributes as a combined work) is a legal judgement rather than
-a technical one. What the audit contributes is that the question now has
-teeth, because the recommendations below would add a fourth GPL-3.0
-optional import (`exspy`) unless someone decides otherwise. **What would
-settle it**: §6 growing a paragraph that says explicitly whether the
-process boundary applies to analysis extras or only to the device layer,
-with the same directness it applies to `nion.*`. Until then, note that
+decision, and the reasoning that would settle it (an optional extra the
+*user* installs is arguably not something this project distributes as a
+combined work) is a legal judgement rather than a technical one. What the
+audit contributes is that the question now has teeth, because the
+recommendations below would add a fourth GPL-3.0 optional import
+(`exspy`) unless someone decides otherwise. **What would settle it**: an
+explicit decision about whether the process boundary applies to analysis
+extras or only to the device layer, with the same directness it applies
+to `nion.*`. Until then, note that
 the ordering of preference falls out for free — Apache-2.0 `niondata`
 first, MIT LiberTEM second, GPL-3.0 everything else — and that ordering
 happens to match the engineering ordering too.
@@ -262,12 +262,11 @@ complex and lazy variants — and no `EELSSpectrum`. EELS and EDS moved out
 to **eXSpy** at the HyperSpy 2.0 split. Any claim that HyperSpy covers
 Swift's EELS menu is a claim about HyperSpy 1.x.
 
-**Since this audit was written, the adapter half of that gap is
-closed.** `exspy` is in the `analysis` extra (it arrived with the EDX
-work), and `analysis/hyperspy_bridge.py` now has `load_as_eels_signal`:
-an EELS camera recording reaches an `exspy.signals.EELSSpectrum` with
-its own energy axis, flattened across the spectrometer slit by the same
-shared loader an EDX recording uses. What that leaves open is the
+**The adapter half of that gap is closed.** `exspy` is in the `analysis`
+extra, and `analysis/hyperspy_bridge.py` has `load_as_eels_signal`: an
+EELS camera recording reaches an `exspy.signals.EELSSpectrum` with its
+own energy axis, flattened across the spectrometer slit by the same
+shared loader an EDX recording uses. What remains open is the
 *menu-action* half of the estimate below, and the instrument geometry
 eXSpy needs for quantification — see "What the adapter can and cannot
 tell eXSpy" after the table.
@@ -395,7 +394,7 @@ recommendation this whole audit converges on.
 | `niondata` as an MIT-side optional extra, with `DataAndMetadata` ↔ `FrameCalibration` conversion both ways | 1.5–2 d |
 | Route the existing NeXus reader into it, so `xd.*` operates on a recording without a second reader | 0.5–1 d |
 | One menu action proving the path, in the shape the other three already have | 1 d |
-| Decide and record §6's position on in-process analysis imports | 0.5 d, mostly not engineering |
+| Decide and record this project's position on in-process analysis imports | 0.5 d, mostly not engineering |
 
 The calibration conversion is the only real work. `DataAndMetadata`
 carries per-axis `Calibration(offset, scale, units)`, and
@@ -532,13 +531,12 @@ preference about a method, not a missing capability.
 not any single operation; it is that a mask, a pick point, or a line
 profile is a graphic the operator drags while the result recomputes live.
 This project has no computation graph and deliberately does not want
-Swift's ([§7](migration-plan.md), and
-[pre-hardware work](pre-hardware-work.md) on why the document model was
-not portable). Whether the answer is napari layer events, an explicit
-recompute button, or nothing at all is a design question nobody has
-framed yet, and costing it before it is framed would be a guess. It
-should be scoped with an operator in the room during the
-[Phase 5](migration-plan.md) pilot.
+Swift's (see [pre-hardware work](pre-hardware-work.md) on why the
+document model was not portable). Whether the answer is napari layer
+events, an explicit recompute button, or nothing at all is a design
+question nobody has framed yet, and costing it before it is framed would
+be a guess. It should be scoped with an operator in the room during a
+future pilot.
 
 ## What is not worth porting, and why
 
@@ -594,15 +592,13 @@ scalar measurement rather than these two specifically.
 
 **`sum_project`, `sum_masked`, and drift tracking.** Real capabilities,
 wrong document. They are acquisition-time features that need a
-synchronized scan-position/camera-frame mode this project does not have
-([Phase 4's py4DSTEM note](migration-plan.md) measures why), so they
-belong with that work and not on an analysis-parity list.
+synchronized scan-position/camera-frame mode this project does not have,
+so they belong with that work and not on an analysis-parity list.
 
 ## Recommended order
 
-Ordered by what an operator would miss first on a real instrument, which
-is the same rule [Phase 5's pilot list](migration-plan.md) uses — not by
-what is cheapest or most interesting.
+Ordered by what an operator would miss first on a real instrument — not
+by what is cheapest or most interesting.
 
 1. **`niondata` as an MIT-side extra, with the calibration conversion**
    (3–5 d). Everything else is smaller afterwards, it is the only
@@ -639,9 +635,8 @@ follows the synchronized acquisition mode, whenever that arrives.
 Stated plainly, because an audit whose facts are guessed is worse than no
 audit.
 
-- ~~**Swift's published documentation was never read.**~~ **It has been
-  read now, and it changes no conclusion on this page.** `readthedocs.io`
-  became reachable and all twenty-seven pages of
+- **Swift's published documentation has been read, and it changes no
+  conclusion on this page.** All twenty-seven pages of
   [nionswift.readthedocs.io](https://nionswift.readthedocs.io/en/stable/)
   were fetched, including the three this section named — Processing,
   Graphics, and Extended Data. What was found:
@@ -661,12 +656,12 @@ audit.
   - **Three of the four packages have no published docs at all.**
     `nionswift-eels-analysis`, `nionswift-experimental` and `niondata`
     all 404 on readthedocs. Those hold groups 2 and 3 — about thirty-one
-    of the ninety operations — so for them the repositories were never
-    the *more* authoritative source, they were the only source.
+    of the ninety operations — so for them the repositories are never
+    the *more* authoritative source, they are the only source.
     `nionswift-instrumentation` does publish, and its pages corroborate
     group 4 and the camera model
     [the Gatan page](adapters/gatan.md) depends on.
-  - **What the docs did add, and the inventory does not cover:** twelve
+  - **What the docs add, and the inventory does not cover:** twelve
     `graphics.*` actions (Add Line/Ellipse/Rectangle/Point/Interval/
     Channel/Spot/Angular/Band-Pass/Lattice Graphic, Add to Mask, Remove
     from Mask), and a layer of keyboard and drag workflow — `l` for line
@@ -674,23 +669,21 @@ audit.
     profile graphic to clone its computation onto another display,
     Alt-drag a crop into an input control. These are region and
     annotation tools and UI habits rather than analysis operations, so
-    leaving them out was right; recording that they were left out is
-    also right, because a menu-registration scrape cannot see them and
-    this is exactly the blind spot the original caveat predicted.
-  - One number drifted: `DocumentController.py` on master today
-    registers **50** `processing.*` actions against the 49 recorded here
-    at 16.18.1. Version drift, not an error, and it moves nothing.
+    they are left out of the inventory; a menu-registration scrape cannot
+    see them, which is a real blind spot in the method.
+  - `DocumentController.py` on master today registers **50**
+    `processing.*` actions against the 49 recorded here at 16.18.1 —
+    version drift, not an error, and it moves nothing.
 
-  Remaining limit, unchanged: the docs describe what Swift *is*, not what
-  any operator reaches for. That is still [Phase 5](migration-plan.md)'s
-  usage audit, below.
+  Remaining limit: the docs describe what Swift *is*, not what any
+  operator reaches for. That gap is what a usage audit, below, would need
+  to close.
 - **No claim here is based on using Swift.** This is a source-level
   capability audit. Which of these fifty-odd operations an operator
-  actually reaches for daily is exactly the question
-  [Phase 5](migration-plan.md) reserves for a usage audit, and this
-  document is not a substitute for it. The ordering above is a considered
-  guess at what would be missed first; a week beside a real operator
-  would beat it.
+  actually reaches for daily is exactly the question a usage audit would
+  answer, and this document is not a substitute for it. The ordering
+  above is a considered guess at what would be missed first; a week
+  beside a real operator would beat it.
 - **Framewise Dark Correction has no confirmed upstream equivalent.**
   Plain dark-reference subtraction is covered by both LiberTEM and
   py4DSTEM. The per-frame variant — tracking a drifting dark level frame
@@ -712,6 +705,6 @@ audit.
   licence files, and the installed distribution metadata of the exact
   version this project pins — three places, checked. That is strong
   evidence about the licence and no evidence at all about whether any
-  particular arrangement complies with it. §6's question about in-process
+  particular arrangement complies with it. The question about in-process
   analysis imports stays open, and should be answered by someone
   qualified to answer it.

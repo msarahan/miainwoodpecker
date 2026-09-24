@@ -96,7 +96,8 @@ def abandon_a_writer(path, frame_count: int = 3) -> None:
     Leave the file an abandoned-but-cleanly-exited writer leaves.
 
     All frames present, no ``/entry/data``, no ``end_time``, no metadata —
-    the second interruption mode in the migration plan's Phase 3 table.
+    the "unfinalized" interruption mode described in
+    ``docs/using-the-viewer.md``.
     """
     writer = NexusWriter(path, title="abandoned")
     # Deliberately entered without ever being __exit__ed or closed.

@@ -232,12 +232,11 @@ of it works on the preview instrument and on a replayed session.
    ([`broker/local.py:448-466`](../src/miainwoodpecker/broker/local.py)).
    The button says so, correctly, on every real instrument.
 
-   **The route on a Nion column is narrower than the migration plan
-   records.** [Migration plan §7](migration-plan.md) says a real 4D-STEM
-   mode needs Swift's `ScanHardwareSource`/`Application` layer, which
-   this project has twice found too heavy to stand up. That was
-   measured on the *simulator's* camera, which reads the probe position
-   from the hardware source. But Swift's own `grab_synchronized` is
+   **The route on a Nion column is narrower than it first appears.** A
+   full `ScanHardwareSource`/`Application` layer — which this project has
+   twice found too heavy to stand up outside Swift's own process — is
+   only needed for the *simulator's* camera, which reads the probe
+   position from the hardware source. Swift's own `grab_synchronized` is
    built on two **device-level** methods that need no application:
    `ScanDevice.prepare_synchronized_scan(frame_parameters,
    camera_exposure_ms=…)` and
@@ -283,7 +282,7 @@ of it works on the preview instrument and on a replayed session.
    stale docstrings still say the pass blocks the window
    ([`live.py:37-39, 2130-2134`](../src/miainwoodpecker/viewer/live.py),
    [`defaults.py:22-25`](../src/miainwoodpecker/viewer/panels/defaults.py))
-   when it has run in a `PassJob` since #40.
+   even though it now runs in a `PassJob` and does not block it.
 5. **After the pass.** A saved pass appears as "0 frames" in the File
    list and reopens as a plain image layer with no spectrum picker
    ([`live.py:2717-2767`](../src/miainwoodpecker/viewer/live.py)). Not

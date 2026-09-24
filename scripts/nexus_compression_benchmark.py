@@ -1,13 +1,13 @@
 """
 Measure which HDF5 codec and storage dtype the NeXus writer should default to.
 
-docs/migration-plan.md §5's Phase 3 "Revisit compression" item recorded a
-bad result for the current default: gzip level 4 on noisy ``float64`` scan
-data measured a *1.08x* ratio - the compressed file was **larger** than
-raw - while ``float32`` camera frames reached 0.69x. The item names two
+A prior investigation into "Revisit compression" recorded a bad result for
+the current default: gzip level 4 on noisy ``float64`` scan data measured a
+*1.08x* ratio - the compressed file was **larger** than raw - while
+``float32`` camera frames reached 0.69x. That investigation names two
 candidate fixes to evaluate: bitshuffle/blosc, and storing scan data as
-``float32``. This script measures both, plus the cheaper thing the item's
-phrasing implies but does not name: HDF5's own built-in ``shuffle``
+``float32``. This script measures both, plus the cheaper thing that
+reasoning implies but does not name: HDF5's own built-in ``shuffle``
 byte-shuffle filter in front of the gzip that is already there.
 
 Why shuffling is the specific technique to test: a generic compressor sees
@@ -19,8 +19,8 @@ floats next to each other - the exponent plane becomes long compressible
 runs, and the noisy mantissa bytes are quarantined where they can only
 fail to compress rather than poisoning everything around them.
 
-**This is a different question from §6's resolved shared-memory
-compression investigation, and that verdict does not transfer.** There,
+**This is a different question from the shared-memory path's own resolved
+compression trade-off, and that verdict does not transfer.** There,
 compression lost because the shared-memory path is a same-host memcpy: no
 wire, so there was no transport cost for a ratio win to amortize, and
 zstd's per-byte cost is simply higher than a copy's. Disk bytes are not
@@ -69,8 +69,9 @@ Run with:
   uv run --extra device python scripts/nexus_compression_benchmark.py
 
 ``hdf5plugin`` supplies the blosc2/bitshuffle/zstd filters. It is a real
-project dependency (unlike ``zstandard`` in the §6 benchmark, which was
-installed ad hoc for a capability that did not ship), because the winner
+project dependency (unlike ``zstandard`` in
+``scripts/shared_memory_compression_benchmark.py``, which was installed
+ad hoc for a capability that did not ship), because the winner
 this script picked is opt-in-able through it; see the writer's module
 docstring for why the *default* deliberately stays on HDF5 built-ins.
 """

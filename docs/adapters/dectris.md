@@ -169,9 +169,8 @@ confirmed at `libertem_live/detectors/dectris/controller.py:63-71`:
 `ints` sets `ntrigger=1, nimages=prod(nav_shape)`, and `exte`/`exts`
 take the mirror image of that. And the string **"ELA" appears nowhere in
 the package** — not in the supported list, not in a test, not in a
-comment — so this page's refusal to claim ELA support on LiberTEM-live's
-behalf was the right call and is now a checked fact rather than a
-caution.)*
+comment — so the ELA's absence from LiberTEM-live's supported list is a
+checked fact, not merely undocumented.)*
 
 What that means for scope:
 
@@ -295,14 +294,13 @@ speak the protocol, and needs a real ELA:
 2. **The trigger-mode arithmetic.** This adapter uses `ints` with
    `nimages=1` and `ntrigger=65536`, i.e. one image per software trigger.
    LiberTEM-live's controller uses the other arrangement for `ints`
-   (`nimages` = the whole series, `ntrigger=1`) — **now read from the
-   source rather than the docs**, at
-   `libertem_live/detectors/dectris/controller.py:63-71` — which is the
-   same series with the numbers the other way round. If the ELA's
-   firmware treats one `trigger` in `ints` as starting the *whole*
-   series, this must change to `inte`, or to re-arming per frame. Note
-   that the disagreement is now known to be a real disagreement between
-   two implementations, not a possible misreading of one.
+   (`nimages` = the whole series, `ntrigger=1`), per
+   `libertem_live/detectors/dectris/controller.py:63-71` — the same
+   series with the numbers the other way round. If the ELA's firmware
+   treats one `trigger` in `ints` as starting the *whole* series, this
+   must change to `inte`, or to re-arming per frame. This is a genuine
+   disagreement between two implementations, not a possible misreading of
+   one — LiberTEM-live's own source confirms the arithmetic above.
 3. **Whether `monitor` is enabled and usable on an ELA at all**, and what
    its buffer semantics are under `mode=enabled` — including whether
    `images/next` really returns 408 rather than blocking when empty.

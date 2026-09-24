@@ -22,40 +22,12 @@ MkDocs is the other most common documentation tool used in the Python
 ecosystem.
 :::
 
-## Setup your documentation
+## Setting up documentation for a new project
 
-You can chose to create sphinx documentation using sphinx-quickstart.
-Below is the Sphinx-quickstart workflow used to create these docs. However,
-inevitably you will likely customize the documentation setup. So you may also
-want to just copy this repository's structure.
-
-```bash
-➜ sphinx-quickstart
-Welcome to the Sphinx 5.3.0 quickstart utility.
-
-Please enter values for the following settings (just press Enter to
-accept a default value, if one is given in brackets).
-
-Selected root path: docs
-
-You have two options for placing the build directory for Sphinx output.
-Either, you use a directory "_build" within the root path, or you separate
-"source" and "build" directories within the root path.
-> Separate source and build directories (y/n) [n]: n
-
-The project name will occur in several places in the built documentation.
-> Project name: miainwoodpecker
-> Author name(s): Michael Sarahan
-> Project release []: 0.1
-
-If the documents are to be written in a language other than English,
-you can select a language here by its language code. Sphinx will then
-translate text that it generates into that language.
-
-For a list of supported codes, see
-https://www.sphinx-doc.org/en/master/usage/configuration.html#confval-language.
-> Project language [en]: en
-```
+Sphinx documentation for a new project can be scaffolded with
+`sphinx-quickstart`, which lays out the `docs` directory and its Sphinx
+config. For this package, you may also want to just copy this repository's
+structure instead.
 
 ## About the conf.py file
 

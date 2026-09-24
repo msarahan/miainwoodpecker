@@ -1,15 +1,14 @@
 # Other vendors: what their SDKs look like, and what adapting one costs
 
-This project's device layer was built vendor-neutral on purpose
-([migration plan §2](migration-plan.md)), but only one vendor has ever
-been behind it. This page is the check on that claim: what the other
-vendors actually expose, what a second adapter would cost, and — the part
-that needed code rather than prose — which spaces in the framework turned
-out to be the wrong shape.
+This project's device layer is vendor-neutral by design, but only one
+vendor has ever been behind it. This page checks that design against
+reality: what the other vendors actually expose, what a second adapter
+would cost, and which spaces in the framework are the wrong shape for a
+second vendor.
 
-**Scope note.** Nothing here is a commitment to build any of it. The
-migration plan's rule holds: no second vendor adapter until someone has
-that instrument. This is the map, not the itinerary.
+**Scope note.** Nothing here is a commitment to build any of it. No
+second vendor adapter is built until someone has that instrument. This is
+the map, not the itinerary.
 
 ## The landscape
 
@@ -111,8 +110,8 @@ build, and has several maintained Python wrappers.
 **Gatan is the exception, but it inverts *ownership*, not direction.**
 GMS 3's Python runs inside DigitalMicrograph and, in Gatan's own words,
 cannot be executed from outside it — so a Gatan adapter cannot be a
-subprocess we launch. It does *not* follow that it must connect out, as
-an earlier draft of this page asserted: `gms-socket-plugin` exposes both
+subprocess we launch. It does *not* follow that it must connect out:
+`gms-socket-plugin` exposes both
 `TCPSocketBind` and `TCPSocketConnect` to DM-Script, SerialEM's DM
 plug-in has listened inside DM for two decades, and a published
 DM-SDK/ZeroMQ bridge already exists (Lei, Weber, Clausen & Wilbrink,
@@ -156,8 +155,8 @@ image is exactly what a `Camera` should not.
 
 The split is also where the *viewer's* limit lands, measured rather than
 assumed: napari's per-update cost is a fixed ~11 ms on an M2 Pro,
-independent of frame size (see [Phase 2](migration-plan.md)), so ~85 fps
-is a ceiling no frame size changes. Survey-rate sources are nowhere near
+independent of frame size, so ~85 fps is a ceiling no frame size changes.
+Survey-rate sources are nowhere near
 it; a high-rate detector is past it before anything else becomes
 interesting.
 
@@ -175,17 +174,13 @@ other is coherent as long as only one of them owns the detector at a
 time. That interlock is the design question to settle before building
 either, and it is why nothing here is built yet.
 
-#### What a detector-only adapter needs, and now has
+#### What a detector-only adapter needs
 
-A direct detector has **no scan unit**. Until this audit, that did not
-work: the cameras were already optional in `remote_instrument`, but
-`connections["scanner"]` was not, so a detector-only server died with a
-`KeyError` — "vendor-neutral" quietly meant "must have a scan unit shaped
-like Nion's". `RemoteInstrumentDevices.scanner` is now `| None`,
-`cameras()` enumerates what is actually there, and the live viewer says
-so plainly instead of failing three frames deep. Covered by
-`tests/unit/test_out_of_tree_server.py`, which drives a detector-only
-server end to end.
+A direct detector has **no scan unit**, and the framework accounts for
+that: `RemoteInstrumentDevices.scanner` is `| None`, `cameras()`
+enumerates what is actually there, and the live viewer says so plainly
+rather than failing several frames in. `tests/unit/test_out_of_tree_server.py`
+drives a detector-only server end to end.
 
 What such an adapter would still have to work around, honestly:
 
@@ -211,7 +206,7 @@ What such an adapter would still have to work around, honestly:
 
 | Detector | Size | Notes |
 |---|---|---|
-| ~~**DECTRIS**~~ | **done** | [`devices/dectris_server.py`](../src/miainwoodpecker/devices/dectris_server.py), both backends; the 3–5 d estimate held. ROI/gain/trigger on `CameraParameters` is the outstanding piece — `roi_mode` is where a DECTRIS detector's readout reduction lives, and it is recorded in the metadata but not settable. |
+| ~~**DECTRIS**~~ | **done** | [`devices/dectris_server.py`](../src/miainwoodpecker/devices/dectris_server.py), both backends. ROI/gain/trigger on `CameraParameters` is the outstanding piece — `roi_mode` is where a DECTRIS detector's readout reduction lives, and it is recorded in the metadata but not settable. |
 | **Direct Electron** | 4–6 d | `deapi` is pip-installable; needs Mission Control running and a detector to test against |
 | **Hamamatsu ORCA** | 5–8 d | C SDK via a Python wrapper; Linux build exists; add ROI and gain mode |
 | **Merlin / ASI** | 2–4 d each | Wrap LiberTEM-live's existing connection behind `Camera` |
@@ -286,8 +281,8 @@ adapter per device: it is **one device server backed by pymmcore**, which
 also picks up a large slice of the scientific camera market for free.
 
 This is also the option that best fits what this project says it is for.
-[§4](migration-plan.md) already names pymmcore-plus as prior art worth
-studying; wrapping it is adopting that work rather than admiring it.
+pymmcore-plus is prior art worth building on; wrapping it is adopting
+that work rather than admiring it.
 
 **A DSLR or mirrorless body is its own small adapter.**
 [libgphoto2](https://github.com/gphoto/libgphoto2), through
@@ -376,6 +371,21 @@ a memcpy — invisible at 10–100 frames per second. At 120 kHz it is the
 wrong architecture, but so is any request/response protocol; that case
 belongs to LiberTEM-live, not to an in-process variant of this one.
 
+Both halves of that measurement have a reason behind them. **`TCP_NODELAY`
+is set on every connection** because a plain socket pair has Nagle's
+algorithm and delayed ACKs enabled by default on both ends, and the two
+can combine to add tens of milliseconds of latency for specific
+message-size patterns; disabling Nagle on every connection removes that
+cost regardless of which sizes happen to trigger it, rather than chasing
+it size by size. **The shared-memory transport reuses one persistent
+segment per device instead of creating one per frame** because
+creating and destroying a named shared-memory segment is its own pair of
+system calls, measurably slower than plain pickling if paid on every
+frame; reusing one segment (resized only when frame shape or dtype
+changes) removes that cost. Reuse is safe without double-buffering only
+because the RPC protocol is strictly synchronous request/response — the
+two sides are never touching the buffer at the same time.
+
 **This is not the bifurcation it might look like.** The in-process path
 already exists and costs nothing: `NionCamera`, `NionScanner` and
 `NionInstrument` satisfy the protocols directly, and the test suite
@@ -385,9 +395,8 @@ drives the same objects both ways — in-process in
 objects and never thinks about transport. What would be a real
 bifurcation is *two supported production paths*, with two lifecycle
 stories, two error models, two teardown paths, and a "which one are you
-on?" question in every bug report. This project has been caught twice by
-behaviour that only appeared on one path — the startup hang, and whether
-frame metadata survives the shared-memory transport — which is the
+on?" question in every bug report — and behaviour that appears on only
+one of the two paths is the concrete shape that risk takes, which is the
 argument against having two.
 
 **Where the calculus genuinely differs.** A benchtop camera has no beam
@@ -423,15 +432,14 @@ was deliberately *not* Nion's `stem.scan.fov_nm` spelling
 so a second adapter fills in the same names rather than negotiating a
 schema.
 
-## What was the wrong shape, and is now fixed
+## What the framework's shape provides for a second vendor
 
-**The client could only ever launch our own Nion server.**
-`_spawn_server` hard-coded `python -m miainwoodpecker.devices.nion_server`,
-so a vendor adapter could not be an out-of-tree package — it would have
-had to be a fork. `remote_instrument(server_module=...)` now names it, and
-the startup diagnostic names the module it failed to launch, since "the
+**The client can launch any vendor's server, not only our own.**
+`remote_instrument(server_module=...)` names the module to spawn, and the
+startup diagnostic names the module it failed to launch, since "the
 package is not installed in this interpreter" is the realistic first
-mistake.
+mistake. This is what lets a vendor adapter be an out-of-tree package
+rather than a fork of this one.
 
 `tests/unit/test_out_of_tree_server.py` writes a complete, vendor-free
 device server and drives the whole client against it — command line,
@@ -440,29 +448,21 @@ no `device` extra installed. It is both the regression test and the
 executable specification an adapter writes against, and the measurement
 it gives is the useful one: **the protocol plumbing is about a hundred
 lines** — the instrument target, an accept loop, a dispatch loop, and a
-`main`. Everything beyond that in a real adapter is vendor work.
+`main`. Everything beyond that in a real adapter is vendor work. It is
+worth re-measuring rather than re-quoting — the stand-in server is in the
+tree, so the count is checkable.
 
-That number was *eighty* when this paragraph was written, and it has
-grown twice since, both times for something a server gained rather than
-something the protocol got clumsier about: a `health()` the client can
-probe without touching a device, and the `endpoints` map that let the
-target list stop being a fixed tuple. It is worth re-measuring rather
-than re-quoting — the stand-in server is in the tree, so the count is
-checkable.
-
-**`InstrumentController` was all-or-nothing to `isinstance`.**
+**`InstrumentController` is deliberately not `runtime_checkable`.**
 `available_controls()` exists precisely so an instrument can serve some
 controls and not others — a webcam has no defocus, a detector-only server
-has no stage — but the protocol was `runtime_checkable`, and a
-`runtime_checkable` Protocol's `isinstance` check demands every method
-regardless of what the instrument says it supports. Two adapters failed
-that check while working perfectly (`camera_server.ServerInstrument` and
-`gatan_bridge.BridgeInstrument`), which meant the check was testing for
-Nion-shapedness rather than for protocol conformance. Found twice, by two
-independent adapters — the signal that it was the abstraction and not the
-adapters, and what mapping the `isinstance` call sites confirmed: every
-one was asking "is this an instrument target I can hold a session
-against", never "does it have a defocus".
+has no stage — but a `runtime_checkable` Protocol's `isinstance` check
+demands every method regardless of what the instrument says it supports.
+An instrument that implements every method it actually supports (a bare
+webcam, a detector-only bridge such as `camera_server.ServerInstrument`
+or `gatan_bridge.BridgeInstrument`) can still fail that check, because it
+tests for Nion-shapedness rather than for protocol conformance — every
+`isinstance` call site is really asking "is this an instrument target I
+can hold a session against", never "does it have a defocus".
 
 The fix splits the protocol along that question. `Instrument` is the
 `runtime_checkable` core every instrument target serves — identity
@@ -478,26 +478,17 @@ structural, so nothing is lost.) Per-control capability is asked through
 instrument that does not serve a control still gets the graceful "control
 not available" refusal, not a call it cannot answer.
 
-Both previously-failing adapters now pass the runtime check, each pinned
-by its own test
-(`test_gatan_bridge.test_a_one_control_instrument_satisfies_the_instrument_protocol`,
-`test_camera_server.test_a_controlless_instrument_satisfies_the_instrument_protocol`),
-and the full Nion controller passes it trivially, being a superset. The
-widening is pinned from the other side too: `test_gatan_bridge.
-test_passing_the_runtime_check_does_not_make_a_missing_control_callable`
-runs `focal_series` against the one-control bridge — whose defocus
-methods are *absent*, not merely unimplemented — and requires the
-documented `ValueError` naming the control, so a skipped capability check
-would show up as an `AttributeError` rather than passing quietly.
+Control-less adapters such as `camera_server.ServerInstrument` and
+`gatan_bridge.BridgeInstrument` satisfy `Instrument`, and the full Nion
+controller satisfies it trivially as a superset. A control an instrument
+does not serve stays a documented `ValueError` naming the control, not a
+silently-skipped check or an `AttributeError`.
 
-**`scan_frame` could not express a simultaneous multi-channel scan.** The
-most consequential wrong shape this page has carried, and the one that
-was not waiting on a second vendor — it was wrong for the instrument this
-project already drives. `scan_frame(parameters, channel)` returns one
-channel per call, and `Frame`'s docstring declined a `scan_id` on the
-grounds that "a second channel is a second pass of the beam". **That
-premise is false, and not as an edge case: a scanned instrument gives you
-one or more signals simultaneously, always.** One pass of the probe,
+**`scan_frame(parameters, channel)` cannot express a simultaneous
+multi-channel scan**, and that is a real limitation for the instrument
+this project already drives, not only for a hypothetical second vendor.
+It returns one channel per call, but a scanned instrument gives you one
+or more signals simultaneously, always. One pass of the probe,
 every detector reading out at once — HAADF and MAADF together on a Nion
 UltraSTEM, and on a segmented-detector SEM such as the SU9000II, BF plus
 each HAADF segment plus SE plus LA-BSE plus HA-BSE, all from the same
@@ -541,34 +532,21 @@ concept, not three (see
 [spectrum detectors](adapters/spectrum-detectors.md)), and `scan_frames`
 deliberately does not pretend to cover it.
 
-### The target names were a fixed tuple, and positional argv
+### Target names are server-chosen, not positional argv
 
-*Kept with its original diagnosis, because the fix is easier to judge
-against the problem it was written for.*
+A fixed positional target tuple forces every vendor's device list onto
+Nion's shape: a Thermo Fisher STEM with three detectors, or a SEM with SE
+and BSE and no camera, would have to map onto whatever fixed names the
+client pre-allocated ports for — which works, but leaves a file's
+`device_id` honest while its target name is a fiction, and leaves the set
+of targets undiscoverable.
 
-`rpc.TARGET_NAMES = ("ronchigram_camera", "eels_camera", "scanner",
-"instrument")` was Nion's device list, and it was *positional argv*: the
-client allocated one port per name before it could talk to the server, so
-the set could not be discovered. A Thermo Fisher STEM with three
-detectors, or a SEM with SE and BSE and no camera, had to map onto those
-four names — which works, but means a file's `device_id` is honest while
-its target name is a fiction.
+The protocol instead binds **one** well-known port for `instrument`; the
+server chooses and reports the rest through `describe()`, and the client
+connects to what it is told. That removes the positional-argv fragility
+as a side effect.
 
-The fix is a protocol change, not a rename: bind **one** well-known
-port for `instrument`, have the server choose and report the rest through
-`describe()`, and let the client connect to what it is told. That removes
-the positional-argv fragility as a side effect.
-
-**This is now done, and the trigger was not the one predicted here.**
-This section said the redesign should wait for a second *column* adapter,
-"when there is a real device list to test it against". The real device
-list turned out to be two USB cameras on a desk — a webcam and a USB
-microscope — which exercises exactly the same protocol question for the
-price of plugging something in, with no beam time and no vendor
-conversation. Waiting for a column adapter was waiting for the expensive
-version of a cheap test.
-
-What landed:
+What this gives:
 
 - `describe()` reports an **`endpoints`** map — target name to `port`,
   `kind` and `label` — so a server can serve targets whose names the
@@ -582,34 +560,26 @@ What landed:
   `camera:2`, `camera:3`, and with no `--plugin` it discovers and serves
   every working one. The first keeps the name every existing recording
   uses.
-- The client honoured `endpoints` when a server reported one and fell
-  back to the argv-allocated ports when it did not. That was a
-  transitional state, and it is what let the servers move one at a time
-  rather than in one commit.
 - **All four servers** — `nion_server`, `camera_server`,
-  `dectris_server`, `spectrum_server` — now take `--instrument-port` and
-  nothing else. The positional port list is gone from the client, from
-  every server, and from the two out-of-tree stand-ins in the test
-  suite; so is the client's fallback, because there is nothing left to
-  fall back for.
+  `dectris_server`, `spectrum_server` — take `--instrument-port` and
+  nothing else. There is no positional port list anywhere: not in the
+  client, not in any server, not in the two out-of-tree stand-ins in the
+  test suite.
 - Which handle a target gets is read from the endpoint's **`kind`**
   rather than guessed from its name. A server can therefore serve
-  `camera:2`, or a name written after this client shipped, and have it
-  arrive as a camera.
-- `TARGET_NAMES` is **no longer append-only**, and no longer reaches any
-  server's command line. What it still decides is which names get a
-  *named attribute* on `RemoteInstrumentDevices`; everything else is
-  reached by name through `cameras()` / `additional_cameras`.
+  `camera:2`, or a name unknown to this client, and have it arrive as a
+  camera.
+- `TARGET_NAMES` is **not append-only**, and does not reach any server's
+  command line. What it decides is which names get a *named attribute* on
+  `RemoteInstrumentDevices`; everything else is reached by name through
+  `cameras()` / `additional_cameras`.
 
-What this costs an out-of-tree adapter: the argv change is a **flag
-day**. A server written against the old shape takes N positional ports
-and will fail argument parsing against this client. The fix is the edits
-`tests/unit/test_out_of_tree_server.py` makes — swap the positional
-`ports` for `--instrument-port`, bind everything else on port 0, and
-return an `endpoints` map from `describe()` — about ten lines. There is
-no version negotiation in the protocol to soften it, which is a real
-limitation and the honest reason it was worth doing before there were
-adapters in the field rather than after.
+An out-of-tree server must take `--instrument-port` and nothing else,
+bind every other target on port 0, and return an `endpoints` map from
+`describe()` — the shape `tests/unit/test_out_of_tree_server.py`
+demonstrates in about ten lines. There is no version negotiation in the
+protocol, so a server that does not follow this shape fails argument
+parsing outright rather than degrading.
 
 One thing did **not** change: the attach path
 (`attached_instrument()`, `gatan_bridge`) still carries an explicit port
@@ -629,9 +599,9 @@ binding to port 0 and *releasing* the socket. The adapter binds it an
 interpreter start and a vendor stack's imports later, and in that window
 anything else on the machine may take it — another session starting, a
 parallel test run, or the client's own connect loop drawing an ephemeral
-source port from the range the probe came from. Not theoretical: it was
-found in this project's own CI, as one job failing where the job for the
-same commit in the duplicate workflow run passed.
+source port from the range the probe came from. This is a real race, not
+a theoretical one: two concurrent sessions, or a session and a parallel
+test run, can collide on the same freed port.
 
 The client can cure that — it re-picks ports and respawns, up to
 `_PORT_RETRY_ATTEMPTS` times — but only if the server *says* so, and the
@@ -652,9 +622,9 @@ does not reproduce. `miainwoodpecker.devices.serving.bind_targets()`
 raises the `OSError` its callers translate; an out-of-tree adapter may
 import it or not, and is obliged only to produce the same exit status.
 
-## What is still the wrong shape
+## Where the framework's shape is still limited
 
-Two, neither fixed, both estimated below rather than pre-emptively built.
+Two gaps, both estimated below rather than pre-emptively built.
 
 ### `CameraParameters.binning` is scalar, and EELS is not
 
@@ -766,8 +736,7 @@ mode for recording, or record what mode it used.
 
 ### Hitachi (SU9000II) — 12–18 days, or 10–16, or 3–5
 
-Estimable now, in four scenarios, because the placeholder here was
-written without a search and the search found something. Full working:
+Estimable now, in four scenarios. Full working:
 [adapters/hitachi.md](adapters/hitachi.md).
 
 **There is very likely an API, and it is undocumented.** Public code
@@ -845,8 +814,8 @@ vendor. Direct Electron is the obvious next one and pip-installable.
 **The best coverage per day of work is pymmcore.** One device server
 backed by Micro-Manager's core reaches every UVC microscope plus much of
 the scientific camera market, and it is the option that most matches what
-this project claims to be: §4 already names pymmcore-plus as prior art,
-and wrapping it is adopting that work rather than admiring it.
+this project claims to be: pymmcore-plus is prior art, and wrapping it is
+adopting that work rather than admiring it.
 
 Among column vendors, Thermo Fisher first — permissive wrapper, offline
 dummy, best class-map fit. JEOL second. Zeiss only if a site already has

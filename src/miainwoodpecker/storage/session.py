@@ -16,7 +16,7 @@ makes a file interpretable six months later (who ran it, on what sample,
 with what note), and a background job so a slow write does not freeze the
 GUI. It is **not** a data-management layer — no database, no index, no
 queries, no cataloguing. The filesystem is the index and NeXus files are
-the records (§1: thin glue, reuse over reimplementation). Everything here
+the records — thin glue, reuse over reimplementation. Everything here
 composes with the Phase 3 primitives rather than replacing them:
 :meth:`Session.record` is a thin wrapper over
 :func:`miainwoodpecker.acquisition.sequence.record`.
@@ -107,8 +107,10 @@ Reading a recording back
 ``/entry/data`` itself: the second reader would be the start of a bespoke
 format layer, and ``read_series`` reads
 ``/entry/instrument/detector``, which is exactly the group that survives
-the interruption modes the migration plan's Phase 3 table measured. A
-recording abandoned by its writer therefore *opens and displays* here even
+an interrupted write — each frame is flushed to disk as it is appended,
+so a recording stopped mid-acquisition loses at most the frame that was
+in flight (see docs/using-the-viewer.md). A recording abandoned by its
+writer therefore *opens and displays* here even
 though the Phase 4 analysis adapters (which read ``/entry/data``) cannot
 touch it — :attr:`Recording.finalized` is that distinction, and callers
 are expected to report it rather than discover it as a ``ValueError``.
@@ -119,11 +121,11 @@ What comes back is enough to analyze, not only to display
 ----------------------------------------------------------
 :class:`LoadedRecording` carries the file's axis calibration alongside its
 frames, and :attr:`LoadedRecording.frames` hands both to the Phase 4
-adapters in one object. That closes a genuinely wasteful path the migration
-plan's Phase 5 list carried as open: analyzing a recording opened in the
-viewer used to read it twice — once here to draw it, once in the adapter,
-which took a path. The calibration is the reason it could not simply be an
-array: an adapter handed frames without it produces a signal whose axes
+adapters in one object. That closes a genuinely wasteful path: analyzing a
+recording opened in the viewer used to read it twice — once here to draw
+it, once in the adapter, which took a path. The calibration is the reason
+it could not simply be an array: an adapter handed frames without it
+produces a signal whose axes
 silently claim bare pixels, which is a worse bug than the duplicated read.
 """
 
@@ -231,10 +233,9 @@ class Recording:
     finalized : bool
         Whether ``NexusWriter.close()`` ran, i.e. whether the file has its
         ``/entry/data`` group, ``end_time``, and metadata. ``False`` with
-        ``frame_count`` above zero is the abandoned-writer case from the
-        migration plan's Phase 3 interruption table: every frame is present
-        and :func:`load_recording` displays them, but the Phase 4 analysis
-        adapters read ``/entry/data`` and cannot.
+        ``frame_count`` above zero is the abandoned-writer case: every frame
+        is present and :func:`load_recording` displays them, but the
+        Phase 4 analysis adapters read ``/entry/data`` and cannot.
     """
 
     path: Path
@@ -271,9 +272,9 @@ class LoadedRecording:
         The per-axis calibration the file records, or ``None`` when it
         states none. ``None`` is not "uncalibrated" — an uncalibrated
         recording says so, in ``"pixel"`` units — it is "this file never
-        got as far as writing its axes", which is the abandoned-writer case
-        from the Phase 3 interruption table: the axis datasets live in
-        ``/entry/data``, which ``NexusWriter.close()`` creates. Kept
+        got as far as writing its axes", which is the abandoned-writer
+        case: the axis datasets live in ``/entry/data``, which
+        ``NexusWriter.close()`` creates. Kept
         distinct because the two are answered differently: the first can be
         analyzed, the second cannot.
     """
@@ -762,10 +763,12 @@ class Session:
         breaking out of the generator — still runs ``close()``, so the
         file is **complete and valid** for however many frames arrived,
         NXdata plotting hints and all. A hard process kill is different:
-        HDF5 buffers its object headers, so a ``SIGKILL`` mid-acquisition
-        leaves a file that does not open at all (not a short-but-valid
-        one). See this module's notes in the migration plan for the
-        ``nexus.py`` flush follow-up that would bound that loss.
+        HDF5 buffers its object headers, so an unflushed ``SIGKILL``
+        mid-acquisition would leave a file that does not open at all — which
+        is why ``NexusWriter`` flushes after every frame by default
+        (:data:`~miainwoodpecker.storage.nexus.DEFAULT_FLUSH_EVERY`),
+        bounding the worst case an operator can hit to the one frame that
+        was in flight rather than the whole recording.
 
         Parameters
         ----------
@@ -1156,7 +1159,7 @@ class RecordingJob(BackgroundJob):
     a daemon thread, state behind a lock, exceptions captured rather than
     raised into the caller, and **no Qt anywhere** — a caller polls
     :attr:`is_running`/:attr:`result`/:attr:`error` from its own event
-    loop (migration plan, Phase 2's thread-safety contract).
+    loop.
 
     :meth:`cancel` is cooperative: it stops pulling frames from the
     generator, which unwinds ``record``'s ``with`` block normally and so
@@ -1255,8 +1258,8 @@ class LoadJob(BackgroundJob):
     The write side already refuses to block the GUI thread
     (:class:`RecordingJob`); reading is the same problem in the other
     direction, and no smaller — the measured 23.3MB two-frame Ronchigram
-    recording from the migration plan's Phase 3 notes took 5.5 seconds to
-    write, and reading it back decompresses the same bytes. So this has
+    recording took 5.5 seconds to write, and reading it back decompresses
+    the same bytes. So this has
     :class:`RecordingJob`'s exact shape: a daemon thread, state behind a
     lock, exceptions captured rather than raised, and **no Qt anywhere**,
     polled by the caller from its own event loop.
@@ -1791,7 +1794,7 @@ def estimate_size(
 
     An upper bound, deliberately: it is the uncompressed size, while the
     writer's default gzip+shuffle measured roughly a 10% saving on scan
-    data (§5 Phase 3). Erring high is the useful direction for a
+    data. Erring high is the useful direction for a
     free-space check - a warning that does not fire is worse than one that
     fires slightly early - and compression ratio depends on the data,
     which is not known until it has been acquired.

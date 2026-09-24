@@ -793,7 +793,8 @@ class ReplayInstrument:
     **Setting the offset is refused rather than accepted and ignored.**
     A replay cannot change what was recorded, and this project has been
     bitten precisely once by a control that accepted a value, echoed it
-    back and did nothing (``probe_position``; see the migration plan).
+    back and did nothing (``probe_position``; see
+    docs/hardware-validation-checklist.md).
     An operator who drives this dial gets a sentence saying the data is
     fixed, which is a true statement about a replay and a useful one.
 

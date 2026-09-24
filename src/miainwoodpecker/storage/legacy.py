@@ -3,11 +3,12 @@ Read legacy Nion Swift ``.ndata`` files so existing data is not orphaned.
 
 Read with the standard library, **deliberately not with Nion's own
 ``NDataHandler``**, and that is a license decision rather than a
-preference. This module is part of the MIT application, and
-docs/migration-plan.md §6's whole architecture rests on the invariant that
-the MIT application never imports ``nion.*`` in-process — an in-process
-import of a GPL-3.0 library is the case that section exists to avoid. An
-earlier version of this module imported ``NDataHandler`` on the reasoning
+preference. This module is part of the MIT application, and the license
+boundary README.md's "A note on licensing" section describes rests on
+the invariant that the MIT application never imports ``nion.*``
+in-process — an in-process import of a GPL-3.0 library is the case that
+boundary exists to avoid. An earlier version of this module imported
+``NDataHandler`` on the reasoning
 that reusing a vendor reader beats re-implementing a container; correct in
 general, and the wrong trade here, because it quietly breached the
 boundary the rest of the project is built around.
@@ -23,10 +24,12 @@ build their fixtures with Nion's *writer* precisely so this reader is
 exercised against the real container rather than against our own
 assumptions about it.
 
-Note this is not the "invent a bespoke format" that §3 warns against; it is
-reading a documented one. RosettaSciIO would have been the natural reuse
-candidate — §3 already names it for file I/O — but it has no ``.ndata``
-reader (checked: 38 IO plugins, none handles the extension).
+Note this is not an invented bespoke format; it is reading a documented
+one — see docs/scripting-and-automation.md's "Migrating a Swift library"
+section for why this project writes plain NeXus/HDF5 rather than building
+bespoke containers. RosettaSciIO would have been the natural reuse
+candidate for file I/O, but it has no ``.ndata`` reader (checked: 38 IO
+plugins, none handles the extension).
 
 Frames come back as the vendor-neutral
 :class:`~miainwoodpecker.devices.interface.Frame`, so they can be written

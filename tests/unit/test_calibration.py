@@ -3,7 +3,7 @@ Tests for the per-axis frame calibration model.
 
 The conversion tests carry most of the weight here. A unit-conversion error
 is the class of bug that silently produces wrong physics rather than a
-failure - the migration plan's hardware checklist flags a metres/nanometres
+failure - ``docs/hardware-validation-checklist.md`` flags a metres/nanometres
 mix-up as its highest-consequence item for the same reason - so the exact
 factors are asserted numerically, not merely round-tripped.
 """

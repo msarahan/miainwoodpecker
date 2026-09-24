@@ -2,16 +2,15 @@
 Measure whether each exposed instrument control actually does anything.
 
 This project's own principle is "measure, don't assume"
-(docs/migration-plan.md, §1), and the device layer has already been bitten
-by the specific failure this script exists to catch: ``nion.usim_device``
-has controls that *accept* a value, report it back on read, and yet have
-no effect on acquired data outside the full ``HardwareSource``/
-``Application`` layer this project deliberately avoids. §7's "A real
-4D-STEM acquisition mode" records exactly that for ``probe_position`` —
-setting it and re-acquiring a Ronchigram frame changed nothing beyond
-shot noise, because ``CameraSimulator._get_frame_settings`` silently drops
-it back to a fixed centred default when no ``ScanHardwareSource`` is
-registered.
+(see docs/hardware-validation-checklist.md), and the device layer has
+already been bitten by the specific failure this script exists to catch:
+``nion.usim_device`` has controls that *accept* a value, report it back on
+read, and yet have no effect on acquired data outside the full
+``HardwareSource``/``Application`` layer this project deliberately avoids.
+That checklist records exactly that for ``probe_position`` — setting it
+and re-acquiring a Ronchigram frame changed nothing beyond shot noise,
+because ``CameraSimulator._get_frame_settings`` silently drops it back to
+a fixed centred default when no ``ScanHardwareSource`` is registered.
 
 So a successful setter proves nothing. For each control that
 :class:`~miainwoodpecker.devices.interface.InstrumentController` exposes,
