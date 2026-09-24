@@ -37,6 +37,10 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# Saved from main only; see test.yml.
+env:
+  SAVE_CACHES: true
+
 jobs:
   pixi:
     runs-on: ${{ matrix.os }}
@@ -51,12 +55,31 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
 
+      # setup-pixi caches the environments by caching the project's .pixi
+      # directory - and the committed .pixi/config.toml moves them out of
+      # it (detached-environments, for checkouts in a OneDrive folder). So
+      # the cache held 1 KB, every run "hit" it, and Windows then spent
+      # ~130s installing from scratch. On a runner the OneDrive reason does
+      # not apply; the environments go back inside the project, where the
+      # cache can see them.
+      - name: Keep the environments where setup-pixi caches them
+        shell: bash
+        run: printf 'detached-environments = false\n' > .pixi/config.toml
+
       - name: Set up pixi
         uses: prefix-dev/setup-pixi@f00437f565399d418b0acc85936d12c1fb668347 # v0.10.1
         with:
           # Fail rather than re-solve if pixi.lock does not match the
           # manifest. See the note at the top of this file.
           frozen: true
+          # Both environments the steps below use, so both are cached;
+          # by default only `default` would be.
+          environments: default style
+          # A new prefix, because the empty caches above are still stored
+          # under the old one, keyed by this very lockfile: left alone,
+          # they would go on "hitting" until pixi.lock next changed.
+          cache-key: pixi-envs-
+          cache-write: ${{ env.SAVE_CACHES }}
 
       - name: Unit suite
         run: pixi run test

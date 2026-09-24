@@ -24,6 +24,10 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# Saved from main only; see test.yml.
+env:
+  SAVE_CACHES: true
+
 jobs:
   install:
     runs-on: windows-latest
@@ -41,6 +45,24 @@ jobs:
       - name: Put the installation somewhere short
         run: |
           [IO.File]::AppendAllText($env:GITHUB_ENV, "WOODPECKER_HOME=$env:RUNNER_TEMP\wph`n")
+          # pixi's package cache, which the installer's pinned pixi reads
+          # like any other. On D: beside the installation rather than its
+          # default under C:\Users: pixi hard-links packages out of the
+          # cache into an environment, and a link cannot cross drives - it
+          # would copy every file instead.
+          [IO.File]::AppendAllText($env:GITHUB_ENV, "PIXI_CACHE_DIR=$env:RUNNER_TEMP\pixi-cache`n")
+
+      # A first install spends most of its time downloading and unpacking
+      # conda packages, and those are fixed by pixi.lock - so the cache is
+      # keyed on it, and a lockfile change starts from the newest cache
+      # rather than from nothing.
+      - name: Restore pixi's package cache
+        id: pixi-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}\pixi-cache
+          key: installer-pixi-${{ hashFiles('pixi.lock') }}
+          restore-keys: installer-pixi-
 
       - name: Install a first release
         run: .\scripts\woodpecker.ps1 install 0.0.1 -From .
@@ -62,3 +84,10 @@ jobs:
             --manifest-path "$env:WOODPECKER_HOME\versions\0.0.2rc1\pyproject.toml" -e device `
             python -c "import miainwoodpecker; print(miainwoodpecker.__version__)"
           if ("$said".Trim() -ne '0.0.2rc1') { throw "the 0.0.2rc1 release reports itself as '$said'" }
+
+      - name: Save pixi's package cache
+        if: env.SAVE_CACHES == 'true' && steps.pixi-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}\pixi-cache
+          key: ${{ steps.pixi-cache.outputs.cache-primary-key }}
