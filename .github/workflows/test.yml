@@ -54,8 +54,27 @@ jobs:
   # viewer tests skip themselves there. This job installs those extras and
   # runs the full suite under a virtual display, because napari needs a real
   # GL canvas (QT_QPA_PLATFORM=offscreen is not a valid substitute).
+  #
+  # Three jobs, each running a third of the suite. As one job it took about
+  # 6.5 minutes, against about 4 for the slowest test matrix leg: ~70s of
+  # environment build and system libraries, then ~4.6 minutes of tests on
+  # the runner's two xdist workers. Each shard pays the ~70s again, so three
+  # shards is what brings it in line with the rest, not two.
+  #
+  # The thirds are by measured *time*, not test count - some 900 unit tests
+  # take seconds together, and a few hundred viewer and device tests take
+  # the rest - from the committed .test_durations. A test missing from that
+  # file is assumed to take the average, so new tests still run; the
+  # balance just drifts until the file is refreshed, which is
+  # `python scripts/update_test_durations.py junit-*.xml` over the JUnit
+  # reports these jobs upload.
   integration:
+    name: integration (${{ matrix.group }}/3)
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        group: [1, 2, 3]
     steps:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -70,15 +89,34 @@ jobs:
     - name: Install GL and Qt system libraries
       run: bash scripts/install-linux-gui-deps.sh
 
-    - name: Full test suite (device + viewer) under a virtual display
+    - name: Full test suite (device + viewer), share ${{ matrix.group }} of 3, under a virtual display
       run: |
         xvfb-run -a -s "-screen 0 1920x1080x24" \
-          hatch run integration:run
+          hatch run integration:run -n auto \
+            --cov=miainwoodpecker --cov-report=term-missing \
+            --splits 3 --group ${{ matrix.group }} \
+            --splitting-algorithm least_duration \
+            --junitxml=junit-${{ matrix.group }}.xml
 
+    # Per-test times, for refreshing .test_durations. JUnit rather than
+    # pytest-split's own --store-durations because JUnit's are recorded
+    # reliably under xdist.
+    - name: Keep the per-test times
+      if: always()
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v4
+      with:
+        name: integration-junit-${{ matrix.group }}
+        path: junit-${{ matrix.group }}.xml
+        if-no-files-found: ignore
+
+    # The two smoke scripts are seconds long and need no splitting; the
+    # first share runs them.
     - name: Phase 0 and Phase 1 device smoke test
+      if: matrix.group == 1
       run: hatch run integration:python scripts/phase0_usim_smoke_test.py
 
     - name: Phase 0 viewer smoke test under a virtual display
+      if: matrix.group == 1
       run: |
         xvfb-run -a -s "-screen 0 1920x1080x24" \
           hatch run integration:python scripts/phase0_viewer_smoke_test.py
