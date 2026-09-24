@@ -22,21 +22,20 @@ GitHub account and no package index:**
 > **<https://claude.ai/code/artifact/f60f60c4-8cc4-4a30-8109-427cb53ad4ef>**
 
 It carries a download button, the full source to read first, and a
-condensed version of this runbook. Two things about it are worth knowing
+condensed version of this runbook. One thing about it is worth knowing
 before sending the link on:
 
-- **It downloads as `superstem_survey.txt`, not `.py`**, because the
-  host only permits an allowlist of extensions and `.py` is not on it.
-  **No rename is needed** — Python runs a file whatever its extension is,
-  so `python superstem_survey.txt --check` works as-is. The page says so
-  too, in those words, because an instrument scientist handed a `.txt`
-  will otherwise reasonably assume it is broken.
 - **The page is private until shared.** It has to be shared from the
   artifact's own share menu before anyone at Daresbury can open it.
 
-Anyone who can reach GitHub can of course take
-`scripts/superstem_survey.py` from the repository instead; it is the same
-file, and the hosted page names the revision it was built from so the two
+**The download button links straight to `scripts/superstem_survey.py` on
+GitHub**, rather than saving a copy through the Claude app — that app-only
+save mechanism doesn't exist for someone who opens the shared link without
+being signed into Claude, which left the button silently broken for
+exactly the audience this page is for. Anyone who can reach GitHub gets
+the same file a click away; the hosted page still embeds a full copy for
+reading and for copy-pasting on a machine that can reach the shared link
+but not GitHub, and it names the revision it was built from so the two
 can be told apart.
 
 **When the script changes, the hosted page must be republished** — it
@@ -121,10 +120,10 @@ Then run the preflight, which touches no hardware and opens no socket:
 python superstem_survey.py --check
 ```
 
-Every command below names the file `superstem_survey.py`. If you took it
-from the hosted page it will be called `superstem_survey.txt` instead —
-substitute the name and change nothing else. Python does not care about
-the extension.
+Every command below names the file `superstem_survey.py`. If you got it
+by pasting from the hosted page's "Copy to clipboard" button instead of
+downloading it, name the file whatever you like — Python does not care
+about the extension.
 
 It prints which interpreter it is in and which sections that interpreter
 could answer. If it disagrees with what you expect, the interpreter is
