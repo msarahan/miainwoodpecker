@@ -39,7 +39,7 @@ concurrency:
 
 # Saved from main only; see test.yml.
 env:
-  SAVE_CACHES: true
+  SAVE_CACHES: ${{ github.event_name == 'push' && github.ref_name == 'main' }}
 
 jobs:
   pixi:

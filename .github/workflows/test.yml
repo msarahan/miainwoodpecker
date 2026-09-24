@@ -25,8 +25,15 @@ concurrency:
 # can read main's caches but cannot share its own with any other branch,
 # so saving from one only spends the repository's 10 GB on copies - and
 # an evicted main cache costs every later run.
+#
+# The hatch jobs cache nothing, and that was measured rather than assumed:
+# with uv's cache kept between runs, an integration shard built its
+# environment in 32s instead of 40s and spent 10s restoring the 557 MB
+# cache to do it, and a Windows test leg saved about 7s of 240. uv
+# already downloads quickly on these runners; what is left is resolving
+# and installing, which a download cache does not touch.
 env:
-  SAVE_CACHES: true
+  SAVE_CACHES: ${{ github.event_name == 'push' && github.ref_name == 'main' }}
 
 jobs:
   test:
@@ -44,26 +51,6 @@ jobs:
       uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v5
       with:
         python-version: ${{ matrix.python-version }}
-
-    # hatch installs with uv (installer = "uv" in pyproject.toml), and
-    # every environment here is built from nothing on every run. uv's own
-    # cache is what makes a second build cheap, so it is kept between runs.
-    # Keyed on pyproject.toml because hatch resolves from it afresh - there
-    # is no lockfile for hatch to follow - and falls back to the newest
-    # cache for this job when it changes, since most of what it holds is
-    # still what the next resolution picks.
-    - name: Put uv's cache where it can be kept
-      shell: bash
-      run: echo "UV_CACHE_DIR=$RUNNER_TEMP/uv-cache" >> "$GITHUB_ENV"
-
-    - name: Restore uv's cache
-      id: uv-cache
-      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-      with:
-        path: ${{ runner.temp }}/uv-cache
-        key: uv-test-${{ runner.os }}-py${{ matrix.python-version }}-${{ hashFiles('pyproject.toml') }}
-        restore-keys: uv-test-${{ runner.os }}-py${{ matrix.python-version }}-
-
     - name: Install hatch
       uses: pypa/hatch@install
 
@@ -76,13 +63,6 @@ jobs:
     - name: Report coverage
       shell: bash
       run: bash <(curl -s https://codecov.io/bash)
-
-    - name: Save uv's cache
-      if: env.SAVE_CACHES == 'true' && steps.uv-cache.outputs.cache-hit != 'true'
-      uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-      with:
-        path: ${{ runner.temp }}/uv-cache
-        key: ${{ steps.uv-cache.outputs.cache-primary-key }}
 
   # The matrix job above installs only the base package, so the device and
   # viewer tests skip themselves there. This job installs those extras and
@@ -117,25 +97,6 @@ jobs:
       with:
         python-version: "3.11"
 
-    # hatch installs with uv (installer = "uv" in pyproject.toml), and
-    # every environment here is built from nothing on every run. uv's own
-    # cache is what makes a second build cheap, so it is kept between runs.
-    # Keyed on pyproject.toml because hatch resolves from it afresh - there
-    # is no lockfile for hatch to follow - and falls back to the newest
-    # cache for this job when it changes, since most of what it holds is
-    # still what the next resolution picks.
-    - name: Put uv's cache where it can be kept
-      shell: bash
-      run: echo "UV_CACHE_DIR=$RUNNER_TEMP/uv-cache" >> "$GITHUB_ENV"
-
-    - name: Restore uv's cache
-      id: uv-cache
-      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-      with:
-        path: ${{ runner.temp }}/uv-cache
-        key: uv-integration-${{ runner.os }}-${{ hashFiles('pyproject.toml') }}
-        restore-keys: uv-integration-${{ runner.os }}-
-
     - name: Install hatch
       uses: pypa/hatch@install
 
@@ -150,13 +111,6 @@ jobs:
             --splits 3 --group ${{ matrix.group }} \
             --splitting-algorithm least_duration \
             --junitxml=junit-${{ matrix.group }}.xml
-
-    - name: Save uv's cache
-      if: env.SAVE_CACHES == 'true' && steps.uv-cache.outputs.cache-hit != 'true'
-      uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-      with:
-        path: ${{ runner.temp }}/uv-cache
-        key: ${{ steps.uv-cache.outputs.cache-primary-key }}
 
     # Per-test times, for refreshing .test_durations. JUnit rather than
     # pytest-split's own --store-durations because JUnit's are recorded
