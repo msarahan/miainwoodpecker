@@ -1,7 +1,7 @@
 """
 Adapter: read a NexusWriter file as a HyperSpy signal.
 
-HyperSpy is the Phase 4 pick (migration plan, §5) over py4DSTEM/LiberTEM:
+HyperSpy is the Phase 4 pick over py4DSTEM/LiberTEM:
 it is the lighter, more general of the three, works directly on the plain
 2D image/scan stacks this app actually produces today (frames from
 ``Scanner``/``Camera``, no 4D-STEM diffraction-scan structure yet), and

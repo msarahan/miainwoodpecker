@@ -3,7 +3,7 @@ Unit tests for the analysis thread cap: the policy, not the scheduling.
 
 What is under test here is arithmetic and a context manager, deliberately.
 The thing the cap exists to prevent — a four-second GUI freeze under eight
-competing workers (docs/migration-plan.md, Phase 2) — is a scheduling
+competing workers (see docs/analysis-isolation.md) — is a scheduling
 outcome on a loaded machine, and a test that tried to observe it would be
 measuring the CI runner's other tenants. So these tests pin the resolved
 worker count for a given core count, including the small-machine edges

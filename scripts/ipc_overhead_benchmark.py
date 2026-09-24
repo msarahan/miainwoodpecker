@@ -1,10 +1,10 @@
 """
 Measure the IPC overhead of the process-isolated device server.
 
-docs/migration-plan.md §6 isolates Nion's GPL-3.0 device layer behind a
-subprocess boundary (see ``miainwoodpecker.devices.remote``) rather than
-importing it in-process, for licensing reasons. The concern raised
-against that: STEM frames are large (a Ronchigram frame here is
+Nion's GPL-3.0 device layer is isolated behind a subprocess boundary (see
+``miainwoodpecker.devices.remote``) rather than imported in-process, for
+licensing reasons (see README.md's "A note on licensing"). The concern
+raised against that: STEM frames are large (a Ronchigram frame here is
 2048x2048 float32, ~16.8MB; real 4D-STEM data is worse), and the naive
 transport - pickling each ``Call``/``Result`` over a
 ``multiprocessing.connection`` socket - copies the array through

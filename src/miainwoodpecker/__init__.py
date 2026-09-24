@@ -25,6 +25,6 @@
 Instrument control and data analysis for STEM.
 
 Built as a thin glue layer over existing open source projects; see
-docs/migration-plan.md for the architecture. The device layer lives in
+README.md for the architecture. The device layer lives in
 :mod:`miainwoodpecker.devices`.
 """

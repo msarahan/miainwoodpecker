@@ -68,7 +68,7 @@ Two related cautions:
   diffraction camera of **unidentified vendor**. Nothing here assumes
   they are Gatan.
 
-## Phase 1: what was established, and from where
+## What was established, and from where
 
 ### The launch inversion is real, and the vendor says so
 
@@ -143,33 +143,24 @@ the morning and outlives many runs of the client.
   whatever the Python API happens to wrap: the camera manager (`CM_*`) and
   imaging-filter families are reachable, with values returned through the
   persistent tag tree.
-- **EELS spectrometer control: reachable, and the spelling is now
-  known.** This used to be the single largest unverified item on the
-  page. It is settled, though not from the source the page expected —
-  see [the imaging-filter commands](#the-imaging-filter-commands-verified)
+- **EELS spectrometer control: reachable, and the command spelling is
+  known** — from SerialEM's source rather than from Gatan's own
+  documentation, which publishes none; see
+  [the imaging-filter commands](#the-imaging-filter-commands-verified)
   below.
 
 ### The imaging-filter commands (verified)
 
-**First, a correction to what this page used to say.** It claimed
-"Gatan's script library documents an example that sets the GIF
-drift-tube voltage and lists the imaging-filter control commands, and it
-requires `Gatan IF Interface Plug-in.dll`". Gatan's script library was
-read this time — all nine pages, all 87 entries, all 78 downloadable
-files — and **it contains no such example**. The example described is
-Dave Mitchell's, on `dmscripting.com`, which is a private community site
-and not Gatan's library. The attribution was wrong, and it was wrong in
-the way [migration plan §7](../migration-plan.md) warns about: it was
-written from a search-index snippet and never re-checked once the page
-became reachable.
-
-Worse for the original plan: **Gatan do not publish a scripting command
-reference at all.** Their scripting page offers a `*.dm5` help file and
-then points readers at three community sites — the FELMI/TU Graz script
-database, `dmscript.tavernmaker.de` and `dmscripting.com`
-([Gatan][gatan-scripting]). All three are still blocked here. So the
-named sources for this item were, and remain, either non-existent or
-unreachable.
+**Gatan does not publish a scripting command reference.** Their
+scripting page offers a `*.dm5` help file and then points readers at
+three community sites — the FELMI/TU Graz script database,
+`dmscript.tavernmaker.de` and `dmscripting.com` ([Gatan][gatan-scripting]).
+All three are blocked here, and Gatan's own script library — all nine
+pages, all 87 entries, all 78 downloadable files — contains no example
+setting the GIF drift-tube voltage or listing the imaging-filter control
+commands. That example, sometimes attributed to Gatan along with a
+`Gatan IF Interface Plug-in.dll` requirement, belongs to Dave Mitchell's
+`dmscripting.com`, a private community site, not to Gatan's library.
 
 The commands were instead read from **SerialEM's own source**, which is
 a better artefact than any of them: production C++ that has been driving
@@ -289,7 +280,7 @@ exists to avoid. It is also unnecessary: Python's own `socket` module
 inside the embedded interpreter needs no plug-in. `execdmscript` is
 MPL-2.0 and likewise not needed; `DM.ExecuteScriptString` is one call.
 
-## Phase 2: what the framework gained
+## What the framework gained
 
 `attached_instrument()`, beside the unchanged `remote_instrument()`.
 
@@ -338,12 +329,13 @@ frames travel as ordinary pickles. Measured cost, from the existing
 benchmark: within noise below ~500 KB, +1.5 ms at ~1 MB, +9.5 ms at
 8.4 MB. A 2k × 2k float32 frame is ~16 MB, so this is real and bounded.
 
-**The spawn path is unchanged.** Its internals were refactored behind a
-`_ServerLifecycle` abstraction so that "what became of the server" has one
-answer per path instead of a `Popen | None` that degraded silently, but
-every existing message, state and test is the same.
+**The spawn path behaves exactly as it did before the attach path
+existed.** Its internals sit behind a `_ServerLifecycle` abstraction, so
+that "what became of the server" has one answer per transport path rather
+than a `Popen | None` a caller has to interpret; every message, state and
+test the spawn path exposes is the same.
 
-## Phase 3: the bridge
+## The bridge
 
 `miainwoodpecker/devices/gatan_bridge.py`, MIT, two backends.
 
@@ -366,7 +358,7 @@ the two-target wiring testable rather than merely plausible.
   and writing a wrong dispersion into every frame.
 - **Instrument control goes through `DM.ExecuteScriptString`, and the
   command names are constructor parameters** with placeholder defaults,
-  for the reason given in Phase 1. A snippet that fails surfaces as a
+  for the reason given above. A snippet that fails surfaces as a
   named `RemoteCallError`, not as a wrong number.
 
 **What the bridge honestly cannot do.** A Gatan spectrometer is not the

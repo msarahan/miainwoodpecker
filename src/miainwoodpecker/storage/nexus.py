@@ -6,7 +6,7 @@ NeXus is a *convention over HDF5* — typed groups (``NX_class``), a
 physical quantity — so writing it needs only ``h5py``, not a conversion
 framework. That keeps the storage layer thin while producing files any
 NeXus-aware tool can open, which is the whole point of not inventing
-another bespoke project format (see docs/migration-plan.md, §3).
+another bespoke project format (see docs/scripting-and-automation.md).
 
 Writes stream frame-by-frame into a resizable, chunked dataset, so a long
 acquisition is persisted as it happens rather than buffered in memory.
@@ -51,8 +51,7 @@ Deliberately written with ``h5py`` alone, not ``pynxtools-em``: NeXus is a
 *convention over HDF5*, and ``pynxtools-em`` is a vendor-format→NXem
 reader/converter that pulls ~70 packages to supply, for our purposes, a
 schema convention. ``pynxtools`` therefore appears only in the validation
-environment, never in the runtime — which is where the migration plan's
-Phase 3 note says this belongs.
+environment, never in the runtime.
 
 Compression defaults are measured, not guessed
 ----------------------------------------------
@@ -88,7 +87,7 @@ Blosc2 with zstd is a further step - marginally better ratios and much
 faster (Ronchigram 84 ms/frame write, 82 ms read) - but it is a *plugin*
 codec: a file written with it cannot be opened at all without
 ``hdf5plugin`` installed in the reading environment. That is a real
-interoperability cost for a project whose entire storage argument (§3) is
+interoperability cost for a project whose entire storage argument is
 "follow a documented format so other tools can read it," and the readers
 in question include ``nexusformat``, HyperSpy, LiberTEM, and py4DSTEM.
 So it stays opt-in - ``compression=hdf5plugin.Blosc2(cname="zstd")``,
@@ -100,7 +99,7 @@ Axis calibration is supplied per acquisition, never invented
 Frames used to get real axes in exactly one case — a scan reporting
 ``fov_nm`` — and an honest ``units = "pixel"`` otherwise, which meant every
 camera frame this project wrote carried no physical axis at all
-(docs/migration-plan.md, §7). :mod:`miainwoodpecker.storage.calibration`
+(see docs/scripting-and-automation.md). :mod:`miainwoodpecker.storage.calibration`
 now models that properly, **per axis** (an EELS frame's dispersive
 direction is energy and the other direction is not) and **per
 acquisition** (the same camera is reciprocal space in one microscope mode
@@ -139,7 +138,7 @@ uncertainty.
 That still does not make it this module's decision. Downcasting is lossy
 and irreversible, the storage layer is handed an array rather than a
 statement about its precision, and no real-hardware dtype has been
-validated yet (§2's open item). A writer that quietly narrowed what it
+validated yet. A writer that quietly narrowed what it
 was given would be asserting something about provenance it cannot know.
 The correct fix is upstream - stop the accidental promotion where it
 happens - so ``dtype`` is offered explicitly, documented, and off by
@@ -585,7 +584,7 @@ class NexusWriter:
             # a rank-4 signal described by two axes - a malformed file
             # rather than an error. Frame.data's docstring still allows 1D
             # for binned spectra; storing those needs a layout decision,
-            # not a shape guess (docs/architecture-review.md, §1.6).
+            # not a shape guess.
             msg = (
                 f"NexusWriter stores 2D frames; got a {frame.data.ndim}D frame "
                 f"of shape {frame.data.shape}"
@@ -673,7 +672,7 @@ class NexusWriter:
         # defocus_nm and requested_defocus_nm frame by frame precisely so a
         # recording says what the instrument did rather than what it was
         # asked to do. Keeping only the first frame's metadata threw that
-        # away silently (docs/architecture-review.md, §1.4).
+        # away silently.
         assert self._frame_metadata is not None  # noqa: S101 - created alongside _data
         self._frame_metadata.resize(index + 1, axis=0)
         self._frame_metadata[index] = json.dumps(

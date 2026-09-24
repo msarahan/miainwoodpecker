@@ -10,8 +10,8 @@ sending :class:`~miainwoodpecker.devices.rpc.Call` objects to a
 imports nothing from ``nion.*`` — that is the entire point: everything
 above the device layer (acquisition, viewer, storage) can depend on this
 module, and by extension on Nion hardware, without the running
-application ever linking GPL-3.0 code into its own process (see
-docs/migration-plan.md, §6).
+application ever linking GPL-3.0 code into its own process (see README.md's
+"A note on licensing" section).
 
 ``remote_instrument(backend=...)`` chooses which devices the server
 builds; ``remote_simulated_instrument()`` is the unchanged
@@ -76,7 +76,7 @@ forever or surfaced a bare ``EOFError``.
   alive. Because ``health`` takes no device lock, this genuinely means
   wedged rather than busy — which is exactly why the bound belongs here
   and not on ordinary device calls, where a real acquisition takes as long
-  as it takes and a wrong timeout would abort a good exposure (§6).
+  as it takes and a wrong timeout would abort a good exposure.
 
 **No reconnect, deliberately.** A device server is not a stateless web
 backend: a fresh subprocess is a fresh instrument construction, so a
@@ -1012,7 +1012,7 @@ class _RemoteDevice:
         Send one call to this device's target and return its value.
 
         No timeout, deliberately: an acquisition takes as long as it takes,
-        and a wrong guess would abort a good exposure (§6). A *dead* server
+        and a wrong guess would abort a good exposure. A *dead* server
         needs no timeout to be detected — the socket closes and the call
         fails at once — so the only thing this adds is naming the cause.
 
@@ -1818,7 +1818,8 @@ class RemoteInstrumentDevices:
         return {**named, **dict(self.additional_cameras)}
 
 
-# Historical name, kept because the migration plan and README refer to it.
+# Historical name, kept for backward compatibility with any external code
+# still importing it under this name.
 RemoteSimulatedInstrument = RemoteInstrumentDevices
 
 

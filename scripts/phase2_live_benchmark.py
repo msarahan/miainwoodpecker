@@ -1,10 +1,9 @@
 """
 Measure live-display latency to decide whether napari is fast enough.
 
-Phase 2 of docs/migration-plan.md calls for benchmarking the live update
-rate before committing to napari as the viewer shell, because the
-pymmcore-plus team moved off napari toward ``ndv`` for exactly this
-reason. This separates the two costs:
+This benchmarks the live update rate before committing to napari as the
+viewer shell, because the pymmcore-plus team moved off napari toward
+``ndv`` for exactly this reason, separating the two costs:
 
 * **acquire** - how fast the device layer produces frames, with no
   display attached at all (the ceiling any viewer must keep up with).
@@ -28,17 +27,20 @@ real instrument workstations with a GPU.
 
 The **acquire** figure is not comparable with the one first recorded for
 Phase 2. This script originally drove ``devices.nion_adapter``, an
-in-process wrapper around usim that no longer exists: §6's license work
-split it into ``nion_server`` (GPL-3.0, subprocess-only) plus ``remote``
-(MIT, IPC client), and the import here went stale rather than wrong. It
+in-process wrapper around usim that no longer exists: the GPL-3.0
+licensing that forced a subprocess split (see README.md's "A note on
+licensing") divided it into ``nion_server`` (GPL-3.0, subprocess-only)
+plus ``remote`` (MIT, IPC client), and the import here went stale rather
+than wrong. It
 is now fixed to ``remote_simulated_instrument()`` — deliberately the
 client, not ``nion_server.simulated_instrument()``, because that is what
 ``viewer/app.py`` and every other benchmark script use, so the number
 measured is the one the shipped application actually pays. The cost of
 that honesty is that "acquire" now includes the IPC round trip; at
 512x512 a float64 scan frame is 2.1MB, well over
-``_SHARED_MEMORY_THRESHOLD_BYTES``, so it travels through shared memory
-and §6's measurements put that overhead at roughly +3ms.
+``_SHARED_MEMORY_THRESHOLD_BYTES``, so it travels through shared memory,
+and the shared-memory transport's measured overhead (see
+docs/vendor-support.md) puts that at roughly +3ms.
 
 Needs a real GL canvas. On a machine with a display - which is the case
 worth measuring, since only hardware-accelerated numbers settle

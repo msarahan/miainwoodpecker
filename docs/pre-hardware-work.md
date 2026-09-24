@@ -13,21 +13,19 @@ document model — are statements about how a STEM acquisition layer must
 behave. Those are portable, and several of them described behaviour this
 project did not have or did not check.
 
-**All seven items below are now done.** The page is kept as the record of
-what was built and why, and of the three §7 open questions the work
-closed — two of them by removal rather than by answering. Each item ends
-with what the simulator taught, since that turned out to be more than
-expected: usim publishes real calibration values, real instrument state,
-and a spectrometer control whose effect on the data is visible.
+**All seven items below are implemented.** Each item ends with what the
+simulator taught, since that turned out to be more than expected: usim
+publishes real calibration values, real instrument state, and a
+spectrometer control whose effect on the data is visible.
 
 ## Reading their tests without taking their code
 
 Everything referenced below is GPL-3.0. What gets ported is the
 *behaviour being asserted*, rewritten against this project's own API —
 not the test code, and not the implementation. That is the same boundary
-[the migration plan §6](migration-plan.md) draws everywhere else: Nion's
-code runs in the device server subprocess, and Nion's *ideas about what
-correct means* are free to inform anything.
+this project draws everywhere else: Nion's code runs in the device server
+subprocess, and Nion's *ideas about what correct means* are free to
+inform anything.
 
 One important consequence, and it is a happy one: where a mechanism is
 genuinely Nion's (the calibration machinery below), we do not reimplement
@@ -49,8 +47,8 @@ which this project deliberately does not have.
 `SynchronizedAcquisition_test.py`, and the 4D-STEM work behind it, need a
 `ScanHardwareSource` registered with the `STEMController` — the full
 `HardwareSource`/`Application` layer that this project has twice found
-too heavy to stand up outside Swift's own process
-([migration plan §7](migration-plan.md)). Nothing here changes that.
+too heavy to stand up outside Swift's own process. Nothing here changes
+that.
 
 **Portable — the device-layer contracts.** Scattered through
 `ScanControl_test.py`, `CameraControl_test.py`, and
@@ -59,13 +57,9 @@ metadata, calibration, and error recovery that are true of any STEM
 acquisition layer, ours included. Those are the source for everything
 below; each item names the specific ones.
 
-## The work, in the order it was done
+## The work
 
-### 1. Feed calibration from the instrument — **done**
-
-This closes the largest open item in
-[migration plan §7](migration-plan.md): "calibration exists as a model but
-nothing feeds it from the instrument."
+### 1. Feed calibration from the instrument
 
 The model in `storage/calibration.py` is fine. What is missing is the
 mechanism to populate it, and Nion's is on disk already. A camera device
@@ -119,16 +113,12 @@ centred on its own length rather than the other axis's (Nion passes
 sensor), and units outside this project's closed vocabulary degrade to
 pixels rather than being written as something nothing can interpret.
 
-### 2. Attach the metadata a frame is supposed to carry — **done**
-
-Measured before: a scan frame carried four metadata keys, and a camera
-frame carried two — `frame_number` and `integration_count`, whatever the
-simulator happened to put in `properties`.
+### 2. Attach the metadata a frame is supposed to carry
 
 Nion has two tests whose entire purpose is to enumerate what must be
 there: `test_context_scan_attaches_required_metadata` and
-`test_acquire_attaches_required_metadata`. The field *set* is now
-adopted; the *names* are not, because putting `stem.scan.fov_nm` in the
+`test_acquire_attaches_required_metadata`. The field *set* is adopted;
+the *names* are not, because putting `stem.scan.fov_nm` in the
 vendor-neutral layer would be a vendor's schema wearing neutral clothing.
 The vocabulary is documented on `Frame` and read entirely from the
 instrument: `EHT` → 100000.0 V, `C10` → 500 nm, `BeamCurrent` → 2e−10 A,
@@ -160,11 +150,11 @@ Three decisions came out of building it.
   field justifies. Everything else stays in the per-frame JSON, which is
   what that column is for.
 
-### 3. Exposure and binning control — **done**
+### 3. Exposure and binning control
 
-§7 said these wanted doing *with* calibration rather than after it, and
-the reason turned out to be mechanical: `build_calibration` takes
-`relative_scale=binning`, so binning multiplies the calibration scale.
+These are done *with* calibration rather than after it for a mechanical
+reason: `build_calibration` takes `relative_scale=binning`, so binning
+multiplies the calibration scale.
 
 `CameraParameters(exposure_ms, binning)` is a value object for the same
 reason `ScanParameters` is — the two settings must change together to
@@ -188,7 +178,7 @@ Two things the simulator taught, both now load-bearing:
   Configuring a stopped camera has the first frame already correct, which
   is the path to use when it matters.
 
-### 4. Two frame-identity contracts nothing was testing — **done**
+### 4. Two frame-identity contracts nothing was testing
 
 `test_frame_do_not_change_after_acquisition` holds four frames, checksums
 them, acquires more, and asserts the checksums still hold. Read that
@@ -207,7 +197,7 @@ Both were verified by removing the copy: with `view.copy()` replaced by
 is worth having separately — aliased views make every frame identical,
 the frozen-image failure a checksum test cannot see.
 
-### 5. Failure and recovery across the RPC boundary — **done**
+### 5. Failure and recovery across the RPC boundary
 
 `test_exception_during_view_halts_scan`, `test_exception_during_record_halts_scan`,
 and `test_able_to_restart_scan_after_exception_scan` say a device error
@@ -228,7 +218,7 @@ controls, leaving the column unparked.
 `test_big_scan_does_not_prevent_further_playing` came with the frame
 identity tests above.
 
-### 6. An energy-offset series, as a worked example — **done**
+### 6. An energy-offset series, as a worked example
 
 `MultipleShiftEELSAcquire` is a real operator workflow with a real test:
 acquire N EELS frames while stepping the spectrometer energy offset,
@@ -254,7 +244,7 @@ The energy offset is the fourth control on `InstrumentController`, and it
 arrived the way that module says controls should: with the caller that
 needed it, not before.
 
-### 7. Adopt Nion's session vocabulary — **done**
+### 7. Adopt Nion's session vocabulary
 
 Their scripting documentation names six session fields:
 `stem.session.instrument`, `microscopist`, `sample`, `sample_area`,
@@ -268,10 +258,9 @@ And `notes` is ours: Nion has no free-text session field, and `NXnote` is
 the obvious home for one.
 
 The payoff is partly that these are the facts making a recording
-identifiable a year later, and partly that it moves the
-"[does the sidecar earn its place](migration-plan.md)" question onto
-firmer ground: a vocabulary someone else maintains is easier to defend
-than one invented here.
+identifiable a year later, and partly that it settles whether the
+sidecar earns its place on firmer ground: a vocabulary someone else
+maintains is easier to defend than one invented here.
 
 **Four of the six get real NeXus fields, and two do not.** Sample and
 sample area map onto `NXsample`'s `name` and `description`, the operator
@@ -303,9 +292,8 @@ just a smaller field of view. It is left off this list because it is a
 feature decision rather than a gap, and it should follow a request from
 someone who wants it rather than the existence of a test for it.
 
-Two things the work above did *not* close, both from
-[§7](migration-plan.md), and both now the operator-facing half of what
-used to be a plumbing problem:
+Two things remain open, and both are now the operator-facing half of a
+plumbing problem:
 
 - **No UI selects a microscope mode, or the camera settings.** Exposure,
   binning, and the energy offset are all reachable from code and all

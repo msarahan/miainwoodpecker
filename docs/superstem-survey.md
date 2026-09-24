@@ -154,12 +154,12 @@ If Python 3.7+ is genuinely unavailable somewhere — a legacy control PC
 with only 2.7, say — do not fight it. Skip that section and tell us;
 the questions it would have asked can be answered by hand.
 
-## What the Nion run records, and why it grew
+## What the Nion run records, and why
 
-The first version of this script asked one question of a Nion column:
-is there an `eels_camera`? The [acquisition UX survey](acquisition-ux-survey.md)
-found that the answers to several more decide the shape of the work,
-and each of them is a property read from the same console:
+The [acquisition UX survey](acquisition-ux-survey.md) found that the
+answers to several properties together decide the shape of the work, not
+just whether there is an `eels_camera`. Each of them is a property read
+from the same console:
 
 - **Which `nionswift_plugin` modules are installed.** The device server
   has to be told which one to load by name, and each instrument file

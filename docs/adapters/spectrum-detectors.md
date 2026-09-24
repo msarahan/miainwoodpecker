@@ -170,8 +170,8 @@ looks.
 arbitrary metadata dict; `storage/calibration.py` already models an
 energy axis kind in eV/meV; the RPC layer, the shared-memory transport,
 and the writer all already handle `Frame`. Reusing it would have been
-close to free, and `Frame.data`'s own docstring had said "may be 1D for
-binned spectra" since Phase 1 — the intent was already there.
+close to free, and `Frame.data`'s own docstring already says "may be 1D
+for binned spectra" — the intent was already there.
 
 *Against.* Three things, and the third is decisive.
 
@@ -305,7 +305,7 @@ What is **not** solvable at this layer, and should not be attempted here:
 - a spectrum image collected simultaneously with HAADF, MAADF and EELS
   from one pass;
 - multi-channel scanning at all;
-- 4D-STEM (`docs/migration-plan.md` §7 already records this as open).
+- 4D-STEM, which remains an open design question.
 
 **These are one missing concept, not three.** The unit of acquisition
 that is absent is a **pass**: one traversal of the probe over a region
@@ -332,15 +332,13 @@ geometry; what a pass adds is a container grouping it with the image
 channels from the same traversal, and `metadata["simultaneous_with"]` is
 where a device that knows already says so.
 
-**Update: the pass was built, and that prediction held.** `ScanPass`
-landed with a `spectra` slot, and filling it needed nothing new from
-this design — the first device to do so, the preview instrument's EEL
-spectrometer, produces exactly the rank-3 `Spectrum` described above and
-fills `simultaneous_with` because the call that made it really did
-traverse the probe once.
+**`ScanPass` reuses this shape without changes.** It carries a `spectra`
+slot, and filling it needs nothing new from this design: the preview
+instrument's EEL spectrometer produces exactly the rank-3 `Spectrum`
+described above and fills `simultaneous_with` because the call that made
+it really did traverse the probe once.
 
-Two things the implementation added that this section did not anticipate,
-both about **which** signal a target contributes:
+Two further points, both about **which** signal a target contributes:
 
 - **The readout mode decides, not the detector type.** A target set to
   a projected readout contributes a spectrum image; one left imaging
@@ -354,52 +352,18 @@ both about **which** signal a target contributes:
   them apart, and a writer using its own default for the detector axes
   would drop it.
 
-### 2.4 `TARGET_NAMES`: add minimally, do not do the redesign
+### 2.4 `spectrum_detector` is a named target
 
-`docs/vendor-support.md` lists the fixed positional tuple under "What is
-still the wrong shape" and proposes replacing it: bind one well-known
-port for `instrument`, let the server choose and report the rest through
-`describe()`. It also says explicitly that the redesign should land *with
-a second column adapter*, against a real device list.
-
-**Decision: add `spectrum_detector` to the tuple; do not do the
-redesign.** Reasons:
-
-- An X-ray detector is **not a second column**, so it does not meet the
-  stated trigger. Doing the redesign here would be doing it on spec —
-  precisely what that section warns against.
-- The redesign touches spawn, connect, teardown and roughly a dozen
-  tests. Settling a protocol change in the same commit as a new device
-  *shape* makes both harder to review and harder to revert
-  independently.
-- Adding a name is mechanically safe here, and that is checkable rather
-  than hoped: every server in this tree reads `len(TARGET_NAMES)` at run
-  time (`nargs=len(TARGET_NAMES)`) rather than counting for itself, which
-  is also the documented contract for out-of-tree adapters. The name is
-  inserted immediately **before** `instrument`, so every existing name
-  keeps its argv position and `instrument` stays last — the invariant
-  `tests/unit/test_rpc.py` already pins.
-
-Cost of the choice: one unused localhost port per session for servers
-that serve no spectrum detector. Measured against the alternative, that
-is nothing.
-
-**It does strengthen the case for the redesign**, and that should be
-recorded: the tuple is now Nion's device list *plus a detector class Nion
-does not have*, which is the clearest statement yet that a fixed list is
-the wrong mechanism.
-
-**The redesign has since landed, and two sentences above are now false.**
-Servers no longer read `len(TARGET_NAMES)` at run time, because they take
-no positional ports; `TARGET_NAMES` no longer reaches any command line,
-and is no longer append-only. The trigger was not the second column
-adapter this section deferred to, but two USB cameras on a desk —
-see [vendor support](../vendor-support.md), "The target names were a
-fixed tuple, and positional argv". The decision recorded here still
-reads correctly for the time it was made: `spectrum_detector` went in as
-a name, the protocol change came separately, and the two were reviewable
-apart. The cost line is now obsolete too — there is no unused localhost
-port per session, because the client allocates one port in total.
+`TARGET_NAMES` includes `spectrum_detector` alongside the column-vendor
+names. An X-ray detector is not a second column, so it does not carry the
+full [target-name protocol
+change](../vendor-support.md#target-names-are-server-chosen-not-positional-argv)
+on its own: `instrument` binds the one well-known port and the server
+reports the rest through `describe()`'s `endpoints` map, with `kind`
+deciding which handle a target gets rather than its name. `TARGET_NAMES`
+itself is not append-only and does not reach any server's command line;
+what it decides is which names get a dedicated attribute on
+`RemoteInstrumentDevices`, and `spectrum_detector` is one of them.
 
 ---
 
@@ -513,15 +477,15 @@ adapter already applies to `1/nm` → `Å⁻¹`, and for the same reason: a
 factor loose in the metadata makes every downstream number wrong by
 exactly that factor with nothing saying so.
 
-**The beam-current row is there because it was got wrong first.** The
-EDS metadata mapping wrote `beam_current_a` straight into
-`Acquisition_instrument.TEM.beam_current`, and eXSpy reads that item as
-**nanoamps** — `exspy/signals/eds_tem.py`'s dose calculation multiplies
-it by 1e-9 to reach coulombs, with the comment saying so. A 200 pA probe
-therefore arrived as 2e-10 nA and made every dose a billion times too
-small, silently, since neither end range-checks it. Nothing in the test
-suite caught it because nothing computed a dose. Exactly the failure
-this section exists to prevent, one row short of preventing it.
+**The beam-current row matters because the unit mismatch is silent and
+severe.** `Acquisition_instrument.TEM.beam_current` is read by eXSpy as
+**nanoamps** — `exspy/signals/eds_tem.py`'s dose calculation multiplies it
+by 1e-9 to reach coulombs, with the comment saying so — so writing
+`beam_current_a` (amps) straight into that field understates every dose
+by a factor of a billion, with nothing on either end range-checking it.
+The conversion from amps to nanoamps has to happen at the point this
+value enters `Acquisition_instrument.TEM.beam_current`, not be assumed
+away.
 
 ---
 
@@ -557,8 +521,8 @@ convergence is the point.
 `load_as_eds_signal` then sits *on top of* that shared path, adding only
 the EDS signal type and eXSpy's detector metadata.
 
-`load_as_eels_signal` is that same thin layer for the camera path, and
-it now exists: it adds the `EELS` signal type, eXSpy's TEM metadata, and
+`load_as_eels_signal` is that same thin layer for the camera path: it
+adds the `EELS` signal type, eXSpy's TEM metadata, and
 one thing the EDS side does not need — normalizing the energy axis to
 eV, because eXSpy's EELS code assumes eV everywhere and checks nowhere,
 while its EDS code validates (`_get_line_energy` raises for any unit but
@@ -727,13 +691,13 @@ plumbing is about eighty lines; everything else is vendor work.
   angle, and the as-installed Mn Kα resolution for the XFlash 6T-100 and
   the Ultim Extreme. The simulator's defaults are the published *class*
   of values, not these units' calibration reports.
-**Settled, and no longer open:** EDX and EELS *do* run together on
-SuperSTEM 2 — confirmed by the facility. They do not physically block one
-another, so the Enfina's acquisition does not take the scan away from the
-EDX detector or the reverse. This was previously listed here as an open
-question about dose, dead time and blocking; the blocking half is
-answered outright, and simultaneous EDX + EELS is therefore a workflow to
-support rather than a configuration this project may reject.
+**EDX and EELS *do* run together on SuperSTEM 2** — confirmed by the
+facility. They do not physically block one another, so the Enfina's
+acquisition does not take the scan away from the EDX detector or the
+reverse. Dose and dead-time interaction between the two detectors is
+still a question for the instrument, but the blocking question is
+answered outright: simultaneous EDX + EELS is a workflow to support, not
+a configuration this project may reject.
 
 That has one design consequence worth stating where the decision was
 made: the **pass** concept in §2.3 now has a confirmed user rather than a

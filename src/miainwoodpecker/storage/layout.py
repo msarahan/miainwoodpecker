@@ -6,7 +6,7 @@ only module that *knew* it: the session layer opened files and hard-coded
 ``entry/...`` paths of its own, and all three Phase 4 analysis adapters
 knew where the frame stack lives. Five modules encoding one format is the
 start of the bespoke-format maintenance burden this project exists to
-avoid (docs/migration-plan.md, §3) — a layout change would have needed
+avoid (see docs/scripting-and-automation.md) — a layout change would have needed
 five coordinated edits, and the message telling an operator a recording
 has no frames was byte-identical in four files with nothing keeping it
 so.

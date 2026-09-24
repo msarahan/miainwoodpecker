@@ -1,10 +1,10 @@
 """
 Adapter: read a NexusWriter file as a LiberTEM ``DataSet``.
 
-The migration plan's Phase 4 note (docs/migration-plan.md, §5) originally
-deferred LiberTEM (and py4DSTEM) in favor of HyperSpy, reasoning that both
-target 4D-STEM (scan-position x diffraction-pattern) data specifically,
-and this app's device interface has no synchronized scan/camera
+LiberTEM (and py4DSTEM) was originally deferred in favor of HyperSpy,
+reasoning that both target 4D-STEM (scan-position x diffraction-pattern)
+data specifically, and this app's device interface has no synchronized
+scan/camera
 acquisition mode yet (``devices/interface.py``'s ``Scanner`` docstring) —
 so there is no 4D-STEM datacube for either to operate on.
 

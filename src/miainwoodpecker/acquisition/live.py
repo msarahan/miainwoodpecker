@@ -7,7 +7,7 @@ frame. A display can then poll :meth:`LiveAcquisition.latest` at its own
 rate: acquisition and display are decoupled, slow consumers simply skip
 frames, and no per-frame event fan-out ever reaches the UI thread — the
 failure mode that made the system this project replaces slow (see
-docs/migration-plan.md, §3).
+docs/developing-the-ui.md).
 
 This module is deliberately UI-agnostic: it knows nothing about Qt or
 napari, only about :class:`~miainwoodpecker.devices.interface.Frame`.
@@ -97,8 +97,9 @@ class LiveAcquisition:
         was still driving it. That is not mere contention: the client's
         shared-memory copy-out and the server's next publish would then
         overlap on one reused segment, producing a frame that is half scan
-        N and half scan N+1 with no exception raised anywhere
-        (docs/architecture-review.md, §1.2).
+        N and half scan N+1 with no exception raised anywhere (see
+        docs/scripting-and-automation.md, "Driving an instrument that
+        other people are also using").
 
         On failure the thread handle is deliberately kept, so
         :attr:`is_running` keeps reporting the truth and a later

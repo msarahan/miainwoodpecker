@@ -6,10 +6,8 @@ verified against a simulator, ordered so each step's failure is diagnosable
 before the next one runs. Anything not on this list is already covered by
 the automated suite.
 
-Context and the reasoning behind each item are in
-[the migration plan](migration-plan.md) — §5 Phase 1 for the six unverified
-assumptions (referenced below as **Assumption 1–6**), §5 Phase 3 for the
-instrument controls, and §6 for shutdown.
+The six unverified assumptions this list checks are referenced below as
+**Assumption 1–6**.
 
 For the other side of the line — the work that *can* be done first, and
 where its specification already exists — see
@@ -75,8 +73,7 @@ calibration values themselves come from instrument controls.
 - [ ] Set defocus to a *small* known offset, confirm read-back, then confirm
       on the operator's own console that the column agrees. **Do not trust
       read-back alone** — a control that echoes its setpoint without acting
-      is exactly the failure the migration plan records for
-      `probe_position`.
+      is a known failure mode, as seen with `probe_position`.
 
 - [ ] Same for stage position, with a small move, confirming direction and
       axis order: `set_stage_position_nm(y, x)` must move the *slow* scan

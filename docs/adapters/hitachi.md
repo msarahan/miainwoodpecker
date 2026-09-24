@@ -4,32 +4,20 @@ orphan: true
 
 # Hitachi: what it would take to drive SuperSTEM 4
 
-[docs/vendor-support.md](../vendor-support.md) has, until now, said this
-about Hitachi:
+This page is a close look at Hitachi, aimed at one specific instrument:
+**SuperSTEM 4 at Daresbury, a Hitachi SU9000II** — an ultra-high-resolution
+cold-FEG **FE-SEM/STEM**, 1–30 kV.
 
-> No public API. Step one is a vendor conversation. If the answer is "no
-> API", the honest options are file-watching whatever EM Flow Creator
-> writes, or nothing.
-
-That was a placeholder written without a search. This page is the search,
-aimed at one specific instrument: **SuperSTEM 4 at Daresbury, a Hitachi
-SU9000II** — an ultra-high-resolution cold-FEG **FE-SEM/STEM**, 1–30 kV.
-
-**A note on how this page was produced**, because it matters for reading
-it. It was first researched against a Hitachi **HF5000** (a 200 kV
-TEM/STEM), and re-targeted mid-task when the facility owner confirmed the
-actual machine. Findings that were specific to the TEM line have been
-discarded. Findings about **Hitachi's software stack as a whole** have
-been kept, and are marked as generalisations wherever they are not
-citable against the SU9000II itself. As it turns out the correction
-improves the answer considerably: the strongest evidence found is about
-Hitachi's **SEM** line, which is the SU9000II's lineage and was not the
-HF5000's.
+**A note on how findings below are marked**, because it matters for
+reading this page. Findings about **Hitachi's software stack as a
+whole** are kept and marked as generalisations wherever they are not
+citable against the SU9000II itself; anything specific to a different
+Hitachi product line is excluded. The strongest evidence on this page is
+about Hitachi's **SEM** line, which is the SU9000II's own lineage.
 
 ## The headline
 
-**The placeholder was wrong, and in a useful direction.** Two findings
-change it.
+Two findings matter most.
 
 **1. A Python control interface for Hitachi FE-SEMs exists, is used by
 third parties in the wild, and is undocumented.** Public code drives a
@@ -43,8 +31,7 @@ anything?" to "is the thing they have fitted to *this* machine?" — and
 that question is answered by looking at the instrument PC, not by a
 vendor negotiation.
 
-**2. On a SEM, the scan is buyable from someone else.** This is the
-single biggest thing the re-target changes. SEMs have carried a dedicated
+**2. On a SEM, the scan is buyable from someone else.** SEMs have carried a dedicated
 **external scan connector** for decades — X and Y beam-position voltages
 in, video out — originally so EDS and X-ray mapping systems could drive
 the beam. Third-party scan generators plug into it and are a product
@@ -63,9 +50,8 @@ this product family: **high**. Confidence it is present, licensed and
 usable on SuperSTEM 4: **unknown**, and cheap to settle.
 
 **Scope note**, same as the parent page: nothing here is a commitment to
-build any of it, and the migration plan's rule holds — no second vendor
-adapter until someone has that instrument. This is a map and a list of
-questions.
+build any of it, and no second vendor adapter is built until someone has
+that instrument. This is a map and a list of questions.
 
 **Out of scope, deliberately.** The instrument carries an **Oxford
 Instruments Ultim® Extreme EDS detector**. The EDX/spectrum-detector
@@ -94,8 +80,7 @@ at 30 kV, is equipped with an EELS spectrometer for 3kV-30kV EELS, a
 diffraction camera, an Oxford Instruments Ultim® Extreme Silicon Drift
 Detector EDS Detector and a range of detectors and holders"
 *(**verified** — [superstem.org/news](https://www.superstem.org/news),
-read directly; the wording the page previously carried was a search-index
-paraphrase and matches)*. Hitachi's
+read directly)*. Hitachi's
 own SU9000II page describes a side-entry stage of the kind found in
 high-end TEMs, simultaneous bright-field and annular dark-field detection
 with the dark-field detector settable to 56 positions, and an upper
@@ -105,10 +90,9 @@ detector takes HA-BSE *(reported —
 [SU9000II brochure PDF](https://milexia.com/products/wp-content/uploads/sites/7/2022/08/Hitachi-SU9000%E2%85%A1.pdf))*.
 
 **Low-kV EELS is unusual, and the spectrometer's maker is the important
-unknown.** This page used to say that published low-voltage STEM-EELS on
-this platform "used a **Hitachi** EEL spectrometer — described as *'a
-Hitachi electron energy-loss spectrometer'*". **That quotation does not
-appear in the paper.** The methods section actually reads:
+unknown.** Published low-voltage STEM-EELS work on this platform does
+**not** attribute the spectrometer to Hitachi — no such quotation appears
+in the paper. The methods section reads:
 
 > "Spectrum images (SI) EELS were acquired using the Hitachi SU9000EA
 > cold field emission SEM/STEM with an EEL spectrometer consisting of
@@ -124,12 +108,11 @@ scanning transmission electron microscope
 (STEM-EELS)"](https://www.sciencedirect.com/science/article/pii/S0304399124000561),
 read by the project owner.)*
 
-The CCD dimensions and the SU9000EA are confirmed. **The attribution was
-not.** "Hitachi" in the search paraphrase came from *the microscope*
-— "the Hitachi SU9000EA" — and the spectrometer itself is left
-unattributed. So the direct evidence that Hitachi *makes* the
-spectrometer is weaker than this page claimed, and item 3 stays open on
-its own terms.
+The CCD dimensions and the SU9000EA are confirmed; the spectrometer's
+manufacturer is not — "Hitachi" describes *the microscope*, "the Hitachi
+SU9000EA", and the spectrometer itself is left unattributed. So the
+direct evidence that Hitachi *makes* the spectrometer is weak, and item 3
+stays open on its own terms.
 
 What the passage gives instead is better for the question that actually
 matters, which is not who manufactured it but whether anything except
@@ -182,19 +165,15 @@ this" and "I inferred this" carries most of the weight.
   page was **not reachable from this environment**. Quoted phrasing is as
   returned by search, so treat it as approximate.
 
-  This list has since changed, and the change is recorded here rather
-  than silently applied. The egress allowlist was widened after this page
-  was first written, and the sources were re-tried. **Now reachable and
-  read directly:** `www.superstem.org`, `pointelectronic.de`, `arxiv.org`,
-  `gatan.com`, `zenodo.org`, `readthedocs.io`. **Still not reachable, and
-  why it differs:** `hitachi-hightech.com` and `sciencedirect.com` now
-  resolve and connect, but their own edge answers **HTTP 403** to this
-  client for every URL including the site root — that is the publisher
-  refusing, not the proxy; `www.hitachi.com`, `academic.oup.com`,
-  `pubmed.ncbi.nlm.nih.gov`, `www.ceos-gmbh.de`, `milexia.com`,
-  `web.archive.org` and `forum.image.sc` are still refused at the
-  gateway. Every claim below that depended on the newly reachable
-  sources has been re-checked against the page itself and re-marked.
+  **Reachable and read directly from this environment:**
+  `www.superstem.org`, `pointelectronic.de`, `arxiv.org`, `gatan.com`,
+  `zenodo.org`, `readthedocs.io`. **Not reachable, and why it differs:**
+  `hitachi-hightech.com` and `sciencedirect.com` resolve and connect, but
+  their own edge answers **HTTP 403** to this client for every URL
+  including the site root — that is the publisher refusing, not the
+  proxy; `www.hitachi.com`, `academic.oup.com`, `pubmed.ncbi.nlm.nih.gov`,
+  `www.ceos-gmbh.de`, `milexia.com`, `web.archive.org` and
+  `forum.image.sc` are refused at the gateway.
 - **Generalising** — established for Hitachi's SEM line or software stack
   broadly, not cited against the SU9000II.
 - **Unverified** — asserted somewhere without a checkable source, or
@@ -589,8 +568,9 @@ closes.
 repo.** `pyproject.toml` deliberately installs plain `pynxtools`, not
 `pynxtools[em]`, because the `[em]` extra pulls
 `pynxtools-em → kikuchipy → numba 0.53.1 → llvmlite 0.36.0`, which is
-both the ~70-package dependency Phase 3 avoided and unbuildable on Python
-3.12. So this path either **re-implements the sidecar parse** — it is an
+both a ~70-package dependency this project avoids elsewhere and
+unbuildable on Python 3.12. So this path either **re-implements the
+sidecar parse** — it is an
 INI-ish key/value file, so this is small — or isolates `pynxtools-em` in
 its own environment the way the schema-validation env already isolates
 `pynxtools`. Re-implementing is the better answer, and the parser above
@@ -909,14 +889,12 @@ spectrum-detector work.
 Listed once, with what would settle each. Nothing here should be repeated
 as fact.
 
-Since the egress allowlist was widened, **item 11 is settled** (a real
-arXiv search was run; the negative holds) and **item 13 is half-settled**
-(SuperSTEM and point electronic read directly, with corrections applied;
-Hitachi and ScienceDirect refuse this client at their own edge and are
-recorded as firm negatives). Item 12's parser half is settled, its
-instrument half is not. Item 3 is unchanged as a question but its stakes
-have moved. Everything else on this list stands exactly as it did, and
-the eleven that still need an instrument or a vendor still need one.
+**Item 11 is settled** (a real arXiv search was run; the negative holds)
+and **item 13 is half-settled** (SuperSTEM and point electronic read
+directly; Hitachi and ScienceDirect refuse this client at their own edge
+and are recorded as firm negatives). Item 12's parser half is settled,
+its instrument half is not. Everything else on this list still needs an
+instrument or a vendor to settle it.
 
 1. **Whether the `MfExtCont` Python control layer exists on the
    SU9000II.** The evidence is SU7000 — same vendor and same FE-SEM
@@ -927,20 +905,18 @@ the eleven that still need an instrument or a vendor still need one.
    site-local wrapper. Inferred from the `sample03_SU7000mod` filename
    and the `Mf` prefix. *Settled by:* vendor question 1, or asking either
    repository's author.
-3. **Who makes SuperSTEM 4's EELS spectrometer.** **The evidence for a
-   Hitachi one got weaker, and the question got sharper.** The
-   Ultramicroscopy paper does *not* attribute the spectrometer to
-   Hitachi — the page misquoted it, and §1 above now carries the real
-   passage. What the paper does establish is that the EELS data were
-   acquired with **Hitachi's own in-house `ElementView` software**, which
-   speaks to the practical question (can anything else drive it?) rather
-   than the manufacturing one. CEOS separately states CEFID is
-   Hitachi-compatible. *Settled by:* question 0a — and now also by the
-   cheaper **"is `ElementView` on the instrument PC?"**, which is the
+3. **Who makes SuperSTEM 4's EELS spectrometer.** The Ultramicroscopy
+   paper does *not* attribute the spectrometer to Hitachi; §1 above
+   carries the passage in full. What the paper does establish is that the
+   EELS data were acquired with **Hitachi's own in-house `ElementView`
+   software**, which speaks to the practical question (can anything else
+   drive it?) rather than the manufacturing one. CEOS separately states
+   CEFID is Hitachi-compatible. *Settled by:* question 0a — and also by
+   the cheaper **"is `ElementView` on the instrument PC?"**, which is the
    same five-minute look as question 0c. High value — it decides
-   whether spectroscopy is reachable independently, and the value of a
-   CEOS answer is now **much** higher than this page assumed. SerialEM
-   drives a CEOS filter over **JSON-RPC 2.0 in netstring framing on a
+   whether spectroscopy is reachable independently, and a CEOS answer
+   would be the most valuable of the three. SerialEM drives a CEOS filter
+   over **JSON-RPC 2.0 in netstring framing on a
    plain TCP socket, default port 7081**, with methods `getInfo`,
    `getFilterMode`, `getSlit`, `setSlit`, `getHighTensionOffset`,
    `setHighTensionOffset`, `getLinerTubeVoltage`, `setLinerTubeVoltage`
@@ -1016,11 +992,10 @@ the eleven that still need an instrument or a vendor still need one.
     question 13 remains the better instrument.)*
 12. **Whether the SU9000II writes TIFF-plus-sidecar** like other Hitachi
     SEMs. The **parser half is settled**: `pynxtools-em` 0.4.6, read from
-    its PyPI sdist, handles `[SemImageFile]` **and `[TemImageFile]`
-    (`parsers/image_tiff_hitachi.py:125`)** — this page previously named
-    only the first, and the second is the one an FE-SEM/**STEM** is more
-    likely to write. That widens the parser's reach but proves nothing
-    new about this model. The **instrument half is not settled**: whether
+    its PyPI sdist, handles both `[SemImageFile]` **and `[TemImageFile]`**
+    (`parsers/image_tiff_hitachi.py:125`) — the second is the one an
+    FE-SEM/**STEM** is more likely to write. The **instrument half is not
+    settled**: whether
     an SU9000II emits either header is still unknown, and EELS and EDS
     will arrive in their own vendors' formats regardless. *Settled by:*
     vendor question 12, or one sample file.
@@ -1046,15 +1021,14 @@ the eleven that still need an instrument or a vendor still need one.
       **remains *reported*, from a search index**, and no amount of
       egress policy will change that from here. *Settled by:* opening
       the pages from an ordinary browser, or one PDF from the facility.
-    - **Two of them settled by relay, after this list was written.** The
-      project owner has access to both and read them back: the SI-NEWS
-      EM Flow Creator article (item 7 above — the quoted sentence is
-      real, and the article says nothing more) and the Ultramicroscopy
-      2024 STEM-EELS paper (§1 above — which produced a **correction**,
-      a misquotation this page had been carrying, plus `ElementView`,
-      the 5 mrad collection angle, and real dispersions). Both are now
-      *Verified (relayed)*. The rest of the Hitachi-hosted set is not,
-      and the paragraph below still holds for it.
+    - **Two of them are settled by relay.** The project owner has access
+      to both and read them back: the SI-NEWS EM Flow Creator article
+      (item 7 above — the quoted sentence is real, and the article says
+      nothing more) and the Ultramicroscopy 2024 STEM-EELS paper (§1
+      above, which gives `ElementView`, the 5 mrad collection angle, and
+      the real dispersions). Both are *Verified (relayed)*. The rest of
+      the Hitachi-hosted set is not, and the paragraph below still holds
+      for it.
     - **ScienceDirect — not settled by reachability, and recorded as a
       firm negative.**
       `sciencedirect.com` also answers **403** at its own edge. There is
@@ -1076,20 +1050,6 @@ the eleven that still need an instrument or a vendor still need one.
       than returning "DOI not found". That settles that the citation is
       real and correctly transcribed; it settles nothing about what the
       paper says.
-
-## What survived the re-target
-
-For the record, since this page was researched twice. Discarded: HF5000
-detector fit-outs, TEM-line remote-operation details, TEM-specific
-estimates. Kept, and now on the correct product line: the `MfExtCont`
-finding (SU7000 is an FE-SEM), the EM Flow Creator analysis (the primary
-source is a **SEM** workflow article), the file-format finding (the
-`[SemImageFile]` section is the SEM one), the negative-space search
-across RosettaSciIO / instamatic / OpenFIBSEM / Micro-Manager / the
-autonomous-microscopy literature, the level-1/2/3 taxonomy, and the
-licensing-pattern comparison. Added by the correction: the external scan
-connector and third-party scan generators, the segmented-detector
-protocol finding, and the low-kV EELS spectrometer question.
 
 ## Sources
 
@@ -1129,8 +1089,7 @@ project owner:
 
 - [Ultramicroscopy 2024: low-voltage STEM-EELS](https://www.sciencedirect.com/science/article/pii/S0304399124000561)
   — the SU9000EA, the 1024 x 256 CCD, `ElementView`, the 5 mrad
-  collection angle, and the dispersions. Corrected a misquotation this
-  page carried; see §1.
+  collection angle, and the dispersions; see §1.
 - [Hitachi SI-NEWS: Automation of SEM Observation Workflow Using EM Flow Creator](https://www.hitachi-hightech.com/global/en/sinews/technical_explanation/130328/)
   ([Japanese PDF](https://www.hitachi-hightech.com/file/jp/pdf/sinews/technology/6220327.pdf))
   — confirms the Python sentence verbatim, and confirms the article goes

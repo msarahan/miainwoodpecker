@@ -7,8 +7,9 @@ RPC protocol is strictly one request at a time, and
 *because* of that: the server cannot publish frame N+1 until the client
 has copied frame N out. Two clients on one device therefore do not merely
 contend - they interleave on a reused buffer and produce a frame that is
-half pass N and half pass N+1, with no exception raised anywhere
-(docs/architecture-review.md, section 1.2).
+half pass N and half pass N+1, with no exception raised anywhere (see
+docs/scripting-and-automation.md, "Driving an instrument that other
+people are also using").
 
 Today that rule is upheld by there being one application. The Qt viewer
 owns the connection, owns every

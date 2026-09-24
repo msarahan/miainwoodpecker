@@ -84,8 +84,8 @@ jobs:
           hatch run integration:python scripts/phase0_viewer_smoke_test.py
 
   # Validate the files this project writes against the official NXem NXDL
-  # schema, per docs/migration-plan.md Phase 3: that check belongs in CI, not
-  # the runtime, so pynxtools lives in its own pixi environment and is never a
+  # schema. That check belongs in CI, not the runtime, so pynxtools lives in
+  # its own pixi environment and is never a
   # dependency of the shipped package. Its own job rather than a step in the
   # matrix above because it needs no extras, no display, and no OS/Python
   # sweep - the file layout it checks does not vary across them.
