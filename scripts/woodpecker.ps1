@@ -345,23 +345,38 @@ function Invoke-Woodpecker {
             }
 
             # Verified here, on this computer, before it can be chosen: each
-            # environment imports the package and agrees on what it is, and
-            # the unit suite passes. A release that cannot do that on this
-            # machine is removed now, rather than found out at the next
-            # start with the instrument waiting.
+            # environment imports what a session will run from it, and all
+            # of them agree on which release they are. A smoke check, not
+            # the test suite - the release was tested before it was tagged,
+            # and what is in question here is this machine's installation
+            # of it, which an import of every entry point answers in
+            # seconds. A release that fails is removed now, rather than
+            # found out at the next start with the instrument waiting.
+            $smoke = @{
+                'default' = @('miainwoodpecker.tray.app', 'miainwoodpecker.viewer.app')
+                # The Nion server imports the GPL-3.0 device stack. Fine in a
+                # throwaway check process; it is the shipped application's
+                # own process that must never import it.
+                'device' = @('miainwoodpecker.broker.app', 'miainwoodpecker.devices.nion_server')
+                'dashboard' = @('miainwoodpecker.dashboard', 'marimo')
+            }
+            $check = 'import importlib, sys, miainwoodpecker; ' +
+                '[importlib.import_module(m) for m in sys.argv[1:]]; ' +
+                'print(miainwoodpecker.__version__)'
             $reported = @{}
             foreach ($environment in $Environments) {
+                Say "checking the $environment environment"
                 $said = & $PixiExe run --frozen --manifest-path $manifest -e $environment `
-                    python -c "import miainwoodpecker; print(miainwoodpecker.__version__)"
-                if ($LASTEXITCODE -ne 0) { throw "the $environment environment cannot import miainwoodpecker" }
+                    python -c $check @($smoke[$environment])
+                if ($LASTEXITCODE -ne 0) {
+                    throw "the $environment environment cannot import $($smoke[$environment] -join ', ')"
+                }
                 $reported[$environment] = "$said".Trim()
             }
             $distinct = @($reported.Values | Sort-Object -Unique)
             if ($distinct.Count -ne 1) {
                 throw "the environments disagree about which release they hold: $(($reported.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" }) -join ', ')"
             }
-            Say "running the unit suite"
-            Invoke-Pixi run --frozen --manifest-path $manifest -e default test -q
 
             Write-Utf8 (Join-Path $dir $VerifiedMarker) ((@{
                 version = $distinct[0]

@@ -58,9 +58,11 @@ says so when a session is running.
 
 **A release is checked before it can be chosen.** `install` and `update`
 install all three environments the tray runs across (the vendor device
-stack, the Qt window, and the browser dashboard), confirm each one
-imports the package and agrees on its version, and run the unit suite
-on this computer. A release that fails any of that is removed on the
+stack, the Qt window, and the browser dashboard). They then confirm
+that each environment imports the entry points a session runs from it
+and that all three agree on the version. This is a smoke check of the
+installation on this computer. The release itself was tested before it
+was tagged. A release that fails any of that is removed on the
 spot and the current one is untouched. Finding out at the next start,
 with the instrument waiting, would be worse.
 

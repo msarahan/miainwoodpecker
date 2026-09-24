@@ -41,8 +41,8 @@ simulators and recorded data; none of it has run a real microscope yet.
   own and starts whichever one a pointer names. So `woodpecker update
   canary` tries a new release and `woodpecker rollback` goes back,
   offline, by rewriting one small file. A release cannot be chosen until
-  all three of its environments have installed, agree on their version,
-  and passed the unit suite on that computer. A switch never touches a
+  all three of its environments have installed on that computer, import
+  what a session runs from them, and agree on their version. A switch never touches a
   running session; it takes effect at the next start. pixi is pinned
   and checksummed, and no git is needed on the microscope. Stable and
   canary are GitHub releases, a pre-release being a canary. The broker
