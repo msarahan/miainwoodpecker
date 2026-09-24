@@ -513,6 +513,12 @@ extra-dependencies = [
     "pytest-cov",
     # Not inherited from the "test" env; this env does its own resolution.
     "pytest-xdist",
+    # CI runs this suite as several jobs rather than one, each taking a
+    # share balanced by measured duration (.test_durations; see
+    # .github/workflows/test.yml and scripts/update_test_durations.py).
+    # Inert without --splits, so a local `hatch run integration:run` still
+    # runs everything.
+    "pytest-split",
 ]
 
 # One worker per core, and the worker count had to be measured against
