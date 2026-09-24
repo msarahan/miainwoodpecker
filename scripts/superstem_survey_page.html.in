@@ -124,7 +124,7 @@
   }
   .filemeta code { background: none; padding: 0; color: var(--muted); }
   .actions { display: flex; flex-wrap: wrap; gap: .65rem; align-items: center; }
-  button {
+  button, .actions a {
     font: inherit;
     font-size: .93rem;
     font-weight: 600;
@@ -133,6 +133,8 @@
     cursor: pointer;
     border: 1px solid transparent;
     transition: background .12s ease, border-color .12s ease;
+    display: inline-block;
+    text-decoration: none;
   }
   .primary { background: var(--accent); color: var(--ground); }
   .primary:hover { filter: brightness(1.08); }
@@ -248,7 +250,7 @@
     <div>
       <h3>Get the script</h3>
       <div class="filemeta" style="margin-top:.45rem">
-        <span><code>superstem_survey.txt</code></span>
+        <span><code>superstem_survey.py</code></span>
         <span>__KIB__&nbsp;KB</span>
         <span>__LINES__ lines</span>
         <span>rev __REV__</span>
@@ -256,16 +258,17 @@
       </div>
     </div>
     <div class="actions">
-      <button class="primary" id="save">Download script</button>
+      <a class="primary" id="save" href="__GITHUB_RAW_URL__" download="superstem_survey.py" target="_blank" rel="noopener">Download script</a>
       <button class="secondary" id="copy">Copy to clipboard</button>
     </div>
     <div id="status"></div>
     <p style="font-size:.9rem;color:var(--muted)">
-      It downloads as <code>.txt</code> rather than <code>.py</code> &mdash; that is a
-      restriction of this page, not of the script. <strong>You do not need to rename
-      it.</strong> Python runs a file whatever its extension, so
-      <code>python superstem_survey.txt --check</code> works as-is. Rename it if you
-      prefer; nothing depends on the name.
+      <strong>Download script</strong> links straight to
+      <code>scripts/superstem_survey.py</code> on GitHub &mdash; it works in any
+      browser, whether or not you are signed into Claude. If that machine has no
+      route to GitHub, use <strong>Copy to clipboard</strong> instead, or open
+      &ldquo;Read the script first&rdquo; below, select all, and paste into a new
+      <code>.py</code> file.
     </p>
   </div>
 
@@ -279,11 +282,12 @@
     </p>
     <pre class="cmd">python -c "import sys; print(sys.version)"</pre>
     <p>Then run the preflight. It touches no hardware and opens no socket:</p>
-    <pre class="cmd">python superstem_survey.txt --check</pre>
+    <pre class="cmd">python superstem_survey.py --check</pre>
     <p>
       It prints which interpreter it is in and which sections that interpreter could
       answer. If it disagrees with what you expect, <strong>the interpreter is the thing
-      to change, not the machine.</strong>
+      to change, not the machine.</strong> (If you copy-pasted the script instead of
+      downloading it, name the file whatever you like &mdash; Python runs it either way.)
     </p>
     <div class="note">
       <span class="lede">Which Python matters more than which computer</span>
@@ -349,7 +353,7 @@
         <dt>Where</dt><dd>The instrument control computer</dd>
         <dt>Interpreter</dt><dd><strong>Nion Swift's own Python console</strong>, while Swift is running</dd>
       </dl>
-      <pre class="cmd">python superstem_survey.txt --nion --out superstem2.json</pre>
+      <pre class="cmd">python superstem_survey.py --nion --out superstem2.json</pre>
       <p>
         <strong>The highest-value run of the set.</strong> It asks whether the STEM
         controller exposes an <code>eels_camera</code> and publishes an energy-offset
@@ -382,7 +386,7 @@
       <dl>
         <dt>Where, first</dt><dd>The control computer, <strong>from Nion Swift's own Python console</strong></dd>
       </dl>
-      <pre class="cmd">python superstem_survey.txt --nion --out superstem3.json</pre>
+      <pre class="cmd">python superstem_survey.py --nion --out superstem3.json</pre>
       <p>
         The mirror image of Run 1's question: <strong>does Nion's stack <em>also</em>
         register an EELS camera on this column?</strong> The ELA is served by its own
@@ -395,7 +399,7 @@
         <dt>Where, second</dt><dd>Any machine on the control network, a laptop included</dd>
         <dt>Interpreter</dt><dd>Any Python 3.7+</dd>
       </dl>
-      <pre class="cmd">python superstem_survey.txt --dectris 192.168.1.10 --out hermes.json</pre>
+      <pre class="cmd">python superstem_survey.py --dectris 192.168.1.10 --out hermes.json</pre>
       <p>
         Use the address of the <strong>control unit</strong>, not the detector head
         &mdash; SIMPLON is served by the DCU on port 80. The address above is an example.
@@ -416,7 +420,7 @@
         <dt>Where</dt><dd>The SU9000II control computer</dd>
         <dt>Interpreter</dt><dd>Whichever Python the vendor software installed into &mdash; if unsure, all of them</dd>
       </dl>
-      <pre class="cmd">python superstem_survey.txt --hitachi --out superstem4.json</pre>
+      <pre class="cmd">python superstem_survey.py --hitachi --out superstem4.json</pre>
       <p>
         This looks for three undocumented external-control modules &mdash;
         <code>MfExtCont</code>, <code>MfKeyMouse</code>, <code>MfCommon</code> &mdash;
@@ -436,8 +440,8 @@
         <dt>Where</dt><dd>The instrument control computer</dd>
         <dt>Interpreter</dt><dd>Any Python 3.7+ on the machine &mdash; then Swift's console, if Swift is there</dd>
       </dl>
-      <pre class="cmd">python superstem_survey.txt --check
-python superstem_survey.txt --all --out superstem1.json</pre>
+      <pre class="cmd">python superstem_survey.py --check
+python superstem_survey.py --all --out superstem1.json</pre>
       <p>
         We know one thing about SuperSTEM 1 first-hand: its spectrometer reads out
         1340&times;100. What drives the column and what drives the Enfina are both
@@ -545,7 +549,6 @@ python superstem_survey.txt --all --out superstem1.json</pre>
     var src = document.getElementById("src").textContent;
     document.getElementById("sourceview").textContent = src;
 
-    var saveBtn = document.getElementById("save");
     var copyBtn = document.getElementById("copy");
     var status = document.getElementById("status");
 
@@ -553,35 +556,6 @@ python superstem_survey.txt --all --out superstem1.json</pre>
       status.textContent = message;
       status.className = kind || "";
     }
-
-    var downloads = window.claude && window.claude.downloads;
-    if (!downloads) {
-      saveBtn.disabled = true;
-      say("Downloading is not available in this view \u2014 use Copy to clipboard, then paste into an empty file and save it as superstem_survey.py", "warn");
-    }
-
-    saveBtn.addEventListener("click", function () {
-      if (!downloads) return;
-      say("Waiting for you to confirm the save\u2026");
-      downloads
-        .save({ filename: "superstem_survey.txt", data: src })
-        .then(function () {
-          say("Saved. Run it with: python superstem_survey.txt --check", "ok");
-        })
-        .catch(function (error) {
-          var code = (error && error.code) || "unavailable";
-          if (code === "declined") {
-            say("Save cancelled. Nothing was written.");
-          } else if (code === "rate_limited") {
-            say("A save prompt is already open \u2014 finish that one, then try again.", "warn");
-          } else if (code === "bad_request" || code === "transform_error") {
-            say("The file could not be prepared. Use Copy to clipboard instead.", "warn");
-          } else {
-            saveBtn.disabled = true;
-            say("Downloading is not available in this view \u2014 use Copy to clipboard instead.", "warn");
-          }
-        });
-    });
 
     copyBtn.addEventListener("click", function () {
       function fallback() {
