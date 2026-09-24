@@ -1,6 +1,36 @@
 # Change Log
 
-## Unreleased
+## 0.1.0 — 2026-09-24
+
+The first release. Everything in it has been built and tested against
+simulators and recorded data; none of it has run a real microscope yet.
+
+**Works:**
+
+- **The tray application**: holds an instrument open from the
+  notification area, with a window, a dashboard and device-server
+  health one right-click away.
+- **The live viewer**: scan and camera feeds, EELS spectra, scan
+  controls.
+- **The browser dashboard.**
+- **The broker**: serves one instrument to every window, notebook and
+  dashboard at once, and arbitrates which of them drives.
+- **NeXus/HDF5 recording**: streamed to disk as an acquisition runs.
+- **The simulated instrument**: nionswift-usim, and an in-process
+  synthetic instrument for `pixi run preview`.
+- **Replay**: a recorded DigitalMicrograph session served as a device.
+- **The Windows installer**: one line to install, side-by-side releases,
+  `woodpecker update canary` to try a new one and `woodpecker rollback`
+  to go back. See [`docs/installing.md`](docs/installing.md).
+
+**Not yet:**
+
+- Nothing has been validated on real hardware.
+  [`docs/hardware-validation-checklist.md`](docs/hardware-validation-checklist.md)
+  is the procedure for doing that.
+- The SuperSTEM instrument files in `instruments/` are hypotheses, not
+  records of working configurations. The lines marked UNVERIFIED wait
+  on the [instrument survey](docs/superstem-survey.md).
 
 ### Added
 

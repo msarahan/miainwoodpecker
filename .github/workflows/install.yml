@@ -30,10 +30,17 @@ jobs:
     defaults:
       run:
         shell: powershell  # 5.1, deliberately; see above
-    env:
-      WOODPECKER_HOME: ${{ runner.temp }}\wph
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+
+      # Set here rather than in the job's `env:`, where the `runner`
+      # context does not exist - a workflow that says so is rejected
+      # before any job starts, and shows up only as a failed run named
+      # after its file. Appended without a byte-order mark: 5.1's `>>`
+      # writes UTF-16, which the runner cannot read.
+      - name: Put the installation somewhere short
+        run: |
+          [IO.File]::AppendAllText($env:GITHUB_ENV, "WOODPECKER_HOME=$env:RUNNER_TEMP\wph`n")
 
       - name: Install a first release
         run: .\scripts\woodpecker.ps1 install 0.0.1 -From .
