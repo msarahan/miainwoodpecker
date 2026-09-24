@@ -244,15 +244,20 @@ def test_a_broker_of_another_release_is_refused_naming_both(tmp_path):
     Which is the case a rollback creates: a notebook left open across it
     is the old release, and the broker it would join is the new one.
     """
+    # Derived from this release rather than a literal, so it differs
+    # from whatever this is installed as. A literal "0.0.1" did not: the
+    # installer workflow installs this checkout *as* 0.0.1, and there the
+    # two matched and nothing was refused.
+    other = f"not-{__version__}"
     BrokerInvitation(
         host="localhost",
         port=1,
         authkey=b"k",
-        software_version="0.0.1",
+        software_version=other,
     ).write_to(tmp_path)
     with pytest.raises(BrokerVersionMismatchError) as refused:
         BrokerInvitation.read_from(tmp_path)
-    assert "0.0.1" in str(refused.value)
+    assert other in str(refused.value)
     assert __version__ in str(refused.value)
 
 

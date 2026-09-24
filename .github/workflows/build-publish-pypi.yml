@@ -55,7 +55,17 @@ jobs:
   publish:
     name: >-
       Publish Python 🐍 distribution 📦 to PyPI
-    if: github.repository_owner == 'msarahan' && github.event_name == 'release'
+    # Off until PyPI trusts this workflow. miainwoodpecker has never been
+    # published, so the first upload needs a *pending* trusted publisher
+    # on pypi.org (owner msarahan, repository miainwoodpecker, workflow
+    # build-publish-pypi.yml, environment pypi); without one, this job
+    # fails its OIDC exchange on every release. Register that, then set
+    # the repository variable PUBLISH_TO_PYPI to `true` - no code change.
+    # Control computers do not need PyPI: the installer builds from the
+    # tagged source (docs/installing.md).
+    if: >-
+      github.repository_owner == 'msarahan' && github.event_name == 'release'
+      && vars.PUBLISH_TO_PYPI == 'true'
     needs:
       - build
     runs-on: ubuntu-latest

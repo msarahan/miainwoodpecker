@@ -58,9 +58,11 @@ says so when a session is running.
 
 **A release is checked before it can be chosen.** `install` and `update`
 install all three environments the tray runs across (the vendor device
-stack, the Qt window, and the browser dashboard), confirm each one
-imports the package and agrees on its version, and run the unit suite
-on this computer. A release that fails any of that is removed on the
+stack, the Qt window, and the browser dashboard). They then confirm
+that each environment imports the entry points a session runs from it
+and that all three agree on the version. This is a smoke check of the
+installation on this computer. The release itself was tested before it
+was tagged. A release that fails any of that is removed on the
 spot and the current one is untouched. Finding out at the next start,
 with the instrument waiting, would be worse.
 
@@ -138,9 +140,12 @@ woodpecker self-update      # take the copy from the current release
 1. Tag the commit `vX.Y.Z`, or `vX.Y.ZrcN` for a candidate, and publish
    a GitHub release from the tag. Tick **pre-release** for a candidate:
    that is the whole difference between a canary and a stable release.
-2. The release workflow publishes to PyPI and attaches `woodpecker.ps1`
-   to the release, which is what the one-line installer downloads from
-   the latest stable release.
+2. The release workflow attaches `woodpecker.ps1` to the release, which
+   is what the one-line installer downloads from the latest stable
+   release. It also publishes to PyPI once the repository variable
+   `PUBLISH_TO_PYPI` is `true`, which waits on a trusted publisher being
+   registered on pypi.org (see the `publish` job). The installer does
+   not use PyPI either way.
 3. Try it on one microscope with `woodpecker update canary` before
    promoting it. Promoting means publishing the stable tag; every other
    microscope then picks it up with `woodpecker update`.
