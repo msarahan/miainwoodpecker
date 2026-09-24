@@ -273,7 +273,7 @@
     <h2>Before anything else</h2>
     <p>
       Check the interpreter. The script needs <strong>Python 3.7 or newer</strong> &mdash;
-      that floor is set by Gatan Microscopy Suite, which embeds 3.7 and is the oldest
+      that floor is set by Gatan Microscopy Suite, which embeds 3.7 from version 3.4 and is the oldest
       Python plausibly sitting near this hardware. On anything older the file will not
       parse, and you get a <code>SyntaxError</code> rather than a useful message.
     </p>
@@ -322,6 +322,12 @@
         a module without executing it, and lists directories. Never imports a vendor
         control module, because importing one may open a connection to the column.
       </li>
+      <li>
+        <strong>Gatan.</strong> Locates the <code>DigitalMicrograph</code> module without
+        importing it, and notices when it is <em>already loaded</em> &mdash; which is how
+        it knows it is inside Gatan Microscopy Suite's own Python window. Executes no DM
+        script and reads no image.
+      </li>
     </ul>
     <p>
       No section reads or transmits acquired data. The report contains instrument
@@ -330,10 +336,11 @@
   </section>
 
   <section>
-    <h2>The three runs</h2>
+    <h2>The runs</h2>
     <p>
-      Three machines, so three separate runs. They are independent &mdash; do them in
-      whatever order suits the schedule.
+      Three instruments and four runs. They are independent &mdash; do them in whatever
+      order suits the schedule. The Nion run is wanted on <em>every</em> Nion column,
+      because it answers a different question on each.
     </p>
 
     <div class="run">
@@ -344,12 +351,24 @@
       </dl>
       <pre class="cmd">python superstem_survey.txt --nion --out superstem2.json</pre>
       <p>
-        <strong>The highest-value run of the three.</strong> It asks whether the STEM
-        controller exposes an <code>eels_camera</code> and publishes a
-        <code>ZLPoffset</code> control. If it does both, the UHV Enfina is already
-        reachable through Nion, the spectrometer is already drivable, and no Gatan-side
-        code is needed here at all. If it does neither, an adapter that has to live
-        inside Gatan Microscopy Suite comes back onto the plan.
+        <strong>The highest-value run of the set.</strong> It asks whether the STEM
+        controller exposes an <code>eels_camera</code> and publishes an energy-offset
+        control &mdash; under either of two names, <code>ZLPoffset</code> (the simulator's)
+        or <code>EELS_MagneticShift_Offset</code> (Nion's own). If it does both, the UHV
+        Enfina is already reachable through Nion, the spectrometer is already drivable,
+        and no Gatan-side code is needed here at all. If it does neither, an adapter that
+        has to live inside Gatan Microscopy Suite comes back onto the plan &mdash; and
+        that plan has a hole in it: SuperSTEM 2 runs DigitalMicrograph 2.x, which has no
+        Python, so nothing of ours can run inside DM there. Run 4's <code>--gatan</code>
+        from any Python on the machine still records the DM installation.
+      </p>
+      <p>
+        It also lists the installed Swift plug-ins (by file, never loaded), every
+        registered camera's own account of itself &mdash; sensor shape, binning, dark and
+        gain support, calibration controls &mdash; the scan unit's channels, each
+        hardware source's saved profiles, and whether the scan and cameras offer Nion's
+        synchronised-acquisition methods, which is whether a spectrum image can be taken
+        through Nion's stack. All of it is property reads and <code>hasattr</code>.
       </p>
       <p>
         Safe to run during a session. A system Python on the same computer will usually
@@ -359,22 +378,35 @@
     </div>
 
     <div class="run">
-      <div class="runhead"><span class="runno">RUN 2</span><h2>HERMES &mdash; DECTRIS control unit</h2></div>
+      <div class="runhead"><span class="runno">RUN 2</span><h2>HERMES &mdash; the column, then the DECTRIS control unit</h2></div>
       <dl>
-        <dt>Where</dt><dd>Any machine on the control network, a laptop included</dd>
+        <dt>Where, first</dt><dd>The control computer, <strong>from Nion Swift's own Python console</strong></dd>
+      </dl>
+      <pre class="cmd">python superstem_survey.txt --nion --out superstem3.json</pre>
+      <p>
+        The mirror image of Run 1's question: <strong>does Nion's stack <em>also</em>
+        register an EELS camera on this column?</strong> The ELA is served by its own
+        process in our configuration; if Nion registers it too, that is two drivers on
+        one detector and the configuration has to choose. The same run records whether
+        the IRIS spectrometer's dispersion and offset are published as column controls,
+        which is where the ELA's frames would get an energy axis from.
+      </p>
+      <dl>
+        <dt>Where, second</dt><dd>Any machine on the control network, a laptop included</dd>
         <dt>Interpreter</dt><dd>Any Python 3.7+</dd>
       </dl>
       <pre class="cmd">python superstem_survey.txt --dectris 192.168.1.10 --out hermes.json</pre>
       <p>
         Use the address of the <strong>control unit</strong>, not the detector head
-        &mdash; SIMPLON is served by the DCU on port 80.
+        &mdash; SIMPLON is served by the DCU on port 80. The address above is an example.
       </p>
       <p>
         This settles which SIMPLON version answers, which configuration keys an ELA
-        actually publishes, and whether the <code>monitor</code> subsystem is enabled.
-        Our adapter was written against published documentation and open-source clients;
-        several of its assumptions are guesses that one <code>GET</code> each can confirm
-        or kill. Safe to run mid-experiment.
+        actually publishes, the trigger mode it is left in, and whether the
+        <code>monitor</code> and <code>stream</code> subsystems are enabled. Our adapter
+        was written against published documentation and open-source clients; several of
+        its assumptions are guesses that one <code>GET</code> each can confirm or kill.
+        Safe to run mid-experiment.
       </p>
     </div>
 
@@ -388,27 +420,96 @@
       <p>
         This looks for three undocumented external-control modules &mdash;
         <code>MfExtCont</code>, <code>MfKeyMouse</code>, <code>MfCommon</code> &mdash;
-        evidenced on an SU7000 and unknown on an SU9000II. Whether they are present is
+        evidenced on an SU7000 and unknown on an SU9000II, and for install folders named
+        for Hitachi, EM Flow Creator and ElementView. Whether the modules are present is
         the single fact deciding between an adapter we can write in a couple of weeks and
         a conversation with Hitachi.
       </p>
       <p>
         Nothing is imported, so nothing connects to the column.
       </p>
-      <div class="note">
-        <span class="lede">While you are at that machine &mdash; two free minutes</span>
-        <p>
-          The script cannot see these, and they are worth more than they cost. Is
-          <strong>EM Flow Creator</strong> installed and licensed? Is
-          <strong>ElementView</strong> there &mdash; Hitachi's in-house EELS acquisition
-          software, named in the published methods for this platform &mdash; and does it
-          have any scripting, macro, batch or watch-folder option? And who made the EELS
-          spectrometer and the diffraction camera? A CEOS or Gatan spectrometer is
-          something we can drive on our own terms; a Hitachi one is behind the same wall
-          as the column.
-        </p>
-      </div>
     </div>
+
+    <div class="run">
+      <div class="runhead"><span class="runno">RUN 4</span><h2>SuperSTEM 1 &mdash; find out what drives it</h2></div>
+      <dl>
+        <dt>Where</dt><dd>The instrument control computer</dd>
+        <dt>Interpreter</dt><dd>Any Python 3.7+ on the machine &mdash; then Swift's console, if Swift is there</dd>
+      </dl>
+      <pre class="cmd">python superstem_survey.txt --check
+python superstem_survey.txt --all --out superstem1.json</pre>
+      <p>
+        We know one thing about SuperSTEM 1 first-hand: its spectrometer reads out
+        1340&times;100. What drives the column and what drives the Enfina are both
+        unknown, so this run is a diagnosis. <code>--all</code> runs the Nion, Gatan and
+        Hitachi sections and reports which of them found anything. If
+        <code>--check</code> says <code>nion: yes</code>, run the Nion section again from
+        Swift's own console as in Run 1.
+      </p>
+      <p>
+        <strong>SuperSTEM 1 runs DigitalMicrograph 1.x and SuperSTEM 2 runs 2.x, and
+        neither has Python built in</strong> &mdash; that arrived with GMS 3.4. So there
+        is no DM Python window to run anything from on either machine. What
+        <code>--gatan</code> still records from any Python is where DM is installed and
+        any GMS environment variables. The facts that matter most on SuperSTEM 1 are for
+        a person: which program drives the column, which drives the Enfina, and the DM
+        version on the About box. They are in the questions below.
+      </p>
+    </div>
+  </section>
+
+  <section>
+    <h2>Questions only you can answer</h2>
+    <p>
+      The script reads what the software publishes. These are the things it cannot, and
+      they matter as much: they are what decides whether a window we build is one you
+      would recognise. A few minutes per instrument, a sentence each.
+    </p>
+    <ul>
+      <li>
+        <strong>Which software, today.</strong> On each column, what do you take a STEM
+        image, an EELS spectrum and a spectrum image in &mdash; Nion Swift,
+        DigitalMicrograph, something site-specific? Which Swift version? Is Swift's own
+        spectrum-imaging panel used, and does it work? On SuperSTEM 1 and 2, which
+        DigitalMicrograph version exactly (the About box), and on SuperSTEM 1, what
+        drives the column at all?
+      </li>
+      <li>
+        <strong>The spectrometer.</strong> How do you set the dispersion (eV per channel),
+        and where? Which dispersions and energy ranges do you actually use? How do you
+        move the zero-loss peak &mdash; which control, in which software? Is there a
+        drift-tube or slit setting you adjust during a session?
+      </li>
+      <li>
+        <strong>Dark and gain.</strong> How do you take a dark reference, and how often?
+        Is gain normalisation used, and where does the reference come from?
+      </li>
+      <li>
+        <strong>A typical spectrum image.</strong> Grid size, per-position exposure,
+        dispersion, which images you keep alongside (HAADF, MAADF), whether drift
+        correction is on and what does it, and roughly how long a pass takes. Do you draw
+        the region on a live image or type the size?
+      </li>
+      <li>
+        <strong>A typical STEM image.</strong> Dwell and size for looking, and for
+        keeping. Scan rotation routinely? Sub-regions?
+      </li>
+      <li>
+        <strong>SuperSTEM 4 specifically.</strong> Who makes the EELS spectrometer and
+        the diffraction camera, and which software drives each? Is
+        <strong>EM Flow Creator</strong> installed and licensed? Is
+        <strong>ElementView</strong> there, and does it have any scripting, macro, batch
+        or watch-folder option?
+      </li>
+      <li>
+        <strong>HERMES, for a later hardware slot.</strong> Is the scan unit's per-pixel
+        trigger output wired to the ELA's external trigger input, and which trigger mode
+        is the ELA in when Swift takes a spectrum image? And, when somebody is watching:
+        does one software <code>trigger</code> in <code>ints</code> mode produce one image
+        or start the whole series? That last one needs the detector armed, which is
+        exactly what this script refuses to do.
+      </li>
+    </ul>
   </section>
 
   <section>

@@ -46,6 +46,10 @@ and a procedure for settling them at the facility.
 The design history is documented unusually thoroughly, decisions and
 measurements included:
 
+- [Acquisition UX survey](acquisition-ux-survey.md) — where a STEM
+  image, an EELS spectrum and a spectrum image each stand today, by
+  backend, and the ordered list of what has to happen before an
+  operator can take all three on a SuperSTEM instrument.
 - [Instrument configuration](instrument-configuration.md) — the file per
   microscope that enumerates its hardware and tells the broker which
   device servers to start, with worked examples for the SuperSTEM
@@ -89,6 +93,7 @@ Architecture review <architecture-review>
 Instrument configuration <instrument-configuration>
 Hardware validation checklist <hardware-validation-checklist>
 Instrument survey runbook <superstem-survey>
+Acquisition UX survey <acquisition-ux-survey>
 Work before hardware <pre-hardware-work>
 Other vendors <vendor-support>
 Analysis parity <analysis-parity>

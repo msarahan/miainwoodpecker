@@ -277,7 +277,10 @@ Full reasoning and sources: [adapters/gatan.md](adapters/gatan.md).
 - [ ] Confirm GMS's embedded Python version (`import sys; sys.version` in
       DM's Python window) and whether `pip install miainwoodpecker` is
       possible inside `GMS_VENV_PYTHON`. The pickle cap assumes 3.7; if
-      GMS has moved on, the cap is unnecessary but harmless.
+      GMS has moved on, the cap is unnecessary but harmless. **Not
+      applicable to SuperSTEM 1 or 2**: they run DigitalMicrograph 1.x
+      and 2.x, which embed no Python, so every item below this one is
+      moot on those machines unless GMS is upgraded.
 
 - [ ] Run the bridge's `simulated` backend *inside GMS* against a client
       on the same network. This exercises the transport, the pickle

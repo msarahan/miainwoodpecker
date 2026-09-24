@@ -4,6 +4,45 @@
 
 ### Added
 
+- **A survey of where the three basic acquisitions stand, and a survey
+  script that asks the instruments what that survey could not.**
+  [`docs/acquisition-ux-survey.md`](docs/acquisition-ux-survey.md) reads
+  the code rather than the documentation and says, per backend, whether
+  a STEM image, an EELS spectrum and a spectrum image can be taken today
+  — and what has to happen before an operator can take all three on a
+  SuperSTEM instrument. Two of its findings changed the questions the
+  read-only instrument survey asks. The energy offset this project's
+  Nion server drives is `ZLPoffset`, the simulator's name; Nion's own
+  acquisition preferences call it `EELS_MagneticShift_Offset`, and the
+  simulator publishes both, which is why nothing noticed. And the
+  spectrum image, which no hardware backend can supply, turns out to
+  rest on two *device-level* Nion methods
+  (`prepare_synchronized_scan` and `acquire_synchronized_*`) rather
+  than on the application layer the migration plan said was needed.
+  So `scripts/superstem_survey.py` now reads both energy-offset names,
+  lists the installed `nionswift_plugin` modules without importing any
+  (the name the instrument file needs), records every registered
+  camera's own account of itself — sensor shape, binning factors, dark
+  and gain support, calibration controls — and the scan unit's channels
+  and current parameters, reads each hardware source's saved profiles
+  (how the operators actually acquire), and reports whether the scan
+  and cameras offer the synchronised-acquisition methods. A `--gatan`
+  section says whether Gatan Microscopy Suite is on a machine and
+  whether the interpreter running the script is DM's own, and the
+  DECTRIS run asks the control unit its API version directly. The
+  runbook gains a run for SuperSTEM 1 and one for SuperSTEM 3's Swift
+  console, and a questionnaire for the operators about the things no
+  script can read: which software they take each acquisition in today,
+  how they set the dispersion, how they take dark references, and what
+  a typical spectrum image looks like on each column. Every new probe
+  is a property read or a `hasattr`; the tests that pin the script's
+  read-only promise cover the new sections too. One fact from the
+  facility is recorded wherever it bites: SuperSTEM 1 runs
+  DigitalMicrograph 1.x and SuperSTEM 2 runs 2.x, neither of which
+  embeds Python, so the inbound Gatan bridge — which runs inside GMS's
+  own interpreter — cannot be the route to the Enfina on either
+  machine. The survey's first run decides whether it needs to be.
+
 - **The instrument as an application in the notification area: right-click
   to open a window on it, to see how its device servers are doing, or to
   stop everything.** `pixi run serve` already holds a microscope open for
