@@ -93,9 +93,14 @@ uv run --extra viewer miainwoodpecker-preview --cameras 2 --session /tmp/scratch
    exposure and binning beside it — readout decides the rank of every
    frame the detector produces. (Try it on the Ronchigram camera too:
    it refuses, with a sentence, because it has no dispersive direction.)
-2. In the Scan group, set **Per-position detector** to `eels_camera` and
-   choose a **Positions** count.
-3. Click **Acquire spectrum image**.
+2. Take a survey scan: **Start** the live scan, or press **Preview**.
+3. Press the **region** button (the rectangle) in the Scan toolbar. A
+   yellow rectangle lands on the survey scan with drag handles; move
+   and resize it over the part you want.
+4. In the Scan settings, set **Per-position detector** to `eels_camera`
+   and choose **Positions** — along the region's longer side; the
+   **Grid** row shows the grid and the nanometres it covers.
+5. Click **Acquire spectrum image**.
 
 One traversal of the probe follows, with a spectrum kept at every beam
 position and every scan channel read out of the same pass. The status
@@ -103,14 +108,21 @@ line names what actually landed — leave the spectrometer imaging and you
 get a 4D stack instead, which is a real experiment rather than a
 mistake, and the line says so.
 
-**Two panels open while it runs**, and they answer different questions.
-`Acquiring (eels_camera)` is the virtual-detector map — one number per
-beam position, which is where drift, contamination and vacuum show up.
-`Acquiring (eels_camera): spectrum` is the spectrum at the position the
-probe is on, captioned with that position, which is where "the
-spectrometer is not on the loss I set it to" shows up. A map cannot say
-that: a spectrometer parked off the edge sums to a perfectly plausible
-number at every pixel.
+**The preview paces the pass** at the spectrometer's exposure per
+position, as a column driving a detector's trigger does, so a 16x16
+grid at the default 20 ms exposure takes about five seconds and can be
+watched. The tests build the preview unpaced, so they do not pay that.
+
+**Three kinds of panel open while it runs**, and they answer different
+questions. `Acquiring (eels_camera)` is the virtual-detector map — one
+number per beam position, which is where drift, contamination and
+vacuum show up. `Acquiring (eels_camera): spectrum` is the spectrum at
+the position the probe is on, captioned with that position, which is
+where "the spectrometer is not on the loss I set it to" shows up. A map
+cannot say that: a spectrometer parked off the edge sums to a perfectly
+plausible number at every pixel. And `Acquiring (HAADF)` is the scan
+detector of the same pass filling in, drawn to the region's scale,
+which is where "the probe is not where I drew the rectangle" shows up.
 
 You can also just start the spectrometer with **Detector readout** on
 `projected` and no pass at all. Its panel is then a plot rather than a

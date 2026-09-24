@@ -279,12 +279,24 @@ class ScanParameters:
         ``pixel_size_nm = fov_nm / max(scan_shape)`` and applies it to
         both axes, and ``ScanFrameParameters.fov_size_nm`` derives the
         second axis from the pixel aspect ratio.
+    center_nm : tuple[float, float]
+        Where the scanned region's centre sits, as ``(y_nm, x_nm)`` from
+        the scan unit's own axis — ``(0, 0)`` scans about the axis, which
+        every scan did before this field existed and is what a scan
+        still does when nothing says otherwise. This is what lets a
+        spectrum image be taken over a *region* of a survey scan rather
+        than over the whole field of view: the region's centre and its
+        extent become this and :attr:`fov_nm`, and the probe goes where
+        the operator drew. Nion's ``ScanFrameParameters.center_nm`` is
+        the same quantity under the same name, in the same ``(y, x)``
+        order, so the adapter passes it straight through.
     """
 
     height: int
     width: int
     pixel_time_us: float
     fov_nm: float
+    center_nm: tuple[float, float] = (0.0, 0.0)
 
     @property
     def shape(self) -> tuple[int, int]:
@@ -1458,6 +1470,19 @@ class SynchronisedScanner(typing.Protocol):
             something to reshape around: the caller allocated it from its
             own idea of the grid, and a mismatch means one of the two is
             wrong about what is being acquired.
+
+            A key that is one of this scanner's **channel names** rather
+            than a target is a destination for that intensity channel:
+            an array of the grid's shape that the adapter writes one
+            beam position at a time, alongside the targets, so a caller
+            can watch the survey image of the pass build with the
+            spectrum image rather than receive it whole at the end. It
+            is a window onto the pass and not the pass's record — the
+            channel's :class:`Frame` in :attr:`ScanPass.images` is that,
+            and is complete whether or not a destination was offered.
+            An adapter whose vendor delivers the channels only at the
+            end may ignore these keys; the caller then sees the frames
+            when the pass returns, which is what it saw before.
 
         Returns
         -------

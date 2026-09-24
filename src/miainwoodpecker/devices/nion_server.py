@@ -1136,10 +1136,13 @@ class NionScanner:
         typing.Any
             The equivalent ``ScanFrameParameters``.
         """
+        # center_nm is Nion's own field, in Nion's own (y, x) order, so
+        # a sub-region of a survey scan reaches the column unchanged.
         return _ScanDeviceKit.ScanFrameParameters(
             pixel_size=(parameters.height, parameters.width),
             pixel_time_us=parameters.pixel_time_us,
             fov_nm=parameters.fov_nm,
+            center_nm=tuple(parameters.center_nm),
         )
 
     def _scan_metadata(

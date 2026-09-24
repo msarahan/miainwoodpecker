@@ -4,6 +4,38 @@
 
 ### Added
 
+- **A spectrum image over a region you draw on the survey scan, with the
+  scan detector building beside the spectrum.** The workflow is now the
+  one an operator expects: take a survey scan, press the rectangle
+  button, drag the yellow rectangle over the part that matters, set how
+  many positions the long side gets, and acquire. The rectangle is a
+  napari shapes layer on the survey scan's own panel, so it already has
+  handles; the **Grid** row in the Scan settings says what the next
+  pass covers, in positions and in nanometres, and follows the
+  rectangle as it is dragged. The grid takes its aspect ratio from the
+  rectangle so pixels stay square, and its centre and extent are
+  recorded with the pass. That needed one thing the scan geometry did
+  not have: `ScanParameters.center_nm`, where the scanned region sits
+  relative to the scan unit's axis, in the (y, x) nanometres Nion's
+  own `center_nm` uses — passed straight through to a Nion column, and
+  honoured by the preview, which now samples its specimen about the
+  centre at the scan's own pixel pitch so a region of a survey scan
+  lands on the piece of specimen the survey showed there (measured: a
+  region pass correlates with the survey's crop at 0.9, and a crop one
+  pixel off is anti-correlated). While the pass runs, every scan
+  channel fills in position by position in an `Acquiring (HAADF)` panel
+  drawn to the region's scale, next to the virtual-detector map and the
+  live spectrum: a synchronised pass may now be handed a destination
+  keyed by a *channel name* as well as by target, and writes that
+  channel through as it goes. The preview traverses its pass in one
+  loop over the positions, reading every signal at each, and the window
+  builds it **paced** — each position waits out the spectrometer's
+  exposure, as a column driving a detector's trigger does — so a 16x16
+  grid takes seconds and can be watched; the tests build it unpaced.
+  The Positions ceiling rises from 128 to 512, since the pass has run
+  behind a job since #40 and the old comment saying otherwise was
+  stale.
+
 - **A survey of where the three basic acquisitions stand, and a survey
   script that asks the instruments what that survey could not.**
   [`docs/acquisition-ux-survey.md`](docs/acquisition-ux-survey.md) reads

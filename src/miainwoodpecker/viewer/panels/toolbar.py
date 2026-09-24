@@ -48,6 +48,7 @@ STOP = "■"  # black square
 PREVIEW = "◐"  # circle with left half black
 ACQUIRE = "◉"  # fisheye - a shutter
 SPECTRUM_IMAGE = "▦"  # square with orthogonal crosshatch fill
+REGION = "▭"  # white rectangle - the region a spectrum image covers
 SAVE = "⤓"  # downwards arrow to bar
 RECORD = "⬤"  # black large circle
 # Not the gear (U+2699). Windows renders that from Segoe UI Emoji in

@@ -19,12 +19,14 @@ _CONTEXT_SAVE_DELAY_MS = 750
 # detector will actually accept is the detector's business, and it
 # refuses in configure(). These only keep the spin box from offering
 # zero (which CameraParameters rejects) or a value no run would finish.
-# Beam positions per side for a spectrum image. The ceiling is low
-# because the acquisition currently blocks the GUI thread; it should rise
-# once the pass runs behind a job, and the default is sized to finish in
-# about a second against the preview.
+# Beam positions along the longer side of a spectrum image's region (or
+# per side of the whole field of view, when no region is marked). The
+# pass runs on its own thread, so the ceiling is about the dataset a
+# session can hold rather than about the window: 512 positions across
+# an EEL spectrometer's 1340 channels is 1.4 GB of float32 at 512x512.
+# The default is sized to finish in seconds against the paced preview.
 _MIN_POSITIONS = 2
-_MAX_POSITIONS = 128
+_MAX_POSITIONS = 512
 _DEFAULT_POSITIONS = 16
 _MIN_EXPOSURE_MS = 0.01
 _MAX_EXPOSURE_MS = 600000.0

@@ -533,11 +533,31 @@ arrive.
 
 ### Acquiring a spectrum image
 
-**Acquire spectrum image** drives the probe over a grid of
-**Positions** beam positions across the current field of view, keeping
-the whole readout of one detector at every one — and reading every scan
-channel out of the same traversal, so the images you navigate the
-dataset with afterwards share its probe positions by construction.
+Four steps, and the first three are about *where*:
+
+1. **Take a survey scan.** Start the live scan, or press Preview or
+   Acquire: any of them puts an image of the field of view on screen,
+   and that image is what the region is drawn on.
+2. **Mark the region** with the rectangle button in the Scan toolbar.
+   A yellow rectangle appears over the middle half of the survey scan,
+   already selected, with handles: drag its corners to resize it and
+   its body to move it. Press the button again to remove it, and the
+   next spectrum image covers the whole field of view instead.
+3. **Set Positions** in the Scan settings: beam positions along the
+   region's *longer* side. The shorter side follows from the rectangle's
+   aspect ratio, so the pixels stay square and the grid samples what
+   you drew — a rectangle twice as tall as it is wide at 64 positions
+   is a 64x32 grid. The **Grid** row says what the next pass will
+   cover, in positions and in nanometres, and follows the rectangle as
+   you drag it.
+4. **Acquire spectrum image.**
+
+The pass drives the probe over that grid, keeping the whole readout of
+one detector at every position — and reading every scan channel out of
+the same traversal, so the images you navigate the dataset with
+afterwards share its probe positions by construction. The region's
+centre and extent are recorded with the pass, so it can be placed back
+on the survey scan later.
 
 **Per-position detector** chooses which detector that is. What you get
 depends on the readout mode it is in, not on which button you pressed:
@@ -576,14 +596,21 @@ curve it is obvious in the first second rather than at analysis time.
 A pass keeping whole detector images gets no spectrum panel, because
 there is no spectrum in a 4D stack.
 
+**And the scan detectors build beside them.** Every scan channel read
+out of the pass — `Acquiring (HAADF)`, `Acquiring (MAADF)` — fills in
+position by position too, drawn to the region's own scale so its scale
+bar says nanometres. That is the image you will navigate the spectrum
+image with afterwards, and seeing it form is how you know the probe is
+where the rectangle said, before the file exists.
+
 The window stays live throughout. The pass runs on its own thread and
 the screen samples it, so the live view keeps running, the panels still
 zoom and pan, and the application answers. It used to run inline: a long
 spectrum image froze the whole window until it finished, which the
 operating system reports as an application that has stopped responding.
 
-The progress panel is sized to its map like any other, so a 64x64 grid
-opens as a 512-pixel window rather than as a 64-pixel stamp.
+The progress panels are sized to their maps like any other, so a 64x64
+grid opens as a 512-pixel window rather than as a 64-pixel stamp.
 
 **Most instruments will refuse, and the refusal is the point.** A
 spectrum image needs the scan and the detector synchronised in
@@ -599,11 +626,9 @@ Today only the [preview instrument](developing-the-ui.md) can do it. The
 assumed — moving the simulator's own probe position changes nothing
 beyond shot noise.
 
-Known limits, while this is being built out: the grid is square (the
-target-area UI that would take its aspect ratio from a region you draw
-is not built yet), the acquisition blocks the window while it runs, and
-a saved pass appears in the **File** list as `0 frames` because that
-list only understands frame stacks.
+Known limits, while this is being built out: a running pass has no
+Stop button, and a saved pass appears in the **File** list as
+`0 frames` because that list only understands frame stacks.
 
 ### Replaying a recorded session
 

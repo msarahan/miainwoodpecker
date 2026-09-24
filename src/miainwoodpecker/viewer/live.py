@@ -34,9 +34,10 @@ GUI thread.** Stopping a live loop means waiting out the pass in flight,
 and a pass is ``height x width x dwell`` — a quarter of a second at
 512x512 and one microsecond, but 42 seconds at 2048x2048 and ten. Every
 acquisition here therefore takes its lease *inside* the generator the
-worker consumes, where waiting costs nothing but the wait. The two
-paths that still block (Preview, and a spectrum image) blocked before
-this change for the same reason and are marked as such.
+worker consumes, where waiting costs nothing but the wait. The one
+path that still blocks, Preview, blocked before this change for the same
+reason and is marked as such; a spectrum image runs behind a
+:class:`~miainwoodpecker.viewer.jobs.PassJob` and takes its lease there.
 
 The one deliberate exception is a control write, which leases the
 ``instrument`` target on the GUI thread — and can, because that target
@@ -215,6 +216,20 @@ _NEXUS_FILE_FILTER = "NeXus recordings (*.nxs *.h5 *.hdf5);;All files (*)"
 # the two kinds of dataset a pass is about to allocate.
 _SPECTRUM_READOUT_RANK = 1
 _IMAGE_READOUT_RANK = 2
+
+# The rectangle an operator draws on the survey scan to say where the
+# next spectrum image goes. One layer, by name, attached to the scan
+# panel it was drawn on: napari's shapes layer already gives it drag
+# handles, so marking a region is drawing one rectangle and moving it.
+_REGION_LAYER = "Spectrum image region"
+_REGION_EDGE_COLOR = "yellow"
+# The first rectangle covers the middle of the survey scan, edge to edge
+# this fraction of it: big enough to see, small enough that it is
+# obviously not "the whole field of view", which is what no region means.
+_REGION_FRACTION = 0.5
+# A region thinner than this many survey pixels on either side is a
+# line, not an area, and is refused rather than turned into a 1xN grid.
+_MIN_REGION_PIXELS = 1.0
 
 # The two keys a stage position arrives under in the broker's control
 # map. One control on the instrument, two numbers on the wire, because
@@ -611,6 +626,18 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         self._pass_target: str | None = None
         self._pass_path: Path | None = None
         self._pass_positions = ""
+        # The scan channels of the running pass, as they build. Windows
+        # onto the images rather than the pass's record of them - see
+        # SynchronisedScanner.scan_synchronised on `into` - so an
+        # operator watches the HAADF fill in beside the spectrum image.
+        self._pass_channel_preview: dict[str, progress.PassPreview] = {}
+        # The grid the running pass covers, so its progress layers can
+        # be drawn to the region's own scale rather than in bare pixels.
+        self._pass_geometry: ScanParameters | None = None
+        # Which scan layer the region rectangle was drawn on. The
+        # rectangle is in that layer's world coordinates, so reading it
+        # back needs the same layer's calibration.
+        self._region_reference: str | None = None
         # Set together with the job, and only read by _poll_analysis, so the
         # result of whichever button started it lands in that button's own
         # status label and layers. One job at a time is enforced in
@@ -1151,6 +1178,7 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
             except BrokerError as error:
                 self._scan_status.setText(str(error))
         self._save_scan_preferences()
+        self._refresh_region_label()
 
     def scan_parameters(self, profile: str) -> ScanParameters:
         """
@@ -2127,11 +2155,14 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         number computed per pixel from it would be computed against a
         position nothing established.
 
-        Blocking, for now. The whole pass runs on the GUI thread, which
-        is tolerable for the preview's small grids and is not what a real
-        acquisition needs; moving it behind a job like
-        :class:`~miainwoodpecker.storage.session.RecordingJob` is the
-        next step, and is why the grid offered here is deliberately small.
+        **Where the probe goes** is the region drawn on the survey scan
+        with :meth:`mark_spectrum_image_region`, or the whole field of
+        view when none is drawn; :meth:`_pass_parameters` turns either
+        into a grid. The pass runs behind a
+        :class:`~miainwoodpecker.viewer.jobs.PassJob`, and the display
+        timer samples it: the spectrum image's virtual-detector map, the
+        spectrum at the position the probe is on, and each scan channel
+        as it fills in — see :meth:`_poll_pass`.
         """
         from miainwoodpecker.storage.passes import PassWriter  # noqa: PLC0415
 
@@ -2223,10 +2254,19 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         positions = f"{parameters.height}x{parameters.width}"
         path, index, slug, started_at = self._session.reserve("spectrum-image")
         self._recording_status.setText(f"acquiring {positions} pass...")
-        channels = list(range(len(self.channel_names())))
+        names = list(self.channel_names())
+        channels = list(range(len(names)))
         # Built on the GUI thread and read from it, so the worker only
         # ever writes through them. See viewer/progress.py.
         watched: dict[str, progress.PassPreview] = {}
+        # One window per scan channel, keyed by the channel's *name*,
+        # which is what tells the scan unit to write that channel through
+        # position by position. The same tee the detector's cube gets,
+        # over a bare array: nothing here goes to disk, because the
+        # channel's frame in the finished pass is what the writer keeps.
+        channel_windows = progress.previews(
+            {name: np.zeros(parameters.shape, dtype=np.float32) for name in names},
+        )
         # The detector's energy axis, filled by the worker when it sizes
         # the file and read by the display timer to label the plot. Same
         # arrangement as `watched` above, and for the same reason: one
@@ -2278,13 +2318,15 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
                         parameters,
                         channels=channels,
                         targets=[target],
-                        into=watched,
+                        into={**channel_windows, **watched},
                     )
                     writer.finish(result)
                     return result
 
         self._pass_job = jobs_module.PassJob(run)
         self._pass_preview = watched
+        self._pass_channel_preview = channel_windows
+        self._pass_geometry = parameters
         self._pass_dispersion = dispersion
         self._pass_target = target
         self._pass_path = path
@@ -2318,6 +2360,8 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         running = job.is_running
         for name, preview in self._pass_preview.items():
             self._show_pass_preview(name, preview)
+        for name, preview in self._pass_channel_preview.items():
+            self._show_pass_map(f"Acquiring ({name})", preview)
         if running:
             done = sum(preview.positions for preview in self._pass_preview.values())
             total = sum(preview.total for preview in self._pass_preview.values())
@@ -2363,10 +2407,39 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         if not preview.positions:
             return
         self._show_pass_spectrum(target, preview)
-        layer_name = f"Acquiring ({target})"
+        self._show_pass_map(f"Acquiring ({target})", preview)
+
+    def _show_pass_map(self, layer_name: str, preview: progress.PassPreview) -> None:
+        """
+        Draw one progress map: a detector's virtual image, or a scan channel.
+
+        Drawn to the pass's own scale when the grid is known, so the
+        panel's scale bar says how many nanometres the region is rather
+        than how many positions - the same calibration the finished
+        pass's channels get on disk.
+
+        Parameters
+        ----------
+        layer_name : str
+            The panel to draw in.
+        preview : progress.PassPreview
+            The map being built.
+        """
+        if not preview.positions:
+            return
         if layer_name not in self._viewer.layers:
             self._bring_to_front(layer_name)
-            self._viewer.add_image(preview.map, name=layer_name, colormap="gray")
+            geometry: dict[str, object] = {}
+            grid = preview.grid
+            if self._pass_geometry is not None and len(grid) == _IMAGE_READOUT_RANK:
+                calibration = FrameCalibration.from_field_size(
+                    self._pass_geometry.fov_size_nm,
+                    (int(grid[0]), int(grid[1])),
+                )
+                geometry = axes.layer_axes(calibration)
+            self._viewer.add_image(
+                preview.map, name=layer_name, colormap="gray", **geometry,
+            )
         layer = self._viewer.layers[layer_name]
         # The same array every tick, updated in place, so this is a
         # redraw rather than a new upload of a new object.
@@ -2427,12 +2500,210 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
             title=f"position {where} of {rows}x{columns}",
         )
 
+    def mark_spectrum_image_region(self) -> None:
+        """
+        Draw the region the next spectrum image covers, or remove it.
+
+        **The survey scan is the reference.** The rectangle goes on the
+        panel of the first enabled detector that has an image on screen
+        - from the live view, a Preview, or an acquired image - and it is
+        that image's calibration that turns the rectangle back into
+        nanometres when the pass is taken. With nothing on screen there
+        is nothing to draw on, and the status line says to take a survey
+        scan first rather than drawing a rectangle on nothing.
+
+        The first rectangle covers the middle half of the field of view.
+        It is a napari shapes layer in *select* mode, so it already has
+        drag handles: the operator moves and resizes it, the **Grid** row
+        follows, and nothing here has to be told. Pressing again removes
+        it, and the next pass covers the whole field of view again.
+        """
+        if not self._has_scanner:
+            return
+        if _REGION_LAYER in self._viewer.layers:
+            del self._viewer.layers[_REGION_LAYER]
+            self._region_reference = None
+            self._refresh_region_label()
+            self._scan_status.setText(
+                "region removed - the next spectrum image covers the whole "
+                "field of view",
+            )
+            return
+        reference = self._survey_layer_name()
+        if reference is None:
+            self._scan_status.setText(
+                "take a survey scan first (Start, Preview or Acquire) - the "
+                "region is drawn on it",
+            )
+            return
+        frame = self._displayed[reference]
+        height, width = (int(size) for size in frame.data.shape[-2:])
+        low, high = (1.0 - _REGION_FRACTION) / 2.0, (1.0 + _REGION_FRACTION) / 2.0
+        corners = np.array(
+            [
+                [height * low, width * low],
+                [height * low, width * high],
+                [height * high, width * high],
+                [height * high, width * low],
+            ],
+        )
+        scale, translate = self._survey_geometry(frame)
+        # The image's own units on the rectangle too: napari warns about
+        # a panel whose layers disagree, and stops using units at all.
+        units = axes.layer_axes(axes.frame_calibration(frame.data, frame.metadata))[
+            "units"
+        ]
+        layer = self._viewer.add_shapes(
+            [corners * scale + translate],
+            shape_type="rectangle",
+            name=_REGION_LAYER,
+            edge_color=_REGION_EDGE_COLOR,
+            face_color="transparent",
+            # In the image's world units, so the edge stays a couple of
+            # survey pixels wide whatever the field of view is.
+            edge_width=float(2.0 * min(scale)),
+            units=tuple(typing.cast("tuple[str, ...]", units)[-2:]),
+            metadata={ATTACHED_TO: reference},
+        )
+        if layer is None:
+            return
+        self._region_reference = reference
+        # Handles, immediately: the whole point of using a shapes layer
+        # is that the rectangle can be dragged, and it can only be
+        # dragged once it is selected in select mode. Best effort - a
+        # display that cannot do this still has the rectangle.
+        with contextlib.suppress(Exception):
+            layer.mode = "select"
+            layer.selected_data = {0}
+            layer.events.data.connect(lambda *_: self._refresh_region_label())
+        self._refresh_region_label()
+        self._scan_status.setText(
+            f"region drawn on {reference} - drag its corners, then acquire "
+            f"the spectrum image",
+        )
+
+    def _survey_layer_name(self) -> str | None:
+        """
+        Return the scan layer a region can be drawn on, if there is one.
+
+        Returns
+        -------
+        str | None
+            The first enabled detector's layer that has a frame on
+            screen, or None when no survey scan has been taken.
+        """
+        for name in self._scan_request[2]:
+            layer_name = self._scan_layer_name(name)
+            if layer_name in self._displayed and layer_name in self._viewer.layers:
+                return layer_name
+        return None
+
+    @staticmethod
+    def _survey_geometry(frame: Frame) -> tuple[np.ndarray, np.ndarray]:
+        """
+        Return how a survey frame's pixels map to its panel's world units.
+
+        The same keywords the frame's image layer was given, read back
+        as arrays, so a rectangle in the panel's coordinates and a pixel
+        of the survey scan convert into one another exactly.
+
+        Parameters
+        ----------
+        frame : Frame
+            The survey scan on screen.
+
+        Returns
+        -------
+        tuple[np.ndarray, np.ndarray]
+            ``(scale, translate)`` for the last two axes: world equals
+            ``pixel * scale + translate``.
+        """
+        geometry = axes.layer_axes(axes.frame_calibration(frame.data, frame.metadata))
+        scale = np.asarray(geometry["scale"], dtype=float)[-2:]
+        translate = np.asarray(geometry["translate"], dtype=float)[-2:]
+        return scale, translate
+
+    def _spectrum_image_region(
+        self,
+    ) -> tuple[tuple[float, float], tuple[float, float]] | None:
+        """
+        Read the drawn region back as an extent and a centre, in nanometres.
+
+        Returns
+        -------
+        tuple[tuple[float, float], tuple[float, float]] | None
+            ``((height_nm, width_nm), (center_y_nm, center_x_nm))``, the
+            centre relative to the scan unit's axis - the survey scan's
+            own centre plus the rectangle's offset from the middle of
+            it. None when no region is drawn, when its survey scan has
+            gone, when the survey scan carries no calibration to
+            convert with, or when the rectangle is too thin to be an
+            area - in each of which cases the next pass covers the whole
+            field of view, which the Grid row says.
+        """
+        reference = self._region_reference
+        if reference is None or _REGION_LAYER not in self._viewer.layers:
+            return None
+        frame = self._displayed.get(reference)
+        if frame is None:
+            return None
+        layer = self._viewer.layers[_REGION_LAYER]
+        shapes = list(layer.data)
+        if not shapes:
+            return None
+        vertices = np.asarray(shapes[0], dtype=float)[:, -2:]
+        # The shapes layer's own geometry is normally the identity, but
+        # a display is free to give it one; read it rather than assume.
+        vertices = (
+            vertices * np.asarray(layer.scale, dtype=float)[-2:]
+            + np.asarray(layer.translate, dtype=float)[-2:]
+        )
+        scale, translate = self._survey_geometry(frame)
+        calibration = axes.frame_calibration(frame.data, frame.metadata)
+        if calibration.y.units != "nm" or calibration.x.units != "nm":
+            return None
+        height, width = (float(size) for size in frame.data.shape[-2:])
+        pixels = (vertices - translate) / scale
+        top, left = np.clip(pixels.min(axis=0), 0.0, [height, width])
+        bottom, right = np.clip(pixels.max(axis=0), 0.0, [height, width])
+        if bottom - top < _MIN_REGION_PIXELS or right - left < _MIN_REGION_PIXELS:
+            return None
+        pixel_y_nm, pixel_x_nm = float(calibration.y.scale), float(calibration.x.scale)
+        extent = ((bottom - top) * pixel_y_nm, (right - left) * pixel_x_nm)
+        base = frame.metadata.get("center_nm") or (0.0, 0.0)
+        centre = (
+            float(base[0]) + ((top + bottom) / 2.0 - height / 2.0) * pixel_y_nm,
+            float(base[1]) + ((left + right) / 2.0 - width / 2.0) * pixel_x_nm,
+        )
+        return extent, centre
+
+    def _refresh_region_label(self) -> None:
+        """Say what the next pass will cover, in positions and in nanometres."""
+        label = getattr(self, "_region_label", None)
+        if label is None or not self._has_scanner:
+            return
+        parameters = self._pass_parameters()
+        extent_y, extent_x = parameters.fov_size_nm
+        where = (
+            "over the marked region"
+            if self._spectrum_image_region() is not None
+            else "over the whole field of view"
+        )
+        label.setText(
+            f"{parameters.height}x{parameters.width} positions {where}: "
+            f"{extent_y:.1f} x {extent_x:.1f} nm",
+        )
+
     def _pass_parameters(self) -> ScanParameters:
         """
         Return the geometry the next synchronised pass will use.
 
-        The panel's, normally: a square grid of **Positions** beam
-        positions over the field of view, at the Acquire profile's dwell.
+        The panel's, normally: **Positions** beam positions along the
+        longer side, at the Acquire profile's dwell. Over the region
+        drawn on the survey scan when there is one - the other side
+        follows from the region's aspect ratio, so the grid samples what
+        was drawn with square pixels - and as a square grid over the
+        whole field of view when there is not.
 
         **Unless the device has only one geometry it can acquire**, which
         is the case for a replay device: it holds the grid the probe
@@ -2459,11 +2730,28 @@ class LiveInstrumentWidget(QtWidgets.QWidget):
         if native is not None:
             return native
         positions = self._positions_spin.value()
+        dwell_us = self._profile_settings(profiles.ACQUIRE).dwell_us
+        region = self._spectrum_image_region()
+        if region is None:
+            return ScanParameters(
+                height=positions,
+                width=positions,
+                pixel_time_us=dwell_us,
+                fov_nm=self._fov_spin.value(),
+            )
+        (height_nm, width_nm), centre = region
+        # Positions along the longer side; the shorter side gets what
+        # square pixels of that size cover, never fewer than one.
+        if height_nm >= width_nm:
+            height, width = positions, max(1, round(positions * width_nm / height_nm))
+        else:
+            height, width = max(1, round(positions * height_nm / width_nm)), positions
         return ScanParameters(
-            height=positions,
-            width=positions,
-            pixel_time_us=self._profile_settings(profiles.ACQUIRE).dwell_us,
-            fov_nm=self._fov_spin.value(),
+            height=height,
+            width=width,
+            pixel_time_us=dwell_us,
+            fov_nm=max(height_nm, width_nm),
+            center_nm=centre,
         )
 
     @staticmethod

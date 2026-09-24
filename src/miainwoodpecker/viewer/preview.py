@@ -88,6 +88,7 @@ import argparse
 import dataclasses
 import datetime
 import math
+import time
 import typing
 
 import numpy as np
@@ -563,15 +564,27 @@ class PreviewScanner(_SyntheticSource):
     cameras : Mapping[str, _PreviewCameraBase] | None
         Cameras wired to this column, readable during a synchronised
         pass. None for a scan unit with nothing attached to it.
+    paced : bool
+        Whether a synchronised pass takes the time a real one would:
+        each beam position waits out the longer of the scan dwell and
+        the exposure of every camera being read out, which is what a
+        column driving a detector's trigger does. Off by default, so a
+        test suite that takes thousands of passes finishes; on for the
+        window, where a pass that lands whole in a millisecond would
+        leave nothing to watch build — and watching it build is the
+        workflow the window exists to show.
     """
 
     def __init__(
         self,
         instrument: PreviewInstrument | None = None,
         cameras: Mapping[str, _PreviewCameraBase] | None = None,
+        *,
+        paced: bool = False,
     ) -> None:
         super().__init__(instrument, _RNG_SEED)
         self._pass_index = 0
+        self._paced = paced
         # The cameras this scanner can read out *during* a pass. Held by
         # the scanner because that is where the capability lives: a
         # synchronised acquisition is the scan unit driving the detector
@@ -709,12 +722,21 @@ class PreviewScanner(_SyntheticSource):
             Values in ``[-1, 1]``, before contrast and blanking.
         """
         height, width = parameters.shape
-        span_y_nm, span_x_nm = parameters.fov_size_nm
+        pixel_nm = parameters.pixel_size_nm
         stage_y_nm, stage_x_nm = self._instrument.stage_position_nm()
-        y_nm = np.linspace(0.0, span_y_nm, height, dtype=np.float32)
-        y_nm += stage_y_nm + drift_nm
-        x_nm = np.linspace(0.0, span_x_nm, width, dtype=np.float32)
-        x_nm += stage_x_nm
+        center_y_nm, center_x_nm = parameters.center_nm
+        # Sampled about the scan's centre rather than from its corner,
+        # and at the scan's own pixel pitch rather than by dividing the
+        # extent into one fewer step. Both are what make a region of a
+        # survey scan land on the piece of specimen the survey showed
+        # there: a pass whose centre is offset by (dy, dx) from the
+        # survey's and whose pixels are the survey's size samples the
+        # survey's own pixel positions, and nothing else in this file
+        # has to know a region was involved.
+        y_nm = (np.arange(height, dtype=np.float32) - (height - 1) / 2.0) * pixel_nm
+        y_nm += stage_y_nm + center_y_nm + drift_nm
+        x_nm = (np.arange(width, dtype=np.float32) - (width - 1) / 2.0) * pixel_nm
+        x_nm += stage_x_nm + center_x_nm
         wavenumber = 2.0 * np.pi / _SPECIMEN_SPACING_NM
         return np.outer(np.cos(y_nm * wavenumber), np.cos(x_nm * wavenumber))
 
@@ -777,6 +799,7 @@ class PreviewScanner(_SyntheticSource):
                 "simultaneous_channels": list(simultaneous),
                 "fov_nm": parameters.fov_nm,
                 "fov_size_nm": list(parameters.fov_size_nm),
+                "center_nm": list(parameters.center_nm),
                 "pixel_time_us": parameters.pixel_time_us,
                 "defocus_nm": instrument.defocus_nm(),
             },
@@ -830,12 +853,138 @@ class PreviewScanner(_SyntheticSource):
             place. None allocates. A preview that allocated the wrong
             way would be a poor model of the acquisition it exists to
             prototype, so this path is the same one the real adapters
-            will take.
+            will take. A key naming one of this scanner's *channels* is
+            a window onto that channel's image, written one position at
+            a time as the pass goes, so the survey image can be watched
+            building beside the spectrum image.
 
         Returns
         -------
         ScanPass
             The pass and everything read out of it.
+
+        Notes
+        -----
+        Propagates ``ValueError`` from :meth:`_check_pass_request` when
+        nothing was asked for, a channel is repeated, or a target is not
+        one this scanner can synchronise, and ``IndexError`` when a
+        channel this scanner does not have is requested; and
+        ``ValueError`` from :meth:`_destination` when a caller's array is
+        the wrong shape or a projecting target has no energy axis. All
+        before the probe moves.
+        """
+        requested, wanted = self._check_pass_request(channels, targets)
+
+        pass_id = f"{self.scanner_id}-sync-{self._pass_index}"
+        drift_nm = self._pass_index * _DRIFT_NM_PER_PASS
+        self._pass_index += 1
+        lattice = self._sample_specimen(parameters, drift_nm)
+        timestamp = _now()
+        images = [
+            self._read_out(
+                lattice,
+                parameters=parameters,
+                channel=index,
+                pass_id=pass_id,
+                simultaneous=requested,
+                timestamp=timestamp,
+            )
+            for index in requested
+        ]
+        # What a target contributes is decided by the readout mode it is
+        # *in*, not by what kind of detector it is: a spectrometer left
+        # imaging really does produce a full frame per beam position, and
+        # storing that as a 4D stack is the truthful thing to do with it.
+        # The camera's settings are the acquisition's settings, which is
+        # also why `DiffractionStack` carries one `CameraParameters` for
+        # the whole stack rather than one per position.
+        destinations = dict(into or {})
+        # Every destination is validated or allocated *before* the probe
+        # moves: a caller pre-allocating gigabytes deserves to be told
+        # which number it got wrong before the pass, not after.
+        cubes = {
+            name: self._destination(name, lattice.shape, destinations.get(name))
+            for name in wanted
+        }
+        # A destination named after a channel is a window onto that
+        # channel's image as the pass goes - see the interface. The
+        # frame itself is complete already; this writes the same values
+        # through one position at a time so a caller can watch them.
+        channel_windows = [
+            (destinations[_CHANNEL_NAMES[index]], images[position].data)
+            for position, index in enumerate(requested)
+            if _CHANNEL_NAMES[index] in destinations
+        ]
+        # One loop over the beam positions, for every signal at once.
+        # That is what a synchronised pass *is* - the scan advancing and
+        # every detector reading out at each position - and it is also
+        # what lets the pass be watched: a loop per target would fill the
+        # first cube completely before the second saw a position.
+        self._traverse(
+            lattice,
+            cubes=cubes,
+            channel_windows=channel_windows,
+            period_s=self._position_period_s(parameters, wanted),
+        )
+        # Every device that read this traversal out, named once so a
+        # spectrum image can say what shares its probe positions. The
+        # scanner appears as one id covering all its channels, which is
+        # what it is: one device, several detectors.
+        participants = [
+            *([self.scanner_id] if requested else []),
+            *(self._cameras[name].camera_id for name in wanted),
+        ]
+        diffraction = {}
+        spectra = {}
+        for name in wanted:
+            if self._cameras[name].parameters().readout == PROJECTED_READOUT:
+                spectra[name] = self._spectrum_image(
+                    name,
+                    cubes[name],
+                    parameters=parameters,
+                    pass_id=pass_id,
+                    timestamp=timestamp,
+                    participants=participants,
+                )
+            else:
+                diffraction[name] = self._diffraction_stack(
+                    name,
+                    cubes[name],
+                    pass_id=pass_id,
+                    timestamp=timestamp,
+                )
+        return ScanPass(
+            pass_id=pass_id,
+            parameters=parameters,
+            images=images,
+            # Every synthetic signal here comes from one loop over one
+            # sampled region, so the correlation is a fact about how it
+            # was produced. Reported as scanner-mastered because that is
+            # what this loop is: the scan drives and the camera follows.
+            scan_sync=SCAN_SYNC_SCANNER,
+            diffraction=diffraction,
+            spectra=spectra,
+        )
+
+    def _check_pass_request(
+        self,
+        channels: Sequence[int],
+        targets: Sequence[str],
+    ) -> tuple[list[int], list[str]]:
+        """
+        Validate what a synchronised pass was asked to read out.
+
+        Parameters
+        ----------
+        channels : Sequence[int]
+            Intensity channels requested.
+        targets : Sequence[str]
+            Camera targets requested.
+
+        Returns
+        -------
+        tuple[list[int], list[str]]
+            The channels and targets, as lists.
 
         Raises
         ------
@@ -870,111 +1019,171 @@ class PreviewScanner(_SyntheticSource):
                 f"synchronise {list(self._cameras)}"
             )
             raise ValueError(msg)
+        return requested, wanted
 
-        pass_id = f"{self.scanner_id}-sync-{self._pass_index}"
-        drift_nm = self._pass_index * _DRIFT_NM_PER_PASS
-        self._pass_index += 1
-        lattice = self._sample_specimen(parameters, drift_nm)
-        timestamp = _now()
-        images = [
-            self._read_out(
-                lattice,
-                parameters=parameters,
-                channel=index,
-                pass_id=pass_id,
-                simultaneous=requested,
-                timestamp=timestamp,
+    def _traverse(
+        self,
+        lattice: np.ndarray,
+        *,
+        cubes: Mapping[str, np.ndarray],
+        channel_windows: Sequence[tuple[np.ndarray, np.ndarray]],
+        period_s: float,
+    ) -> None:
+        """
+        Visit every beam position once, reading every signal out at each.
+
+        Parameters
+        ----------
+        lattice : np.ndarray
+            The pass's sampled specimen modulation, one value per position.
+        cubes : Mapping[str, np.ndarray]
+            Each target's destination, written at ``[row, column]``.
+        channel_windows : Sequence[tuple[np.ndarray, np.ndarray]]
+            Pairs of a caller's window and the finished channel image it
+            is fed from, one position at a time.
+        period_s : float
+            Seconds each position takes, or zero to run flat out.
+        """
+        started = time.monotonic()
+        visited = 0
+        for row in range(lattice.shape[0]):
+            for column in range(lattice.shape[1]):
+                state = self._probe_state(lattice, row, column)
+                for name, cube in cubes.items():
+                    cube[row, column] = self._cameras[name].readout_at(state)
+                for window, image in channel_windows:
+                    window[row, column] = image[row, column]
+                visited += 1
+                if period_s > 0.0:
+                    # Against a schedule rather than sleeping the period
+                    # each time, so the readout's own cost does not
+                    # accumulate into drift over a long pass.
+                    remaining = started + visited * period_s - time.monotonic()
+                    if remaining > 0.0:
+                        time.sleep(remaining)
+
+    def _position_period_s(
+        self,
+        parameters: ScanParameters,
+        targets: Sequence[str],
+    ) -> float:
+        """
+        Return how long one beam position takes, or zero when unpaced.
+
+        Parameters
+        ----------
+        parameters : ScanParameters
+            The pass's scan geometry, for its dwell.
+        targets : Sequence[str]
+            The cameras read out at each position, for their exposures.
+
+        Returns
+        -------
+        float
+            Seconds per position: the longer of the dwell and the
+            slowest exposure, because a scan driving a detector's trigger
+            waits for the detector, and a detector faster than the dwell
+            waits for the scan. Zero when this scanner was built unpaced.
+        """
+        if not self._paced:
+            return 0.0
+        exposures_s = [
+            self._cameras[name].parameters().exposure_ms / 1000.0 for name in targets
+        ]
+        return max([parameters.pixel_time_us / 1e6, *exposures_s])
+
+    def _destination(
+        self,
+        name: str,
+        grid: tuple[int, ...],
+        destination: np.ndarray | None,
+    ) -> np.ndarray:
+        """
+        Return the cube one target's readouts will be written into.
+
+        Sized from what the target will produce at each beam position -
+        its energy channels when projecting, its detector shape when
+        imaging - and either the caller's array, checked against that,
+        or a fresh one.
+
+        Parameters
+        ----------
+        name : str
+            The camera's target name.
+        grid : tuple[int, ...]
+            The pass's beam positions, as ``(rows, columns)``.
+        destination : np.ndarray | None
+            A pre-allocated cube to fill, or None to allocate one.
+
+        Returns
+        -------
+        np.ndarray
+            The cube, navigation axes first.
+
+        Raises
+        ------
+        ValueError
+            If the target is projecting but has no energy axis - its
+            counts would not be spectra, and a
+            :class:`~miainwoodpecker.devices.interface.Spectrum` cannot
+            exist without one - or if ``destination`` does not match
+            what the pass will produce. The whole shape is checked, not
+            only the navigation axes: a wrong detector size let through
+            here surfaced as an h5py broadcast error naming neither the
+            target nor the acquisition.
+        """
+        camera = self._cameras[name]
+        if camera.parameters().readout == PROJECTED_READOUT:
+            if camera.frame_calibration().energy_axis_name() is None:
+                msg = (
+                    f"{name} is set to a projected readout but reports no "
+                    f"energy-calibrated axis, so its counts are not spectra; a "
+                    f"camera with no dispersive direction cannot produce a "
+                    f"spectrum image"
+                )
+                raise ValueError(msg)
+            per_position: tuple[int, ...] = (camera.channel_count,)
+            described = f"{camera.channel_count} energy channels"
+        else:
+            per_position = tuple(camera.readout_shape)
+            described = str(per_position)
+        expected = (*grid, *per_position)
+        if destination is None:
+            return np.empty(expected, dtype=np.float32)
+        if tuple(destination.shape) != expected:
+            msg = (
+                f"destination for {name} has shape {tuple(destination.shape)}, "
+                f"but the pass produces {expected} ({grid} beam positions of "
+                f"{described})"
             )
-            for index in requested
-        ]
-        # What a target contributes is decided by the readout mode it is
-        # *in*, not by what kind of detector it is: a spectrometer left
-        # imaging really does produce a full frame per beam position, and
-        # storing that as a 4D stack is the truthful thing to do with it.
-        # The camera's settings are the acquisition's settings, which is
-        # also why `DiffractionStack` carries one `CameraParameters` for
-        # the whole stack rather than one per position.
-        destinations = dict(into or {})
-        # Every device that read this traversal out, named once so a
-        # spectrum image can say what shares its probe positions. The
-        # scanner appears as one id covering all its channels, which is
-        # what it is: one device, several detectors.
-        participants = [
-            *([self.scanner_id] if requested else []),
-            *(self._cameras[name].camera_id for name in wanted),
-        ]
-        diffraction = {}
-        spectra = {}
-        for name in wanted:
-            if self._cameras[name].parameters().readout == PROJECTED_READOUT:
-                spectra[name] = self._spectrum_image(
-                    name,
-                    lattice,
-                    parameters=parameters,
-                    pass_id=pass_id,
-                    timestamp=timestamp,
-                    destination=destinations.get(name),
-                    participants=participants,
-                )
-            else:
-                diffraction[name] = self._diffraction_stack(
-                    name,
-                    lattice,
-                    pass_id=pass_id,
-                    timestamp=timestamp,
-                    destination=destinations.get(name),
-                )
-        return ScanPass(
-            pass_id=pass_id,
-            parameters=parameters,
-            images=images,
-            # Every synthetic signal here comes from one loop over one
-            # sampled region, so the correlation is a fact about how it
-            # was produced. Reported as scanner-mastered because that is
-            # what this loop is: the scan drives and the camera follows.
-            scan_sync=SCAN_SYNC_SCANNER,
-            diffraction=diffraction,
-            spectra=spectra,
-        )
+            raise ValueError(msg)
+        return destination
 
     def _spectrum_image(  # noqa: PLR0913 - one call site; splitting it would only hide the arity
         self,
         name: str,
-        lattice: np.ndarray,
+        cube: np.ndarray,
         *,
         parameters: ScanParameters,
         pass_id: str,
         timestamp: datetime.datetime,
-        destination: np.ndarray | None,
         participants: Sequence[str],
     ) -> Spectrum:
         """
-        Build one spectrometer's spectrum image for an already-traversed pass.
+        Describe one spectrometer's filled cube as the pass's spectrum image.
 
-        The spectrum-side twin of :meth:`_diffraction_stack`, and it
-        differs in one thing that matters: a
-        :class:`~miainwoodpecker.devices.interface.Spectrum` **cannot
-        exist without its energy axis**, so a target that is projecting
-        but has no dispersive direction is refused here rather than
-        stored as counts against nothing. Nothing this module assembles
-        can reach that state — a camera with no dispersive axis refuses a
-        projected readout in ``configure`` — but the scanner accepts the
-        cameras it is given, and a detector that lies about its own axes
-        should meet an error rather than produce a spectrum image whose
-        energies are pixel indices.
-
-        The composition under the probe is read from the same sampled
-        specimen field the image channels are read from, which is what
-        makes a silicon map computed from this pass track the HAADF
+        The spectrum-side twin of :meth:`_diffraction_stack`. The cube
+        was filled by the pass loop, position by position, from the same
+        sampled specimen field the image channels are read from - which
+        is what makes a silicon map computed from it track the HAADF
         channel of the same pass rather than merely resemble it.
 
         Parameters
         ----------
         name : str
             The camera's target name.
-        lattice : np.ndarray
-            The pass's sampled specimen modulation, one value per beam
-            position.
+        cube : np.ndarray
+            The filled rank-3 cube, energy on the last axis.
         parameters : ScanParameters
             The pass's scan geometry, recorded so storage calibrates the
             navigation axes through the path a scanned frame uses.
@@ -982,8 +1191,6 @@ class PreviewScanner(_SyntheticSource):
             Identifier shared by every output of this pass.
         timestamp : datetime.datetime
             The pass's acquisition time.
-        destination : np.ndarray | None
-            A pre-allocated cube to fill, or None to allocate one.
         participants : Sequence[str]
             Every device id read out during this pass, recorded as the
             spectrum's ``simultaneous_with``.
@@ -992,47 +1199,14 @@ class PreviewScanner(_SyntheticSource):
         -------
         Spectrum
             The rank-3 spectrum image, energy on the last axis.
-
-        Raises
-        ------
-        ValueError
-            If the target has no energy axis, or if ``destination`` does
-            not match what the pass will produce.
         """
         camera = self._cameras[name]
         calibration = camera.frame_calibration()
         energy_name = calibration.energy_axis_name()
-        if energy_name is None:
-            msg = (
-                f"{name} is set to a projected readout but reports no "
-                f"energy-calibrated axis, so its counts are not spectra; a "
-                f"camera with no dispersive direction cannot produce a "
-                f"spectrum image"
-            )
-            raise ValueError(msg)
+        # Refused in _destination before the pass ran; asserted rather
+        # than re-raised so the type checker knows the axis is there.
+        assert energy_name is not None  # noqa: S101 - checked before the loop
         energy = calibration.axis(energy_name).converted_to("eV")
-        channels = camera.channel_count
-        expected = (*lattice.shape, channels)
-        cube = destination
-        if cube is None:
-            cube = np.empty(expected, dtype=np.float32)
-        elif tuple(cube.shape) != expected:
-            msg = (
-                f"destination for {name} has shape {tuple(cube.shape)}, but "
-                f"the pass produces {expected} ({lattice.shape} beam "
-                f"positions of {channels} energy channels)"
-            )
-            raise ValueError(msg)
-        # Written through position by position for the reason the
-        # diffraction cube is: the destination may be an h5py dataset
-        # chunked one beam position per chunk, and then each assignment
-        # is a single chunk write that overlaps the next position's
-        # exposure instead of following the whole acquisition.
-        for row in range(lattice.shape[0]):
-            for column in range(lattice.shape[1]):
-                cube[row, column] = camera.readout_at(
-                    self._probe_state(lattice, row, column),
-                )
         settings = camera.parameters()
         metadata: dict[str, object] = {
             "device_id": camera.camera_id,
@@ -1051,6 +1225,7 @@ class PreviewScanner(_SyntheticSource):
             # rejected as "an id that nothing establishes".
             "simultaneous_with": list(participants),
             "fov_size_nm": list(parameters.fov_size_nm),
+            "center_nm": list(parameters.center_nm),
             "pixel_time_us": parameters.pixel_time_us,
             "exposure_ms": settings.exposure_ms,
             "binning": settings.binning,
@@ -1073,69 +1248,31 @@ class PreviewScanner(_SyntheticSource):
     def _diffraction_stack(
         self,
         name: str,
-        lattice: np.ndarray,
+        cube: np.ndarray,
         *,
         pass_id: str,
         timestamp: datetime.datetime,
-        destination: np.ndarray | None,
     ) -> DiffractionStack:
         """
-        Build one camera's datacube for an already-traversed pass.
+        Describe one camera's filled cube as the pass's datacube.
 
         Parameters
         ----------
         name : str
             The camera's target name.
-        lattice : np.ndarray
-            The pass's sampled specimen modulation, one value per beam
-            position.
+        cube : np.ndarray
+            The filled 4D cube, navigation axes first.
         pass_id : str
             Identifier shared by every output of this pass.
         timestamp : datetime.datetime
             The pass's acquisition time.
-        destination : np.ndarray | None
-            A pre-allocated cube to fill, or None to allocate one.
 
         Returns
         -------
         DiffractionStack
             The 4D data, navigation axes first.
-
-        Raises
-        ------
-        ValueError
-            If ``destination`` does not cover the pass's beam positions.
         """
         camera = self._cameras[name]
-        detector = camera.readout_shape
-        expected = (*lattice.shape, *detector)
-        cube = destination
-        if cube is None:
-            cube = np.empty(expected, dtype=np.float32)
-        elif tuple(cube.shape) != expected:
-            # The whole shape, not just the navigation axes. Checking half
-            # of it let a wrong detector size through to the write loop,
-            # where it surfaced as an h5py broadcast TypeError naming
-            # neither the target nor the acquisition - and a caller
-            # pre-allocating gigabytes deserves to be told which of the
-            # two numbers it got wrong.
-            msg = (
-                f"destination for {name} has shape {tuple(cube.shape)}, but "
-                f"the pass produces {expected} ({lattice.shape} beam "
-                f"positions of {detector})"
-            )
-            raise ValueError(msg)
-        # Written into the cube position by position rather than built as
-        # a list of arrays and stacked. The stacking version allocated
-        # every pattern twice and moved the whole dataset a second time,
-        # which is the cost this interface's `into` exists to avoid - and
-        # a preview that allocated the wrong way would be a poor model of
-        # the acquisition it exists to prototype.
-        for row in range(lattice.shape[0]):
-            for column in range(lattice.shape[1]):
-                cube[row, column] = camera.readout_at(
-                    self._probe_state(lattice, row, column),
-                )
         return DiffractionStack(
             data=cube,
             camera_id=camera.camera_id,
@@ -2292,6 +2429,7 @@ def build_preview_devices(
     camera: bool = True,
     camera_count: int = 1,
     controls: Iterable[str] | None = None,
+    paced: bool = False,
 ) -> PreviewDevices:
     """
     Build a preview instrument in whatever shape the window needs.
@@ -2308,6 +2446,9 @@ def build_preview_devices(
         detectors on a bench.
     controls : Iterable[str] | None
         Which controls the instrument publishes, or None for all.
+    paced : bool
+        Whether the scan unit's synchronised pass takes real time per
+        beam position; see :class:`PreviewScanner`.
 
     Returns
     -------
@@ -2348,7 +2489,7 @@ def build_preview_devices(
         # synchronised pass is the scan unit reading them out per beam
         # position, so it has to hold them. Built after them for that
         # reason, rather than beside them.
-        scanner=PreviewScanner(instrument=instrument, cameras=cameras)
+        scanner=PreviewScanner(instrument=instrument, cameras=cameras, paced=paced)
         if scan
         else None,
         cameras=cameras,
@@ -2518,6 +2659,9 @@ def main(argv: list[str] | None = None) -> int:
         camera=args.camera,
         camera_count=args.cameras,
         controls=args.controls,
+        # The window is for watching a pass build, so here the pass
+        # takes the time a real one takes. The tests build unpaced.
+        paced=True,
     )
     window = documents.open_window(f"miainwoodpecker ({PREVIEW_BACKEND})")
     widget = LiveInstrumentWidget(

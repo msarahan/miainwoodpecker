@@ -263,27 +263,24 @@ of it works on the preview instrument and on a replayed session.
    monitor. That is a second, larger step; the survey's DECTRIS run
    records the trigger configuration the detector is in today.
 
-2. **The region.** The grid is square, Positions × Positions, and the
-   panel says it is "a placeholder for the target-area UI: the aspect
-   ratio should come from a region drawn on the reference scan"
-   ([`panels/devices.py:265-269`](../src/miainwoodpecker/viewer/panels/devices.py)).
-   A rectangle on the HAADF panel, converted to a scan centre, field of
-   view and aspect ratio, needs the scan-geometry fields from the STEM
-   image list above. The document board already has an `add_shapes`
-   used by the py4DSTEM overlay
-   ([`viewer/documents.py:1841`](../src/miainwoodpecker/viewer/documents.py)).
+2. ~~**The region.**~~ **Built, on the preview, after this survey was
+   written.** `ScanParameters` gained `center_nm`, the Scan toolbar
+   gained a region button that draws an editable rectangle on the
+   survey scan, the grid takes its aspect ratio from the rectangle with
+   Positions along the long side, and the scan channels build live in
+   `Acquiring (HAADF)` beside the spectrum. What remains of this item
+   is the hardware half: the Nion server passes `center_nm` through to
+   the column's own `ScanFrameParameters`, but has no synchronised pass
+   to use it in (item 1).
 3. **No cancel.** Stop recording cancels a `RecordingJob` only
    ([`live.py:2615-2627`](../src/miainwoodpecker/viewer/live.py)); a
    running pass has no stop, and a second press starts a second pass
    over the first (`_run_spectrum_image` overwrites `self._pass_job`).
 4. **Every scan channel is read, not the checked ones**
-   ([`live.py:2226`](../src/miainwoodpecker/viewer/live.py)), the
+   ([`live.py:2226`](../src/miainwoodpecker/viewer/live.py)), and the
    detector calibration is not handed to the writer
-   ([`live.py:2267`](../src/miainwoodpecker/viewer/live.py)), and the
-   stale docstrings still say the pass blocks the window
-   ([`live.py:37-39, 2130-2134`](../src/miainwoodpecker/viewer/live.py),
-   [`defaults.py:22-25`](../src/miainwoodpecker/viewer/panels/defaults.py))
-   when it has run in a `PassJob` since #40.
+   ([`live.py:2267`](../src/miainwoodpecker/viewer/live.py)). The
+   stale docstrings that said the pass blocks the window are fixed.
 5. **After the pass.** A saved pass appears as "0 frames" in the File
    list and reopens as a plain image layer with no spectrum picker
    ([`live.py:2717-2767`](../src/miainwoodpecker/viewer/live.py)). Not

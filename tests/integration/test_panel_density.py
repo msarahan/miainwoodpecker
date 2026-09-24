@@ -27,7 +27,7 @@ from miainwoodpecker.viewer.panels import toolbar
 from miainwoodpecker.viewer.preview import build_preview_devices
 
 #: Every action that used to be a full-width button in the Scan group.
-_SCAN_ACTIONS = 7
+_SCAN_ACTIONS = 8
 #: And in a Camera group.
 _CAMERA_ACTIONS = 5
 #: A long exposure, distinct from any default, for the read-back test.
@@ -80,7 +80,7 @@ def _buttons(row: QtWidgets.QWidget) -> list[QtWidgets.QToolButton]:
 
 
 def test_the_scan_actions_are_one_row_of_icons():
-    """Seven actions, seven icon buttons, one row."""
+    """Eight actions, eight icon buttons, one row."""
     viewer, widget = _open()
     try:
         group = widget._scan_button.parentWidget()  # noqa: SLF001

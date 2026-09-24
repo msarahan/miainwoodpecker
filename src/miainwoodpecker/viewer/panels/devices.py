@@ -91,7 +91,15 @@ def build_scan_group(widget: LiveInstrumentWidget) -> QtWidgets.QGroupBox:
         scan_group,
         toolbar.SPECTRUM_IMAGE,
         "Acquire a spectrum image: the whole readout of one detector "
-        "kept at every beam position",
+        "kept at every beam position, over the marked region or the "
+        "whole field of view",
+    )
+    widget._region_button = toolbar.action_button(
+        scan_group,
+        toolbar.REGION,
+        "Mark the region for the next spectrum image on the survey scan. "
+        "Drag its corners to move or resize it; press again to remove it",
+        on_click=widget.mark_spectrum_image_region,
     )
     widget._scan_save_button = toolbar.action_button(
         scan_group,
@@ -114,6 +122,7 @@ def build_scan_group(widget: LiveInstrumentWidget) -> QtWidgets.QGroupBox:
                 widget._scan_button,
                 widget._preview_button,
                 widget._scan_image_button,
+                widget._region_button,
                 widget._spectrum_image_button,
                 widget._scan_save_button,
                 widget._scan_record_button,
@@ -262,11 +271,12 @@ def build_spectrum_image_controls(
     true, and it is the same explanation whether they are on usim or on
     a column whose trigger is not wired.
 
-    Positions are square, and the count is small. Both are placeholders
-    for the target-area UI: the aspect ratio should come from a region
-    drawn on the reference scan rather than be assumed, and the grid
-    should be as large as the operator's patience rather than as small
-    as a blocking call can afford.
+    The count is positions along the *longer* side. With a region drawn
+    on the survey scan (the toolbar's region button) the other side
+    follows from the region's aspect ratio, so the grid samples what was
+    drawn with square pixels; with no region the grid is square over
+    the whole field of view. The **Grid** row says which, in positions
+    and in nanometres, and follows the region as it is dragged.
 
     Parameters
     ----------
@@ -282,10 +292,22 @@ def build_spectrum_image_controls(
     widget._positions_spin.setValue(_DEFAULT_POSITIONS)
     widget._positions_spin.setPrefix("")
     widget._positions_spin.setToolTip(
-        "Beam positions per side. A whole detector readout is kept at "
-        "each, so the dataset grows with the square of this number",
+        "Beam positions along the longer side of the marked region, or "
+        "per side of the whole field of view when none is marked. A whole "
+        "detector readout is kept at each, so the dataset grows with the "
+        "square of this number",
     )
-    scan_form.addRow("Positions", widget._positions_spin)
+    scan_form.addRow("Positions (long side)", widget._positions_spin)
+    # What the next pass will actually cover, in the operator's units.
+    # Read-only: the region is set by dragging, the count above.
+    widget._region_label = QtWidgets.QLabel("", scan_group)
+    widget._region_label.setWordWrap(True)
+    scan_form.addRow("Grid", widget._region_label)
+    widget._positions_spin.valueChanged.connect(
+        lambda *_: widget._refresh_region_label(),
+    )
+    widget._fov_spin.valueChanged.connect(lambda *_: widget._refresh_region_label())
+    widget._refresh_region_label()
 
     # Which detector is read out at each beam position. A combo box and
     # not checkboxes, unlike the scan channels above, because those are

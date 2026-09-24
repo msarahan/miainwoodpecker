@@ -677,6 +677,10 @@ class PassWriter:
                 "scan_sync": result.scan_sync,
                 "fov_nm": self._parameters.fov_nm,
                 "pixel_time_us": self._parameters.pixel_time_us,
+                # Where the grid sat, so a pass over a region of a survey
+                # scan can be placed back on it. Read with getattr for a
+                # parameters object predating the field.
+                "center_nm": list(getattr(self._parameters, "center_nm", (0.0, 0.0))),
                 "diffraction": {
                     name: stack.metadata for name, stack in result.diffraction.items()
                 },
