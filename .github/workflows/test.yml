@@ -21,6 +21,20 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# Caches are restored everywhere and saved from main only. A pull request
+# can read main's caches but cannot share its own with any other branch,
+# so saving from one only spends the repository's 10 GB on copies - and
+# an evicted main cache costs every later run.
+#
+# The hatch jobs cache nothing, and that was measured rather than assumed:
+# with uv's cache kept between runs, an integration shard built its
+# environment in 32s instead of 40s and spent 10s restoring the 557 MB
+# cache to do it, and a Windows test leg saved about 7s of 240. uv
+# already downloads quickly on these runners; what is left is resolving
+# and installing, which a download cache does not touch.
+env:
+  SAVE_CACHES: ${{ github.event_name == 'push' && github.ref_name == 'main' }}
+
 jobs:
   test:
     runs-on: ${{ matrix.os }}
@@ -140,11 +154,17 @@ jobs:
     steps:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+    # See pixi.yml: without this the cache setup-pixi saves is empty.
+    - name: Keep the environment where setup-pixi caches it
+      run: printf 'detached-environments = false\n' > .pixi/config.toml
+
     - name: Set up pixi
       uses: prefix-dev/setup-pixi@f00437f565399d418b0acc85936d12c1fb668347 # v0.10.1
       with:
         environments: validate
         frozen: true
+        cache-key: pixi-envs-
+        cache-write: ${{ env.SAVE_CACHES }}
 
     - name: Validate written files against the NXem NXDL schema
       run: pixi run -e validate schema

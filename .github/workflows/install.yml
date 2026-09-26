@@ -41,6 +41,15 @@ jobs:
       - name: Put the installation somewhere short
         run: |
           [IO.File]::AppendAllText($env:GITHUB_ENV, "WOODPECKER_HOME=$env:RUNNER_TEMP\wph`n")
+          # pixi's package cache, on D: beside the installation rather
+          # than its default under C:\Users. pixi hard-links packages out of
+          # the cache into an environment, and a link cannot cross drives:
+          # from C: it copied every file, and the first install took 120s
+          # where it now takes about 50s.
+          #
+          # Not kept between runs. That was measured too: restoring the
+          # 604 MB cache took 27s and saved 19s of installing.
+          [IO.File]::AppendAllText($env:GITHUB_ENV, "PIXI_CACHE_DIR=$env:RUNNER_TEMP\pixi-cache`n")
 
       - name: Install a first release
         run: .\scripts\woodpecker.ps1 install 0.0.1 -From .
