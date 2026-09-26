@@ -89,6 +89,13 @@ _SPECTRUM_SIGNAL = "intensity"
 _SPECTRUM_ENERGY_AXIS = "axis_energy"
 _SPECTRUM_SPATIAL_AXES = ("axis_j", "axis_i")
 _IMAGE_SIGNAL = "data"
+# NXimage's own axis vocabulary, slowest first, which is the order this
+# writer's own (scan_y, scan_x, det_y, det_x) already uses. NXem
+# documents an image only in these names, so the NXimage view writes
+# them; the plottable group keeps the descriptive ones. See
+# _write_nxem_image.
+_NXEM_IMAGE_AXES = ("axis_m", "axis_k", "axis_j", "axis_i")
+_NXEM_IMAGE_SIGNAL = "intensity"
 _ENERGY_UNITS = "eV"
 
 
@@ -511,9 +518,145 @@ class PassWriter:
         group.attrs["signal"] = _IMAGE_SIGNAL
         group.attrs["axes"] = [*_NAVIGATION_AXES, *_DETECTOR_AXES]
         for index, axis in enumerate([*_NAVIGATION_AXES, *_DETECTOR_AXES]):
-            group.attrs[f"{axis}_indices"] = index
+            # Unsigned for the reason storage/nexus.py's _write_nxdata gives.
+            group.attrs.create(f"{axis}_indices", index, dtype="uint32")
+        # What makes a reader see a *cube* rather than four navigation
+        # axes: with ``interpretation``, RosettaSciIO marks the last two
+        # axes as the signal, so HyperSpy builds a 2-navigation,
+        # 2-signal Signal2D - scan position over diffraction pattern,
+        # which is the shape py4DSTEM's DataCube wants too. Without it,
+        # measured against rsciio 0.14.0, every axis comes back as
+        # navigation and the cube is a shapeless stack. Group and field
+        # both, and the reason for each is in
+        # storage/nexus.py's _write_nxdata. This writer claims no
+        # application definition, so the guard that module needs does
+        # not arise here.
+        group.attrs["interpretation"] = "image"
+        group[_IMAGE_SIGNAL].attrs["interpretation"] = "image"
         group[_IMAGE_SIGNAL].attrs["units"] = "counts"
         group.attrs["camera_id"] = stack.camera_id
+        self._write_nxem_image(name, group, stack.camera_id)
+
+    def _write_nxem_image(
+        self,
+        name: str,
+        group: h5py.Group,
+        camera_id: str,
+    ) -> None:
+        """
+        Publish the cube where NXem documents an image, as links.
+
+        Two paths, one array, which is the trade ``entry/data`` already
+        makes against ``entry/data_<name>``. The plottable group keeps
+        the descriptive axis names a person reads - ``scan_y``,
+        ``det_x`` - while NXem documents images only under
+        ``measurement/eventID``, in ``NXimage``'s fixed vocabulary
+        (``intensity``, ``axis_m`` down to ``axis_i``). A reader of
+        either finds the same bytes.
+
+        **Named after the detector rather than ``imageID``**, and that
+        was measured rather than chosen for readability. ``NXem``
+        declares both a named ``imageID`` concept and, through
+        ``NXem_event_data``, an unnamed ``NXimage`` one. A group called
+        ``imageID`` matches the former and pynxtools then demands an
+        ``@AXISNAME_indices`` attribute that no instantiated file can
+        supply - the same NXDL-template-versus-instance confusion the
+        ``interpretation`` attribute ran into
+        (FAIRmat-NFDI/pynxtools#834). A group named for the camera
+        matches the unnamed concept and validates clean, and it also
+        answers "which detector is this" without opening a second group.
+
+        What that validation does and does not cover was measured too: a
+        ``signal`` attribute pointing at a dataset that is not there is
+        caught, while a detector axis labelled in kilograms is not. This
+        is a placement guarantee, not a physics one.
+
+        Parameters
+        ----------
+        name : str
+            The camera's target name, which names the NXimage group.
+        group : h5py.Group
+            The plottable ``NXdata`` holding the cube and its axes.
+        camera_id : str
+            The detector's own id, recorded beside the links.
+        """
+        image = self._nxem_event().create_group(name)
+        image.attrs["NX_class"] = "NXimage"
+        image.attrs["camera_id"] = camera_id
+        data = image.create_group("image_4d")
+        data.attrs["NX_class"] = "NXdata"
+        # Hard links, so the cube is never written or copied twice.
+        data[_NXEM_IMAGE_SIGNAL] = group[_IMAGE_SIGNAL]
+        source_axes = [*_NAVIGATION_AXES, *_DETECTOR_AXES]
+        for index, (ours, theirs) in enumerate(
+            zip(source_axes, _NXEM_IMAGE_AXES, strict=True),
+        ):
+            data[theirs] = group[ours]
+            data.attrs.create(f"{theirs}_indices", index, dtype="uint32")
+        data.attrs["signal"] = _NXEM_IMAGE_SIGNAL
+        data.attrs["axes"] = list(_NXEM_IMAGE_AXES)
+        data.attrs["interpretation"] = "image"
+
+    def _nxem_event(self) -> h5py.Group:
+        """
+        Return the one ``NXem_event_data`` group this pass's signals share.
+
+        One event, deliberately: a pass acquires its cube, its spectrum
+        image and its scan channels at the same beam positions, and that
+        they were taken *together* is a fact the file otherwise states
+        only by co-location. ``NXem`` has somewhere to put it, so it goes
+        there.
+
+        Returns
+        -------
+        h5py.Group
+            The event group, created on first use.
+        """
+        measurement = self._entry.require_group("measurement")
+        measurement.attrs["NX_class"] = "NXem_measurement"
+        event = measurement.require_group("eventID")
+        event.attrs["NX_class"] = "NXem_event_data"
+        return event
+
+    def _write_nxem_spectrum(
+        self,
+        name: str,
+        group: h5py.Group,
+        detector_id: object,
+    ) -> None:
+        """
+        Publish the spectrum image where NXem documents a spectrum.
+
+        The spectrum-side twin of :meth:`_write_nxem_image`, and simpler:
+        the plottable group is already spelled in ``NXspectrum``'s own
+        field names (``intensity``, ``axis_j``, ``axis_i``,
+        ``axis_energy``), so the view is those datasets hard-linked under
+        a group of the right class rather than a second vocabulary.
+
+        Parameters
+        ----------
+        name : str
+            The spectrometer's target name, which names the group.
+        group : h5py.Group
+            The plottable ``NXdata`` holding the spectrum image.
+        detector_id : object
+            The detector's own id where it reported one.
+        """
+        spectrum = self._nxem_event().create_group(name)
+        spectrum.attrs["NX_class"] = "NXspectrum"
+        if detector_id is not None:
+            spectrum.attrs["detector_id"] = str(detector_id)
+        data = spectrum.create_group("spectrum_2d")
+        data.attrs["NX_class"] = "NXdata"
+        axes = [*_SPECTRUM_SPATIAL_AXES, _SPECTRUM_ENERGY_AXIS]
+        # Hard links, so the spectra are never written twice.
+        data[_SPECTRUM_SIGNAL] = group[_SPECTRUM_SIGNAL]
+        for index, axis in enumerate(axes):
+            data[axis] = group[axis]
+            data.attrs.create(f"{axis}_indices", index, dtype="uint32")
+        data.attrs["signal"] = _SPECTRUM_SIGNAL
+        data.attrs["axes"] = axes
+        data.attrs["interpretation"] = "spectrum"
 
     def _stack_calibration(self, stack: object) -> FrameCalibration:
         """
@@ -597,11 +740,17 @@ class PassWriter:
         group.attrs["signal"] = _SPECTRUM_SIGNAL
         group.attrs["axes"] = axes
         for index, axis in enumerate(axes):
-            group.attrs[f"{axis}_indices"] = index
+            # Unsigned for the reason storage/nexus.py's _write_nxdata gives.
+            group.attrs.create(f"{axis}_indices", index, dtype="uint32")
+        # Energy last, so "spectrum" makes exactly that axis the
+        # signal; see the cube above for why this is written at all.
+        group.attrs["interpretation"] = "spectrum"
+        group[_SPECTRUM_SIGNAL].attrs["interpretation"] = "spectrum"
         group[_SPECTRUM_SIGNAL].attrs["long_name"] = "Counts"
         identifier = spectrum.metadata.get("device_id")
         if identifier is not None:
             group.attrs["detector_id"] = str(identifier)
+        self._write_nxem_spectrum(name, group, identifier)
 
     def _write_image(self, index: int, frame: object) -> None:
         """
@@ -631,7 +780,11 @@ class PassWriter:
         group.attrs["signal"] = "data"
         group.attrs["axes"] = list(_IMAGE_AXES)
         for axis_index, axis in enumerate(_IMAGE_AXES):
-            group.attrs[f"{axis}_indices"] = axis_index
+            # Unsigned for the reason storage/nexus.py's _write_nxdata gives.
+            group.attrs.create(f"{axis}_indices", axis_index, dtype="uint32")
+        # Both axes are the picture; see the cube above.
+        group.attrs["interpretation"] = "image"
+        data.attrs["interpretation"] = "image"
 
     @staticmethod
     def _write_axis(

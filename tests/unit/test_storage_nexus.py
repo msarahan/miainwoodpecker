@@ -122,6 +122,26 @@ def test_a_file_claiming_nxem_leaves_the_reader_hint_out(tmp_path):
         assert "interpretation" not in handle["entry/data/data"].attrs
 
 
+def test_the_axis_index_attributes_are_unsigned(tmp_path):
+    """
+    ``AXISNAME_indices`` is ``NX_UINT``, and h5py's default is not.
+
+    A bare Python ``int`` reaches the file as a *signed* ``int64``, and
+    ``pynxtools`` rejects the type outright — measured, that alone is
+    enough to make an otherwise-valid file fail wherever the schema
+    checks the attribute. It is also the truer description: an axis index
+    is a position in a shape, and there is no negative one. Asserted on
+    the dtype rather than the value, since ``0 == 0`` either way and the
+    signedness is the whole point.
+    """
+    path = tmp_path / "series.nxs"
+    write_frames(path, [_frame(0)])
+    with h5py.File(path, "r") as handle:
+        attrs = handle["entry/data"].attrs
+        for name in ("frame_time_indices", "y_indices", "x_indices"):
+            assert attrs[name].dtype.kind == "u", name
+
+
 def test_nxdata_links_rather_than_copies_the_array(tmp_path):
     """NXdata/data is a hard link to the detector array, not a second copy."""
     path = tmp_path / "series.nxs"
