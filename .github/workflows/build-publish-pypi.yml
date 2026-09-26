@@ -55,7 +55,17 @@ jobs:
   publish:
     name: >-
       Publish Python 🐍 distribution 📦 to PyPI
-    if: github.repository_owner == 'msarahan' && github.event_name == 'release'
+    # Off until PyPI trusts this workflow. miainwoodpecker has never been
+    # published, so the first upload needs a *pending* trusted publisher
+    # on pypi.org (owner msarahan, repository miainwoodpecker, workflow
+    # build-publish-pypi.yml, environment pypi); without one, this job
+    # fails its OIDC exchange on every release. Register that, then set
+    # the repository variable PUBLISH_TO_PYPI to `true` - no code change.
+    # Control computers do not need PyPI: the installer builds from the
+    # tagged source (docs/installing.md).
+    if: >-
+      github.repository_owner == 'msarahan' && github.event_name == 'release'
+      && vars.PUBLISH_TO_PYPI == 'true'
     needs:
       - build
     runs-on: ubuntu-latest
@@ -77,3 +87,39 @@ jobs:
         # Only publish to real PyPI on release
         if: github.event_name == 'release'
         uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
+
+  # The one-line installer in docs/installing.md downloads
+  # releases/latest/download/woodpecker.ps1, so every release must carry
+  # the script it was tagged with. "latest" skips pre-releases, which makes
+  # a first installation always a stable one; a canary is chosen
+  # afterwards, on purpose, with `woodpecker update canary`.
+  #
+  # This job checks that and cannot fix it. The repository has immutable
+  # releases on, so a published release takes no new assets - v0.1.0 was
+  # published without the script, this job's upload was refused with a
+  # 422, and the one-liner answered 404 until v0.1.1. The script has to be
+  # attached *while the release is created*: `gh release create <tag>
+  # <file>` makes a draft, uploads, and only then publishes (see "Making a
+  # release" in docs/installing.md). What this job adds is noticing, loudly,
+  # a release that went out without the script or with a different one
+  # than its tag holds.
+  check-installer-asset:
+    name: Check woodpecker.ps1 is attached
+    if: github.repository_owner == 'msarahan' && github.event_name == 'release'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+      - name: Compare the asset with the tagged script
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          if ! gh release download "$TAG" --pattern woodpecker.ps1 --dir asset; then
+            echo "::error::release $TAG has no woodpecker.ps1, so the one-line install cannot find it. A published release is immutable: cut the next one with 'gh release create <tag> <script>' (docs/installing.md)."
+            exit 1
+          fi
+          if ! cmp -s asset/woodpecker.ps1 scripts/woodpecker.ps1; then
+            echo "::error::release $TAG carries a woodpecker.ps1 that differs from the one at the tag. Attach 'git show <tag>:scripts/woodpecker.ps1', not a working copy."
+            exit 1
+          fi

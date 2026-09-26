@@ -35,7 +35,7 @@ choices *before* starting a job and defers every layer and label update to
 Off the GUI thread is necessary and not sufficient, which is the second
 thing this module does. One job on one worker thread still starves the
 GUI if the libraries inside it each fan out to every core — measured, at
-a four-second freeze (docs/migration-plan.md, Phase 2) — so the work runs
+a four-second freeze (see docs/analysis-isolation.md) — so the work runs
 inside :func:`~miainwoodpecker.analysis.threads.limit_analysis_threads`.
 That module holds the policy and the evidence for it.
 """

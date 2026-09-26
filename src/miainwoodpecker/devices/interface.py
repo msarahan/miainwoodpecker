@@ -4,7 +4,7 @@ Vendor-neutral device interfaces for the acquisition layer.
 Everything above the device layer (acquisition orchestration, the live
 viewer, storage) depends only on the protocols in this module, never on a
 vendor SDK, so another vendor's hardware can be added later as a new
-adapter without touching those layers (see docs/migration-plan.md, §2).
+adapter without touching those layers.
 
 These are deliberately the *smallest* interfaces that support the phase
 that needs them: a camera produces frames continuously once started, and a
@@ -67,8 +67,7 @@ class Frame:
 
     This is the neutral currency between the device layer and everything
     downstream: the live viewer displays ``data`` directly, and the
-    storage layer (migration plan, Phase 3) persists ``data`` plus
-    ``metadata``.
+    storage layer persists ``data`` plus ``metadata``.
 
     **The metadata vocabulary.**
     Every adapter attaches what it can of the following, and omits what
@@ -193,7 +192,7 @@ class Frame:
     enabled detector out during *one* pass, always — but the refusal had
     the right instinct: an identifier nothing establishes is a claim,
     which is exactly how ``probe_position`` bit this project
-    (docs/migration-plan.md, §7). So the identity exists now that a call
+    (see docs/hardware-validation-checklist.md). So the identity exists now that a call
     exists to establish it: ``scan_pass_id`` is produced by
     :meth:`Scanner.scan_frames` and only by it, and the single-channel
     :meth:`Scanner.scan_frame` still attaches nothing — its frames never
@@ -218,9 +217,8 @@ class Frame:
         :data:`PROJECTED_READOUT` produces a 1D frame whose one axis is
         the dispersive one, calibration kept verbatim.
         :class:`~miainwoodpecker.storage.nexus.NexusWriter` still names
-        exactly two frame axes and raises on any other rank
-        (docs/architecture-review.md, §1.6: "a layout decision, not a
-        shape guess") — a projected frame is routed by the recording path
+        exactly two frame axes and raises on any other rank — a projected
+        frame is routed by the recording path
         into :class:`~miainwoodpecker.storage.spectra.SpectrumWriter`
         instead, landing in the same ``NXspectrum`` layout as EDX
         (:func:`miainwoodpecker.acquisition.sequence.record` is the
@@ -640,8 +638,8 @@ class Scanner(typing.Protocol):
     and asking for k channels through ``scan_frame`` costs k passes of
     dose with drift between them.
 
-    Continuous live imaging is a repeated ``scan_frame`` loop (migration
-    plan, Phase 2). Synchronising a *camera* to the scan
+    Continuous live imaging is a repeated ``scan_frame`` loop.
+    Synchronising a *camera* to the scan
     (camera-per-probe-position spectrum imaging, 4D-STEM) is still
     deliberately not part of this interface: that is a cross-device pass,
     and ``scan_frames`` covers only the scan unit's own channels.
@@ -1036,7 +1034,7 @@ class SpectrumDetector(typing.Protocol):
     one, exactly as it consults
     :meth:`Instrument.available_controls` before driving a
     control. This project has been bitten before by treating "the setter
-    returned" as "the control works" (docs/migration-plan.md, §7), and a
+    returned" as "the control works" (see docs/hardware-validation-checklist.md), and a
     map on an unsynchronised detector is the same trap with a much more
     expensive failure: it returns a plausible cube in which pixel and
     spectrum have no relationship.
@@ -1567,7 +1565,7 @@ class InstrumentController(typing.Protocol):
     blanker; a simulator may model a control it then ignores), so callers
     must consult :meth:`available_controls` before driving one rather than
     assuming a successful setter means a working control — a distinction
-    this project has already been bitten by (docs/migration-plan.md, §7).
+    this project has already been bitten by (see docs/hardware-validation-checklist.md).
 
     **Range limits belong behind these setters, not in front of them**,
     and that is the project owner's decision rather than an omission.

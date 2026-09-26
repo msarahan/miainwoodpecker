@@ -7,8 +7,8 @@ format. That is the entire point of this file, and it is why it still
 needs the ``device`` extra even though
 :mod:`miainwoodpecker.storage.legacy` no longer does: the reader was
 re-implemented on the standard library to keep GPL-3.0 code out of the MIT
-application's process (see that module's docstring and
-docs/migration-plan.md §6), so the risk that replaces the old one is a
+application's process (see that module's docstring and README.md's "A note
+on licensing" section), so the risk that replaces the old one is a
 reader that works against our *assumptions* about the format rather than
 the format itself. Writing the fixtures with the vendor's own writer is
 what closes that gap.

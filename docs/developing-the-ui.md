@@ -164,11 +164,32 @@ xvfb-run -a uv run --extra device --extra viewer --extra tests pytest
 `QOpenGLWidget`, napari's layer lifecycle breaks on teardown, and the
 GPU rendering path napari was chosen for is never exercised.
 
+That GPU path is also why napari's live-display cost is a fixed
+per-update GUI/CPU overhead, roughly independent of frame size: it
+shrinks as a fraction of total time on larger acquisitions and stays
+well under the ~30 fps a human eye needs for scanned-imaging or typical
+camera live view. A lighter, napari-independent viewer only pays off for
+a workload that must process *every* frame from a very fast detector —
+that is a job for a dedicated processing pipeline, not the display
+layer. Live acquisition feeds the display through a "latest-frame-wins"
+buffer for the same reason: a background worker thread keeps only the
+newest frame, and the display polls it at its own rate rather than being
+pushed to. A slow display drops frames instead of building a backlog,
+and no per-frame event ever has to reach the UI thread — which is what
+keeps the GUI responsive regardless of acquisition rate.
+
 ### The viewing area is many napari viewers, not one
 
 `viewer/documents.py` gives every dataset its own `napari.Viewer` inside
 a `QMdiArea` sub-window, which is what makes zoom, pan and contrast
-per-panel. Two consequences are worth knowing before editing it.
+per-panel. It has to work this way: napari's own model is one canvas
+whose layers all share a single set of axis units, and it refuses to
+render units at all once layers disagree — a HAADF map in nm, a
+Ronchigram in mrad and an EEL spectrum in eV cannot share a canvas. Every
+acquired image carries its own calibration, so each dataset needs an
+independent napari viewer; that is why the MDI shell exists, rather than
+a single shared canvas being a style choice. Two further consequences are
+worth knowing before editing it.
 
 **It reparents `viewer.window._qt_window`, which is private napari
 API.** Nothing else exposes the Qt widget behind a viewer, and the
@@ -196,14 +217,12 @@ array** and nothing else — a camera's readout mode can change between
 one frame and the next, so the shape is the fact and the label would be
 a guess.
 
-Before this existed, a 1D frame did not merely display badly: it could
-not be displayed at all. `axes.frame_calibration` unpacks a height and a
-width from `data.shape[-2:]`, and a spectrum has one axis, so putting a
-spectrometer into `projected` and starting it raised `ValueError` out of
-the display timer. `axes.spectrum_axis` is the 1D answer to the same
-question, and it reports anything that is not an energy axis as bare
-channels rather than labelling counts with a ruler they were not
-measured against.
+`axes.frame_calibration` unpacks a height and a width from
+`data.shape[-2:]`, which assumes two axes — and a spectrum has only one,
+so it cannot be the thing that calibrates a projecting detector's
+readout. `axes.spectrum_axis` is the 1D counterpart, and it reports
+anything that is not an energy axis as bare channels rather than
+labelling counts with a ruler they were not measured against.
 
 Two things worth knowing before editing it:
 
@@ -221,10 +240,9 @@ Two things worth knowing before editing it:
 this module reads all three to tell the operator's actions from its own.
 Both latches — "has the operator arranged the windows" and "has the
 operator zoomed this panel" — therefore guard on *both* an in-progress
-flag and the value the application last set. Either guard alone was
-tried and neither is sufficient: the flag misses queued events, and the
-value alone misses synchronous ones. `test_documents.py` pins both
-cases.
+flag and the value the application last set, because either alone is
+insufficient: the flag misses queued events, and the value alone misses
+synchronous ones. `test_documents.py` pins both cases.
 
 The preview's own tests split along the same line. The devices are
 ordinary objects, so `tests/unit/test_viewer_preview.py` needs no

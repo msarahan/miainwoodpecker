@@ -23,12 +23,11 @@ leave the decision where it belongs.
 
 [Analysis parity](analysis-parity.md) closed by observing that
 `viewer/live.py` imports GPL-3.0 libraries in the application's own
-process, "the same shape §6 went to considerable trouble to avoid for the
-device layer", and said explicitly that it was not the document to
-resolve it. [Migration plan §6](migration-plan.md) is where the device
-layer's boundary was drawn and measured. This page picks up the thread
-those two left, and adds nothing to either — proposed edits to §6 are
-listed at the bottom rather than made here.
+process, "the same shape the device layer's process boundary goes to
+considerable trouble to avoid", and said explicitly that it was not the
+document to resolve it. The device layer's boundary was drawn and
+measured separately. This page picks up the thread those two left, and
+adds nothing to either.
 
 ## The licence facts, from installed metadata
 
@@ -148,10 +147,10 @@ too. `nionswift`, `niondata` and the rest are installed by the user with
 with `[analysis]`. Neither is in the wheel. Optionality alone separates
 nothing.
 
-The *mechanism* is also identical. §6's technical premise is that "a
-Python `import` of a GPL-3.0 library into the same process is generally
-treated as linking under the FSF's own interpretation", and that premise
-does not care which library is being imported. If it is right for
+The *mechanism* is also identical. The device layer's technical premise
+is that "a Python `import` of a GPL-3.0 library into the same process is
+generally treated as linking under the FSF's own interpretation", and
+that premise does not care which library is being imported. If it is right for
 `nion.*` it is right for `hyperspy`, on any machine where the `analysis`
 extra is installed.
 
@@ -278,14 +277,20 @@ an interrupted one. In a worker it costs one result.
 `test_a_worker_killed_between_calls_is_replaced_transparently` kills the
 worker mid-session and asserts the next click works.
 
-**Thread control that actually works.** `analysis/threads.py` is unusually
-honest about its own ceiling: `OMP_NUM_THREADS`, `OPENBLAS_NUM_THREADS`
-and `MKL_NUM_THREADS` "are read **once, when the native library loads**",
-so the in-process cap has to be a `threadpoolctl` runtime call whose
-scope is *time*, not a thread — process-global while an analysis runs. A
-worker's environment is set before its interpreter starts, so the cap
-becomes a property of the process, it covers numba (which
-`threadpoolctl` cannot reach), and nothing in the GUI process is
+**Thread control that actually works.** BLAS, numba and OpenMP default to
+using every available core, which contends with the GUI thread and can
+freeze the live view for seconds when an analysis job runs on the same
+machine as the viewer. The budget applied is the core count minus two,
+floored at one, so a one- or two-core machine still gets a working budget
+instead of zero or a crash. `analysis/threads.py` is unusually honest
+about why that budget cannot be set through `OMP_NUM_THREADS`,
+`OPENBLAS_NUM_THREADS` and `MKL_NUM_THREADS`: those are read **once, when
+the native library loads**, so setting them from a running process is a
+silent no-op — the in-process cap has to be a `threadpoolctl` runtime
+call whose scope is *time*, not a thread — process-global while an
+analysis runs. A worker's environment is set before its interpreter
+starts, so the cap becomes a property of the process, it covers numba
+(which `threadpoolctl` cannot reach), and nothing in the GUI process is
 throttled at all.
 `test_the_worker_runs_under_the_thread_budget_it_was_given` reads the
 worker's `/proc/<pid>/environ` and asserts the budget is there.
@@ -337,8 +342,8 @@ in four ways that all follow from what an analysis is.
    and opens it — nothing crosses. The array transport is only for the
    already-opened-recording case, which exists precisely so a 2048²
    recording is not read twice.
-4. **Dying is survivable, so the client restarts.** §6 rejected reconnect
-   for the device layer with a good reason: a fresh server is a fresh
+4. **Dying is survivable, so the client restarts.** The device layer
+   rejects reconnect for a good reason: a fresh server is a fresh
    instrument construction, and a recording in progress would keep
    appending frames from differently-configured hardware. None of that is
    true here — the input is still on disk or still in the client's memory
@@ -445,13 +450,12 @@ datacube — see [Real 4D-STEM
 data](#real-4d-stem-data-and-what-it-did-and-did-not-change) at the end
 of this page.
 
-**The two arms are interleaved call by call, and that is not a
-refinement.** Running one arm to completion and then the other produced a
-*reproducible* 400–560 ms "isolation overhead" for py4DSTEM at 2048²,
-across two runs — which vanished when the isolated arm was run on its
-own. It was the container getting slower over a long run, not the
-boundary. Alternating removes it, and the fact that a plausible,
-repeatable number was wrong is the reason this paragraph exists.
+**The two arms are interleaved call by call, not run one after the
+other.** Running one arm to completion and then the other is contaminated
+by the container slowing down over a long run: it produces a
+*reproducible* 400–560 ms "isolation overhead" for py4DSTEM at 2048² that
+vanishes once the isolated arm is timed on its own. Interleaving call by
+call cancels that drift.
 
 ### Worker startup, paid once per target per session
 
@@ -495,7 +499,7 @@ projection crosses back:
 | 21.0 MB | 21.0 + 4.2 MB | +8.9 ms (1.96×) | +14.1 ms (1.72×) | +19.1 ms (1.18×) |
 | 83.9 MB | 83.9 + 16.8 MB | +75.5 ms (4.02×) | +81.0 ms (2.29×) | +367.1 ms (1.83×) |
 
-**About 0.75–0.9 ms per megabyte moved**, which is the same figure §6
+**About 0.75–0.9 ms per megabyte moved**, which matches the figure
 measured for the device layer's reused-segment transport (+25 ms at
 33.6 MB, or 0.74 ms/MB) — as it should be, since it is the same code
 doing the same memcpy. The 84 MB row's HyperSpy and LiberTEM numbers
@@ -568,7 +572,7 @@ API and the status messages are transport-independent already.
   metadata, with the README naming `io` as the MIT part). The individual
   module files carry no per-file headers, so the README is the whole of
   the evidence. Anyone depending on it should confirm with the project.
-- ~~**No 4D-STEM dataset was analysed.**~~ **One has been now.** See
+- **A 4D-STEM dataset has been analysed.** See
   [Real 4D-STEM data](#real-4d-stem-data-and-what-it-did-and-did-not-change)
   below: the transport conclusion survives unchanged, and a separate
   problem turned up that only real data could expose.
@@ -576,7 +580,7 @@ API and the status messages are transport-independent already.
 ## Real 4D-STEM data, and what it did and did not change
 
 The measurements above were taken on synthetic noise. A real dataset is
-now reachable and was used, so the caveat can be replaced with a result.
+also reachable, and is used below.
 
 **The data.** Zenodo record [8233585](https://zenodo.org/records/8233585),
 "Mixed Phase Test Datasets for py4dstem", CC-BY-4.0, file
@@ -585,8 +589,7 @@ genuine 2D scan of 2D diffraction patterns, 153 MB on disk and 9.55 GB
 raw. Sparse, as real fast-scan 4D-STEM is: a five-pattern burst has
 **1.9 % of pixels non-zero** and a mean of **0.03 counts**.
 
-**Everything below is reproducible**, which for a page that had to
-correct its own first table is not a footnote:
+**Everything below is reproducible:**
 
 ```console
 $ uv run --extra analysis --extra libertem --extra py4dstem \
@@ -629,15 +632,15 @@ a re-measurement of the earlier ones. And that py4DSTEM overhead is the
 same on both datasets, which is one more thing the open item about it
 has to explain.
 
-**Two methodology notes, recorded because both were mistakes made here
-first.** An earlier attempt measured real frames to completion and then
-synthetic frames, and reported a 2337 ms real median against 46 ms
-synthetic — a 50× "real data penalty" on a transport that does not read
-the data. It was drift. The same attempt also left the in-process arm
-uncapped while the worker ran under its thread budget, which is not a
-comparison. The sibling benchmark's `_interleaved` already documented
-both hazards; not reading it first cost a wrong table, which was briefly
-committed to this page and is corrected here.
+**Two methodology hazards shape how this benchmark is structured.**
+Measuring real frames to completion and then synthetic frames is
+contaminated by the same container drift described above, producing a
+spurious 50× "real data penalty" (a 2337 ms real median against a 46 ms
+synthetic one) on a transport that never reads the data. Leaving the
+in-process arm uncapped while the worker runs under its thread budget is
+not a comparison either, since the two arms then run under different
+core budgets. The benchmark's shared `_interleaved` helper avoids both:
+it round-robins the two arms and caps both under the same thread budget.
 
 ### What real data did break
 

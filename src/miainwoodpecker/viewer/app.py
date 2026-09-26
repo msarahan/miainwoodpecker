@@ -69,7 +69,7 @@ to end. Point it at ``--backend hardware`` and it is a real webcam.
 Deliberately imports ``miainwoodpecker.devices.remote``, not
 ``miainwoodpecker.devices.nion_server``: the running application talks to
 the device server over IPC and never imports Nion's GPL-3.0 code directly
-(see docs/migration-plan.md, §6). ``--server-module`` does not weaken
+(see README.md, "A note on licensing"). ``--server-module`` does not weaken
 that — the named module is launched as a *subprocess*, never imported
 here, which is why an out-of-tree adapter under any licence can be
 plugged in this way.

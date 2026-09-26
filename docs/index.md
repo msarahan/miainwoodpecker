@@ -41,19 +41,24 @@ decisions still rest on guesses about the instruments themselves; the
 [instrument survey runbook](superstem-survey.md) is a read-only script
 and a procedure for settling them at the facility.
 
+To put it on a microscope's control computer, see
+[installing](installing.md): one command to install, and side-by-side
+releases so a canary can be tried and a bad release rolled back without
+reinstalling anything.
+
 ## For developers
 
 The design history is documented unusually thoroughly, decisions and
 measurements included:
 
+- [Acquisition UX survey](acquisition-ux-survey.md) — where a STEM
+  image, an EELS spectrum and a spectrum image each stand today, by
+  backend, and the ordered list of what has to happen before an
+  operator can take all three on a SuperSTEM instrument.
 - [Instrument configuration](instrument-configuration.md) — the file per
   microscope that enumerates its hardware and tells the broker which
   device servers to start, with worked examples for the SuperSTEM
   instruments and the simulator.
-- [Migration plan](migration-plan.md) — the architecture, why each
-  piece was built or adopted, and the phased record of getting here.
-- [Architecture review](architecture-review.md) — a full-stack audit of
-  the implementation, findings and fixes.
 - [Other vendors](vendor-support.md) — what Thermo Fisher, JEOL, Zeiss,
   Hitachi and Bruker actually expose, and what a second device adapter
   would cost.
@@ -82,13 +87,13 @@ measurements included:
 :maxdepth: 2
 :hidden:
 
+Installing <installing>
 Using the viewer <using-the-viewer>
 Scripting and automation <scripting-and-automation>
-Migration plan <migration-plan>
-Architecture review <architecture-review>
 Instrument configuration <instrument-configuration>
 Hardware validation checklist <hardware-validation-checklist>
 Instrument survey runbook <superstem-survey>
+Acquisition UX survey <acquisition-ux-survey>
 Work before hardware <pre-hardware-work>
 Other vendors <vendor-support>
 Analysis parity <analysis-parity>

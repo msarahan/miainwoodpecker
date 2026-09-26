@@ -2,8 +2,8 @@
 Measure what isolating the analysis libraries in a worker process costs.
 
 docs/analysis-isolation.md asks whether the analysis layer should get a
-process boundary like the one docs/migration-plan.md §6 built for the
-device layer, and this is the measurement half of the answer. Same
+process boundary like the one built for the device layer (see README.md's
+"A note on licensing"), and this is the measurement half of the answer. Same
 structure and the same reporting as
 ``scripts/ipc_overhead_benchmark.py``, which measured the device side:
 run the identical operation both ways and print the difference, rather

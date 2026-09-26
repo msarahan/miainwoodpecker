@@ -44,6 +44,19 @@ _TEMPLATE = _REPO / "scripts" / "superstem_survey_page.html.in"
 
 _UNKNOWN_REVISION = "unknown"
 
+_GITHUB_RAW_URL = (
+    "https://raw.githubusercontent.com/msarahan/miainwoodpecker/main/"
+    "scripts/superstem_survey.py"
+)
+"""
+Where the page's download button points.
+
+A link to GitHub works in any browser reachable by anyone the artifact
+link is shared with — unlike ``window.claude.downloads``, which only
+exists inside the Claude app and leaves the button silently broken for
+a public viewer.
+"""
+
 
 def _revision(path: Path) -> str:
     """
@@ -96,6 +109,7 @@ def render(script: Path = _SCRIPT, template: Path = _TEMPLATE) -> str:
         "__REV__": _revision(script),
         "__LINES__": str(source.count("\n") + 1),
         "__KIB__": str(round(len(source.encode()) / 1024)),
+        "__GITHUB_RAW_URL__": _GITHUB_RAW_URL,
     }
     page = template.read_text(encoding="utf-8")
     for marker, value in substitutions.items():

@@ -10,8 +10,8 @@ over a socket is "communication at arm's length" between independent
 programs, not a combined work, which is the standard reading of what the
 GPL's copyleft does and does not reach for Python (an in-process
 ``import`` of a GPL library is normally treated as linking; a subprocess
-talking over a documented protocol is not). See docs/migration-plan.md,
-§6, for the reasoning and the alternative considered.
+talking over a documented protocol is not). See README.md's "A note on
+licensing" section for the reasoning and the alternative considered.
 
 Deliberately minimal rather than a general RPC framework: one call shape,
 one result shape, dispatch by looking up ``target`` then ``getattr`` for

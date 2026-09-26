@@ -4,8 +4,8 @@ Unit tests: the ``.ndata`` reader, without any vendor code.
 These run in the base test environment, which is the point:
 :mod:`miainwoodpecker.storage.legacy` was re-implemented on the standard
 library so the MIT application never imports Nion's GPL-3.0 code in-process
-(docs/migration-plan.md §6), and a reader that needs no extra to work
-should need no extra to test either.
+(see README.md's "A note on licensing" section), and a reader that needs no
+extra to work should need no extra to test either.
 
 Containers here are hand-built with :mod:`zipfile` to the format Nion's own
 ``NDataHandler`` documents — ``data.npy`` and ``metadata.json``, both

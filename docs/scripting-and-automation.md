@@ -42,6 +42,29 @@ nanometres. Any HDF5 tool can open it; the
 [analysis section below](#loading-recordings-into-analysis-tools) opens
 it in HyperSpy in one line.
 
+Storage defaults to plain HDF5 written with `h5py`, not `pynxtools-em`
+and not Zarr. NeXus is a convention layered on plain HDF5 — typed
+groups, `signal`/`axes` hints, `units` — not a distinct container
+format, so writing it with `h5py` directly follows the convention
+without pulling in `pynxtools-em`'s much heavier reader/converter stack,
+which exists to translate *other* vendor formats into NeXus, a problem
+this project doesn't have. Zarr isn't used either: none of the analysis
+libraries this project relies on — RosettaSciIO, LiberTEM, py4DSTEM —
+read it, NeXus itself is an HDF5-only convention, and nothing about this
+project's acquisition pattern (single-writer, not object storage) needs
+it. The default compression is gzip with byte-shuffle rather than a
+faster plugin codec (blosc2/zstd) or a downcast to float32: detector
+frames are noisy floats where a generic compressor sees mostly
+incompressible interleaved mantissa bytes, and shuffling into byte
+planes groups the compressible exponent bytes, which roughly halves
+write time as a side effect. A plugin codec compresses further and
+faster, but a file written with it can't be opened by other NeXus tools
+(HyperSpy, LiberTEM, py4DSTEM, `nexusformat`) unless they too have that
+plugin installed — broad interoperability is the point of using NeXus,
+so gzip+shuffle is the default, universally readable, and a plugin codec
+is opt-in. Downcasting to float32 saves more space than any codec but
+isn't a default because it's lossy and irreversible.
+
 ## The building blocks
 
 The API is small, and each layer only depends on the one below it:
@@ -165,8 +188,15 @@ with remote_simulated_instrument() as microscope:
 ```
 
 The recorded energy axis follows the sweep on its own, because the
-camera resolves its calibration from the same instrument control. This
-is the acquisition half of what Nion Swift calls a multiple-shift EELS
+camera resolves its calibration from the same instrument control. Axis
+calibration — kind, scale, offset, units — is a property of the
+*acquisition* rather than of the detector: the same camera can yield
+reciprocal-space diffraction data in one microscope mode and something
+else in another, so calibration is supplied per-recording instead of
+being fixed to which detector was used. An axis with no known
+calibration is a first-class, honestly-labelled state ("pixel") rather
+than a default that silently invents a scale. This is the acquisition
+half of what Nion Swift calls a multiple-shift EELS
 acquire; summing and aligning the series afterwards is HyperSpy's job,
 and [the analysis section](#loading-recordings-into-analysis-tools) is how you
 hand it over.
@@ -178,6 +208,14 @@ new step's label — a series wrong by one throughout. Restarting costs a
 little time and removes the possibility.
 
 ## Instrument controls
+
+This surface exposes only a handful of controls — stage, defocus,
+blanker, and so on — rather than a general control API. A real
+microscope controller exposes hundreds of named, vendor-specific
+controls; wrapping all of them would just be the vendor API wearing
+vendor-neutral clothing. This interface exposes only what an
+acquisition sequence actually needs to drive and record, deliberately
+staying smaller than what the hardware offers.
 
 The controls are directly available too — check `available_controls()`
 first, since not every microscope has every control:
@@ -221,8 +259,7 @@ cannot publish frame N+1 until the client has copied frame N out. Two
 clients on one device therefore do not merely take turns badly. They
 interleave on a reused buffer and produce a frame that is half pass N and
 half pass N+1, with nothing raised anywhere; the recording simply
-contains a torn frame. (That is [architecture review
-§1.2](architecture-review.md), which is where it was found.)
+contains a torn frame.
 
 `miainwoodpecker.broker` is where the one-driver rule lives once there is
 more than one program. One process holds the device session and every
@@ -398,10 +435,9 @@ again".
 
 The consequence is for anything with a UI: **do not take a lease on a
 thread that has to stay responsive.** Take it the way the viewer records
-— on a worker, reporting progress — not inside a click handler. That is
-not tidiness, it is the viewer's own fixed bug: stopping the scan on the
-GUI thread turned a long scan into "still busy, try again" instead of a
-wait.
+— on a worker, reporting progress — not inside a click handler: leasing
+on the GUI thread blocks it for as long as the pass already in flight,
+which reads as "still busy, try again" instead of a wait.
 
 A lease also expires on its own, 300 s after it was granted, unless
 somebody renews it. That is not a nicety either: a notebook kernel that
@@ -487,11 +523,8 @@ program that *built* it should call that: one client leaving must not end
 the session for the others, blank their beam, or stop their live view.
 `miainwoodpecker-broker` does it for you on the way out. If you build a
 `LocalBroker` yourself — embedding one in your own program, or in a test
-— it is yours to close, and forgetting has already cost once: a test that
-handed its broker to a window and then closed only the window leaked a
-live loop that kept a fake scanner spinning flat out for the rest of the
-session, which read as the whole suite becoming slow rather than as a
-failure.
+— it is yours to close: forgetting leaves a live loop running in the
+background, which reads as slowness rather than a failure.
 
 One gap worth knowing about rather than discovering: `miainwoodpecker-viewer`
 opens its own device session and builds its own broker, so it cannot yet
@@ -539,9 +572,8 @@ Four things about it are worth knowing before you change it:
   interval to 0.1 s, so ten a second is the ceiling of the mechanism
   whatever the kernel does. Against the simulated instrument, a
   three-tile grid at `0.1s` sustains about 9.7 fps with 128 px tiles, 9.0
-  with 256 px, and 7.0 with 512 px — where the shipped default before
-  this was `0.5s`, or two. If the numbers matter to you, the tile menu is
-  where you spend them.
+  with 256 px, and 7.0 with 512 px. If the numbers matter to you, the
+  tile menu is where you spend them.
 - **Acquire does not take its lease in the cell you pressed.** It starts
   an `AcquisitionJob`, which takes the lease on a worker thread and
   renews it per frame; the same display poll that draws the tiles
@@ -626,9 +658,8 @@ HAADF and a follow-up HAADF thirty seconds later carry byte-identical
 **Data acquired without a session is kept, not dropped.** Leaving the
 session directory blank is a real choice — looking at a Ronchigram to
 decide whether it is worth keeping should not litter a session with
-files — and it used to be irreversible, because the frames went into a
-thumbnail and were released. Now the entry keeps them, and the log
-offers two ways out:
+files — so the entry keeps the frames rather than releasing them once a
+thumbnail is shown, and the log offers two ways out:
 
 - a **Save** button per signal, which is `mo.download` over a NeXus file
   rendered on demand. This is the one to use when the browser is not on
@@ -832,7 +863,13 @@ private format.
 ## Migrating a Swift library
 
 Existing Nion Swift `.ndata` files convert to one NeXus file without
-Swift installed:
+Swift installed. The `.ndata` container format is simple and documented
+— an uncompressed zip of one array and one metadata JSON file — so the
+reader here is hand-written against that documented format rather than
+built on a vendor or third-party library: it is standard-library-only
+and adds no dependency, reusing the vendor's own reader would pull
+GPL-3.0 code into this MIT-licensed application, and no third-party I/O
+library already in use supports the format.
 
 ```python
 from miainwoodpecker.storage import write_frames
