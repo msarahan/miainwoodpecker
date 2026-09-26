@@ -78,13 +78,13 @@ dev = [
     # Pinned exactly: with ruff's select = ["ALL"], a minor upgrade enables
     # newly added rules and can fail CI with no change of ours. Dependabot
     # bumps this as a reviewable PR.
-    "ruff==0.16.2",
+    "ruff==0.16.8",
 ]
 tests = [
     "pytest>=8.4.2",
 ]
-# Nion's STEM device layer (camera/scan hardware sources) and simulator.
-# See docs/migration-plan.md Phase 0/1 - this is kept and reused, not rewritten.
+# Nion's STEM device layer (camera/scan hardware sources) and simulator,
+# kept and reused rather than rewritten.
 #
 # Pinned exactly, transitively (not just nionswift-usim itself): hatch builds
 # each env (test/integration/style/...) in its own venv under
@@ -105,8 +105,8 @@ device = [
     "nionui==10.2.2",
     "nionutils==4.14.1",
 ]
-# Live-viewer shell candidate. See docs/migration-plan.md section 4 - benchmark
-# against ndv before committing further if per-frame overhead is too high.
+# Live-viewer shell candidate. Benchmark against ndv before committing
+# further if per-frame overhead is too high.
 viewer = [
     "napari[pyside6]>=0.5",
     # For the operator preferences that outlive a session
@@ -156,8 +156,7 @@ viewer = [
 dashboard = [
     "marimo>=0.9",
 ]
-# Phase 4 analysis integration - see docs/migration-plan.md section 5.
-# HyperSpy chosen for this extra: it is the lighter, more general option
+# Analysis integration. HyperSpy chosen for this extra: it is the lighter, more general option
 # and matches the plain scan/camera frame stacks this app produces today
 # (no 4D-STEM diffraction-scan mode yet). py4DSTEM and LiberTEM each get
 # their own extra below - py4DSTEM because its core object is a true 4D
@@ -174,8 +173,8 @@ dashboard = [
 # release that breaks this adapter.
 # threadpoolctl is here for src/miainwoodpecker/analysis/threads.py, which
 # caps the BLAS thread pools underneath an analysis so the GUI thread keeps
-# a core (measured: docs/migration-plan.md, Phase 2 - eight competing
-# workers froze the viewer for four seconds). It is checked, not assumed,
+# a core (see docs/analysis-isolation.md: eight competing workers froze
+# the viewer for four seconds). It is checked, not assumed,
 # to be new weight only here: uv.lock has libertem and py4dstem both
 # depending on it directly, and scikit-learn (which both pull in) as well,
 # so the other two analysis extras already ship it. Bare "analysis" did
@@ -212,7 +211,7 @@ analysis = [
     "threadpoolctl>=3",
 ]
 # LiberTEM: kept as its own extra, not folded into "analysis" above.
-# Measured (docs/migration-plan.md section 5): `pip install libertem` alone
+# Measured: `pip install libertem` alone
 # resolves ~102 packages against a 2-package bare venv baseline - dask,
 # distributed, numba, scikit-learn, scikit-image, matplotlib, and a
 # Jupyter/ipywidgets stack for its own notebook GUI - roughly 3x HyperSpy's
@@ -227,8 +226,7 @@ analysis = [
 libertem = [
     "libertem>=0.16",
 ]
-# Phase 4, follow-up: py4DSTEM specifically - see
-# docs/migration-plan.md section 5's Phase 4 notes and
+# py4DSTEM specifically - see
 # src/miainwoodpecker/analysis/py4dstem_bridge.py's docstring for why this
 # is scoped to single-diffraction-pattern operations, not py4DSTEM's 4D
 # DataCube (no synchronized scan-position/camera-frame acquisition mode
@@ -247,8 +245,8 @@ libertem = [
 py4dstem = [
     "py4dstem>=0.14",
 ]
-# Phase 3, storage compression - see docs/migration-plan.md section 5 and
-# src/miainwoodpecker/storage/nexus.py's module docstring for the measurements.
+# Storage compression - see docs/scripting-and-automation.md and
+# src/miainwoodpecker/storage/nexus.py's module docstring for the reasoning.
 # An extra, deliberately not a base dependency, and the reason is
 # interoperability rather than weight (hdf5plugin is one wheel of bundled
 # codecs, not a 70-package stack): a file written with a blosc2/bitshuffle
@@ -353,8 +351,8 @@ ignore = [
                # license is declared once in LICENSE and pyproject.toml; per-file
                # notices are redundant for it. The one exception,
                # devices/nion_server.py, is GPL-3.0 (it imports Nion's GPL-3.0
-               # device stack directly - see docs/migration-plan.md section 6)
-               # and states that in its own module docstring instead of a
+               # device stack directly - see README.md's "A note on
+               # licensing" section) and states that in its own module docstring instead of a
                # ruff-style copyright stamp.
 ]
 exclude = [
@@ -515,6 +513,12 @@ extra-dependencies = [
     "pytest-cov",
     # Not inherited from the "test" env; this env does its own resolution.
     "pytest-xdist",
+    # CI runs this suite as several jobs rather than one, each taking a
+    # share balanced by measured duration (.test_durations; see
+    # .github/workflows/test.yml and scripts/update_test_durations.py).
+    # Inert without --splits, so a local `hatch run integration:run` still
+    # runs everything.
+    "pytest-split",
 ]
 
 # One worker per core, and the worker count had to be measured against
@@ -554,7 +558,7 @@ description = """Check the style of the codebase."""
 dependencies = [
     "pydoclint",
     # Keep in step with the pin in the "dev" extra above.
-    "ruff==0.16.2",
+    "ruff==0.16.8",
 ]
 detached = true
 
@@ -707,8 +711,8 @@ ruff = "==0.16.2"
 pydoclint = "*"
 pre-commit = "*"
 
-# The NXem schema check. docs/migration-plan.md section 5, Phase 3 put it
-# in CI rather than the runtime, and it stays there - pynxtools is never a
+# The NXem schema check runs in CI rather than the runtime, and stays
+# there - pynxtools is never a
 # dependency of the shipped package. What changed is that it is now an
 # environment anyone can run: `hatch run validate:schema` was the only way
 # in, so the one check guarding the on-disk format could not be run on a

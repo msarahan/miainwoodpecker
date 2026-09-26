@@ -26,9 +26,10 @@ schema = 1
 name = "SuperSTEM 1"
 site = "SuperSTEM, Daresbury"
 description = """\
-A dedicated STEM with a 1340x100 EEL spectrometer (Gatan Enfina). Column \
-control software UNIDENTIFIED; everything below is a hypothesis pending \
-the instrument survey.\
+A dedicated STEM with a 1340x100 EEL spectrometer (Gatan Enfina), read \
+out by DigitalMicrograph 1.x - which has no Python, so the inbound Gatan \
+bridge cannot run here. Column control software UNIDENTIFIED; everything \
+below is a hypothesis pending the instrument survey.\
 """
 
 # ---------------------------------------------------------------------

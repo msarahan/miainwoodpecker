@@ -21,6 +21,20 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# Caches are restored everywhere and saved from main only. A pull request
+# can read main's caches but cannot share its own with any other branch,
+# so saving from one only spends the repository's 10 GB on copies - and
+# an evicted main cache costs every later run.
+#
+# The hatch jobs cache nothing, and that was measured rather than assumed:
+# with uv's cache kept between runs, an integration shard built its
+# environment in 32s instead of 40s and spent 10s restoring the 557 MB
+# cache to do it, and a Windows test leg saved about 7s of 240. uv
+# already downloads quickly on these runners; what is left is resolving
+# and installing, which a download cache does not touch.
+env:
+  SAVE_CACHES: ${{ github.event_name == 'push' && github.ref_name == 'main' }}
+
 jobs:
   test:
     runs-on: ${{ matrix.os }}
@@ -54,8 +68,27 @@ jobs:
   # viewer tests skip themselves there. This job installs those extras and
   # runs the full suite under a virtual display, because napari needs a real
   # GL canvas (QT_QPA_PLATFORM=offscreen is not a valid substitute).
+  #
+  # Three jobs, each running a third of the suite. As one job it took about
+  # 6.5 minutes, against about 4 for the slowest test matrix leg: ~70s of
+  # environment build and system libraries, then ~4.6 minutes of tests on
+  # the runner's two xdist workers. Each shard pays the ~70s again, so three
+  # shards is what brings it in line with the rest, not two.
+  #
+  # The thirds are by measured *time*, not test count - some 900 unit tests
+  # take seconds together, and a few hundred viewer and device tests take
+  # the rest - from the committed .test_durations. A test missing from that
+  # file is assumed to take the average, so new tests still run; the
+  # balance just drifts until the file is refreshed, which is
+  # `python scripts/update_test_durations.py junit-*.xml` over the JUnit
+  # reports these jobs upload.
   integration:
+    name: integration (${{ matrix.group }}/3)
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        group: [1, 2, 3]
     steps:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -70,22 +103,41 @@ jobs:
     - name: Install GL and Qt system libraries
       run: bash scripts/install-linux-gui-deps.sh
 
-    - name: Full test suite (device + viewer) under a virtual display
+    - name: Full test suite (device + viewer), share ${{ matrix.group }} of 3, under a virtual display
       run: |
         xvfb-run -a -s "-screen 0 1920x1080x24" \
-          hatch run integration:run
+          hatch run integration:run -n auto \
+            --cov=miainwoodpecker --cov-report=term-missing \
+            --splits 3 --group ${{ matrix.group }} \
+            --splitting-algorithm least_duration \
+            --junitxml=junit-${{ matrix.group }}.xml
 
+    # Per-test times, for refreshing .test_durations. JUnit rather than
+    # pytest-split's own --store-durations because JUnit's are recorded
+    # reliably under xdist.
+    - name: Keep the per-test times
+      if: always()
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v4
+      with:
+        name: integration-junit-${{ matrix.group }}
+        path: junit-${{ matrix.group }}.xml
+        if-no-files-found: ignore
+
+    # The two smoke scripts are seconds long and need no splitting; the
+    # first share runs them.
     - name: Phase 0 and Phase 1 device smoke test
+      if: matrix.group == 1
       run: hatch run integration:python scripts/phase0_usim_smoke_test.py
 
     - name: Phase 0 viewer smoke test under a virtual display
+      if: matrix.group == 1
       run: |
         xvfb-run -a -s "-screen 0 1920x1080x24" \
           hatch run integration:python scripts/phase0_viewer_smoke_test.py
 
   # Validate the files this project writes against the official NXem NXDL
-  # schema, per docs/migration-plan.md Phase 3: that check belongs in CI, not
-  # the runtime, so pynxtools lives in its own pixi environment and is never a
+  # schema. That check belongs in CI, not the runtime, so pynxtools lives in
+  # its own pixi environment and is never a
   # dependency of the shipped package. Its own job rather than a step in the
   # matrix above because it needs no extras, no display, and no OS/Python
   # sweep - the file layout it checks does not vary across them.
@@ -102,11 +154,17 @@ jobs:
     steps:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+    # See pixi.yml: without this the cache setup-pixi saves is empty.
+    - name: Keep the environment where setup-pixi caches it
+      run: printf 'detached-environments = false\n' > .pixi/config.toml
+
     - name: Set up pixi
-      uses: prefix-dev/setup-pixi@f00437f565399d418b0acc85936d12c1fb668347 # v0.10.1
+      uses: prefix-dev/setup-pixi@d3f436a425481402e6a95a1d1fc10331c708cd9e # v0.10.2
       with:
         environments: validate
         frozen: true
+        cache-key: pixi-envs-
+        cache-write: ${{ env.SAVE_CACHES }}
 
     - name: Validate written files against the NXem NXDL schema
       run: pixi run -e validate schema

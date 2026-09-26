@@ -20,9 +20,7 @@ else. If this project is even remotely successful, it might need a less tongue-i
 
 This is a Nion Swift replacement: instrument control and data analysis for
 scanning transmission electron microscopes, built as a thin glue layer over
-existing open source projects rather than a from-scratch rewrite. See
-[`docs/migration-plan.md`](docs/migration-plan.md) for the architecture and
-phased migration plan.
+existing open source projects rather than a from-scratch rewrite.
 
 The project is early. What exists today:
 
@@ -43,6 +41,19 @@ The project is early. What exists today:
   disk as they run, and
 * **NeXus/HDF5 storage** (`miainwoodpecker.storage`), including an importer
   for legacy Nion Swift `.ndata` files.
+
+### Install it on a microscope control computer
+
+On Windows, from a PowerShell prompt, with no administrator and nothing
+else installed first:
+
+```powershell
+irm https://github.com/msarahan/miainwoodpecker/releases/latest/download/woodpecker.ps1 | iex
+```
+
+Releases install side by side, so trying a canary is `woodpecker update
+canary` and going back is `woodpecker rollback`, neither of which touches
+a running session. See [`docs/installing.md`](docs/installing.md).
 
 ### Try it without a microscope
 
@@ -239,5 +250,4 @@ only ever runs as a subprocess, launched via
 `python -m miainwoodpecker.devices.nion_server`; the rest of this
 project — including the shipped `miainwoodpecker-viewer` entry point —
 talks to it only through the plain-data message protocol in
-`miainwoodpecker.devices.rpc`, never by importing it directly. See
-[`docs/migration-plan.md`](docs/migration-plan.md), §6, for the reasoning.
+`miainwoodpecker.devices.rpc`, never by importing it directly.

@@ -1,8 +1,8 @@
 """
 Unit tests for the RPC wire protocol.
 
-``rpc.py`` is described as "the entire license boundary" (see
-docs/migration-plan.md, §6), yet it was previously exercised only through
+``rpc.py`` is described as "the entire license boundary" (see README.md's
+"A note on licensing" section), yet it was previously exercised only through
 ``tests/integration/test_remote_nion.py``, which skips unless the
 ``device`` extra is installed. In a base environment - which is what most
 contributors and the default CI matrix job run - the module carrying the
@@ -251,8 +251,9 @@ def test_call_and_result_survive_a_round_trip_as_plain_data(connection_pair):
     The protocol carries only plain data, which is what the boundary rests on.
 
     Two programs exchanging dataclasses of builtins is the "arm's length"
-    arrangement §6 relies on; a Call that only worked by shipping a live
-    object would quietly undermine it.
+    arrangement the GPL-3.0 subprocess isolation relies on (see
+    README.md's "A note on licensing"); a Call that only worked by
+    shipping a live object would quietly undermine it.
     """
     client, server = connection_pair
     original = Call("instrument", "set_defocus_nm", (12.5,), {"note": "abc"})

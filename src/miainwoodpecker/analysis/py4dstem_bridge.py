@@ -1,7 +1,7 @@
 """
 Adapter: read a NexusWriter file as a py4DSTEM ``DiffractionSlice``.
 
-Phase 4 (migration plan, §5) picked HyperSpy first, over py4DSTEM/LiberTEM,
+Phase 4 picked HyperSpy first, over py4DSTEM/LiberTEM,
 because the device layer had no synchronized scan-position/camera-frame
 acquisition mode - so there was no 4D-STEM (scan_y, scan_x, det_y, det_x)
 data for py4DSTEM's headline ``DataCube`` type to operate on, only plain
@@ -24,8 +24,7 @@ it to offset the simulated aberrations - but only through
 and silently ignores ``probe_position`` entirely if that resolves to
 ``None``. That registration only happens inside the full
 ``HardwareSource``/``Application`` layer - the same layer Phase 0 already
-found too heavy to stand up outside Swift's own process (migration plan,
-§5, Phase 0's note on ``AcquisitionTestContext``). Measured directly
+found too heavy to stand up outside Swift's own process. Measured directly
 against ``nion.usim_device.DeviceConfiguration.AcquisitionContextConfiguration``
 (the same lightweight construction ``nion_server.py`` uses, with no
 ``HardwareSource`` registered): setting ``instrument.probe_position`` to
@@ -87,8 +86,8 @@ conversion is done by
 which is an exact within-kind factor table and is unit-tested
 independently of py4DSTEM being installed, and the numbers are asserted in
 ``tests/integration/test_py4dstem_bridge.py`` specifically. This is the
-same class of error the hardware checklist flags as its
-highest-consequence check (a metres/nanometres mix-up, migration plan §7).
+same class of error docs/hardware-validation-checklist.md flags as its
+highest-consequence check (a metres/nanometres mix-up).
 
 An axis this container genuinely cannot carry is refused rather than
 approximated: a real-space (nanometre) recording, which is what a *scan*

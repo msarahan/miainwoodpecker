@@ -1,7 +1,7 @@
 """
 Leave the GUI thread somewhere to run while an analysis is going.
 
-**Measured, not assumed** (docs/migration-plan.md, Phase 2).
+**Measured, not assumed** (see docs/analysis-isolation.md).
 ``scripts/phase2_live_benchmark.py --source camera --load N`` runs N
 CPU-saturating numpy workers beside the live display. On an M2 Pro,
 512x512 camera frames, the worst single display update went 516 ms at

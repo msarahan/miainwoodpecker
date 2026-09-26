@@ -12,7 +12,8 @@ MIT-licensed client (:mod:`miainwoodpecker.devices.remote`) only through
 the plain-data protocol in :mod:`miainwoodpecker.devices.rpc`. Two
 independent programs communicating over a socket, rather than one program
 importing another's internals, is the standard boundary the GPL's
-copyleft does not reach across (see docs/migration-plan.md, §6).
+copyleft does not reach across (see README.md's "A note on licensing"
+section).
 
 Camera/scanner logic here (``NionCamera``, ``NionScanner``,
 ``simulated_instrument``) is unchanged from the in-process adapter this
@@ -232,7 +233,7 @@ _ORPHAN_GRACE_S = 30.0
 # ControlDescription("blanker", ..., "C_Blank", "bool", ...) and
 # MultiAcquire defaults blanker="C_Blank". All three are therefore Nion's
 # names rather than ours - but they are only *verified* against the
-# simulator here; see docs/migration-plan.md's hardware-day checklist.
+# simulator here; see docs/hardware-validation-checklist.md.
 _DEFOCUS_CONTROL_NAME = "C10"
 _BLANKER_CONTROL_NAME = "C_Blank"
 _STAGE_POSITION_CONTROL_NAME = "stage_position_m"
@@ -1029,8 +1030,8 @@ class NionScanner:
         stamps is only true if the device really ran one pass and really
         read every requested channel out of it. Enabling a channel is a
         setter, and this project's rule about setters is that a returned
-        ``True`` is not evidence (docs/migration-plan.md, §7 —
-        ``probe_position`` accepted values it then ignored). So the three
+        ``True`` is not evidence (see docs/hardware-validation-checklist.md
+        — ``probe_position`` accepted values it then ignored). So the three
         ways the claim could be false are refused rather than papered
         over: a bad frame, a frame number that moved (a second traversal
         began), and a channel that produced no data element.
@@ -1513,7 +1514,8 @@ class InstrumentDevices:
         return [(name, camera) for name, camera in pairs if camera is not None]
 
 
-# Historical name, kept because README and the migration plan refer to it.
+# Historical name, kept for backward compatibility with any external code
+# still importing it under this name.
 SimulatedInstrument = InstrumentDevices
 
 
@@ -2068,8 +2070,8 @@ def _orphan_watchdog(session: _ServerSession, grace_s: float) -> None:
     **"The client is gone" is inferred rather than guessed at**, and that
     is what makes this safe to act on. Every connection closing would be
     ambiguous for most servers — a client might be about to reconnect —
-    but this project deliberately does not support reconnect
-    (docs/migration-plan.md, §6: a fresh subprocess is a fresh instrument
+    but this project deliberately does not support reconnect (see README.md's
+    "A note on licensing" section: a fresh subprocess is a fresh instrument
     construction, so silently resuming would hand the operator a session
     whose device state is quietly wrong). A client therefore holds its
     connections for its entire life by construction, and their

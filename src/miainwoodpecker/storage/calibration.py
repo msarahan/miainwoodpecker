@@ -5,8 +5,8 @@ Why this exists
 ---------------
 Until now :mod:`miainwoodpecker.storage.nexus` could build a physical axis
 for exactly one case — a scan frame reporting ``fov_nm`` — and honestly
-labelled everything else ``"pixel"`` (docs/migration-plan.md, §7:
-"per-detector calibration ... still absent"). That gap propagated into all
+labelled everything else ``"pixel"`` (see docs/scripting-and-automation.md:
+per-detector calibration was still absent). That gap propagated into all
 three Phase 4 analysis adapters: a Ronchigram or EELS frame reached
 HyperSpy, py4DSTEM, and LiberTEM with no physical axis at all.
 
@@ -63,7 +63,7 @@ lets the axis be recorded as what the instrument actually reports.
 
 **4. An uncalibrated axis stays uncalibrated.** ``AxisKind.UNCALIBRATED``
 (scale 1, offset 0, units ``"pixel"``) is a first-class state and the
-default, mirroring the NXem decision in §5 Phase 3: the writer declines to
+default, mirroring the NXem decision: the writer declines to
 claim what it cannot demonstrate. A confidently wrong reciprocal
 calibration on a diffraction pattern is worse than an admitted pixel axis,
 because every downstream number computed from it is wrong by that factor
@@ -109,8 +109,9 @@ one exact conversion factor per unit. :meth:`AxisCalibration.converted_to`
 converts *within* a kind only (nm <-> angstrom, 1/nm <-> 1/angstrom, eV
 <-> meV, rad <-> mrad), which is all any adapter here needs and all that
 can be done without physical constants. Adding ``pint`` or ``astropy.units``
-to convert between kinds would be the bespoke over-build §1-§3 warns
-against, and would not help: the conversions this project actually lacks
+to convert between kinds would be the kind of bespoke over-build this
+project avoids (see docs/scripting-and-automation.md), and would not
+help: the conversions this project actually lacks
 (angle -> reciprocal) need instrument state, not a unit registry.
 
 Placed in ``storage`` because ``storage`` is what writes it, but it imports
@@ -222,7 +223,7 @@ _UNIT_FACTORS: dict[AxisKind, dict[str, float]] = {
     },
     AxisKind.ENERGY: {"eV": 1.0, "meV": 1.0e-3, "keV": 1.0e3},
     # mrad rather than rad is canonical for the same reason ScanParameters
-    # is in nanometres rather than metres (migration plan, §5 Phase 3):
+    # is in nanometres rather than metres (see docs/scripting-and-automation.md):
     # units here are the operator's, and a STEM convergence or collection
     # angle is tens of mrad. It is also py4DSTEM's own literal, so an
     # angular axis reaches that adapter needing no conversion at all.

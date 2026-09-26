@@ -1,6 +1,54 @@
 # Change Log
 
-## Unreleased
+## 0.1.1 — 2026-09-24
+
+0.1.0 with a working one-line installer. The application is unchanged;
+everything under 0.1.0 below applies.
+
+### Fixed
+
+- **The one-line install found nothing to download.** v0.1.0 was
+  published without `woodpecker.ps1` attached, and this repository's
+  immutable releases refused the release workflow's attempt to attach it
+  afterwards (HTTP 422). So `releases/latest/download/woodpecker.ps1`
+  answered 404. Releases are now published with the script attached in
+  the same command (`gh release create <tag> woodpecker.ps1`), which
+  uploads to a draft before publishing. The workflow's upload job is now
+  a check that fails loudly when a release lacks the script or carries a
+  different one than its tag. See "Making a release" in
+  [`docs/installing.md`](docs/installing.md).
+
+## 0.1.0 — 2026-09-24
+
+The first release. Everything in it has been built and tested against
+simulators and recorded data; none of it has run a real microscope yet.
+
+**Works:**
+
+- **The tray application**: holds an instrument open from the
+  notification area, with a window, a dashboard and device-server
+  health one right-click away.
+- **The live viewer**: scan and camera feeds, EELS spectra, scan
+  controls.
+- **The browser dashboard.**
+- **The broker**: serves one instrument to every window, notebook and
+  dashboard at once, and arbitrates which of them drives.
+- **NeXus/HDF5 recording**: streamed to disk as an acquisition runs.
+- **The simulated instrument**: nionswift-usim, and an in-process
+  synthetic instrument for `pixi run preview`.
+- **Replay**: a recorded DigitalMicrograph session served as a device.
+- **The Windows installer**: one line to install, side-by-side releases,
+  `woodpecker update canary` to try a new one and `woodpecker rollback`
+  to go back. See [`docs/installing.md`](docs/installing.md).
+
+**Not yet:**
+
+- Nothing has been validated on real hardware.
+  [`docs/hardware-validation-checklist.md`](docs/hardware-validation-checklist.md)
+  is the procedure for doing that.
+- The SuperSTEM instrument files in `instruments/` are hypotheses, not
+  records of working configurations. The lines marked UNVERIFIED wait
+  on the [instrument survey](docs/superstem-survey.md).
 
 ### Added
 
@@ -61,6 +109,61 @@
   Checked, so the claim is not larger than it is: a `signal` attribute
   pointing at a dataset that is not there **is** caught there; a detector
   axis labelled in kilograms is **not**.
+- **One-line installation on a Windows control computer, with
+  side-by-side releases for canaries and rollback.**
+  `scripts/woodpecker.ps1` (`irm .../woodpecker.ps1 | iex`, no
+  administrator needed) installs each release into a directory of its
+  own and starts whichever one a pointer names. So `woodpecker update
+  canary` tries a new release and `woodpecker rollback` goes back,
+  offline, by rewriting one small file. A release cannot be chosen until
+  all three of its environments have installed on that computer, import
+  what a session runs from them, and agree on their version. A switch never touches a
+  running session; it takes effect at the next start. pixi is pinned
+  and checksummed, and no git is needed on the microscope. Stable and
+  canary are GitHub releases, a pre-release being a canary. The broker
+  now writes its release into `broker.json`, and a client of a
+  different release is refused with both versions named, rather than
+  meeting it halfway through a scan. See
+  [`docs/installing.md`](docs/installing.md).
+
+- **A survey of where the three basic acquisitions stand, and a survey
+  script that asks the instruments what that survey could not.**
+  [`docs/acquisition-ux-survey.md`](docs/acquisition-ux-survey.md) reads
+  the code rather than the documentation and says, per backend, whether
+  a STEM image, an EELS spectrum and a spectrum image can be taken today
+  — and what has to happen before an operator can take all three on a
+  SuperSTEM instrument. Two of its findings changed the questions the
+  read-only instrument survey asks. The energy offset this project's
+  Nion server drives is `ZLPoffset`, the simulator's name; Nion's own
+  acquisition preferences call it `EELS_MagneticShift_Offset`, and the
+  simulator publishes both, which is why nothing noticed. And the
+  spectrum image, which no hardware backend can supply, turns out to
+  rest on two *device-level* Nion methods
+  (`prepare_synchronized_scan` and `acquire_synchronized_*`) rather
+  than on the application layer the migration plan said was needed.
+  So `scripts/superstem_survey.py` now reads both energy-offset names,
+  lists the installed `nionswift_plugin` modules without importing any
+  (the name the instrument file needs), records every registered
+  camera's own account of itself — sensor shape, binning factors, dark
+  and gain support, calibration controls — and the scan unit's channels
+  and current parameters, reads each hardware source's saved profiles
+  (how the operators actually acquire), and reports whether the scan
+  and cameras offer the synchronised-acquisition methods. A `--gatan`
+  section says whether Gatan Microscopy Suite is on a machine and
+  whether the interpreter running the script is DM's own, and the
+  DECTRIS run asks the control unit its API version directly. The
+  runbook gains a run for SuperSTEM 1 and one for SuperSTEM 3's Swift
+  console, and a questionnaire for the operators about the things no
+  script can read: which software they take each acquisition in today,
+  how they set the dispersion, how they take dark references, and what
+  a typical spectrum image looks like on each column. Every new probe
+  is a property read or a `hasattr`; the tests that pin the script's
+  read-only promise cover the new sections too. One fact from the
+  facility is recorded wherever it bites: SuperSTEM 1 runs
+  DigitalMicrograph 1.x and SuperSTEM 2 runs 2.x, neither of which
+  embeds Python, so the inbound Gatan bridge — which runs inside GMS's
+  own interpreter — cannot be the route to the Enfina on either
+  machine. The survey's first run decides whether it needs to be.
 
 - **The instrument as an application in the notification area: right-click
   to open a window on it, to see how its device servers are doing, or to

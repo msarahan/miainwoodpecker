@@ -26,6 +26,24 @@ not an intention, and it is worth stating exactly what it means:
   ``importlib.util.find_spec``, which locates a module without executing
   it, and lists directories. It never imports a vendor control module,
   because importing one may open a connection to the column.
+- **Gatan**: the same ``find_spec`` for ``DigitalMicrograph``, plus a
+  look at whether that module is *already loaded* — which is how it
+  knows it is running inside Gatan Microscopy Suite's own Python window.
+  It executes no DM script and reads no image.
+
+What the Nion section now records, beyond whether the spectrometer is
+there: the installed ``nionswift_plugin`` modules (so the device server
+can be told which one to load), every registered camera's own account
+of itself (sensor shape, binning factors, dark and gain support, and the
+calibration controls its energy axis comes from), the scan unit's
+channels and current parameters, the saved acquisition profiles of each
+hardware source (how the operators actually acquire here), and whether
+the scan and cameras offer Nion's synchronised-acquisition methods —
+which is whether this column can take a spectrum image through Nion's
+stack at all. Two names are read for the energy offset, because the
+simulator's (``ZLPoffset``) and the instrumentation kit's own
+(``EELS_MagneticShift_Offset``) differ, and which one answers decides a
+control name in this project's server.
 
 Python environment
 ------------------
@@ -76,6 +94,20 @@ On the Hitachi SU9000II control computer::
 
     python superstem_survey.py --hitachi --out superstem4.json
 
+On any machine that may have Gatan Microscopy Suite — and, only where
+GMS is 3.4 or newer, **from DM's own Python window**. SuperSTEM 1 and 2
+run DigitalMicrograph 1.x and 2.x, which embed no Python, so there the
+section runs from whatever Python the machine has and records where DM
+is installed::
+
+    python superstem_survey.py --gatan --out gatan.json
+
+The Nion run is wanted on **every Nion column** — SuperSTEM 2 and
+SuperSTEM 3 both, and SuperSTEM 1 if it turns out to be one — because
+each answers a different question: whether the Enfina is Nion's EELS
+camera on SuperSTEM 2, and whether Nion *also* registers the ELA on
+SuperSTEM 3, which would put two drivers on one detector.
+
 Several sections can be combined in one run, and ``--all`` runs every
 section that makes sense on the machine it finds itself on.
 """
@@ -87,6 +119,7 @@ import contextlib
 import importlib.util
 import json
 import os
+import pkgutil
 import platform
 import socket
 import sys
@@ -156,7 +189,17 @@ _NION_CONTROLS = (
     "C12",
     "C21",
     "C30",
+    "C_Blank",
     "ZLPoffset",
+    "EELS_MagneticShift_Offset",
+    "eels_x_scale",
+    "eels_x_offset",
+    "eels_y_scale",
+    "eels_y_offset",
+    "ronchigram_x_scale",
+    "ronchigram_x_offset",
+    "ronchigram_y_scale",
+    "ronchigram_y_offset",
     "ConvergenceAngle",
     "CAperture",
     "StageOutX",
@@ -166,11 +209,120 @@ _NION_CONTROLS = (
 """
 Named controls to ask for, by read only.
 
-``ZLPoffset`` is the load-bearing one: it is the spectrometer's
-drift-tube offset, and Nion publishing it would mean Nion drives the
-spectrometer — which would make the UHV Enfina on SuperSTEM 2 supported
-today, with no Gatan code at all.
+The energy offset is asked for under **two** names, and which one answers
+matters more than any other control here. ``ZLPoffset`` is what the
+``nionswift-usim`` simulator publishes, and it is the name this project's
+own device server drives today. ``EELS_MagneticShift_Offset`` is the name
+Nion's instrumentation kit itself uses for the energy offset in its
+acquisition preferences (``AcquisitionPreferences.acquisition_controls``),
+which is the better guess for a real column. If only the second exists,
+the server's control name is wrong and must change before the energy
+offset can be driven; if neither exists, the spectrometer is not driven
+through Nion at all. Either answer is one control read.
+
+``C_Blank`` is Nion's documented blanker control. The ``eels_*`` and
+``ronchigram_*`` names are the *calibration* controls a Nion camera
+resolves its energy and angular axes against; their presence says
+whether recorded spectra will carry an eV axis, and ``eels_x_scale`` is
+the dispersion in eV per channel.
 """
+
+_NION_2D_CONTROLS = ("stage_position_m",)
+"""
+Two-dimensional controls, read with ``GetVal2D`` rather than ``TryGetVal``.
+
+Tried both with and without an ``axis`` keyword, because Nion's own
+reference implementation and its ``STEMController`` protocol disagree
+about whether the keyword is required, and this project's server hedges
+between them. Which one a real controller accepts is recorded rather
+than assumed.
+"""
+
+_NION_PROFILE_COUNT = 3
+"""
+Nion's scan and camera hardware sources each keep three profiles
+(view, record and a third). Reading all three records how the operators
+actually acquire on this machine — dwell, size, exposure, binning,
+processing — which is what a replacement's defaults should be built from.
+"""
+
+_NION_CAMERA_FACTS = (
+    "camera_id",
+    "camera_name",
+    "camera_type",
+    "camera_version",
+    "sensor_dimensions",
+    "readout_area",
+    "binning_values",
+    "exposure_precision",
+    "flip",
+    "is_dark_subtraction_available",
+    "is_dark_subtraction_enabled",
+    "is_gain_normalization_available",
+    "is_gain_normalization_enabled",
+    "calibration_controls",
+    "configuration_properties",
+)
+"""
+Attributes read from each registered camera device, all properties.
+
+``calibration_controls`` is the mapping from axis to instrument control
+name — it says where the energy axis comes from. The dark and gain
+entries say whether the *device* offers reference correction, which
+decides whether a replacement UI needs to build it or merely switch it
+on. ``camera_type`` is what this project's server sorts cameras by, and
+``"ronchigram"``/``"eels"`` are assumed values, never checked.
+"""
+
+_NION_CAMERA_CAPABILITIES = (
+    "acquire_synchronized_prepare",
+    "acquire_synchronized_begin",
+    "acquire_sequence_prepare",
+    "acquire_sequence_begin",
+    "acquire_single_begin",
+    "set_dark_image",
+    "set_gain_image",
+    "get_expected_dimensions",
+)
+"""
+Camera device methods whose *existence* is the question, never called.
+
+``acquire_synchronized_*`` is how Nion's stack reads a camera in step
+with a scan — a spectrum image. A device without it cannot take one
+through Nion, whatever a UI offers.
+"""
+
+_NION_SCAN_CAPABILITIES = (
+    "prepare_synchronized_scan",
+    "calculate_flyback_pixels",
+    "calculate_max_field_of_view",
+    "read_partial",
+    "get_buffer_data",
+    "set_sequence_buffer_size",
+)
+"""
+Scan device methods whose existence is the question, never called.
+
+``prepare_synchronized_scan`` is the scan half of a Nion spectrum image.
+"""
+
+_NION_SCAN_SOURCE_CAPABILITIES = (
+    "grab_synchronized",
+    "grab_synchronized_get_info",
+    "record_immediate",
+    "prepare_sequence_mode",
+)
+"""
+Scan *hardware source* methods whose existence is the question.
+
+``grab_synchronized`` is Nion's spectrum-image entry point. Whether it
+is there, and whether the camera beside it has
+``acquire_synchronized_*``, together say whether this column can take a
+spectrum image through Nion's own stack today.
+"""
+
+_GATAN_SEARCH_FRAGMENTS = ("gatan", "digitalmicrograph", "gms")
+_GATAN_ENVIRONMENT_FRAGMENTS = ("GMS", "GATAN", "DIGITALMICROGRAPH")
 
 _HITACHI_MODULES = ("MfExtCont", "MfKeyMouse", "MfCommon")
 """
@@ -281,13 +433,23 @@ def interpreter_report() -> dict[str, Any]:
             "interpreter Nion Swift runs — ideally Swift's own Python console."
         )
 
+    inside_gms = "DigitalMicrograph" in sys.modules
+    if inside_gms:
+        warnings.append(
+            "This is Gatan Microscopy Suite's own Python. That is the right "
+            "place for --gatan, and this interpreter's version is the answer "
+            "to the GMS-embedded-Python question on the hardware checklist."
+        )
+
     return {
         "machine": machine_facts(),
         "sections_this_interpreter_can_answer": {
             "nion": can_nion,
             "dectris": True,
+            "gatan": True,
             "hitachi": sys.platform.startswith("win") or sys.platform == "linux",
         },
+        "inside_gms": inside_gms,
         "warnings": warnings,
     }
 
@@ -317,6 +479,104 @@ def _installed_versions(prefixes: tuple[str, ...]) -> dict[str, str]:
     return found
 
 
+def _public_names(target: Any) -> list[str]:  # noqa: ANN401 - any object
+    """
+    List an object's public attribute names, reading none of them.
+
+    Parameters
+    ----------
+    target : Any
+        The object to describe.
+
+    Returns
+    -------
+    list[str]
+        Names not starting with an underscore. ``dir`` on its own reads
+        no property, so this is a description of the surface and not a
+        sweep of its values.
+    """
+    return [name for name in dir(target) if not name.startswith("_")]
+
+
+def _plain(value: Any) -> Any:  # noqa: ANN401 - vendor object in, JSON-shaped out
+    """
+    Turn a vendor value into something ``json.dumps`` can carry.
+
+    Parameters
+    ----------
+    value : Any
+        A frame-parameters object, a mapping, a tuple, or a scalar.
+
+    Returns
+    -------
+    Any
+        ``as_dict()`` when the object offers it, a ``dict`` for a mapping,
+        a list for a sequence, and ``str`` for anything else exotic.
+    """
+    as_dict = getattr(value, "as_dict", None)
+    if callable(as_dict):
+        with contextlib.suppress(Exception):
+            return _plain(as_dict())
+    if isinstance(value, dict):
+        return {str(key): _plain(item) for key, item in value.items()}
+    if hasattr(value, "items") and callable(value.items):
+        with contextlib.suppress(Exception):
+            return {str(key): _plain(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_plain(item) for item in value]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)
+
+
+def _capabilities(target: Any, names: tuple[str, ...]) -> dict[str, bool]:  # noqa: ANN401
+    """
+    Say which named methods an object has, calling none of them.
+
+    Parameters
+    ----------
+    target : Any
+        The object to inspect.
+    names : tuple[str, ...]
+        Method names whose presence is the question.
+
+    Returns
+    -------
+    dict[str, bool]
+        Name to whether a callable of that name exists.
+    """
+    return {name: callable(getattr(target, name, None)) for name in names}
+
+
+def _nion_plugins() -> dict[str, Any]:
+    """
+    List the installed ``nionswift_plugin`` modules without importing any.
+
+    Returns
+    -------
+    dict[str, Any]
+        Where the namespace lives and the module names found in it.
+
+    Notes
+    -----
+    This is the first item on the hardware checklist, and it settles two
+    assumptions at once: which vendor plug-in this project's device server
+    must load by name, and whether that name is one autodiscovery would
+    have skipped. ``find_spec`` locates the namespace package and
+    ``pkgutil.iter_modules`` lists files in it; neither runs any of the
+    plug-ins, which is the property that makes this safe beside a running
+    Swift.
+    """
+    spec = importlib.util.find_spec("nionswift_plugin")
+    if spec is None:
+        return {"found": False, "modules": []}
+    locations = list(spec.submodule_search_locations or [])
+    modules = sorted(
+        {info.name for info in pkgutil.iter_modules(locations)},
+    )
+    return {"found": True, "locations": locations, "modules": modules}
+
+
 def _nion_camera(controller: Any, attribute: str) -> Any:  # noqa: ANN401 - vendor object
     """
     Describe one camera a stem controller exposes, if it exposes it.
@@ -326,7 +586,8 @@ def _nion_camera(controller: Any, attribute: str) -> Any:  # noqa: ANN401 - vend
     controller : Any
         The registered ``stem_controller`` component.
     attribute : str
-        Attribute name, ``ronchigram_camera`` or ``eels_camera``.
+        Attribute name: ``ronchigram_camera``, ``eels_camera`` or
+        ``slit_camera``.
 
     Returns
     -------
@@ -339,10 +600,92 @@ def _nion_camera(controller: Any, attribute: str) -> Any:  # noqa: ANN401 - vend
     return {
         "present": True,
         "class": type(camera).__name__,
+        "hardware_source_id": getattr(camera, "hardware_source_id", None),
+        "display_name": getattr(camera, "display_name", None),
         "camera_id": getattr(camera, "camera_id", None),
         "camera_type": getattr(camera, "camera_type", None),
         "camera_name": getattr(camera, "camera_name", None),
     }
+
+
+def _nion_camera_device(device: Any) -> dict[str, Any]:  # noqa: ANN401 - vendor object
+    """
+    Read a camera device's descriptive properties and list its methods.
+
+    Parameters
+    ----------
+    device : Any
+        A ``camera_module.camera_device``.
+
+    Returns
+    -------
+    dict[str, Any]
+        Each fact in ``_NION_CAMERA_FACTS`` (as data or as the error
+        reading it raised), which of ``_NION_CAMERA_CAPABILITIES`` exist,
+        the expected frame shape at binning 1, and the device's public
+        surface.
+
+    Notes
+    -----
+    Every entry is a property read or a ``hasattr``. ``get_expected_dimensions``
+    is the one method called, because it is pure arithmetic on the
+    readout area and answers the frame-shape question directly.
+    """
+    facts = {
+        name: _safe(name, lambda attribute=name: _plain(getattr(device, attribute)))
+        for name in _NION_CAMERA_FACTS
+    }
+    expected = getattr(device, "get_expected_dimensions", None)
+    return {
+        "class": f"{type(device).__module__}.{type(device).__name__}",
+        "facts": facts,
+        "capabilities": _capabilities(device, _NION_CAMERA_CAPABILITIES),
+        "expected_dimensions_at_binning_1": _safe(
+            "get_expected_dimensions(1)",
+            lambda: _plain(expected(1)) if callable(expected) else None,
+        ),
+        "surface": _public_names(device),
+    }
+
+
+def _nion_camera_modules(registry: Any) -> list[dict[str, Any]]:  # noqa: ANN401
+    """
+    Describe every registered ``camera_module``, not only the two named ones.
+
+    Parameters
+    ----------
+    registry : Any
+        ``nion.utils.Registry``.
+
+    Returns
+    -------
+    list[dict[str, Any]]
+        One entry per camera module, ordered by camera id.
+
+    Notes
+    -----
+    The stem controller names at most a Ronchigram, an EELS and a slit
+    camera. A column can register more, and a camera whose
+    ``camera_type`` is neither ``"ronchigram"`` nor ``"eels"`` is one
+    this project's server would sort wrongly, so all of them are listed.
+    """
+    get_all = getattr(registry, "get_components_by_type", None)
+    modules = list(get_all("camera_module")) if callable(get_all) else []
+    described = []
+    for module in modules:
+        device = getattr(module, "camera_device", None)
+        described.append(
+            {
+                "module_class": type(module).__name__,
+                "camera_settings_class": type(
+                    getattr(module, "camera_settings", None),
+                ).__name__,
+                "camera_panel_type": getattr(module, "camera_panel_type", None),
+                "device": _nion_camera_device(device) if device is not None else None,
+            },
+        )
+    described.sort(key=lambda entry: str((entry.get("device") or {}).get("facts")))
+    return described
 
 
 def _nion_scan_channels(registry: Any) -> Any:  # noqa: ANN401 - vendor object
@@ -357,7 +700,9 @@ def _nion_scan_channels(registry: Any) -> Any:  # noqa: ANN401 - vendor object
     Returns
     -------
     Any
-        Channel count and per-channel identity, or None without a scan module.
+        Channel count, per-channel identity, the device's current frame
+        parameters and its synchronisation-related methods, or None
+        without a scan module.
     """
     scan = registry.get_component("scan_module")
     device = getattr(scan, "device", None) if scan is not None else None
@@ -366,16 +711,151 @@ def _nion_scan_channels(registry: Any) -> Any:  # noqa: ANN401 - vendor object
     count = getattr(device, "channel_count", None)
     channels = []
     for index in range(int(count or 0)):
-        info = getattr(device, "get_channel_info", None)
         entry: dict[str, Any] = {"index": index}
+        info = getattr(device, "get_channel_info", None)
         if callable(info):
             with contextlib.suppress(Exception):
                 channel = info(index)
                 entry["name"] = getattr(channel, "name", None)
                 entry["id"] = getattr(channel, "channel_id", None)
                 entry["enabled"] = getattr(channel, "enabled", None)
+        get_name = getattr(device, "get_channel_name", None)
+        if "name" not in entry and callable(get_name):
+            with contextlib.suppress(Exception):
+                entry["name"] = get_name(index)
         channels.append(entry)
-    return {"channel_count": count, "channels": channels}
+    return {
+        "device_class": f"{type(device).__module__}.{type(device).__name__}",
+        "scan_device_id": getattr(device, "scan_device_id", None),
+        "scan_device_name": getattr(device, "scan_device_name", None),
+        "channel_count": count,
+        "channels": channels,
+        "channels_enabled": _safe(
+            "channels_enabled",
+            lambda: _plain(getattr(device, "channels_enabled", None)),
+        ),
+        "current_frame_parameters": _safe(
+            "current_frame_parameters",
+            lambda: _plain(getattr(device, "current_frame_parameters", None)),
+        ),
+        "flyback_pixels_attribute": getattr(device, "flyback_pixels", None),
+        "capabilities": _capabilities(device, _NION_SCAN_CAPABILITIES),
+        "surface": _public_names(device),
+    }
+
+
+def _nion_profiles(source: Any) -> dict[str, Any]:  # noqa: ANN401 - vendor object
+    """
+    Read a hardware source's saved profiles and its current parameters.
+
+    Parameters
+    ----------
+    source : Any
+        A scan or camera hardware source.
+
+    Returns
+    -------
+    dict[str, Any]
+        The selected profile index, each profile's parameters, and the
+        parameters in force now. Reads only: nothing is selected or set.
+    """
+    get_profile = getattr(source, "get_frame_parameters", None)
+    profiles = {
+        str(index): _safe(
+            f"profile {index}",
+            lambda i=index: _plain(get_profile(i)) if callable(get_profile) else None,
+        )
+        for index in range(_NION_PROFILE_COUNT)
+    }
+    current = getattr(source, "get_current_frame_parameters", None)
+    return {
+        "selected_profile_index": getattr(source, "selected_profile_index", None),
+        "profiles": profiles,
+        "current": _safe(
+            "current frame parameters",
+            lambda: _plain(current()) if callable(current) else None,
+        ),
+    }
+
+
+def _nion_hardware_sources() -> dict[str, Any]:
+    """
+    List Swift's hardware sources: the scan and cameras as the application sees them.
+
+    Returns
+    -------
+    dict[str, Any]
+        One entry per hardware source with its identity, features,
+        profiles and — for the scan — whether it offers
+        ``grab_synchronized``, Nion's spectrum-image entry point.
+
+    Notes
+    -----
+    Only meaningful from Swift's own console, where the application has
+    built these. Everything read is a property, a saved profile or a
+    ``hasattr``; no source is started, and no profile is selected.
+    """
+    from nion.instrumentation import HardwareSource  # noqa: PLC0415 - optional, probed
+
+    manager = HardwareSource.HardwareSourceManager()
+    entries = []
+    for source in list(manager.hardware_sources):
+        entry: dict[str, Any] = {
+            "hardware_source_id": getattr(source, "hardware_source_id", None),
+            "display_name": getattr(source, "display_name", None),
+            "class": f"{type(source).__module__}.{type(source).__name__}",
+            "features": _safe("features", lambda s=source: _plain(s.features)),
+            "profiles": _safe("profiles", lambda s=source: _nion_profiles(s)),
+            "modes": _safe("modes", lambda s=source: _plain(getattr(s, "modes", None))),
+            "surface": _public_names(source),
+        }
+        scan_device = getattr(source, "scan_device", None)
+        if scan_device is not None:
+            entry["scan"] = {
+                "source_capabilities": _capabilities(
+                    source,
+                    _NION_SCAN_SOURCE_CAPABILITIES,
+                ),
+                "channel_count": getattr(source, "channel_count", None),
+                "subscan_enabled": getattr(source, "subscan_enabled", None),
+                "probe_state": getattr(source, "probe_state", None),
+            }
+        camera = getattr(source, "camera", None)
+        if camera is not None:
+            entry["camera"] = _safe(
+                "camera device", lambda c=camera: _nion_camera_device(c)
+            )
+        entries.append(entry)
+    return {"count": len(entries), "sources": entries}
+
+
+def _nion_2d_control(controller: Any, name: str) -> dict[str, Any]:  # noqa: ANN401
+    """
+    Read one 2D control, trying both ``GetVal2D`` calling conventions.
+
+    Parameters
+    ----------
+    controller : Any
+        The registered ``stem_controller`` component.
+    name : str
+        Control name, e.g. ``stage_position_m``.
+
+    Returns
+    -------
+    dict[str, Any]
+        The value under each convention, or the error each raised.
+    """
+    getter = getattr(controller, "GetVal2D", None)
+    if not callable(getter):
+        return {"queried": False, "reason": "no GetVal2D on this controller"}
+    return {
+        "queried": True,
+        "without_axis": _safe("GetVal2D(name)", lambda: _plain(getter(name))),
+        "with_axis": _safe(
+            "GetVal2D(name, axis=('x', 'y'))",
+            lambda: _plain(getter(name, axis=("x", "y"))),
+        ),
+    }
 
 
 def _nion_control(controller: Any, name: str) -> Any:  # noqa: ANN401 - vendor return
@@ -426,6 +906,9 @@ def probe_nion() -> dict[str, Any]:
         "installed nion packages",
         lambda: _installed_versions(("nion",)),
     )
+    # Which vendor plug-in this project's server must load by name, and
+    # whether autodiscovery would have skipped it. Listed, not imported.
+    report["plugins"] = _safe("installed nionswift_plugin modules", _nion_plugins)
 
     try:
         from nion.utils import Registry  # noqa: PLC0415 - optional, probed
@@ -457,27 +940,70 @@ def probe_nion() -> dict[str, Any]:
     report["stem_controller"] = {
         "class": type(controller).__name__,
         "module": type(controller).__module__,
+        "surface": _public_names(controller),
+        # Assumption 5 on the hardware checklist: the server falls back to
+        # a 1 um stage when this is absent, which makes every default
+        # field of view wrong rather than failing.
+        "stage_size_nm": _safe(
+            "stage_size_nm",
+            lambda: _plain(getattr(controller, "stage_size_nm", None)),
+        ),
+        "probe_position": _safe(
+            "probe_position",
+            lambda: _plain(getattr(controller, "probe_position", None)),
+        ),
+        "subscan_state": _safe(
+            "subscan_state",
+            lambda: _plain(getattr(controller, "subscan_state", None)),
+        ),
+        "drift_tracker": _safe(
+            "drift_tracker",
+            lambda: type(getattr(controller, "drift_tracker", None)).__name__,
+        ),
     }
 
     # THE question for SuperSTEM 2: if eels_camera is present, the UHV
-    # Enfina is reached through Nion and needs no Gatan code at all.
+    # Enfina is reached through Nion and needs no Gatan code at all. The
+    # same read on SuperSTEM 3 says whether Nion also registers the ELA,
+    # which would put two drivers on one detector.
     report["cameras"] = {
         name: _safe(name, lambda attribute=name: _nion_camera(controller, attribute))
-        for name in ("ronchigram_camera", "eels_camera")
+        for name in ("ronchigram_camera", "eels_camera", "slit_camera")
     }
+    report["scan_controller"] = _safe(
+        "scan_controller",
+        lambda: type(getattr(controller, "scan_controller", None)).__name__,
+    )
 
     report["registry_components"] = {
         name: _safe(name, lambda key=name: Registry.get_component(key) is not None)
         for name in ("scan_module", "camera_module", "stem_controller")
     }
 
+    # Every camera the registry holds, with what each device says about
+    # itself: shape, binning, dark and gain support, calibration controls,
+    # and whether it can be read in step with a scan.
+    report["camera_modules"] = _safe(
+        "camera modules",
+        lambda: _nion_camera_modules(Registry),
+    )
+
     # The multi-channel question: how many signals this column reads out
-    # from one pass, and what they are called.
+    # from one pass, and what they are called - plus the scan device's
+    # current parameters and whether it can prepare a synchronised scan.
     report["scan"] = _safe("scan channels", lambda: _nion_scan_channels(Registry))
+
+    # The application's view: hardware sources, their saved profiles (how
+    # the operators actually acquire here), and grab_synchronized.
+    report["hardware_sources"] = _safe("hardware sources", _nion_hardware_sources)
 
     report["controls"] = {
         name: _safe(name, lambda control=name: _nion_control(controller, control))
         for name in _NION_CONTROLS
+    }
+    report["controls_2d"] = {
+        name: _safe(name, lambda control=name: _nion_2d_control(controller, control))
+        for name in _NION_2D_CONTROLS
     }
     return report
 
@@ -508,7 +1034,26 @@ def _simplon_get(address: str, module: str, version: str, path: str) -> Any:  # 
     instrument network, where an HTTP proxy either cannot route to it or
     resolves the address to something else entirely.
     """
-    url = f"http://{address}/{module}/api/{version}/{path}"
+    return _simplon_get_unversioned(address, f"{module}/api/{version}/{path}")
+
+
+def _simplon_get_unversioned(address: str, path: str) -> Any:  # noqa: ANN401
+    """
+    Perform one SIMPLON ``GET`` at a path given in full, returning the ``value``.
+
+    Parameters
+    ----------
+    address : str
+        ``host`` or ``host:port`` of the detector control unit.
+    path : str
+        Everything after the host, e.g. ``detector/api/version``.
+
+    Returns
+    -------
+    Any
+        The ``value`` field if the answer has one, else the whole answer.
+    """
+    url = f"http://{address}/{path}"
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     # http:// is built above from a host, so the scheme is not attacker-chosen.
     request = urllib.request.Request(url, method="GET")
@@ -542,6 +1087,14 @@ def probe_dectris(address: str) -> dict[str, Any]:
     detector — and the state it reports will say if somebody is.
     """
     report: dict[str, Any] = {"section": "dectris", "address": address}
+
+    # SIMPLON's own answer to "which version", at the one path that is
+    # not itself versioned. Recorded beside the by-trial answer below
+    # rather than replacing it: an older DCU may not serve this path.
+    report["advertised_api_version"] = _safe(
+        "GET /detector/api/version",
+        lambda: _simplon_get_unversioned(address, "detector/api/version"),
+    )
 
     working: str | None = None
     attempts: dict[str, str] = {}
@@ -579,6 +1132,14 @@ def probe_dectris(address: str) -> dict[str, Any]:
         "detector config key list",
         lambda: _simplon_get(address, "detector", working, "config/keys"),
     )
+    report["status_keys_published"] = _safe(
+        "detector status key list",
+        lambda: _simplon_get(address, "detector", working, "status/keys"),
+    )
+    report["command_keys_published"] = _safe(
+        "detector command key list",
+        lambda: _simplon_get(address, "detector", working, "command/keys"),
+    )
     report["config"] = {
         key: _safe(
             key,
@@ -594,7 +1155,9 @@ def probe_dectris(address: str) -> dict[str, Any]:
         for name, path in (
             ("mode", "config/mode"),
             ("buffer_size", "config/buffer_size"),
+            ("discard_new", "config/discard_new"),
             ("state", "status/state"),
+            ("buffer_fill_level", "status/buffer_fill_level"),
         )
     }
     report["stream"] = {
@@ -602,12 +1165,20 @@ def probe_dectris(address: str) -> dict[str, Any]:
             name,
             lambda p=path: _simplon_get(address, "stream", working, p),
         )
-        for name, path in (("mode", "config/mode"), ("state", "status/state"))
+        for name, path in (
+            ("mode", "config/mode"),
+            ("header_detail", "config/header_detail"),
+            ("format", "config/format"),
+            ("state", "status/state"),
+        )
     }
     return report
 
 
-def _find_directories(name_fragment: str) -> list[str]:
+def _find_directories(
+    name_fragment: str,
+    roots: tuple[str, ...] = _HITACHI_SEARCH_ROOTS,
+) -> list[str]:
     """
     Look for directories whose name contains a fragment, within bounded roots.
 
@@ -615,6 +1186,8 @@ def _find_directories(name_fragment: str) -> list[str]:
     ----------
     name_fragment : str
         Lowercase substring to match against directory names.
+    roots : tuple[str, ...]
+        Directories to walk, a few levels deep each.
 
     Returns
     -------
@@ -627,7 +1200,7 @@ def _find_directories(name_fragment: str) -> list[str]:
     on an instrument computer is neither quick nor polite.
     """
     found: list[str] = []
-    for root in _HITACHI_SEARCH_ROOTS:
+    for root in roots:
         base = Path(root)
         if not base.is_dir():
             continue
@@ -682,7 +1255,14 @@ def probe_hitachi() -> dict[str, Any]:
     report["sys_path"] = list(sys.path)
     report["directories"] = {
         fragment: _safe(fragment, lambda f=fragment: _find_directories(f))
-        for fragment in ("hitachi", "su9000", "flow creator", "pc-sem", "sem")
+        for fragment in (
+            "hitachi",
+            "su9000",
+            "flow creator",
+            "elementview",
+            "pc-sem",
+            "sem",
+        )
     }
     report["python_files_named_mf"] = _safe(
         "Mf*.py on sys.path",
@@ -693,6 +1273,69 @@ def probe_hitachi() -> dict[str, Any]:
             for path in Path(entry).glob("Mf*.py")
         ],
     )
+    return report
+
+
+def probe_gatan() -> dict[str, Any]:
+    """
+    Say whether Gatan Microscopy Suite is here, and whether this is its Python.
+
+    Returns
+    -------
+    dict[str, Any]
+        Whether ``DigitalMicrograph`` can be located, whether it is
+        *already loaded* (which means this interpreter is DM's own
+        Python window), the module's surface if so, GMS-related
+        environment variables, and likely install directories.
+
+    Notes
+    -----
+    ``find_spec`` locates the module without importing it. If the module
+    is already in ``sys.modules`` the script is running inside GMS, and
+    listing the module's public names is a ``dir`` call on something
+    the host loaded — no DM script is executed, no image is read, and
+    nothing on the spectrometer is touched. The one thing worth knowing
+    from inside GMS that this cannot see is which imaging-filter
+    commands exist; that is a deliberate act for the hardware checklist,
+    not a survey.
+    """
+    report: dict[str, Any] = {"section": "gatan"}
+    loaded = sys.modules.get("DigitalMicrograph")
+    if loaded is not None:
+        # Already loaded by the host. find_spec is not consulted, because
+        # an embedded module can carry no spec at all, and asking raises.
+        spec = getattr(loaded, "__spec__", None)
+        origin = getattr(spec, "origin", None) or getattr(loaded, "__file__", None)
+        report["module"] = {"locatable": True, "origin": origin}
+    else:
+        spec = importlib.util.find_spec("DigitalMicrograph")
+        report["module"] = {
+            "locatable": spec is not None,
+            "origin": getattr(spec, "origin", None),
+        }
+    report["inside_gms"] = loaded is not None
+    report["module_surface"] = _public_names(loaded) if loaded is not None else None
+    report["environment"] = {
+        key: value
+        for key, value in os.environ.items()
+        if any(fragment in key.upper() for fragment in _GATAN_ENVIRONMENT_FRAGMENTS)
+    }
+    report["directories"] = {
+        fragment: _safe(
+            fragment,
+            lambda f=fragment: _find_directories(f, _HITACHI_SEARCH_ROOTS),
+        )
+        for fragment in _GATAN_SEARCH_FRAGMENTS
+    }
+    if loaded is None and spec is None:
+        report["note"] = (
+            "DigitalMicrograph is not importable from this interpreter. That is "
+            "expected on DigitalMicrograph 1.x and 2.x, which embed no Python; "
+            "the directories and environment above still say whether and where "
+            "DM is installed. On GMS 3.4 or newer, run --check and --gatan from "
+            "DM's own Python window (Help > Python) as well, to record its "
+            "interpreter and the module's surface."
+        )
     return report
 
 
@@ -729,9 +1372,14 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--hitachi", action="store_true", help="look for Hitachi control modules"
     )
     parser.add_argument(
+        "--gatan",
+        action="store_true",
+        help="look for Gatan Microscopy Suite, and say if this is its Python",
+    )
+    parser.add_argument(
         "--all",
         action="store_true",
-        help="run the Nion and Hitachi sections (DECTRIS needs an address)",
+        help="run the Nion, Gatan and Hitachi sections (DECTRIS needs an address)",
     )
     parser.add_argument(
         "--out",
@@ -756,9 +1404,24 @@ def _print_section(section: dict[str, Any]) -> None:
     if name == "nion":
         cameras = section.get("cameras", {})
         eels = cameras.get("eels_camera", {}).get("value")
+        controller = section.get("stem_controller") or {}
+        controls = section.get("controls", {})
+        plugins = (section.get("plugins") or {}).get("value") or {}
+        sources = (section.get("hardware_sources") or {}).get("value") or {}
         print(f"  registry available : {section.get('registry_available')}")
-        print(f"  stem_controller    : {section.get('stem_controller')}")
+        print(f"  plug-ins installed : {plugins.get('modules')}")
+        print(
+            f"  stem_controller    : {controller.get('class') if controller else None}"
+        )
         print(f"  eels_camera        : {eels}")
+        print(f"  hardware sources   : {sources.get('count')}")
+        for control in ("ZLPoffset", "EELS_MagneticShift_Offset", "C_Blank"):
+            answer = controls.get(control, {}).get("value") or {}
+            exists, value = answer.get("exists"), answer.get("value")
+            print(f"  {control:26} : exists={exists} value={value}")
+    elif name == "gatan":
+        print(f"  DigitalMicrograph  : {section.get('module')}")
+        print(f"  inside GMS         : {section.get('inside_gms')}")
     elif name == "dectris":
         print(f"  reachable          : {section.get('reachable')}")
         print(f"  api version        : {section.get('api_version')}")
@@ -819,12 +1482,14 @@ def main(argv: list[str] | None = None) -> int:
         sections.append(probe_nion())
     if args.dectris:
         sections.append(probe_dectris(args.dectris))
+    if args.gatan or args.all:
+        sections.append(probe_gatan())
     if args.hitachi or args.all:
         sections.append(probe_hitachi())
 
     if not sections:
         print("Nothing requested. Try --check first, then --nion, --dectris")
-        print("ADDRESS, --hitachi or --all.")
+        print("ADDRESS, --gatan, --hitachi or --all.")
         return 0
 
     report = {

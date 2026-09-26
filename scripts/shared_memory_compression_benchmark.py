@@ -1,16 +1,18 @@
 """
 Measure whether zstd compression helps the shared-memory frame path.
 
-docs/migration-plan.md §6 already replaced one-shot shared-memory segments
-with persistent, reused ones (:mod:`miainwoodpecker.devices.shared_frame`),
-so the transfer cost per frame is now essentially one memcpy in
-(``SharedFrameWriter.publish``) and one memcpy out
-(``SharedFrameReader.read``). This script asks a follow-on question: can
+Shared-memory segments are persistent and reused, not allocated per frame
+(:mod:`miainwoodpecker.devices.shared_frame`; see
+docs/scripting-and-automation.md's "Driving an instrument that other
+people are also using" section for why reuse matters), so the transfer
+cost per frame is essentially one memcpy in (``SharedFrameWriter.publish``)
+and one memcpy out (``SharedFrameReader.read``). This script asks a
+follow-on question: can
 transparent zstd compression - using idle CPU cores in parallel, via
 ``zstandard.ZstdCompressor(threads=N)`` - reduce end-to-end latency
 further, by shrinking the bytes that cross the memcpy boundary?
 
-The Phase 3 storage finding (§5's "Revisit compression" item) is the
+The storage-compression finding in docs/scripting-and-automation.md is the
 reason to suspect not: gzip level 4 on noisy float64 scan data measured a
 *1.08x* ratio (bigger than raw), while float32 camera frames compressed
 to 0.69x. That is an HDF5-storage measurement, not this IPC path, but it
@@ -41,8 +43,7 @@ shared memory in each case, not just an isolated compression benchmark.
 
 Run with: uv run --extra device python scripts/shared_memory_compression_benchmark.py
 (or: install zstandard into that environment first, e.g.
-``uv pip install zstandard``, since it is not yet a project dependency -
-see this investigation's conclusion in docs/migration-plan.md §6 for why).
+``uv pip install zstandard``, since it is not yet a project dependency).
 """
 
 from __future__ import annotations

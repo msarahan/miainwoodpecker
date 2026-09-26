@@ -21,8 +21,9 @@ Two things here are deliberately more than "does the wrapper work":
 - The **instrument controls** are checked for *effect on data*, not just
   for a successful setter and a matching read-back. usim has controls
   that accept a value and then quietly ignore it outside the full
-  ``HardwareSource``/``Application`` layer (docs/migration-plan.md, §7,
-  on ``probe_position``), so read-back alone would prove nothing.
+  ``HardwareSource``/``Application`` layer (see
+  docs/hardware-validation-checklist.md on ``probe_position``), so
+  read-back alone would prove nothing.
   Thresholds here come from ``scripts/device_control_verification.py``.
 
 Skipped automatically unless the ``device`` optional dependency group is
@@ -429,12 +430,12 @@ def _camera_frame(camera) -> np.ndarray:
 # ------------------------------------------------------- command line
 #
 # The documented precedence is "each defaulting to an environment
-# variable, with the command line winning" (docs/migration-plan.md, §5
-# Phase 1). Asserted rather than assumed, because the natural argparse
-# spelling of it is silently wrong: ``action="append"`` appends to its
-# default instead of replacing it, so seeding that default from the
-# environment made ``--plugin foo`` mean "the environment's plug-ins *and*
-# foo". On a hardware backend that loads vendor plug-ins nobody asked for.
+# variable, with the command line winning". Asserted rather than assumed,
+# because the natural argparse spelling of it is silently wrong:
+# ``action="append"`` appends to its default instead of replacing it, so
+# seeding that default from the environment made ``--plugin foo`` mean
+# "the environment's plug-ins *and* foo". On a hardware backend that
+# loads vendor plug-ins nobody asked for.
 
 # The whole port list, which is now one port: everything else the server
 # serves binds where the OS says and is reported through describe(). This
@@ -681,9 +682,9 @@ def test_park_blanks_the_beam():
 # hold them, which ``camera_base.build_calibration`` resolves at
 # acquisition time - because a camera's angular scale depends on the
 # projector lenses, so it is instrument state rather than a device
-# constant. These pin what usim actually reports through that path, which
-# is what the migration plan's §7 "nothing feeds calibration from the
-# instrument" gap needed.
+# constant (see docs/scripting-and-automation.md on axis calibration
+# being a property of the acquisition rather than the detector). These
+# pin what usim actually reports through that path.
 
 
 class _FakeCalibration:
@@ -978,8 +979,8 @@ def test_an_instrument_that_reports_nothing_contributes_no_keys():
 
 # ------------------------------------------------- exposure and binning
 #
-# §7 wanted these done *with* calibration rather than after it, and the
-# reason is now mechanical rather than stylistic: binning multiplies the
+# These are done *with* calibration rather than after it, for a reason
+# that is mechanical rather than stylistic: binning multiplies the
 # calibration scale (build_calibration's relative_scale), so a binning
 # control that did not reach the calibration would write axes wrong by an
 # integer factor on every binned frame.

@@ -451,7 +451,12 @@ them:
   `No session - data is not being kept`.
 - **Free space** — an absolute figure, with a warning if the recording
   you are set up to take would not fit. With no session there is no
-  figure to give, so the field is not there at all.
+  figure to give, so the field is not there at all. The comparison is
+  made against the *uncompressed* size of the planned acquisition rather
+  than an estimated compressed size: erring high means warning slightly
+  early, which is the safe direction to be wrong about running out of
+  disk mid-acquisition, and the actual compression ratio depends on data
+  that does not exist yet at warning time.
 
 Both are **read-only**. They tell you where you stand; they are not
 where you change it, so the setting has one home rather than two.
@@ -578,9 +583,9 @@ there is no spectrum in a 4D stack.
 
 The window stays live throughout. The pass runs on its own thread and
 the screen samples it, so the live view keeps running, the panels still
-zoom and pan, and the application answers. It used to run inline: a long
-spectrum image froze the whole window until it finished, which the
-operating system reports as an application that has stopped responding.
+zoom and pan, and the application answers — a long spectrum image never
+freezes the window, which the operating system would otherwise report as
+an application that has stopped responding.
 
 The progress panel is sized to its map like any other, so a 64x64 grid
 opens as a 512-pixel window rather than as a 64-pixel stamp.
@@ -672,7 +677,11 @@ If an acquisition was interrupted, the file list says exactly what
 survived rather than making you find out: a recording whose writer was
 stopped abruptly still opens and displays every frame (it is marked
 "unfinalized — viewable, not analyzable"), while one from a hard-killed
-process is reported as damaged.
+process is reported as damaged. Each appended frame is flushed to disk
+immediately rather than buffered, so an abrupt kill loses at most the one
+frame that was in flight, never the recording as a whole — an orderly
+interruption, whether an exception or a stop request, always leaves a
+complete, valid file.
 
 ## First-look analysis
 

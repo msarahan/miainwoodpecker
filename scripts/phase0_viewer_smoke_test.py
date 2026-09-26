@@ -1,8 +1,7 @@
 """
 Confirm a bare napari + PySide6 window can be constructed.
 
-Phase 0 groundwork check (see docs/migration-plan.md) for the live-viewer
-shell.
+Phase 0 groundwork check for the live-viewer shell.
 
 Requires a real (or virtual) display. ``QT_QPA_PLATFORM=offscreen`` is
 deliberately *not* offered as a fallback: under offscreen Qt provides no

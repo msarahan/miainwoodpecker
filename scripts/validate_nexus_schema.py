@@ -1,15 +1,14 @@
 """
 Validate this project's own NeXus output against the NXem NXDL schema.
 
-docs/migration-plan.md §5's Phase 3 left this open: files declared
-``definition = "NXem"`` to state intent, but the claim was unverified,
-because the NeXus/FAIRmat spec sites are unreachable from this
-environment. They still are - but ``pynxtools`` is on PyPI, PyPI *is*
-reachable, and ``pynxtools`` ships the NXDL definitions inside the
-package, so the schema can be checked entirely offline. The Phase 3 note
-also said where this belongs: a CI validation step, not the runtime. This
-script is that step; ``pynxtools`` appears only in the ``validate`` pixi
-environment and is never imported by the shipped package.
+Files declared ``definition = "NXem"`` to state intent, but the claim was
+left unverified, because the NeXus/FAIRmat spec sites are unreachable
+from this environment. They still are - but ``pynxtools`` is on PyPI,
+PyPI *is* reachable, and ``pynxtools`` ships the NXDL definitions inside
+the package, so the schema can be checked entirely offline, as a CI
+validation step rather than at runtime. This script is that step;
+``pynxtools`` appears only in the ``validate`` pixi environment and is
+never imported by the shipped package.
 
 What it checks, and why each check exists
 -----------------------------------------

@@ -465,10 +465,11 @@ def _abandon_a_writer(path, frame_count: int = 3) -> None:
     """
     Leave the file an abandoned-but-cleanly-exited writer leaves.
 
-    Frames all present, no ``/entry/data``, no ``end_time`` — the second
-    interruption mode in the migration plan's Phase 3 table. (The third,
-    a real ``SIGKILL``, is produced for real in ``tests/unit/test_session.py``;
-    here what matters is only what the widget says about it.)
+    Frames all present, no ``/entry/data``, no ``end_time`` — the
+    "unfinalized" interruption mode described in
+    ``docs/using-the-viewer.md``. (The other, a real ``SIGKILL``, is
+    produced for real in ``tests/unit/test_session.py``; here what
+    matters is only what the widget says about it.)
     """
     writer = NexusWriter(path, title="abandoned")
     # Deliberately entered without ever being __exit__ed or closed.

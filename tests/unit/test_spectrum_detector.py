@@ -176,10 +176,10 @@ def test_the_simulated_detector_satisfies_the_protocol_structurally():
     """
     ``isinstance`` against the runtime-checkable protocol, as the others do.
 
-    The protocols here are structural on purpose (migration plan, Phase
-    1) so an adapter satisfies them by shape rather than by inheriting.
-    Asserting it here is what makes the claim testable for a device kind
-    that has no in-tree hardware adapter to check it against.
+    The protocols here are structural on purpose, so an adapter satisfies
+    them by shape rather than by inheriting. Asserting it here is what
+    makes the claim testable for a device kind that has no in-tree
+    hardware adapter to check it against.
     """
     detector = open_detector(SIMULATED_BACKEND, None)
     assert isinstance(detector, SpectrumDetector)

@@ -55,7 +55,7 @@ worker holds no state that outlives one call — its input is still on disk
 or still in this process's memory, and its output is the result of the
 call that died — so a worker that dies costs one result and a respawn.
 :meth:`WorkerRunner.run` therefore starts a new one on the next call
-rather than ending the session, and the difference from §6's rule is a
+rather than ending the session, and the difference from that rule is a
 difference in what is at stake, not an inconsistency.
 """
 
